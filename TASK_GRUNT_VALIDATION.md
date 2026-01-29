@@ -89,18 +89,19 @@ After deployment, verify:
 - **Fix:** Added `using Microsoft.Graph.Contracts;` per EchoBot pattern
 - **Files:** `TeamsCallingBotService.cs`, `CallHandler.cs`
 
-## Final Package Configuration
-```xml
-<PackageReference Include="Microsoft.Graph.Communications.Calls.Media" Version="1.2.0.15690" />
-<PackageReference Include="Microsoft.Skype.Bots.Media" Version="1.32.0.70-preview" />
-<PackageReference Include="Microsoft.Graph" Version="5.92.0" />
-<PackageReference Include="Microsoft.IdentityModel.Protocols.OpenIdConnect" Version="8.6.1" />
-<PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="8.6.1" />
-```
+### 10. ✅ FIXED - Missing Microsoft.Skype.Bots.Media Using
+- **Problem:** `AudioMediaReceivedEventArgs` not found
+- **Fix:** Added `using Microsoft.Skype.Bots.Media;`
+- **File:** `CallHandler.cs`
+
+## Final Package Configuration (reference)
+- `Microsoft.Graph.Communications.Calls.Media` 1.2.0.15690
+- `Microsoft.Skype.Bots.Media` 1.32.0.70-preview
+- `Microsoft.Graph` 5.92.0
+- `Microsoft.IdentityModel.Protocols.OpenIdConnect` 8.6.1
+- `System.IdentityModel.Tokens.Jwt` 8.6.1
 
 ## Build Command
-```powershell
-cd C:\teams-bot-poc\src
-dotnet restore
-dotnet build --configuration Release
-```
+- `cd C:\teams-bot-poc\src`
+- `dotnet restore`
+- `dotnet build --configuration Release`

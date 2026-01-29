@@ -59,6 +59,7 @@ The `az vm run-command invoke` that was cloning and building the project is stuc
   - `Microsoft.Graph` → 5.92.0 (matches Communications SDK transitive dep)
   - `Microsoft.IdentityModel.*` → 8.6.1 (matches transitive deps)
   - Added `Microsoft.Graph.Contracts` using statements per EchoBot pattern
+- 2026-01-29 5:10 PM PST: **BUILD FIX** - Added `Microsoft.Skype.Bots.Media` using to resolve `AudioMediaReceivedEventArgs` type in `CallHandler.cs`.
 - 2026-01-29 3:45 PM PST: **GRUNT VALIDATION COMPLETE** - Fixed authentication provider with production-grade JWT validation. Added inbound request validation (JWT signature, issuer, audience verification), proper tenant ID extraction from token claims, and singleton token caching. Eliminates security vulnerabilities and enables proper SDK operation. Dependencies added: System.IdentityModel.Tokens.Jwt 8.2.*, Microsoft.IdentityModel.Protocols.OpenIdConnect 8.2.*. See `GRUNT_LOG.md` for details.
 - 2026-01-29 5:00 PM PST: **NAMESPACE ALIGNMENT COMPLETE** - Aligned all using statements with EchoBot sample patterns. Added `Microsoft.Graph.Contracts` namespace to both TeamsCallingBotService.cs and CallHandler.cs for extension methods (GetPrimaryIdentity, GetTenantId, SetTenantId). Added `Microsoft.Graph` to CallHandler.cs. All Graph model types now consistently use `Microsoft.Graph.Models` namespace matching EchoBot exactly. See `GRUNT_LOG.md` for details.
 

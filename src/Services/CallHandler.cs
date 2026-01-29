@@ -5,6 +5,7 @@ using Microsoft.Graph.Communications.Common.Telemetry;
 using Microsoft.Graph.Communications.Resources;
 using Microsoft.Graph.Models;
 using Microsoft.Graph.Contracts;
+using Microsoft.Skype.Bots.Media;
 using System.Runtime.InteropServices;
 using System.Timers;
 
