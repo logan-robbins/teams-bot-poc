@@ -1,16 +1,97 @@
 # Teams Media Bot - Real-time Meeting Transcription
 
 **Created:** 2026-01-29  
-**Status:** VM DEPLOYED AND RUNNING - Awaiting SSL certificate installation
+**Last Updated:** 2026-01-29 (deployment in progress)
 
 A production bot that joins Microsoft Teams meetings, receives real-time audio, transcribes with Azure Speech, and streams transcripts to a Python agent framework.
 
 ---
 
+## 🚨 CURRENT DEPLOYMENT STATUS (FOR AI AGENTS)
+
+**READ THIS FIRST** - Deployment is partially complete. Here is the exact state:
+
+### What IS Done:
+- ✅ Azure VM created: `vm-tbot-prod` at IP `52.188.117.153`
+- ✅ VM ports open: 443, 8445, 3389 (RDP)
+- ✅ Chocolatey installed on VM
+- ✅ Git installed on VM
+- ✅ .NET SDK 10.0.102 installed on VM
+- ✅ NSSM installed on VM
+- ✅ SSL certificate purchased (Namecheap PositiveSSL Wildcard for *.qmachina.com)
+- ✅ SSL certificate installed in Windows cert store (Thumbprint: `0FE5A81189A4D9EDB8B25EF879412CD35BC83535`)
+- ✅ CA bundle imported to Intermediate CA store
+- ✅ GitHub repo created: https://github.com/logan-robbins/teams-bot-poc
+
+### What is NOT Done:
+- ❌ Project NOT cloned to VM yet (C:\teams-bot-poc does NOT exist)
+- ❌ Project NOT built on VM
+- ❌ Windows Service NOT created (TeamsMediaBot service does not exist)
+- ❌ appsettings.json NOT updated with certificate thumbprint on VM
+- ❌ DNS records NOT created (teamsbot.qmachina.com, media.qmachina.com)
+- ❌ Azure Bot webhook NOT updated
+
+### Why Deployment Stalled:
+The `az vm run-command invoke` that was cloning and building the project is stuck/hanging. The command has been running for >15 minutes. There may be a previous run-command still in progress.
+
+### TO RESUME DEPLOYMENT:
+
+**Option A: Wait and retry via az cli**
+```bash
+# Check if previous command finished
+az vm run-command invoke \
+  --resource-group rg-teams-media-bot-poc \
+  --name vm-tbot-prod \
+  --command-id RunPowerShellScript \
+  --scripts 'Test-Path C:\teams-bot-poc' \
+  --query 'value[0].message' -o tsv
+```
+
+**Option B: RDP to VM and complete manually**
+```
+RDP: 52.188.117.153
+User: azureuser
+Pass: SecureTeamsBot2026!
+
+# Then run in PowerShell as Admin:
+cd C:\
+git clone https://github.com/logan-robbins/teams-bot-poc.git
+cd C:\teams-bot-poc\src
+dotnet restore
+dotnet build --configuration Release
+
+# Update config with cert thumbprint
+$config = Get-Content C:\teams-bot-poc\src\Config\appsettings.json | ConvertFrom-Json
+$config.MediaPlatformSettings.CertificateThumbprint = "0FE5A81189A4D9EDB8B25EF879412CD35BC83535"
+$config | ConvertTo-Json -Depth 10 | Set-Content C:\teams-bot-poc\src\Config\appsettings.json
+
+# Create logs directory
+New-Item -ItemType Directory -Path C:\teams-bot-poc\logs -Force
+
+# Create Windows Service
+nssm install TeamsMediaBot "C:\Program Files\dotnet\dotnet.exe"
+nssm set TeamsMediaBot AppParameters "exec C:\teams-bot-poc\src\bin\Release\net8.0\TeamsMediaBot.dll"
+nssm set TeamsMediaBot AppDirectory "C:\teams-bot-poc\src"
+nssm set TeamsMediaBot Start SERVICE_AUTO_START
+nssm set TeamsMediaBot AppStdout "C:\teams-bot-poc\logs\service-output.log"
+nssm set TeamsMediaBot AppStderr "C:\teams-bot-poc\logs\service-error.log"
+
+# Start service
+Start-Service TeamsMediaBot
+Get-Service TeamsMediaBot
+```
+
+### After VM Setup Complete, Still Need:
+1. Create DNS A records pointing to 52.188.117.153
+2. Update Azure Bot webhook
+3. Test end-to-end
+
+---
+
 ## ✅ What's Already Complete
 
-### 1. Azure Infrastructure + VM (100% Done)
-All resources provisioned and VM deployed:
+### 1. Azure Infrastructure + VM (Partially Done)
+All resources provisioned, VM created but not fully configured:
 
 ```
 Resource Group: rg-teams-media-bot-poc (eastus)
@@ -20,12 +101,18 @@ Azure Bot: teams-media-bot-poc (Teams channel enabled)
 Speech Service: speech-teams-bot-poc (key in appsettings.json)
 Permissions: Calls.AccessMedia.All, Calls.JoinGroupCall.All (admin consent granted)
 
-VM Deployed:
+VM Created:
   Name: vm-tbot-prod
   Public IP: 52.188.117.153
   Admin User: azureuser
   Admin Password: SecureTeamsBot2026!
-  Status: RUNNING (Windows Service installed)
+  Status: VM RUNNING, but bot NOT deployed yet
+
+SSL Certificate:
+  Thumbprint: 0FE5A81189A4D9EDB8B25EF879412CD35BC83535
+  Subject: CN=*.qmachina.com
+  Expires: 2027-01-29
+  Status: Installed in Windows cert store
 ```
 
 **Cost:** ~$145/month (VM + Speech Service)
@@ -576,18 +663,23 @@ Includes copy/paste commands for:
 
 **Completed:**
 - ✅ All Azure infrastructure provisioned
-- ✅ All code written and deployed
-- ✅ VM running at 52.188.117.153
-- ✅ Windows Service installed and running
+- ✅ All code written (in this repo)
+- ✅ VM created at 52.188.117.153
+- ✅ VM has Git, .NET SDK, NSSM installed
+- ✅ SSL certificate purchased and installed on VM
 - ✅ GitHub repo: https://github.com/logan-robbins/teams-bot-poc
 
-**Remaining:**
-- ⏳ Create DNS records (teamsbot.qmachina.com, media.qmachina.com)
-- ⏳ Install SSL certificate
-- ⏳ Update Azure Bot webhook
+**IN PROGRESS (stalled - see top of README):**
+- ⏳ Clone project to VM
+- ⏳ Build project on VM
+- ⏳ Create Windows Service
+
+**Remaining (after bot deployed):**
+- ⏳ Create DNS records (teamsbot.qmachina.com, media.qmachina.com → 52.188.117.153)
+- ⏳ Update Azure Bot webhook to https://teamsbot.qmachina.com/api/calling
 - ⏳ Test end-to-end
 
-**Once DNS + SSL are configured, test with:**
+**Once everything is configured, test with:**
 ```bash
 curl https://teamsbot.qmachina.com/api/calling/health
 ```
