@@ -1,12 +1,17 @@
+using Microsoft.Graph;
 using Microsoft.Graph.Communications.Calls;
 using Microsoft.Graph.Communications.Calls.Media;
 using Microsoft.Graph.Communications.Client;
 using Microsoft.Graph.Communications.Client.Authentication;
 using Microsoft.Graph.Communications.Common;
 using Microsoft.Graph.Communications.Common.Telemetry;
-using Microsoft.Graph.Models;
 using Microsoft.Identity.Client;
-using System.Security.Cryptography.X509Certificates;
+using System.Net;
+using System.Net.Http.Headers;
+using System.Runtime.Serialization;
+using System.Runtime.Serialization.Json;
+using System.Text;
+using System.Text.RegularExpressions;
 using TeamsMediaBot.Models;
 
 namespace TeamsMediaBot.Services;
@@ -50,6 +55,7 @@ public class TeamsCallingBotService : IAsyncDisposable
         var authProvider = new AuthenticationProvider(
             _botConfig.AppId,
             _botConfig.AppSecret,
+            _botConfig.TenantId,
             _logger);
 
         // Configure media platform settings per S2, S14
@@ -121,12 +127,10 @@ public class TeamsCallingBotService : IAsyncDisposable
                 ReceiveUnmixedMeetingAudio = false            // Mixed audio is fine for transcription
             });
 
-        var joinParams = new JoinMeetingParameters
+        var tenantId = meetingInfo.Organizer?.GetPrimaryIdentity()?.GetTenantId();
+        var joinParams = new JoinMeetingParameters(chatInfo, meetingInfo, mediaSession)
         {
-            ChatInfo = chatInfo,
-            MeetingInfo = meetingInfo,
-            MediaSession = mediaSession,
-            TenantId = _botConfig.TenantId
+            TenantId = string.IsNullOrWhiteSpace(tenantId) ? _botConfig.TenantId : tenantId
         };
 
         // Join the call
@@ -233,52 +237,39 @@ public class TeamsCallingBotService : IAsyncDisposable
     /// </summary>
     private (ChatInfo chatInfo, OrganizerMeetingInfo meetingInfo) ParseJoinUrl(string joinUrl)
     {
-        // Teams join URLs contain thread ID and message ID
-        // Format: https://teams.microsoft.com/l/meetup-join/19:meeting_XXXX@thread.v2/...
-        
-        var uri = new Uri(joinUrl);
-        var threadId = ExtractThreadId(joinUrl);
+        var decodedUrl = WebUtility.UrlDecode(joinUrl);
+        var match = Regex.Match(
+            decodedUrl,
+            "https://teams\\.microsoft\\.com.*/(?<thread>[^/]+)/(?<message>[^/]+)\\?context=(?<context>{.*})");
+
+        if (!match.Success)
+        {
+            throw new ArgumentException($"Join URL cannot be parsed: {joinUrl}.", nameof(joinUrl));
+        }
+
+        JoinUrlContext context;
+        using (var stream = new MemoryStream(Encoding.UTF8.GetBytes(match.Groups["context"].Value)))
+        {
+            context = (JoinUrlContext)new DataContractJsonSerializer(typeof(JoinUrlContext)).ReadObject(stream)!;
+        }
 
         var chatInfo = new ChatInfo
         {
-            ThreadId = threadId,
-            MessageId = "0"  // Can be 0 for meetings
+            ThreadId = match.Groups["thread"].Value,
+            MessageId = match.Groups["message"].Value,
+            ReplyChainMessageId = context.MessageId
         };
 
         var meetingInfo = new OrganizerMeetingInfo
         {
             Organizer = new IdentitySet
             {
-                User = new Identity
-                {
-                    Id = _botConfig.AppId,
-                    TenantId = _botConfig.TenantId
-                }
-            },
-            AllowConversationWithoutHost = true
+                User = new Identity { Id = context.Oid }
+            }
         };
+        meetingInfo.Organizer.User.SetTenantId(context.Tid);
 
         return (chatInfo, meetingInfo);
-    }
-
-    private string ExtractThreadId(string joinUrl)
-    {
-        // Extract thread ID from join URL
-        // Format: .../19:meeting_XXXXX@thread.v2/...
-        var match = System.Text.RegularExpressions.Regex.Match(joinUrl, @"19:[^/]+@thread\.v2");
-        if (match.Success)
-        {
-            return match.Value;
-        }
-
-        // Fallback: for scheduled meetings, thread ID might be in different format
-        match = System.Text.RegularExpressions.Regex.Match(joinUrl, @"19:[^/]+");
-        if (match.Success)
-        {
-            return match.Value + "@thread.v2";
-        }
-
-        throw new ArgumentException($"Could not extract thread ID from join URL: {joinUrl}");
     }
 
     public async ValueTask DisposeAsync()
@@ -306,33 +297,39 @@ internal class AuthenticationProvider : IRequestAuthenticationProvider
 {
     private readonly string _clientId;
     private readonly string _clientSecret;
+    private readonly string _defaultTenantId;
     private readonly ILogger _logger;
-    private readonly IConfidentialClientApplication _app;
 
-    public AuthenticationProvider(string clientId, string clientSecret, ILogger logger)
+    public AuthenticationProvider(string clientId, string clientSecret, string tenantId, ILogger logger)
     {
         _clientId = clientId;
         _clientSecret = clientSecret;
+        _defaultTenantId = tenantId;
         _logger = logger;
-
-        _app = ConfidentialClientApplicationBuilder
-            .Create(_clientId)
-            .WithClientSecret(_clientSecret)
-            .WithAuthority("https://login.microsoftonline.com/common")
-            .Build();
     }
 
-    public async Task<string> AuthenticateOutboundRequestAsync(Uri requestUri, string tenantId)
+    public async Task AuthenticateOutboundRequestAsync(HttpRequestMessage request, string tenant)
     {
         var scopes = new[] { "https://graph.microsoft.com/.default" };
+        var resolvedTenant = string.IsNullOrWhiteSpace(tenant) ? _defaultTenantId : tenant;
+        if (string.IsNullOrWhiteSpace(resolvedTenant))
+        {
+            resolvedTenant = "common";
+        }
+        var authority = $"https://login.microsoftonline.com/{resolvedTenant}";
+        var app = ConfidentialClientApplicationBuilder
+            .Create(_clientId)
+            .WithClientSecret(_clientSecret)
+            .WithAuthority(authority)
+            .Build();
 
         try
         {
-            var result = await _app
+            var result = await app
                 .AcquireTokenForClient(scopes)
                 .ExecuteAsync();
 
-            return result.AccessToken;
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", result.AccessToken);
         }
         catch (Exception ex)
         {
@@ -341,9 +338,26 @@ internal class AuthenticationProvider : IRequestAuthenticationProvider
         }
     }
 
-    public Task AuthenticateInboundRequestAsync(HttpRequestMessage request)
+    public Task<RequestValidationResult> ValidateInboundRequestAsync(HttpRequestMessage request)
     {
-        // Inbound webhook validation would go here if needed
-        return Task.CompletedTask;
+        // POC: accept inbound requests and use configured tenant id.
+        return Task.FromResult(new RequestValidationResult
+        {
+            IsValid = true,
+            TenantId = _defaultTenantId
+        });
     }
+}
+
+[DataContract]
+internal sealed class JoinUrlContext
+{
+    [DataMember]
+    public string Tid { get; set; } = string.Empty;
+
+    [DataMember]
+    public string Oid { get; set; } = string.Empty;
+
+    [DataMember]
+    public string MessageId { get; set; } = string.Empty;
 }

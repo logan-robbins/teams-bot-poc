@@ -3,7 +3,9 @@
 **Created:** 2026-01-29  
 **Last Updated:** 2026-01-29 (deployment in progress)
 
-A production bot that joins Microsoft Teams meetings, receives real-time audio, transcribes with Azure Speech, and streams transcripts to a Python agent framework.
+POC only (non-commercial). Optimize for speed and validation over hardening.
+
+A POC bot that joins Microsoft Teams meetings, receives real-time audio, transcribes with Azure Speech, and streams transcripts to a Python agent framework.
 
 ---
 
@@ -18,13 +20,13 @@ A production bot that joins Microsoft Teams meetings, receives real-time audio, 
 - ✅ Git installed on VM
 - ✅ .NET SDK 10.0.102 installed on VM
 - ✅ NSSM installed on VM
+- ✅ Project cloned on VM: `C:\teams-bot-poc`
 - ✅ SSL certificate purchased (Namecheap PositiveSSL Wildcard for *.qmachina.com)
 - ✅ SSL certificate installed in Windows cert store (Thumbprint: `0FE5A81189A4D9EDB8B25EF879412CD35BC83535`)
 - ✅ CA bundle imported to Intermediate CA store
 - ✅ GitHub repo created: https://github.com/logan-robbins/teams-bot-poc
 
 ### What is NOT Done:
-- ❌ Project NOT cloned to VM yet (C:\teams-bot-poc does NOT exist)
 - ❌ Project NOT built on VM
 - ❌ Windows Service NOT created (TeamsMediaBot service does not exist)
 - ❌ appsettings.json NOT updated with certificate thumbprint on VM
@@ -42,6 +44,8 @@ The `az vm run-command invoke` that was cloning and building the project is stuc
 - 2026-01-29 1:35 PM PST: Decision made to switch to **RDP** and complete provisioning manually
 - 2026-01-29 2:05 PM PST: `dotnet restore` failed on VM because `Microsoft.Graph.Communications.*` packages are pinned to `1.4.*` (not available on nuget.org; latest is `1.2.0.15690`)
 - 2026-01-29 2:20 PM PST: Build failed due to Graph SDK API mismatch (IGraphLogger interface + missing Graph models). Fix applied in repo: use SDK `GraphLogger` + add `Microsoft.Graph` package for `ChatInfo`/`OrganizerMeetingInfo`
+- 2026-01-29 2:45 PM PST: Verified local `microsoft-graph-comms-samples` repo; sample projects use `Microsoft.Graph.Communications.*` 1.2.x versions (consistent with our 1.2.0.15690 pin)
+- 2026-01-29 3:10 PM PST: Aligned join URL parsing + auth provider signatures to match sample patterns; removed explicit `Microsoft.Graph` package to avoid type mismatch with SDK transitive models (POC-only inbound validation)
 
 **Root cause (current):** Azure Run Command only allows one execution at a time. A long-running or stuck Run Command blocks all new Run Command invocations until it completes. Current Conflict (409) indicates the earlier run is still executing.
 
@@ -50,6 +54,13 @@ The `az vm run-command invoke` that was cloning and building the project is stuc
 - A running script cannot be canceled
 - Max runtime 90 minutes (then it times out)
 - VM must have outbound connectivity to Azure to return results; VM Agent must be Ready
+
+**Reference docs / examples (official):**
+- Teams calls & meetings bots overview (requirements, app-hosted media bots): https://learn.microsoft.com/microsoftteams/platform/bots/calls-and-meetings/calls-meetings-bots-overview
+- Real-time media concepts + samples list: https://learn.microsoft.com/microsoftteams/platform/bots/calls-and-meetings/real-time-media-concepts
+- Graph communications calling SDK samples repo: https://github.com/microsoftgraph/microsoft-graph-comms-samples
+- PolicyRecordingBot sample (app-hosted media): https://github.com/microsoftgraph/microsoft-graph-comms-samples/tree/master/Samples/V1.0Samples/LocalMediaSamples/PolicyRecordingBot
+- Graph calling SDK docs: https://microsoftgraph.github.io/microsoft-graph-comms-samples/docs/articles/index.html
 
 ---
 
@@ -106,7 +117,6 @@ cd C:\teams-bot-poc\src
 # Fix package versions (1.4.* not available on nuget.org)
 # Edit TeamsMediaBot.csproj and set:
 # Microsoft.Graph.Communications.* => 1.2.0.15690
-# Microsoft.Graph => 5.101.0
 # Microsoft.Identity.Client => 4.73.1
 
 dotnet restore

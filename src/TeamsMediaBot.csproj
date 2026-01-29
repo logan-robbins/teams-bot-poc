@@ -25,9 +25,6 @@
     <!-- Microsoft Identity for authentication -->
     <PackageReference Include="Microsoft.Identity.Client" Version="4.73.1" />
 
-    <!-- Microsoft Graph models (ChatInfo/OrganizerMeetingInfo) -->
-    <PackageReference Include="Microsoft.Graph" Version="5.101.0" />
-    
     <!-- Logging and Configuration -->
     <PackageReference Include="Serilog.AspNetCore" Version="8.0.*" />
     <PackageReference Include="Serilog.Sinks.Console" Version="6.0.*" />
