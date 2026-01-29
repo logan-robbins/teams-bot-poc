@@ -5,20 +5,35 @@ using Microsoft.Graph.Communications.Client;
 using Microsoft.Graph.Communications.Client.Authentication;
 using Microsoft.Graph.Communications.Common;
 using Microsoft.Graph.Communications.Common.Telemetry;
+using Microsoft.Graph.Communications.Resources;
 using Microsoft.Identity.Client;
+using Microsoft.IdentityModel.Protocols;
+using Microsoft.IdentityModel.Protocols.OpenIdConnect;
+using Microsoft.IdentityModel.Tokens;
+using System.Collections.Concurrent;
+using System.IdentityModel.Tokens.Jwt;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Runtime.Serialization;
 using System.Runtime.Serialization.Json;
+using System.Security.Claims;
 using System.Text;
 using System.Text.RegularExpressions;
 using TeamsMediaBot.Models;
+using Microsoft.Graph.Models;
 
 namespace TeamsMediaBot.Services;
 
 /// <summary>
 /// Core bot service for joining Teams meetings and receiving real-time audio
-/// Based on Part A of the validated guide
+/// Based on Part A of the validated guide and Microsoft's EchoBot sample
+/// 
+/// Key features (per Microsoft samples):
+/// - ConcurrentDictionary for thread-safe call management
+/// - Global call event subscriptions (OnIncoming, OnUpdated)
+/// - CallHandler pattern with heartbeat keepalive
+/// - VideoSocketSettings even when video inactive
+/// 
 /// Sources: S3, S4, S5, S6, S7, S10, S11, S14
 /// </summary>
 public class TeamsCallingBotService : IAsyncDisposable
@@ -27,20 +42,35 @@ public class TeamsCallingBotService : IAsyncDisposable
     private readonly MediaPlatformConfiguration _mediaConfig;
     private readonly ILogger<TeamsCallingBotService> _logger;
     private readonly IGraphLogger _graphLogger;
+    private readonly IServiceProvider _serviceProvider;
 
     private ICommunicationsClient? _client;
-    private readonly Dictionary<string, CallContext> _activeCalls = new();
+    
+    /// <summary>
+    /// Thread-safe dictionary of active call handlers, keyed by thread ID
+    /// Per Microsoft EchoBot sample: Uses ConcurrentDictionary for thread safety
+    /// </summary>
+    public ConcurrentDictionary<string, CallHandler> CallHandlers { get; } = new();
+
+    /// <summary>
+    /// Exposes the Graph Communications client for notification processing
+    /// Required by CallingController to process webhook notifications
+    /// </summary>
+    public ICommunicationsClient Client => _client 
+        ?? throw new InvalidOperationException("Bot service not initialized. Call InitializeAsync first.");
 
     public TeamsCallingBotService(
         BotConfiguration botConfig,
         MediaPlatformConfiguration mediaConfig,
         ILogger<TeamsCallingBotService> logger,
-        IGraphLogger graphLogger)
+        IGraphLogger graphLogger,
+        IServiceProvider serviceProvider)
     {
         _botConfig = botConfig;
         _mediaConfig = mediaConfig;
         _logger = logger;
         _graphLogger = graphLogger;
+        _serviceProvider = serviceProvider;
     }
 
     /// <summary>
@@ -67,7 +97,7 @@ public class TeamsCallingBotService : IAsyncDisposable
                 CertificateThumbprint = _mediaConfig.CertificateThumbprint,
                 InstanceInternalPort = _mediaConfig.InstanceInternalPort,
                 InstancePublicPort = _mediaConfig.InstancePublicPort,
-                InstancePublicIPAddress = System.Net.IPAddress.Parse(_mediaConfig.InstancePublicIPAddress),
+                InstancePublicIPAddress = IPAddress.Parse(_mediaConfig.InstancePublicIPAddress),
                 ServiceFqdn = _mediaConfig.ServiceFqdn
             }
         };
@@ -93,6 +123,11 @@ public class TeamsCallingBotService : IAsyncDisposable
 
         _client = builder.Build();
 
+        // Subscribe to global call events (per Microsoft EchoBot sample)
+        // This is required for proper SDK state management
+        _client.Calls().OnIncoming += OnCallsIncoming;
+        _client.Calls().OnUpdated += OnCallsUpdated;
+
         // Start the client
         await _client.StartAsync().ConfigureAwait(false);
 
@@ -100,8 +135,130 @@ public class TeamsCallingBotService : IAsyncDisposable
     }
 
     /// <summary>
+    /// Handles incoming calls (e.g., when bot is added to an existing call)
+    /// Per Microsoft samples: Answer incoming calls with media session
+    /// </summary>
+    private void OnCallsIncoming(ICallCollection sender, CollectionEventArgs<ICall> args)
+    {
+        foreach (var call in args.AddedResources)
+        {
+            _logger.LogInformation(
+                "Incoming call received: {CallId}, IncomingContext: {Context}",
+                call.Id, call.Resource.IncomingContext?.ObservedParticipantId);
+
+            // For incoming calls, we need to answer them
+            // Create media session and answer
+            var mediaSession = CreateMediaSession(call.Id);
+            
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await call.AnswerAsync(mediaSession).ConfigureAwait(false);
+                    _logger.LogInformation("Answered incoming call: {CallId}", call.Id);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to answer incoming call: {CallId}", call.Id);
+                }
+            });
+        }
+    }
+
+    /// <summary>
+    /// Handles call collection updates (added/removed calls)
+    /// Per Microsoft samples: Create CallHandler for new calls, cleanup for removed
+    /// </summary>
+    private void OnCallsUpdated(ICallCollection sender, CollectionEventArgs<ICall> args)
+    {
+        // Handle added calls
+        foreach (var call in args.AddedResources)
+        {
+            var threadId = call.Resource.ChatInfo?.ThreadId ?? call.Id;
+            
+            // Check if we already have a handler for this call
+            if (!CallHandlers.ContainsKey(threadId))
+            {
+                _logger.LogInformation(
+                    "Call added to collection: {CallId}, ThreadId: {ThreadId}",
+                    call.Id, threadId);
+                
+                // Get or create transcriber (may have been pre-registered by JoinMeetingAsync)
+                var transcriber = GetOrCreateTranscriber(threadId);
+                
+                // Get media session from call
+                var mediaSession = call.GetLocalMediaSession();
+                
+                // Create handler with heartbeat keepalive
+                var handler = new CallHandler(call, mediaSession, transcriber, _logger);
+                CallHandlers[threadId] = handler;
+                
+                _logger.LogInformation(
+                    "Created CallHandler for thread: {ThreadId} (heartbeat enabled every 10 min)", 
+                    threadId);
+            }
+        }
+
+        // Handle removed calls
+        foreach (var call in args.RemovedResources)
+        {
+            var threadId = call.Resource.ChatInfo?.ThreadId ?? call.Id;
+            
+            if (CallHandlers.TryRemove(threadId, out var handler))
+            {
+                _logger.LogInformation("Removing CallHandler for thread: {ThreadId}", threadId);
+                
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await handler.ShutdownAsync().ConfigureAwait(false);
+                        handler.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Error disposing CallHandler for thread: {ThreadId}", threadId);
+                    }
+                });
+            }
+            
+            // Clean up any pending transcribers that weren't used
+            _pendingTranscribers.TryRemove(threadId, out _);
+        }
+    }
+
+    /// <summary>
+    /// Creates a local media session with audio and video socket settings
+    /// Per Microsoft samples: Include VideoSocketSettings even when video is inactive
+    /// </summary>
+    private ILocalMediaSession CreateMediaSession(string? callId = null)
+    {
+        Guid mediaSessionId = default;
+        if (!string.IsNullOrEmpty(callId) && Guid.TryParse(callId, out var parsedId))
+        {
+            mediaSessionId = parsedId;
+        }
+
+        return Client.CreateMediaSession(
+            new AudioSocketSettings
+            {
+                StreamDirections = StreamDirection.Recvonly,  // We only need to receive audio
+                SupportedAudioFormat = AudioFormat.Pcm16K,    // 16 kHz PCM per S5
+                ReceiveUnmixedMeetingAudio = false            // Mixed audio is fine for transcription
+            },
+            new VideoSocketSettings
+            {
+                StreamDirections = StreamDirection.Inactive   // No video needed
+            },
+            mediaSessionId: mediaSessionId);
+    }
+
+    /// <summary>
     /// Join a Teams meeting using join URL
     /// Per S6: POST /communications/calls with meeting info
+    /// 
+    /// Note: CallHandler creation is now handled by OnCallsUpdated event
+    /// This method just initiates the join; SDK events handle the rest
     /// </summary>
     public async Task<string> JoinMeetingAsync(
         string joinUrl,
@@ -115,17 +272,14 @@ public class TeamsCallingBotService : IAsyncDisposable
 
         _logger.LogInformation("Joining meeting: {JoinUrl}, DisplayName: {DisplayName}", joinUrl, displayName);
 
+        // A tracking id for logging purposes. Helps identify this call in logs.
+        var scenarioId = Guid.NewGuid();
+
         // Parse join URL to extract meeting info per S7
         var (chatInfo, meetingInfo) = ParseJoinUrl(joinUrl);
 
-        // Create call with app-hosted media config per S6, S14
-        var mediaSession = _client.CreateMediaSession(
-            new AudioSocketSettings
-            {
-                StreamDirections = StreamDirection.Recvonly,  // We only need to receive audio
-                SupportedAudioFormat = AudioFormat.Pcm16K,    // 16 kHz PCM per S5
-                ReceiveUnmixedMeetingAudio = false            // Mixed audio is fine for transcription
-            });
+        // Create media session with both audio and video settings
+        var mediaSession = CreateMediaSession();
 
         var tenantId = meetingInfo.Organizer?.GetPrimaryIdentity()?.GetTenantId();
         var joinParams = new JoinMeetingParameters(chatInfo, meetingInfo, mediaSession)
@@ -133,102 +287,53 @@ public class TeamsCallingBotService : IAsyncDisposable
             TenantId = string.IsNullOrWhiteSpace(tenantId) ? _botConfig.TenantId : tenantId
         };
 
-        // Join the call
-        var call = await _client.Calls().AddAsync(joinParams).ConfigureAwait(false);
-
-        _logger.LogInformation("Call created: {CallId}", call.Id);
-
-        // Store call context
-        var context = new CallContext
+        // If display name is specified, join as guest
+        if (!string.IsNullOrWhiteSpace(displayName))
         {
-            Call = call,
-            MediaSession = mediaSession,
-            Transcriber = transcriber,
-            JoinedAt = DateTime.UtcNow
-        };
-
-        _activeCalls[call.Id] = context;
-
-        // Wire up call state change handler
-        call.OnUpdated += (sender, args) =>
-        {
-            _logger.LogInformation("Call state changed: {State}", call.Resource.State);
-
-            if (call.Resource.State == CallState.Established)
+            joinParams.GuestIdentity = new Identity
             {
-                _logger.LogInformation("Call established - media should start flowing");
-                // Start transcription when call is established
-                _ = Task.Run(async () =>
-                {
-                    try
-                    {
-                        await transcriber.StartAsync();
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, "Failed to start transcriber");
-                    }
-                });
-            }
-            else if (call.Resource.State == CallState.Terminated)
-            {
-                _logger.LogInformation("Call terminated");
-                _ = Task.Run(async () =>
-                {
-                    try
-                    {
-                        await transcriber.StopAsync();
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, "Failed to stop transcriber");
-                    }
-                });
-
-                _activeCalls.Remove(call.Id);
-            }
-        };
-
-        // Wire up audio receive handler per S5
-        if (mediaSession.AudioSocket != null)
-        {
-            mediaSession.AudioSocket.AudioMediaReceived += (sender, e) =>
-            {
-                // Per S5: Audio frames are 20ms each, delivered at ~50 fps
-                // Extract PCM bytes from unmanaged buffer
-                var buffer = e.Buffer;
-                if (buffer != null && buffer.Data != null)
-                {
-                    // Convert unmanaged buffer to managed byte array
-                    var pcmData = new byte[buffer.Length];
-                    unsafe
-                    {
-                        fixed (byte* ptr = pcmData)
-                        {
-                            Buffer.MemoryCopy(
-                                buffer.Data.ToPointer(),
-                                ptr,
-                                buffer.Length,
-                                buffer.Length);
-                        }
-                    }
-
-                    // Push to transcriber per J3
-                    transcriber.PushPcm16k16bitMono(pcmData);
-                }
-
-                // Must dispose buffer per SDK requirements
-                e.Buffer?.Dispose();
+                Id = Guid.NewGuid().ToString(),
+                DisplayName = displayName
             };
+        }
 
-            _logger.LogInformation("Audio media receive handler configured");
-        }
-        else
+        // Check if we already have a handler for this thread
+        var threadId = chatInfo.ThreadId;
+        if (CallHandlers.ContainsKey(threadId))
         {
-            _logger.LogWarning("AudioSocket is null - media may not work");
+            _logger.LogWarning("Call handler already exists for thread: {ThreadId}", threadId);
+            throw new InvalidOperationException($"Bot is already in a call for thread: {threadId}");
         }
+
+        // Store transcriber for when CallHandler is created by OnCallsUpdated
+        // We need to pre-register the transcriber since OnCallsUpdated won't have access to it
+        // Note: This is a simplification - in production, you'd use a more robust pattern
+        _pendingTranscribers[threadId] = transcriber;
+
+        // Join the call - this will trigger OnCallsUpdated which creates the CallHandler
+        var call = await _client.Calls().AddAsync(joinParams, scenarioId).ConfigureAwait(false);
+
+        _logger.LogInformation("Call created: {CallId}, ThreadId: {ThreadId}", call.Id, threadId);
 
         return call.Id;
+    }
+
+    // Temporary storage for transcribers while CallHandler is being created
+    private readonly ConcurrentDictionary<string, AzureSpeechRealtimeTranscriber> _pendingTranscribers = new();
+
+    /// <summary>
+    /// Gets or creates a transcriber for the given thread
+    /// </summary>
+    internal AzureSpeechRealtimeTranscriber GetOrCreateTranscriber(string threadId)
+    {
+        if (_pendingTranscribers.TryRemove(threadId, out var transcriber))
+        {
+            return transcriber;
+        }
+
+        // If no pending transcriber, create a new one via DI
+        using var scope = _serviceProvider.CreateScope();
+        return scope.ServiceProvider.GetRequiredService<AzureSpeechRealtimeTranscriber>();
     }
 
     /// <summary>
@@ -272,80 +377,305 @@ public class TeamsCallingBotService : IAsyncDisposable
         return (chatInfo, meetingInfo);
     }
 
+    /// <summary>
+    /// Gracefully shuts down the bot service, terminating all active calls
+    /// </summary>
+    public async Task ShutdownAsync()
+    {
+        _logger.LogWarning("Shutting down bot service - terminating all active calls");
+
+        if (_client != null)
+        {
+            // Unsubscribe from events
+            _client.Calls().OnIncoming -= OnCallsIncoming;
+            _client.Calls().OnUpdated -= OnCallsUpdated;
+
+            // Terminate all active calls
+            await _client.TerminateAsync().ConfigureAwait(false);
+        }
+
+        // Dispose all handlers
+        foreach (var kvp in CallHandlers)
+        {
+            try
+            {
+                await kvp.Value.ShutdownAsync().ConfigureAwait(false);
+                kvp.Value.Dispose();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error disposing handler for thread: {ThreadId}", kvp.Key);
+            }
+        }
+        CallHandlers.Clear();
+        _pendingTranscribers.Clear();
+
+        _logger.LogInformation("Bot service shutdown complete");
+    }
+
     public async ValueTask DisposeAsync()
     {
+        await ShutdownAsync().ConfigureAwait(false);
+        
         if (_client != null)
         {
             await _client.DisposeAsync();
         }
     }
-
-    private class CallContext
-    {
-        public required ICall Call { get; set; }
-        public required IMediaSession MediaSession { get; set; }
-        public required AzureSpeechRealtimeTranscriber Transcriber { get; set; }
-        public DateTime JoinedAt { get; set; }
-    }
 }
 
 /// <summary>
 /// Authentication provider for Graph Communications
-/// Per S13: Uses client credentials flow
+/// Implements production-grade JWT validation and token caching
+/// Based on Microsoft's official EchoBot sample
+/// Sources: 
+/// - https://github.com/microsoftgraph/microsoft-graph-comms-samples/blob/master/Samples/PublicSamples/EchoBot/src/EchoBot/Authentication/AuthenticationProvider.cs
+/// - https://microsoftgraph.github.io/microsoft-graph-comms-samples/docs/articles/calls/calling-notifications.html
 /// </summary>
 internal class AuthenticationProvider : IRequestAuthenticationProvider
 {
+    private const string AuthDomain = "https://api.aps.skype.com/v1/.well-known/OpenIdConfiguration";
+    private const string GraphResource = "https://graph.microsoft.com";
+    
     private readonly string _clientId;
     private readonly string _clientSecret;
     private readonly string _defaultTenantId;
     private readonly ILogger _logger;
+    
+    // Singleton MSAL application for token caching
+    private readonly IConfidentialClientApplication _msalApp;
+    
+    // OpenID configuration for JWT validation (refreshed every 2 hours)
+    private readonly TimeSpan _openIdConfigRefreshInterval = TimeSpan.FromHours(2);
+    private DateTime _prevOpenIdConfigUpdateTimestamp = DateTime.MinValue;
+    private OpenIdConnectConfiguration? _openIdConfiguration;
+    private readonly SemaphoreSlim _configLock = new(1, 1);
 
     public AuthenticationProvider(string clientId, string clientSecret, string tenantId, ILogger logger)
     {
-        _clientId = clientId;
-        _clientSecret = clientSecret;
-        _defaultTenantId = tenantId;
-        _logger = logger;
+        _clientId = clientId ?? throw new ArgumentNullException(nameof(clientId));
+        _clientSecret = clientSecret ?? throw new ArgumentNullException(nameof(clientSecret));
+        _defaultTenantId = tenantId ?? throw new ArgumentNullException(nameof(tenantId));
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        
+        // Create singleton MSAL application for token caching
+        // Per MSAL best practices: https://learn.microsoft.com/en-us/entra/msal/dotnet/getting-started/best-practices
+        var authority = $"https://login.microsoftonline.com/{_defaultTenantId}";
+        _msalApp = ConfidentialClientApplicationBuilder
+            .Create(_clientId)
+            .WithClientSecret(_clientSecret)
+            .WithAuthority(authority)
+            .Build();
+            
+        _logger.LogInformation("AuthenticationProvider initialized with singleton token cache");
     }
 
+    /// <summary>
+    /// Authenticates outbound requests to Microsoft Graph
+    /// Uses cached tokens when available (MSAL handles caching automatically)
+    /// Per Microsoft recommendation: Token caching improves performance and prevents throttling
+    /// </summary>
     public async Task AuthenticateOutboundRequestAsync(HttpRequestMessage request, string tenant)
     {
-        var scopes = new[] { "https://graph.microsoft.com/.default" };
+        var scopes = new[] { $"{GraphResource}/.default" };
         var resolvedTenant = string.IsNullOrWhiteSpace(tenant) ? _defaultTenantId : tenant;
         if (string.IsNullOrWhiteSpace(resolvedTenant))
         {
             resolvedTenant = "common";
         }
-        var authority = $"https://login.microsoftonline.com/{resolvedTenant}";
-        var app = ConfidentialClientApplicationBuilder
-            .Create(_clientId)
-            .WithClientSecret(_clientSecret)
-            .WithAuthority(authority)
-            .Build();
+
+        _logger.LogDebug("Acquiring token for tenant: {Tenant}", resolvedTenant);
 
         try
         {
-            var result = await app
-                .AcquireTokenForClient(scopes)
-                .ExecuteAsync();
+            // If tenant differs from default, create temporary app for that tenant
+            // Otherwise use singleton (which has cached tokens)
+            IConfidentialClientApplication app;
+            if (resolvedTenant != _defaultTenantId)
+            {
+                var authority = $"https://login.microsoftonline.com/{resolvedTenant}";
+                app = ConfidentialClientApplicationBuilder
+                    .Create(_clientId)
+                    .WithClientSecret(_clientSecret)
+                    .WithAuthority(authority)
+                    .Build();
+                _logger.LogDebug("Created temporary MSAL app for tenant: {Tenant}", resolvedTenant);
+            }
+            else
+            {
+                app = _msalApp;
+            }
+
+            // Acquire token with retry (MSAL automatically uses cache)
+            var result = await AcquireTokenWithRetryAsync(app, scopes, 3);
+            
+            _logger.LogDebug(
+                "Token acquired successfully. Expires in {Minutes:F1} minutes", 
+                result.ExpiresOn.Subtract(DateTimeOffset.UtcNow).TotalMinutes);
 
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", result.AccessToken);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to acquire token");
+            _logger.LogError(ex, "Failed to acquire token for client: {ClientId}, tenant: {Tenant}", _clientId, resolvedTenant);
             throw;
         }
     }
 
-    public Task<RequestValidationResult> ValidateInboundRequestAsync(HttpRequestMessage request)
+    /// <summary>
+    /// Validates inbound requests from Microsoft Graph
+    /// Implements production-grade JWT validation per Microsoft security requirements
+    /// 
+    /// Security checks:
+    /// 1. Validates JWT signature using OpenID Connect configuration
+    /// 2. Verifies issuers: https://graph.microsoft.com and https://api.botframework.com
+    /// 3. Validates audience matches App ID
+    /// 4. Extracts tenant ID from token claims
+    /// 
+    /// Per Microsoft: Returning IsValid=false triggers 403 Forbidden response
+    /// Source: https://microsoftgraph.github.io/microsoft-graph-comms-samples/docs/client/Microsoft.Graph.Communications.Client.Authentication.IRequestAuthenticationProvider.html
+    /// </summary>
+    public async Task<RequestValidationResult> ValidateInboundRequestAsync(HttpRequestMessage request)
     {
-        // POC: accept inbound requests and use configured tenant id.
-        return Task.FromResult(new RequestValidationResult
+        var token = request?.Headers?.Authorization?.Parameter;
+        if (string.IsNullOrWhiteSpace(token))
         {
-            IsValid = true,
-            TenantId = _defaultTenantId
-        });
+            _logger.LogWarning("Inbound request validation failed: No Authorization token provided");
+            return new RequestValidationResult { IsValid = false };
+        }
+
+        // Update OpenID configuration if needed (cached for 2 hours)
+        if (_openIdConfiguration == null || DateTime.Now > _prevOpenIdConfigUpdateTimestamp.Add(_openIdConfigRefreshInterval))
+        {
+            await _configLock.WaitAsync();
+            try
+            {
+                // Double-check after acquiring lock
+                if (_openIdConfiguration == null || DateTime.Now > _prevOpenIdConfigUpdateTimestamp.Add(_openIdConfigRefreshInterval))
+                {
+                    _logger.LogInformation("Updating OpenID configuration from {AuthDomain}", AuthDomain);
+
+                    // Download the OIDC configuration which contains the JWKS
+                    // Microsoft signs tokens with private certificates; we validate with public keys
+                    IConfigurationManager<OpenIdConnectConfiguration> configurationManager =
+                        new ConfigurationManager<OpenIdConnectConfiguration>(
+                            AuthDomain,
+                            new OpenIdConnectConfigurationRetriever());
+                    
+                    _openIdConfiguration = await configurationManager.GetConfigurationAsync(CancellationToken.None);
+                    _prevOpenIdConfigUpdateTimestamp = DateTime.Now;
+                    
+                    _logger.LogInformation(
+                        "OpenID configuration updated. {KeyCount} signing keys available", 
+                        _openIdConfiguration.SigningKeys.Count);
+                }
+            }
+            finally
+            {
+                _configLock.Release();
+            }
+        }
+
+        // Validate issuers: Graph and Bot Framework
+        var authIssuers = new[]
+        {
+            "https://graph.microsoft.com",
+            "https://api.botframework.com",
+        };
+
+        // Configure token validation parameters
+        var validationParameters = new TokenValidationParameters
+        {
+            ValidIssuers = authIssuers,
+            ValidAudience = _clientId,
+            IssuerSigningKeys = _openIdConfiguration!.SigningKeys,
+        };
+
+        ClaimsPrincipal claimsPrincipal;
+        try
+        {
+            // Validate token signature, expiration, issuer, audience
+            var handler = new JwtSecurityTokenHandler();
+            claimsPrincipal = handler.ValidateToken(token, validationParameters, out _);
+            
+            _logger.LogDebug("JWT token validation successful");
+        }
+        catch (SecurityTokenExpiredException ex)
+        {
+            _logger.LogWarning(ex, "Inbound request validation failed: Token expired");
+            return new RequestValidationResult { IsValid = false };
+        }
+        catch (SecurityTokenInvalidSignatureException ex)
+        {
+            _logger.LogWarning(ex, "Inbound request validation failed: Invalid token signature (possible tampering)");
+            return new RequestValidationResult { IsValid = false };
+        }
+        catch (SecurityTokenValidationException ex)
+        {
+            _logger.LogWarning(ex, "Inbound request validation failed: Token validation error");
+            return new RequestValidationResult { IsValid = false };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Inbound request validation failed: Unexpected error for client: {ClientId}", _clientId);
+            return new RequestValidationResult { IsValid = false };
+        }
+
+        // Extract tenant ID from token claims
+        const string TenantIdClaimType = "http://schemas.microsoft.com/identity/claims/tenantid";
+        var tenantClaim = claimsPrincipal.FindFirst(claim => claim.Type.Equals(TenantIdClaimType, StringComparison.Ordinal));
+
+        if (string.IsNullOrEmpty(tenantClaim?.Value))
+        {
+            _logger.LogWarning("Inbound request validation failed: No tenant claim in token");
+            return new RequestValidationResult { IsValid = false };
+        }
+
+        _logger.LogDebug("Request validated successfully for tenant: {TenantId}", tenantClaim.Value);
+        
+        // Store tenant in request properties for SDK use
+        request.Properties.Add("Microsoft-Tenant-Id", tenantClaim.Value);
+        
+        return new RequestValidationResult 
+        { 
+            IsValid = true, 
+            TenantId = tenantClaim.Value 
+        };
+    }
+
+    /// <summary>
+    /// Acquires token with retry logic for transient failures
+    /// MSAL automatically uses cached tokens when available
+    /// </summary>
+    private async Task<AuthenticationResult> AcquireTokenWithRetryAsync(
+        IConfidentialClientApplication app, 
+        string[] scopes, 
+        int attempts)
+    {
+        while (true)
+        {
+            attempts--;
+
+            try
+            {
+                return await app
+                    .AcquireTokenForClient(scopes)
+                    .ExecuteAsync()
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                if (attempts < 1)
+                {
+                    _logger.LogError(ex, "Token acquisition failed after all retry attempts");
+                    throw;
+                }
+                
+                _logger.LogWarning(ex, "Token acquisition failed. Retrying... ({AttemptsLeft} attempts left)", attempts);
+            }
+
+            await Task.Delay(1000).ConfigureAwait(false);
+        }
     }
 }
 

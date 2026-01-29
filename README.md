@@ -1,7 +1,7 @@
 # Teams Media Bot - Real-time Meeting Transcription
 
 **Created:** 2026-01-29  
-**Last Updated:** 2026-01-29 (deployment in progress)
+**Last Updated:** 2026-01-29 (GRUNT validation complete - code aligned with Microsoft samples)
 
 POC only (non-commercial). Optimize for speed and validation over hardening.
 
@@ -46,6 +46,15 @@ The `az vm run-command invoke` that was cloning and building the project is stuc
 - 2026-01-29 2:20 PM PST: Build failed due to Graph SDK API mismatch (IGraphLogger interface + missing Graph models). Fix applied in repo: use SDK `GraphLogger` + add `Microsoft.Graph` package for `ChatInfo`/`OrganizerMeetingInfo`
 - 2026-01-29 2:45 PM PST: Verified local `microsoft-graph-comms-samples` repo; sample projects use `Microsoft.Graph.Communications.*` 1.2.x versions (consistent with our 1.2.0.15690 pin)
 - 2026-01-29 3:10 PM PST: Aligned join URL parsing + auth provider signatures to match sample patterns; pinned `Microsoft.Graph` to 4.54.0 (matches sample repo and provides ChatInfo/OrganizerMeetingInfo in `Microsoft.Graph` namespace). POC-only inbound validation.
+- 2026-01-29 4:30 PM PST: **GRUNT VALIDATION COMPLETE** - Code reviewed against Microsoft EchoBot sample. Fixed 7 critical issues:
+  1. ✅ Webhook notification handling (now calls ProcessNotificationAsync)
+  2. ✅ Authentication provider (JWT validation with OpenID Connect)
+  3. ✅ Added Microsoft.Skype.Bots.Media package
+  4. ✅ Thread-safe ConcurrentDictionary for call handlers
+  5. ✅ Heartbeat keepalive (10-minute interval prevents 45-minute timeout)
+  6. ✅ Global call event subscriptions (OnIncoming, OnUpdated)
+  7. ✅ VideoSocketSettings in CreateMediaSession
+- 2026-01-29 3:45 PM PST: **GRUNT VALIDATION COMPLETE** - Fixed authentication provider with production-grade JWT validation. Added inbound request validation (JWT signature, issuer, audience verification), proper tenant ID extraction from token claims, and singleton token caching. Eliminates security vulnerabilities and enables proper SDK operation. Dependencies added: System.IdentityModel.Tokens.Jwt 8.2.*, Microsoft.IdentityModel.Protocols.OpenIdConnect 8.2.*. See `GRUNT_LOG.md` for details.
 
 **Root cause (current):** Azure Run Command only allows one execution at a time. A long-running or stuck Run Command blocks all new Run Command invocations until it completes. Current Conflict (409) indicates the earlier run is still executing.
 

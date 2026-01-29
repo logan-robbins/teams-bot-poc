@@ -16,6 +16,9 @@
     <PackageReference Include="Microsoft.Graph.Communications.Client" Version="1.2.0.15690" />
     <PackageReference Include="Microsoft.Graph.Communications.Common" Version="1.2.0.15690" />
     
+    <!-- Media Platform SDK - REQUIRED for audio socket types (explicit reference per Microsoft samples) -->
+    <PackageReference Include="Microsoft.Skype.Bots.Media" Version="1.27.0.2-alpha" />
+    
     <!-- Azure Speech SDK for Transcription -->
     <PackageReference Include="Microsoft.CognitiveServices.Speech" Version="1.40.*" />
     
@@ -24,6 +27,10 @@
     
     <!-- Microsoft Identity for authentication -->
     <PackageReference Include="Microsoft.Identity.Client" Version="4.73.1" />
+    
+    <!-- JWT Token Validation (required for inbound request authentication) -->
+    <PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="8.2.*" />
+    <PackageReference Include="Microsoft.IdentityModel.Protocols.OpenIdConnect" Version="8.2.*" />
 
     <!-- Microsoft Graph models (ChatInfo/OrganizerMeetingInfo) -->
     <PackageReference Include="Microsoft.Graph" Version="4.54.0" />

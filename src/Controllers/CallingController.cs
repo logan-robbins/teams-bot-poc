@@ -30,27 +30,72 @@ public class CallingController : ControllerBase
     /// <summary>
     /// Webhook endpoint for Graph calling notifications
     /// Per S1, S2: This is where Teams sends call state changes
+    /// CRITICAL: Must call ProcessNotificationAsync to trigger SDK events
     /// </summary>
     [HttpPost]
     public async Task<IActionResult> OnIncomingRequest()
     {
         try
         {
-            // Read raw request body
-            using var reader = new StreamReader(Request.Body);
-            var body = await reader.ReadToEndAsync();
+            _logger.LogDebug("Received calling webhook: {Method} {Path}", Request.Method, Request.Path);
 
-            _logger.LogDebug("Received calling webhook: {Body}", body);
+            // Convert ASP.NET Core HttpRequest to HttpRequestMessage
+            var httpRequestMessage = ConvertToHttpRequestMessage(Request);
 
-            // The Graph Communications SDK processes these notifications internally
-            // We just need to acknowledge receipt
-            return Ok();
+            // Pass notification to SDK for processing
+            // This is REQUIRED to trigger call state events (OnUpdated, etc.)
+            var response = await _botService.Client.ProcessNotificationAsync(httpRequestMessage)
+                .ConfigureAwait(false);
+
+            _logger.LogDebug("Notification processed, status: {StatusCode}", response.StatusCode);
+
+            // Convert HttpResponseMessage back to IActionResult
+            return new HttpResponseMessageResult(response);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error processing calling webhook");
             return StatusCode(500);
         }
+    }
+
+    /// <summary>
+    /// Convert ASP.NET Core HttpRequest to System.Net.Http.HttpRequestMessage
+    /// Required for Graph Communications SDK compatibility
+    /// </summary>
+    private static HttpRequestMessage ConvertToHttpRequestMessage(HttpRequest request)
+    {
+        var httpRequestMessage = new HttpRequestMessage
+        {
+            Method = new HttpMethod(request.Method),
+            RequestUri = new UriBuilder
+            {
+                Scheme = request.Scheme,
+                Host = request.Host.Host,
+                Port = request.Host.Port ?? (request.Scheme == "https" ? 443 : 80),
+                Path = request.PathBase.Add(request.Path),
+                Query = request.QueryString.ToString()
+            }.Uri,
+            Content = new StreamContent(request.Body)
+        };
+
+        // Copy headers
+        foreach (var header in request.Headers)
+        {
+            if (!httpRequestMessage.Headers.TryAddWithoutValidation(header.Key, header.Value.AsEnumerable()))
+            {
+                httpRequestMessage.Content?.Headers.TryAddWithoutValidation(header.Key, header.Value.AsEnumerable());
+            }
+        }
+
+        // Set content type if present
+        if (request.ContentType != null)
+        {
+            httpRequestMessage.Content!.Headers.ContentType = 
+                System.Net.Http.Headers.MediaTypeHeaderValue.Parse(request.ContentType);
+        }
+
+        return httpRequestMessage;
     }
 
     /// <summary>
@@ -99,6 +144,45 @@ public class CallingController : ControllerBase
             Timestamp = DateTime.UtcNow,
             Service = "Teams Media Bot POC"
         });
+    }
+}
+
+/// <summary>
+/// Helper class to convert HttpResponseMessage to IActionResult
+/// Required because Graph SDK returns HttpResponseMessage but ASP.NET Core uses IActionResult
+/// </summary>
+internal class HttpResponseMessageResult : IActionResult
+{
+    private readonly HttpResponseMessage _responseMessage;
+
+    public HttpResponseMessageResult(HttpResponseMessage responseMessage)
+    {
+        _responseMessage = responseMessage;
+    }
+
+    public async Task ExecuteResultAsync(ActionContext context)
+    {
+        var response = context.HttpContext.Response;
+
+        response.StatusCode = (int)_responseMessage.StatusCode;
+
+        // Copy headers
+        foreach (var header in _responseMessage.Headers)
+        {
+            response.Headers[header.Key] = header.Value.ToArray();
+        }
+
+        // Copy content headers
+        if (_responseMessage.Content != null)
+        {
+            foreach (var header in _responseMessage.Content.Headers)
+            {
+                response.Headers[header.Key] = header.Value.ToArray();
+            }
+
+            // Copy content
+            await _responseMessage.Content.CopyToAsync(response.Body);
+        }
     }
 }
 
