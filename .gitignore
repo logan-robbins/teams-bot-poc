@@ -1,0 +1,62 @@
+# Visual Studio / MSBuild
+.vs/
+bin/
+obj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.userprefs
+
+# Build results
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+[Ww][Ii][Nn]32/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+ENV/
+env/
+
+# Logs
+logs/
+*.log
+
+# Secrets - NEVER COMMIT
+appsettings.Development.json
+appsettings.Production.json
+*.pfx
+*.key
+*.pem
+*.crt
+
+# ngrok
+ngrok.yml  # Contains authtoken
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Package restores
+node_modules/
+packages/

@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>TeamsMediaBot</RootNamespace>
+    <AssemblyName>TeamsMediaBot</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Microsoft Graph Communications SDK for Calls and Media -->
+    <PackageReference Include="Microsoft.Graph.Communications.Calls" Version="1.4.*" />
+    <PackageReference Include="Microsoft.Graph.Communications.Calls.Media" Version="1.4.*" />
+    <PackageReference Include="Microsoft.Graph.Communications.Client" Version="1.4.*" />
+    <PackageReference Include="Microsoft.Graph.Communications.Common" Version="1.4.*" />
+    
+    <!-- Azure Speech SDK for Transcription -->
+    <PackageReference Include="Microsoft.CognitiveServices.Speech" Version="1.40.*" />
+    
+    <!-- ASP.NET Core for webhook endpoints -->
+    <PackageReference Include="Microsoft.AspNetCore.Mvc.NewtonsoftJson" Version="8.0.*" />
+    
+    <!-- Microsoft Identity for authentication -->
+    <PackageReference Include="Microsoft.Identity.Client" Version="4.65.*" />
+    
+    <!-- Logging and Configuration -->
+    <PackageReference Include="Serilog.AspNetCore" Version="8.0.*" />
+    <PackageReference Include="Serilog.Sinks.Console" Version="6.0.*" />
+    <PackageReference Include="Serilog.Sinks.File" Version="6.0.*" />
+    
+    <!-- HTTP Client -->
+    <PackageReference Include="System.Net.Http.Json" Version="8.0.*" />
+  </ItemGroup>
+
+</Project>

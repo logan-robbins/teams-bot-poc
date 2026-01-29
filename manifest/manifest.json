@@ -1,0 +1,49 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/teams/v1.11/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.11",
+  "version": "1.0.0",
+  "id": "ff4b0902-5ae8-450b-bf45-7e2338292554",
+  "packageName": "com.qmachina.teamsmediabotpoc",
+  "developer": {
+    "name": "QMachina",
+    "websiteUrl": "https://qmachina.com",
+    "privacyUrl": "https://qmachina.com/privacy",
+    "termsOfUseUrl": "https://qmachina.com/terms"
+  },
+  "name": {
+    "short": "Teams Media Bot POC",
+    "full": "Teams Real-time Audio Transcription Bot (POC)"
+  },
+  "description": {
+    "short": "Internal POC: Real-time meeting transcription",
+    "full": "Internal proof-of-concept bot that joins Teams meetings, receives real-time audio, transcribes using Azure Speech, and streams transcripts to Python agent framework."
+  },
+  "icons": {
+    "outline": "outline.png",
+    "color": "color.png"
+  },
+  "accentColor": "#FFFFFF",
+  "bots": [
+    {
+      "botId": "ff4b0902-5ae8-450b-bf45-7e2338292554",
+      "scopes": [
+        "personal",
+        "team",
+        "groupchat"
+      ],
+      "supportsFiles": false,
+      "isNotificationOnly": false,
+      "supportsCalling": true,
+      "supportsVideo": false
+    }
+  ],
+  "permissions": [
+    "identity",
+    "messageTeamMembers"
+  ],
+  "validDomains": [
+    "teamsbot.qmachina.com",
+    "media.qmachina.com",
+    "qmachina.com"
+  ]
+}

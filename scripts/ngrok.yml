@@ -1,0 +1,13 @@
+version: "2"
+authtoken: YOUR_NGROK_AUTHTOKEN_HERE
+
+tunnels:
+  signaling:
+    proto: http
+    addr: 9441
+    # The bot listens on HTTP locally, ngrok provides HTTPS publicly per S2
+    
+  media:
+    proto: tcp
+    addr: 8445
+    # TCP tunnel for application-hosted media per S2
