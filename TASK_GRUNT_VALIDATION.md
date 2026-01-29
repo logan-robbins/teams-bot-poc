@@ -94,6 +94,11 @@ After deployment, verify:
 - **Fix:** Added `using Microsoft.Skype.Bots.Media;`
 - **File:** `CallHandler.cs`
 
+### 11. ✅ FIXED - Media SDK Namespace + API Differences
+- **Problem:** `MediaPlatformSettings`, `AudioSocketSettings`, `StreamDirection`, and `AudioFormat` not resolved; `ICommunicationsClient.StartAsync/DisposeAsync` missing
+- **Fix:** Updated usings to pull media types from `Microsoft.Skype.Bots.Media` and removed StartAsync/DisposeAsync calls
+- **Files:** `TeamsCallingBotService.cs`, `CallingController.cs`
+
 ## Final Package Configuration (reference)
 - `Microsoft.Graph.Communications.Calls.Media` 1.2.0.15690
 - `Microsoft.Skype.Bots.Media` 1.32.0.70-preview

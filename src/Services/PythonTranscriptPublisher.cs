@@ -27,7 +27,8 @@ public sealed class PythonTranscriptPublisher : IDisposable
     {
         try
         {
-            var response = await _http.PostAsJsonAsync(_endpoint, evt, ct);
+            using var content = JsonContent.Create(evt);
+            var response = await _http.PostAsync(_endpoint, content, ct);
             
             if (!response.IsSuccessStatusCode)
             {

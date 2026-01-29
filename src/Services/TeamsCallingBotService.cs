@@ -22,6 +22,7 @@ using System.Text.RegularExpressions;
 using TeamsMediaBot.Models;
 using Microsoft.Graph.Models;
 using Microsoft.Graph.Contracts;
+using Microsoft.Skype.Bots.Media;
 
 namespace TeamsMediaBot.Services;
 
@@ -90,6 +91,7 @@ public class TeamsCallingBotService : IAsyncDisposable
             _logger);
 
         // Configure media platform settings per S2, S14
+        // NOTE: MediaPlatformSettings is from Microsoft.Skype.Bots.Media (not Graph.Communications)
         var mediaPlatformSettings = new MediaPlatformSettings
         {
             ApplicationId = _mediaConfig.ApplicationId,
@@ -128,9 +130,6 @@ public class TeamsCallingBotService : IAsyncDisposable
         // This is required for proper SDK state management
         _client.Calls().OnIncoming += OnCallsIncoming;
         _client.Calls().OnUpdated += OnCallsUpdated;
-
-        // Start the client
-        await _client.StartAsync().ConfigureAwait(false);
 
         _logger.LogInformation("Teams Calling Bot Service initialized successfully");
     }
@@ -176,6 +175,11 @@ public class TeamsCallingBotService : IAsyncDisposable
         foreach (var call in args.AddedResources)
         {
             var threadId = call.Resource.ChatInfo?.ThreadId ?? call.Id;
+            if (string.IsNullOrWhiteSpace(threadId))
+            {
+                _logger.LogWarning("Call added with no threadId or callId; skipping handler creation");
+                continue;
+            }
             
             // Check if we already have a handler for this call
             if (!CallHandlers.ContainsKey(threadId))
@@ -204,6 +208,11 @@ public class TeamsCallingBotService : IAsyncDisposable
         foreach (var call in args.RemovedResources)
         {
             var threadId = call.Resource.ChatInfo?.ThreadId ?? call.Id;
+            if (string.IsNullOrWhiteSpace(threadId))
+            {
+                _logger.LogWarning("Call removed with no threadId or callId; skipping handler cleanup");
+                continue;
+            }
             
             if (CallHandlers.TryRemove(threadId, out var handler))
             {
@@ -299,6 +308,10 @@ public class TeamsCallingBotService : IAsyncDisposable
         }
 
         // Check if we already have a handler for this thread
+        if (string.IsNullOrWhiteSpace(chatInfo.ThreadId))
+        {
+            throw new InvalidOperationException("Join URL did not contain a valid threadId");
+        }
         var threadId = chatInfo.ThreadId;
         if (CallHandlers.ContainsKey(threadId))
         {
@@ -420,7 +433,7 @@ public class TeamsCallingBotService : IAsyncDisposable
         
         if (_client != null)
         {
-            await _client.DisposeAsync();
+            _client.Dispose();
         }
     }
 }
@@ -634,8 +647,8 @@ internal class AuthenticationProvider : IRequestAuthenticationProvider
 
         _logger.LogDebug("Request validated successfully for tenant: {TenantId}", tenantClaim.Value);
         
-        // Store tenant in request properties for SDK use
-        request.Properties.Add("Microsoft-Tenant-Id", tenantClaim.Value);
+        // Store tenant in request options for SDK use (HttpRequestMessage.Properties is obsolete)
+        request.Options.Set(new HttpRequestOptionsKey<string>("Microsoft-Tenant-Id"), tenantClaim.Value);
         
         return new RequestValidationResult 
         { 
