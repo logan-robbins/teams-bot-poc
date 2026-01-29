@@ -99,6 +99,11 @@ After deployment, verify:
 - **Fix:** Updated usings to pull media types from `Microsoft.Skype.Bots.Media` and removed StartAsync/DisposeAsync calls
 - **Files:** `TeamsCallingBotService.cs`, `CallingController.cs`
 
+### 12. ✅ FIXED - Build Warnings Cleanup
+- **Problem:** CS8602 null dereference in inbound validation; NETSDK1206 from transitive SQLitePCLRaw alpine RIDs
+- **Fix:** Added null guard in ValidateInboundRequestAsync and suppressed NETSDK1206 in csproj
+- **Files:** `TeamsCallingBotService.cs`, `TeamsMediaBot.csproj`
+
 ## Final Package Configuration (reference)
 - `Microsoft.Graph.Communications.Calls.Media` 1.2.0.15690
 - `Microsoft.Skype.Bots.Media` 1.32.0.70-preview

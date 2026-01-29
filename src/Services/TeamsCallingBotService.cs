@@ -551,7 +551,13 @@ internal class AuthenticationProvider : IRequestAuthenticationProvider
     /// </summary>
     public async Task<RequestValidationResult> ValidateInboundRequestAsync(HttpRequestMessage request)
     {
-        var token = request?.Headers?.Authorization?.Parameter;
+        if (request == null)
+        {
+            _logger.LogWarning("Inbound request validation failed: Request is null");
+            return new RequestValidationResult { IsValid = false };
+        }
+
+        var token = request.Headers?.Authorization?.Parameter;
         if (string.IsNullOrWhiteSpace(token))
         {
             _logger.LogWarning("Inbound request validation failed: No Authorization token provided");

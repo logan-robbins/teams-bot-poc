@@ -8,6 +8,8 @@
     <RootNamespace>TeamsMediaBot</RootNamespace>
     <AssemblyName>TeamsMediaBot</AssemblyName>
     <Platforms>x64</Platforms>
+    <!-- Suppress transitive RID warning from SQLitePCLRaw.lib.e_sqlite3 (not used by this app) -->
+    <NoWarn>$(NoWarn);NETSDK1206</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
