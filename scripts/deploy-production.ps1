@@ -17,7 +17,7 @@ Write-Host ""
 # Configuration
 $projectRoot = "C:\teams-bot-poc"
 $serviceName = "TeamsMediaBot"
-$gitRepo = "https://github.com/YOUR-USERNAME/teams-bot-poc.git"  # Update this!
+$gitRepo = "https://github.com/logan-robbins/teams-bot-poc.git"
 
 # Get VM public IP
 Write-Host "Getting VM public IP..." -ForegroundColor Yellow
