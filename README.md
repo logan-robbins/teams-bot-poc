@@ -54,7 +54,13 @@ The `az vm run-command invoke` that was cloning and building the project is stuc
   5. ✅ Heartbeat keepalive (10-minute interval prevents 45-minute timeout)
   6. ✅ Global call event subscriptions (OnIncoming, OnUpdated)
   7. ✅ VideoSocketSettings in CreateMediaSession
+- 2026-01-29 5:00 PM PST: **PACKAGE VERSION FIX** - Resolved NuGet dependency conflicts:
+  - `Microsoft.Skype.Bots.Media` → 1.32.0.70-preview (native .NET 8.0 support)
+  - `Microsoft.Graph` → 5.92.0 (matches Communications SDK transitive dep)
+  - `Microsoft.IdentityModel.*` → 8.6.1 (matches transitive deps)
+  - Added `Microsoft.Graph.Contracts` using statements per EchoBot pattern
 - 2026-01-29 3:45 PM PST: **GRUNT VALIDATION COMPLETE** - Fixed authentication provider with production-grade JWT validation. Added inbound request validation (JWT signature, issuer, audience verification), proper tenant ID extraction from token claims, and singleton token caching. Eliminates security vulnerabilities and enables proper SDK operation. Dependencies added: System.IdentityModel.Tokens.Jwt 8.2.*, Microsoft.IdentityModel.Protocols.OpenIdConnect 8.2.*. See `GRUNT_LOG.md` for details.
+- 2026-01-29 5:00 PM PST: **NAMESPACE ALIGNMENT COMPLETE** - Aligned all using statements with EchoBot sample patterns. Added `Microsoft.Graph.Contracts` namespace to both TeamsCallingBotService.cs and CallHandler.cs for extension methods (GetPrimaryIdentity, GetTenantId, SetTenantId). Added `Microsoft.Graph` to CallHandler.cs. All Graph model types now consistently use `Microsoft.Graph.Models` namespace matching EchoBot exactly. See `GRUNT_LOG.md` for details.
 
 **Root cause (current):** Azure Run Command only allows one execution at a time. A long-running or stuck Run Command blocks all new Run Command invocations until it completes. Current Conflict (409) indicates the earlier run is still executing.
 

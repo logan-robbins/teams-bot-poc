@@ -70,3 +70,37 @@ After deployment, verify:
 3. Audio frames received (~50/sec)
 4. Transcription events published to Python
 5. Calls don't disconnect after 45 minutes (heartbeat working)
+
+---
+
+## Phase 2: Package Version Alignment (2026-01-29)
+
+### 8. ✅ FIXED - NuGet Package Version Conflicts
+- **Problem:** Package downgrade errors during restore (NU1605)
+- **Root cause:** Our SDK versions (1.2.0.15690) require newer transitive deps
+- **Fix:** Updated all packages to match transitive requirements:
+  - `Microsoft.Skype.Bots.Media` → 1.32.0.70-preview (native .NET 8.0)
+  - `Microsoft.Graph` → 5.92.0
+  - `Microsoft.IdentityModel.*` → 8.6.1
+- **File:** `TeamsMediaBot.csproj`
+
+### 9. ✅ FIXED - Missing Microsoft.Graph.Contracts Using
+- **Problem:** Extension methods like `GetTenantId()`, `SetTenantId()` need this namespace
+- **Fix:** Added `using Microsoft.Graph.Contracts;` per EchoBot pattern
+- **Files:** `TeamsCallingBotService.cs`, `CallHandler.cs`
+
+## Final Package Configuration
+```xml
+<PackageReference Include="Microsoft.Graph.Communications.Calls.Media" Version="1.2.0.15690" />
+<PackageReference Include="Microsoft.Skype.Bots.Media" Version="1.32.0.70-preview" />
+<PackageReference Include="Microsoft.Graph" Version="5.92.0" />
+<PackageReference Include="Microsoft.IdentityModel.Protocols.OpenIdConnect" Version="8.6.1" />
+<PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="8.6.1" />
+```
+
+## Build Command
+```powershell
+cd C:\teams-bot-poc\src
+dotnet restore
+dotnet build --configuration Release
+```

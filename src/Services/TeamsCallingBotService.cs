@@ -21,6 +21,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using TeamsMediaBot.Models;
 using Microsoft.Graph.Models;
+using Microsoft.Graph.Contracts;
 
 namespace TeamsMediaBot.Services;
 

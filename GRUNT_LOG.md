@@ -1,5 +1,41 @@
 # Grunt Validation Log
 
+## [2026-01-29] Namespace Alignment with EchoBot Sample
+
+**Task:** Align namespace patterns with Microsoft's EchoBot sample to ensure compatibility with Graph Communications SDK.
+
+**Analysis:**
+Compared EchoBot sample files against our implementation:
+- EchoBot BotService.cs → our TeamsCallingBotService.cs
+- EchoBot CallHandler.cs → our CallHandler.cs
+- EchoBot JoinInfo.cs → our ParseJoinUrl method
+- EchoBot AuthenticationProvider.cs → our AuthenticationProvider class
+
+**Key Findings:**
+1. ✅ Both use `Microsoft.Graph.Models` for ChatInfo, IdentitySet, Identity, OrganizerMeetingInfo, Call, CallState
+2. ✅ Both use `Microsoft.Graph.Communications.*` for SDK types
+3. ❌ **Missing:** `using Microsoft.Graph.Contracts;` in our code (provides extension methods)
+4. ❌ **Missing:** `using Microsoft.Graph;` in CallHandler.cs
+
+**Changes Applied:**
+1. Added `using Microsoft.Graph.Contracts;` to TeamsCallingBotService.cs
+2. Added `using Microsoft.Graph.Contracts;` to CallHandler.cs
+3. Added `using Microsoft.Graph;` to CallHandler.cs
+
+**Extension Methods Now Available:**
+- `GetPrimaryIdentity()` - extracts primary identity from IdentitySet
+- `GetTenantId()` - extracts tenant ID from Identity
+- `SetTenantId()` - sets tenant ID on Identity
+
+**Verification:**
+- ✅ All Graph model types use `Microsoft.Graph.Models` namespace (consistent with EchoBot)
+- ✅ All extension methods have proper namespace imports (consistent with EchoBot)
+- ✅ Package references compatible: Microsoft.Graph 5.92.0 provides all required types
+
+**No Breaking Changes:** Additive only - added missing using statements for extension methods that were implicitly available.
+
+---
+
 ## [2026-01-29] AuthenticationProvider (TeamsCallingBotService.cs)
 
 **Issue:** POC-only authentication implementation had critical security vulnerabilities and missing production requirements.

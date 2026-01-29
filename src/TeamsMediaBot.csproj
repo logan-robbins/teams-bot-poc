@@ -7,6 +7,7 @@
     <OutputType>Exe</OutputType>
     <RootNamespace>TeamsMediaBot</RootNamespace>
     <AssemblyName>TeamsMediaBot</AssemblyName>
+    <Platforms>x64</Platforms>
   </PropertyGroup>
 
   <ItemGroup>
@@ -16,8 +17,18 @@
     <PackageReference Include="Microsoft.Graph.Communications.Client" Version="1.2.0.15690" />
     <PackageReference Include="Microsoft.Graph.Communications.Common" Version="1.2.0.15690" />
     
-    <!-- Media Platform SDK - REQUIRED for audio socket types (explicit reference per Microsoft samples) -->
-    <PackageReference Include="Microsoft.Skype.Bots.Media" Version="1.27.0.2-alpha" />
+    <!-- Media Platform SDK - .NET 8.0 native support version -->
+    <PackageReference Include="Microsoft.Skype.Bots.Media" Version="1.32.0.70-preview" />
+    
+    <!-- Microsoft Graph - required by Communications.Core (explicit for version clarity) -->
+    <PackageReference Include="Microsoft.Graph" Version="5.92.0" />
+    
+    <!-- Microsoft Identity for authentication -->
+    <PackageReference Include="Microsoft.Identity.Client" Version="4.73.1" />
+    
+    <!-- JWT Token Validation - match transitive deps from Microsoft.Graph.Core -->
+    <PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="8.6.1" />
+    <PackageReference Include="Microsoft.IdentityModel.Protocols.OpenIdConnect" Version="8.6.1" />
     
     <!-- Azure Speech SDK for Transcription -->
     <PackageReference Include="Microsoft.CognitiveServices.Speech" Version="1.40.*" />
@@ -25,16 +36,6 @@
     <!-- ASP.NET Core for webhook endpoints -->
     <PackageReference Include="Microsoft.AspNetCore.Mvc.NewtonsoftJson" Version="8.0.*" />
     
-    <!-- Microsoft Identity for authentication -->
-    <PackageReference Include="Microsoft.Identity.Client" Version="4.73.1" />
-    
-    <!-- JWT Token Validation (required for inbound request authentication) -->
-    <PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="8.2.*" />
-    <PackageReference Include="Microsoft.IdentityModel.Protocols.OpenIdConnect" Version="8.2.*" />
-
-    <!-- Microsoft Graph models (ChatInfo/OrganizerMeetingInfo) -->
-    <PackageReference Include="Microsoft.Graph" Version="4.54.0" />
-
     <!-- Logging and Configuration -->
     <PackageReference Include="Serilog.AspNetCore" Version="8.0.*" />
     <PackageReference Include="Serilog.Sinks.Console" Version="6.0.*" />

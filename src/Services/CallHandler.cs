@@ -1,8 +1,10 @@
+using Microsoft.Graph;
 using Microsoft.Graph.Communications.Calls;
 using Microsoft.Graph.Communications.Calls.Media;
 using Microsoft.Graph.Communications.Common.Telemetry;
 using Microsoft.Graph.Communications.Resources;
 using Microsoft.Graph.Models;
+using Microsoft.Graph.Contracts;
 using System.Runtime.InteropServices;
 using System.Timers;
 
