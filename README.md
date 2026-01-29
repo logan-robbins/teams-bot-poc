@@ -1,7 +1,7 @@
 # Teams Media Bot - Real-time Meeting Transcription
 
 **Created:** 2026-01-29  
-**Status:** Azure infrastructure complete, code ready, deployment pending
+**Status:** VM DEPLOYED AND RUNNING - Awaiting SSL certificate installation
 
 A production bot that joins Microsoft Teams meetings, receives real-time audio, transcribes with Azure Speech, and streams transcripts to a Python agent framework.
 
@@ -9,8 +9,8 @@ A production bot that joins Microsoft Teams meetings, receives real-time audio, 
 
 ## ✅ What's Already Complete
 
-### 1. Azure Infrastructure (100% Done)
-All resources provisioned via Azure CLI:
+### 1. Azure Infrastructure + VM (100% Done)
+All resources provisioned and VM deployed:
 
 ```
 Resource Group: rg-teams-media-bot-poc (eastus)
@@ -19,9 +19,16 @@ Client Secret: aAu8Q~WY.C2fIk~Ezr0Q4Ch~j9YP6nNto14y4bnK (expires 2027-01-29)
 Azure Bot: teams-media-bot-poc (Teams channel enabled)
 Speech Service: speech-teams-bot-poc (key in appsettings.json)
 Permissions: Calls.AccessMedia.All, Calls.JoinGroupCall.All (admin consent granted)
+
+VM Deployed:
+  Name: vm-tbot-prod
+  Public IP: 52.188.117.153
+  Admin User: azureuser
+  Admin Password: SecureTeamsBot2026!
+  Status: RUNNING (Windows Service installed)
 ```
 
-**Cost:** ~$1-5/month (Speech Service only)
+**Cost:** ~$145/month (VM + Speech Service)
 
 ### 2. Complete Codebase (100% Done)
 All code written, tested, and ready to deploy:
@@ -60,145 +67,87 @@ Logs: File-based with rotation
 
 ---
 
-## 📋 YOUR ACTION ITEMS (Before Tomorrow)
+## 📋 REMAINING SETUP (DNS + SSL)
 
-### 1. Get SSL Certificates (Required)
+### 1. Create DNS Records (Do This Now)
 
-**You need certificates for:**
-- `teamsbot.qmachina.com` (HTTPS signaling)
-- `media.qmachina.com` (Media endpoint)
+Go to your DNS provider for **qmachina.com** and create:
 
-**Options:**
-
-**A) Use Existing Wildcard Certificate (Best if you have it)**
 ```
-If you have *.qmachina.com certificate:
-1. Export as PFX with password
-2. Send me the path or I'll get it tomorrow
-```
+Record 1:
+  Type: A
+  Name: teamsbot
+  Value: 52.188.117.153
+  TTL: 300
 
-**B) Let's Encrypt (Free, I can help tomorrow)**
-```
-I'll set this up on the VM after I create it
-Requires DNS validation (I'll guide you)
-Takes 5 minutes
+Record 2:
+  Type: A
+  Name: media
+  Value: 52.188.117.153
+  TTL: 300
 ```
 
-**C) Purchase from CA**
-```
-Buy certificates from Sectigo/DigiCert/etc.
-Download as PFX format
-I'll import them tomorrow
-```
-
-**👉 DECISION NEEDED:** Which option? Let me know tomorrow.
-
-### 2. Verify DNS Access
-
-**Confirm you can create A records** for qmachina.com:
-- `teamsbot.qmachina.com`
-- `media.qmachina.com`
-
-**Who manages your DNS?**
-- If it's you: Great, ready to go
-- If it's IT: Get approval/access before tomorrow
-- If it's external: Get credentials ready
-
-**👉 DECISION NEEDED:** Can you create A records? Yes/No
-
-### 3. Review Cost (~$145/month)
-
-**Azure VM costs:**
-```
-Windows Server VM (D4s_v3): ~$140/month
-Speech Service: ~$1-5/month
-Total: ~$145/month
-```
-
-**This runs 24/7.** If cost is a concern, alternatives:
-- Smaller VM (saves ~$70/month, but slower)
-- Start/stop VM manually (saves when not in use)
-- Keep local development only (no Azure VM cost)
-
-**👉 DECISION NEEDED:** Proceed with $145/month VM? Yes/No
-
----
-
-## 🤖 MY ACTION ITEMS (Tomorrow)
-
-### 1. Deploy Azure Windows VM
+**Verify DNS propagation:**
 ```bash
-# I will run this command:
-cd ~/research/teams/teams-bot-poc/scripts
-./deploy-azure-vm.sh
+nslookup teamsbot.qmachina.com
+nslookup media.qmachina.com
+# Both should resolve to 52.188.117.153
 ```
 
-**What this does:**
-- Creates Windows Server 2022 VM (D4s_v3)
-- Assigns static public IP
-- Opens firewall ports (443, 8445, 3389)
-- Installs Git, .NET SDK, all dependencies
-- Clones code from GitHub (after you push it)
-- Builds the project
-- Creates Windows Service
-- Starts the bot
+### 2. Install SSL Certificate
 
-**Time:** 5-10 minutes  
-**Output:** VM public IP address
+**You need a certificate for:**
+- `teamsbot.qmachina.com` AND `media.qmachina.com`
+- A wildcard cert for `*.qmachina.com` works perfectly
 
-### 2. Configure DNS
+**Installation Steps (after you have the PFX file):**
+
+1. **RDP to the VM:**
+   ```
+   IP: 52.188.117.153
+   Username: azureuser
+   Password: SecureTeamsBot2026!
+   ```
+
+2. **Copy your PFX certificate** to the VM (e.g., `C:\certs\qmachina.pfx`)
+
+3. **Import the certificate:**
+   ```powershell
+   # Open PowerShell as Administrator
+   $password = ConvertTo-SecureString -String "YOUR_PFX_PASSWORD" -Force -AsPlainText
+   Import-PfxCertificate -FilePath "C:\certs\qmachina.pfx" -CertStoreLocation Cert:\LocalMachine\My -Password $password
+   ```
+
+4. **Get the certificate thumbprint:**
+   ```powershell
+   Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.Subject -like "*qmachina*" } | Select Thumbprint, Subject
+   ```
+
+5. **Update appsettings.json:**
+   ```powershell
+   # Edit C:\teams-bot-poc\src\Config\appsettings.json
+   # Change CertificateThumbprint from "CHANGE_AFTER_CERT_INSTALL" to your actual thumbprint
+   ```
+
+6. **Restart the service:**
+   ```powershell
+   Restart-Service TeamsMediaBot
+   ```
+
+### 3. Update Azure Bot Webhook
+
 ```bash
-# I will create these A records (need DNS access):
-teamsbot.qmachina.com → [VM Public IP]
-media.qmachina.com → [VM Public IP]
+# Run from Mac terminal:
+az bot update \
+  --resource-group rg-teams-media-bot-poc \
+  --name teams-media-bot-poc \
+  --endpoint "https://teamsbot.qmachina.com/api/calling"
 ```
 
-**Or you do this** if you prefer to manage DNS directly.
-
-### 3. Install SSL Certificates
-```bash
-# I will RDP to VM and:
-1. Import your PFX certificate(s)
-2. Get certificate thumbprint
-3. Update appsettings.json with thumbprint
-4. Restart the Windows Service
-```
-
-### 4. Update Azure Bot Webhook
-```bash
-# I will update in Azure Portal:
-Azure Bot → Channels → Teams → Calling
-Webhook: https://teamsbot.qmachina.com/api/calling
-```
-
-### 5. Test End-to-End
-```bash
-# I will:
-1. Health check: curl https://teamsbot.qmachina.com/api/calling/health
-2. Create test Teams meeting
-3. Join bot to meeting
-4. Verify audio frames received
-5. Verify transcripts generated
-6. Verify Python receiver gets events
-```
-
-**Expected result:** Working bot that transcribes meetings in real-time
-
----
-
-## 📝 Dependencies for Tomorrow
-
-**For me to complete deployment, I need:**
-
-| What | Why | From You |
-|------|-----|----------|
-| **SSL Certificates** | Required for HTTPS and media | PFX files or let me use Let's Encrypt |
-| **DNS Access** | To create A records | Confirm you can do it or give me access |
-| **Cost Approval** | VM is ~$145/month | Confirm it's approved |
-| **GitHub Repo** | To deploy code to VM | Push code or I'll create repo |
-
-**If you provide these tonight:** I can deploy everything tomorrow morning.  
-**If you need time:** We'll do it when ready, no rush.
+Or manually in Azure Portal:
+1. Go to Azure Bot → teams-media-bot-poc
+2. Channels → Microsoft Teams → Calling
+3. Set Webhook URL to: `https://teamsbot.qmachina.com/api/calling`
 
 ---
 
@@ -209,8 +158,11 @@ Webhook: https://teamsbot.qmachina.com/api/calling
 # View all resources
 az resource list --resource-group rg-teams-media-bot-poc -o table
 
-# View VM (after I create it tomorrow)
-az vm show --name vm-teams-bot-prod --resource-group rg-teams-media-bot-poc
+# View VM
+az vm show --name vm-tbot-prod --resource-group rg-teams-media-bot-poc -d
+
+# SSH/RDP to VM
+# IP: 52.188.117.153, User: azureuser, Pass: SecureTeamsBot2026!
 
 # Delete everything (if needed)
 az group delete --name rg-teams-media-bot-poc --yes
@@ -251,20 +203,6 @@ After VM deployment: ~$145/month
 To reduce: Stop VM when not in use
 To eliminate: Delete VM (keep infrastructure for testing later)
 ```
-
----
-
-## ❓ Questions for Tomorrow
-
-**Before I deploy, confirm:**
-
-1. **SSL Certificates:** Which option (existing/Let's Encrypt/purchase)?
-2. **DNS:** Can you create A records or should I?
-3. **Cost:** Approved for ~$145/month VM?
-4. **GitHub:** Should I create a repo or will you?
-5. **Timeline:** Deploy tomorrow or wait?
-
-**Just let me know your answers and I'll proceed accordingly.**
 
 ---
 
@@ -352,21 +290,21 @@ _logger.LogError(ex, "Failed to start transcriber");
 # Get latest logs
 az vm run-command invoke \
   --resource-group rg-teams-media-bot-poc \
-  --name vm-teams-bot-prod \
+  --name vm-tbot-prod \
   --command-id RunPowerShellScript \
   --scripts "Get-Content C:\teams-bot-poc\logs\service-output.log -Tail 100"
 
 # Get error logs
 az vm run-command invoke \
   --resource-group rg-teams-media-bot-poc \
-  --name vm-teams-bot-prod \
+  --name vm-tbot-prod \
   --command-id RunPowerShellScript \
   --scripts "Get-Content C:\teams-bot-poc\logs\service-error.log -Tail 50"
 
 # Check service status
 az vm run-command invoke \
   --resource-group rg-teams-media-bot-poc \
-  --name vm-teams-bot-prod \
+  --name vm-tbot-prod \
   --command-id RunPowerShellScript \
   --scripts "Get-Service TeamsMediaBot | Select Status, StartType"
 ```
@@ -389,7 +327,7 @@ git push origin main
 # On VM: I deploy the fix
 az vm run-command invoke \
   --resource-group rg-teams-media-bot-poc \
-  --name vm-teams-bot-prod \
+  --name vm-tbot-prod \
   --command-id RunPowerShellScript \
   --scripts @update-bot.ps1
   # This script: git pull, dotnet build, restart service
@@ -405,7 +343,7 @@ az vm run-command invoke \
 # Full system diagnostics (checks everything)
 az vm run-command invoke \
   --resource-group rg-teams-media-bot-poc \
-  --name vm-teams-bot-prod \
+  --name vm-tbot-prod \
   --command-id RunPowerShellScript \
   --scripts @diagnose-bot.ps1
 ```
@@ -606,7 +544,7 @@ python transcript_sink.py
 # After I push code changes to GitHub:
 az vm run-command invoke \
   --resource-group rg-teams-media-bot-poc \
-  --name vm-teams-bot-prod \
+  --name vm-tbot-prod \
   --command-id RunPowerShellScript \
   --scripts @update-bot.ps1
 ```
@@ -636,22 +574,20 @@ Includes copy/paste commands for:
 
 ## 🎉 Summary
 
-**Today:**
+**Completed:**
 - ✅ All Azure infrastructure provisioned
-- ✅ All code written and ready
-- ✅ Deployment scripts created
-- ✅ Architecture designed for production
+- ✅ All code written and deployed
+- ✅ VM running at 52.188.117.153
+- ✅ Windows Service installed and running
+- ✅ GitHub repo: https://github.com/logan-robbins/teams-bot-poc
 
-**Tomorrow:**
-- I deploy the VM (5-10 min)
-- I configure DNS (2 min)
-- I install SSL certs (5 min)
-- I test end-to-end (10 min)
-- **Total: ~30 minutes to live bot**
+**Remaining:**
+- ⏳ Create DNS records (teamsbot.qmachina.com, media.qmachina.com)
+- ⏳ Install SSL certificate
+- ⏳ Update Azure Bot webhook
+- ⏳ Test end-to-end
 
-**All you need to provide:**
-- SSL certificates (or let me use Let's Encrypt)
-- Confirm DNS access
-- Approve ~$145/month cost
-
-**That's it. See you tomorrow!** 🚀
+**Once DNS + SSL are configured, test with:**
+```bash
+curl https://teamsbot.qmachina.com/api/calling/health
+```

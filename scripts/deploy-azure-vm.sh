@@ -15,7 +15,7 @@ echo ""
 
 # Configuration
 RG_NAME="rg-teams-media-bot-poc"
-VM_NAME="vm-teams-bot-prod"
+VM_NAME="vm-tbot-prod"
 LOCATION="eastus"
 VM_SIZE="Standard_D4s_v3"
 ADMIN_USER="azureuser"
