@@ -1,9 +1,10 @@
 using Microsoft.Graph.Communications.Calls;
 using Microsoft.Graph.Communications.Calls.Media;
 using Microsoft.Graph.Communications.Client;
+using Microsoft.Graph.Communications.Client.Authentication;
 using Microsoft.Graph.Communications.Common;
 using Microsoft.Graph.Communications.Common.Telemetry;
-using Microsoft.Graph.Communications.Resources;
+using Microsoft.Graph.Models;
 using Microsoft.Identity.Client;
 using System.Security.Cryptography.X509Certificates;
 using TeamsMediaBot.Models;

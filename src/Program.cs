@@ -1,4 +1,5 @@
 using Microsoft.Graph.Communications.Common.Telemetry;
+using Microsoft.Extensions.Logging;
 using Serilog;
 using TeamsMediaBot.Models;
 using TeamsMediaBot.Services;
@@ -34,11 +35,17 @@ builder.Services.AddSingleton(mediaConfig);
 builder.Services.AddSingleton(speechConfig);
 builder.Services.AddSingleton(transcriptSinkConfig);
 
-// Register Graph logger
+// Register Graph logger (use SDK GraphLogger to satisfy IGraphLogger interface)
 builder.Services.AddSingleton<IGraphLogger>(sp =>
 {
-    var logger = sp.GetRequiredService<ILogger<Program>>();
-    return new GraphLogger(logger);
+    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+    var graphLogger = new GraphLogger(
+        component: "TeamsMediaBotPOC",
+        properties: Array.Empty<object>(),
+        redirectToTrace: false,
+        obfuscationConfiguration: null);
+    graphLogger.BindToILoggerFactory(loggerFactory);
+    return graphLogger;
 });
 
 // Register Python transcript publisher
@@ -96,36 +103,3 @@ await app.RunAsync();
 // Cleanup
 await botService.DisposeAsync();
 Log.CloseAndFlush();
-
-/// <summary>
-/// Adapter to bridge ILogger to IGraphLogger
-/// </summary>
-internal class GraphLogger : IGraphLogger
-{
-    private readonly ILogger _logger;
-
-    public GraphLogger(ILogger logger)
-    {
-        _logger = logger;
-    }
-
-    public void Error(string message, Exception? exception = null, [System.Runtime.CompilerServices.CallerMemberName] string? memberName = null, [System.Runtime.CompilerServices.CallerFilePath] string? filePath = null, [System.Runtime.CompilerServices.CallerLineNumber] int lineNumber = 0)
-    {
-        _logger.LogError(exception, "{Message} [{MemberName}@{FilePath}:{LineNumber}]", message, memberName, filePath, lineNumber);
-    }
-
-    public void Info(string message, [System.Runtime.CompilerServices.CallerMemberName] string? memberName = null, [System.Runtime.CompilerServices.CallerFilePath] string? filePath = null, [System.Runtime.CompilerServices.CallerLineNumber] int lineNumber = 0)
-    {
-        _logger.LogInformation("{Message} [{MemberName}]", message, memberName);
-    }
-
-    public void Verbose(string message, [System.Runtime.CompilerServices.CallerMemberName] string? memberName = null, [System.Runtime.CompilerServices.CallerFilePath] string? filePath = null, [System.Runtime.CompilerServices.CallerLineNumber] int lineNumber = 0)
-    {
-        _logger.LogDebug("{Message} [{MemberName}]", message, memberName);
-    }
-
-    public void Warn(string message, [System.Runtime.CompilerServices.CallerMemberName] string? memberName = null, [System.Runtime.CompilerServices.CallerFilePath] string? filePath = null, [System.Runtime.CompilerServices.CallerLineNumber] int lineNumber = 0)
-    {
-        _logger.LogWarning("{Message} [{MemberName}]", message, memberName);
-    }
-}

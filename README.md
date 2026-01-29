@@ -34,13 +34,14 @@ A production bot that joins Microsoft Teams meetings, receives real-time audio, 
 ### Why Deployment Stalled:
 The `az vm run-command invoke` that was cloning and building the project is stuck/hanging. The command has been running for >15 minutes. There may be a previous run-command still in progress.
 
-**Latest status (checked 2026-01-29 2:10 PM PST / 22:10:06Z):**
+**Latest status (checked 2026-01-29 2:40 PM PST / 22:40:35Z):**
 - Run Command failed earlier with `VMExtensionProvisioningTimeout` (RunCommandWindows extension timed out)
 - 2026-01-29 12:45:10 PM PST / 20:45:10Z: Re-clone run-command started (delete + git clone) — still running as of last check
 - 2026-01-29 1:02:00 PM PST / 21:02:00Z: New Run Command attempt failed with `Conflict` ("execution is in progress")
 - 2026-01-29 12:53:54 PM PST / 20:53:54Z: VM restart requested — still pending completion as of last check
 - 2026-01-29 1:35 PM PST: Decision made to switch to **RDP** and complete provisioning manually
 - 2026-01-29 2:05 PM PST: `dotnet restore` failed on VM because `Microsoft.Graph.Communications.*` packages are pinned to `1.4.*` (not available on nuget.org; latest is `1.2.0.15690`)
+- 2026-01-29 2:20 PM PST: Build failed due to Graph SDK API mismatch (IGraphLogger interface + missing Graph models). Fix applied in repo: use SDK `GraphLogger` + add `Microsoft.Graph` package for `ChatInfo`/`OrganizerMeetingInfo`
 
 **Root cause (current):** Azure Run Command only allows one execution at a time. A long-running or stuck Run Command blocks all new Run Command invocations until it completes. Current Conflict (409) indicates the earlier run is still executing.
 
@@ -105,6 +106,8 @@ cd C:\teams-bot-poc\src
 # Fix package versions (1.4.* not available on nuget.org)
 # Edit TeamsMediaBot.csproj and set:
 # Microsoft.Graph.Communications.* => 1.2.0.15690
+# Microsoft.Graph => 5.101.0
+# Microsoft.Identity.Client => 4.73.1
 
 dotnet restore
 dotnet build --configuration Release

@@ -1,6 +1,6 @@
 {
   "task": "Unblock Run Command conflict and complete VM provisioning",
-  "updated_utc": "2026-01-29T22:11:37Z",
+  "updated_utc": "2026-01-29T22:40:35Z",
   "plan": [
     {
       "step": 1,
@@ -20,25 +20,30 @@
     {
       "step": 4,
       "title": "Fix Microsoft.Graph.Communications package versions (1.2.0.15690)",
-      "status": "pending"
+      "status": "completed"
     },
     {
       "step": 5,
+      "title": "Resolve build errors: use SDK GraphLogger + add Microsoft.Graph package for ChatInfo/OrganizerMeetingInfo",
+      "status": "in_progress"
+    },
+    {
+      "step": 6,
       "title": "Restore/build in small chunks via RDP",
       "status": "pending"
     },
     {
-      "step": 6,
+      "step": 7,
       "title": "Update appsettings.json cert thumbprint and create logs dir",
       "status": "pending"
     },
     {
-      "step": 7,
+      "step": 8,
       "title": "Create/verify Windows service and capture logs",
       "status": "pending"
     },
     {
-      "step": 8,
+      "step": 9,
       "title": "Update README with current deployment status",
       "status": "completed"
     }
