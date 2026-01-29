@@ -23,7 +23,7 @@
     <PackageReference Include="Microsoft.AspNetCore.Mvc.NewtonsoftJson" Version="8.0.*" />
     
     <!-- Microsoft Identity for authentication -->
-    <PackageReference Include="Microsoft.Identity.Client" Version="4.65.*" />
+    <PackageReference Include="Microsoft.Identity.Client" Version="4.73.1" />
     
     <!-- Logging and Configuration -->
     <PackageReference Include="Serilog.AspNetCore" Version="8.0.*" />
