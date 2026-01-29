@@ -34,26 +34,42 @@ A production bot that joins Microsoft Teams meetings, receives real-time audio, 
 ### Why Deployment Stalled:
 The `az vm run-command invoke` that was cloning and building the project is stuck/hanging. The command has been running for >15 minutes. There may be a previous run-command still in progress.
 
-### TO RESUME DEPLOYMENT:
+---
 
-**Option A: Wait and retry via az cli**
-```bash
-# Check if previous command finished
-az vm run-command invoke \
-  --resource-group rg-teams-media-bot-poc \
-  --name vm-tbot-prod \
-  --command-id RunPowerShellScript \
-  --scripts 'Test-Path C:\teams-bot-poc' \
-  --query 'value[0].message' -o tsv
+## ⚡ IMMEDIATE NEXT STEPS
+
+### Step 1: Create DNS Records (DO NOW - can be done in parallel)
+The IP **52.188.117.153 is STATIC** (Azure Standard SKU). Safe to create DNS now.
+
+Go to your DNS provider for `qmachina.com` and create:
+```
+Record 1:
+  Type: A
+  Name: teamsbot
+  Value: 52.188.117.153
+  TTL: 300
+
+Record 2:
+  Type: A
+  Name: media  
+  Value: 52.188.117.153
+  TTL: 300
 ```
 
-**Option B: RDP to VM and complete manually**
+Verify with: `nslookup teamsbot.qmachina.com` and `nslookup media.qmachina.com`
+
+### Step 2: Deploy Bot to VM (choose one option)
+
+**Option A: RDP and complete manually (RECOMMENDED - faster)**
 ```
 RDP: 52.188.117.153
 User: azureuser
 Pass: SecureTeamsBot2026!
+```
 
-# Then run in PowerShell as Admin:
+Run in PowerShell as Administrator:
+```powershell
+# Clone and build
 cd C:\
 git clone https://github.com/logan-robbins/teams-bot-poc.git
 cd C:\teams-bot-poc\src
@@ -81,10 +97,29 @@ Start-Service TeamsMediaBot
 Get-Service TeamsMediaBot
 ```
 
-### After VM Setup Complete, Still Need:
-1. Create DNS A records pointing to 52.188.117.153
-2. Update Azure Bot webhook
-3. Test end-to-end
+**Option B: Wait and retry via Azure CLI**
+A previous `az vm run-command` is stuck. Wait ~10 min and retry:
+```bash
+az vm run-command invoke \
+  --resource-group rg-teams-media-bot-poc \
+  --name vm-tbot-prod \
+  --command-id RunPowerShellScript \
+  --scripts 'Test-Path C:\teams-bot-poc' \
+  --query 'value[0].message' -o tsv
+```
+
+### Step 3: Update Azure Bot Webhook (after DNS propagates)
+```bash
+az bot update \
+  --resource-group rg-teams-media-bot-poc \
+  --name teams-media-bot-poc \
+  --endpoint "https://teamsbot.qmachina.com/api/calling"
+```
+
+### Step 4: Test
+```bash
+curl https://teamsbot.qmachina.com/api/calling/health
+```
 
 ---
 
