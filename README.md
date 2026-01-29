@@ -45,7 +45,7 @@ The `az vm run-command invoke` that was cloning and building the project is stuc
 - 2026-01-29 2:05 PM PST: `dotnet restore` failed on VM because `Microsoft.Graph.Communications.*` packages are pinned to `1.4.*` (not available on nuget.org; latest is `1.2.0.15690`)
 - 2026-01-29 2:20 PM PST: Build failed due to Graph SDK API mismatch (IGraphLogger interface + missing Graph models). Fix applied in repo: use SDK `GraphLogger` + add `Microsoft.Graph` package for `ChatInfo`/`OrganizerMeetingInfo`
 - 2026-01-29 2:45 PM PST: Verified local `microsoft-graph-comms-samples` repo; sample projects use `Microsoft.Graph.Communications.*` 1.2.x versions (consistent with our 1.2.0.15690 pin)
-- 2026-01-29 3:10 PM PST: Aligned join URL parsing + auth provider signatures to match sample patterns; removed explicit `Microsoft.Graph` package to avoid type mismatch with SDK transitive models (POC-only inbound validation)
+- 2026-01-29 3:10 PM PST: Aligned join URL parsing + auth provider signatures to match sample patterns; pinned `Microsoft.Graph` to 4.54.0 (matches sample repo and provides ChatInfo/OrganizerMeetingInfo in `Microsoft.Graph` namespace). POC-only inbound validation.
 
 **Root cause (current):** Azure Run Command only allows one execution at a time. A long-running or stuck Run Command blocks all new Run Command invocations until it completes. Current Conflict (409) indicates the earlier run is still executing.
 
@@ -118,6 +118,7 @@ cd C:\teams-bot-poc\src
 # Edit TeamsMediaBot.csproj and set:
 # Microsoft.Graph.Communications.* => 1.2.0.15690
 # Microsoft.Identity.Client => 4.73.1
+# Microsoft.Graph => 4.54.0
 
 dotnet restore
 dotnet build --configuration Release
