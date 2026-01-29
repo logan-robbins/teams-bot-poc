@@ -34,9 +34,37 @@ A production bot that joins Microsoft Teams meetings, receives real-time audio, 
 ### Why Deployment Stalled:
 The `az vm run-command invoke` that was cloning and building the project is stuck/hanging. The command has been running for >15 minutes. There may be a previous run-command still in progress.
 
+**Latest status (checked 2026-01-29 2:10 PM PST / 22:10:06Z):**
+- Run Command failed earlier with `VMExtensionProvisioningTimeout` (RunCommandWindows extension timed out)
+- 2026-01-29 12:45:10 PM PST / 20:45:10Z: Re-clone run-command started (delete + git clone) — still running as of last check
+- 2026-01-29 1:02:00 PM PST / 21:02:00Z: New Run Command attempt failed with `Conflict` ("execution is in progress")
+- 2026-01-29 12:53:54 PM PST / 20:53:54Z: VM restart requested — still pending completion as of last check
+- 2026-01-29 1:35 PM PST: Decision made to switch to **RDP** and complete provisioning manually
+- 2026-01-29 2:05 PM PST: `dotnet restore` failed on VM because `Microsoft.Graph.Communications.*` packages are pinned to `1.4.*` (not available on nuget.org; latest is `1.2.0.15690`)
+
+**Root cause (current):** Azure Run Command only allows one execution at a time. A long-running or stuck Run Command blocks all new Run Command invocations until it completes. Current Conflict (409) indicates the earlier run is still executing.
+
+**Run Command constraints to keep in mind:**
+- Only one script at a time; new invocations return Conflict while another is running
+- A running script cannot be canceled
+- Max runtime 90 minutes (then it times out)
+- VM must have outbound connectivity to Azure to return results; VM Agent must be Ready
+
 ---
 
 ## ⚡ IMMEDIATE NEXT STEPS
+
+### Step 0: Check/clear the stuck Run Command (do this first if it's still running)
+We may have a stuck provisioning job. Please check in the Azure Portal UI:
+
+1. Azure Portal → **VM** `vm-tbot-prod`
+2. **Run command** (left nav)
+3. Look at the **Job history** / **Run command jobs** list
+4. If a job is **Running** for >10–15 minutes, try **Cancel**; if Cancel is unavailable or ineffective, just proceed with **RDP** and avoid starting new Run Commands
+
+If you don't have portal access right now, tell me what you see and I'll adjust the plan.
+
+If a job is running for >15 minutes or appears stuck, cancel it in the portal. Prefer **Option A (RDP)** or retry with **shorter, split Run Command steps** (avoid long builds in a single command).
 
 ### Step 1: Create DNS Records (DO NOW - can be done in parallel)
 The IP **52.188.117.153 is STATIC** (Azure Standard SKU). Safe to create DNS now.
@@ -73,6 +101,11 @@ Run in PowerShell as Administrator:
 cd C:\
 git clone https://github.com/logan-robbins/teams-bot-poc.git
 cd C:\teams-bot-poc\src
+
+# Fix package versions (1.4.* not available on nuget.org)
+# Edit TeamsMediaBot.csproj and set:
+# Microsoft.Graph.Communications.* => 1.2.0.15690
+
 dotnet restore
 dotnet build --configuration Release
 
