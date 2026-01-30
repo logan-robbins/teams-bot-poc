@@ -71,15 +71,16 @@ builder.Services.AddSingleton<IGraphLogger>(sp =>
     return graphLogger;
 });
 
-// Register Python transcript publisher
-builder.Services.AddScoped(sp =>
+// Register Python transcript publisher as transient (each transcriber gets its own)
+builder.Services.AddTransient(sp =>
 {
     var logger = sp.GetRequiredService<ILogger<PythonTranscriptPublisher>>();
     return new PythonTranscriptPublisher(transcriptSinkConfig.PythonEndpoint, logger);
 });
 
-// Register Azure Speech transcriber
-builder.Services.AddScoped(sp =>
+// Register Azure Speech transcriber as transient
+// Lifetime is managed by CallHandler, not by DI container
+builder.Services.AddTransient(sp =>
 {
     var publisher = sp.GetRequiredService<PythonTranscriptPublisher>();
     var logger = sp.GetRequiredService<ILogger<AzureSpeechRealtimeTranscriber>>();

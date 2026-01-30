@@ -111,8 +111,10 @@ public class CallingController : ControllerBase
             _logger.LogInformation("Received join meeting request: {JoinUrl}", request.JoinUrl);
 
             // Create a new transcriber for this call
-            using var scope = _serviceProvider.CreateScope();
-            var transcriber = scope.ServiceProvider.GetRequiredService<AzureSpeechRealtimeTranscriber>();
+            // Note: We create it manually (not via scoped DI) because the transcriber's lifetime
+            // extends beyond this HTTP request - it lives for the duration of the call.
+            // The CallHandler will dispose it when the call ends.
+            var transcriber = _serviceProvider.GetRequiredService<AzureSpeechRealtimeTranscriber>();
 
             var callId = await _botService.JoinMeetingAsync(
                 request.JoinUrl,
@@ -145,6 +147,42 @@ public class CallingController : ControllerBase
             Timestamp = DateTime.UtcNow,
             Service = "Teams Media Bot POC"
         });
+    }
+}
+
+/// <summary>
+/// Controller for Bot Framework messaging (stub - this bot is calling-only)
+/// This prevents 404 errors when Azure Bot sends messaging probes
+/// </summary>
+[ApiController]
+[Route("api/messages")]
+public class MessagesController : ControllerBase
+{
+    private readonly ILogger<MessagesController> _logger;
+
+    public MessagesController(ILogger<MessagesController> logger)
+    {
+        _logger = logger;
+    }
+
+    /// <summary>
+    /// Bot Framework messaging endpoint (stub)
+    /// This bot is calling-only, so we just acknowledge the request
+    /// </summary>
+    [HttpPost]
+    public IActionResult Post()
+    {
+        _logger.LogInformation("Received Bot Framework message (this is a calling-only bot) - v1.0.2");
+        return Ok(new { status = "ok", version = "1.0.2", message = "This bot handles calls, not messages" });
+    }
+
+    /// <summary>
+    /// Health check for messages endpoint
+    /// </summary>
+    [HttpGet]
+    public IActionResult Get()
+    {
+        return Ok(new { status = "ok", version = "1.0.2", endpoint = "messages", note = "This is a calling-only bot" });
     }
 }
 
