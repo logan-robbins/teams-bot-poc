@@ -11,6 +11,8 @@ import asyncio
 from datetime import datetime
 from typing import Optional
 import logging
+import os
+from pathlib import Path
 
 # Configure logging
 logging.basicConfig(
@@ -18,6 +20,31 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Transcript file path - save to Desktop for easy access
+DESKTOP_PATH = Path(os.environ.get("USERPROFILE", "C:/Users/azureuser")) / "Desktop"
+TRANSCRIPT_FILE = DESKTOP_PATH / "meeting_transcript.txt"
+
+def save_transcript_to_file(kind: str, text: str, timestamp: str):
+    """Append transcript to file on desktop"""
+    try:
+        # Ensure desktop folder exists
+        DESKTOP_PATH.mkdir(parents=True, exist_ok=True)
+        
+        with open(TRANSCRIPT_FILE, "a", encoding="utf-8") as f:
+            if kind == "session_started":
+                f.write(f"\n{'='*60}\n")
+                f.write(f"NEW SESSION STARTED: {timestamp}\n")
+                f.write(f"{'='*60}\n\n")
+            elif kind == "recognized" and text:
+                # Only save final transcripts (not partial)
+                f.write(f"[{timestamp}] {text}\n")
+            elif kind == "session_stopped":
+                f.write(f"\n--- Session ended: {timestamp} ---\n\n")
+                
+        logger.debug(f"Saved to file: {TRANSCRIPT_FILE}")
+    except Exception as e:
+        logger.error(f"Failed to save transcript to file: {e}")
 
 app = FastAPI(title="Teams Transcript Sink", version="1.0.0")
 
@@ -67,12 +94,16 @@ async def receive_transcript(req: Request):
         elif kind == "recognized":
             stats["final_transcripts"] += 1
             logger.info(f"[FINAL] {text}")
+            # Save final transcripts to file
+            save_transcript_to_file(kind, text, ts_utc)
         elif kind == "session_started":
             stats["session_started"] += 1
             logger.info("Speech recognition session started")
+            save_transcript_to_file(kind, text, ts_utc)
         elif kind == "session_stopped":
             stats["session_stopped"] += 1
             logger.info("Speech recognition session stopped")
+            save_transcript_to_file(kind, text, ts_utc)
         elif kind == "canceled":
             stats["errors"] += 1
             logger.error(f"Speech recognition error: {details}")
@@ -159,6 +190,7 @@ if __name__ == "__main__":
     logger.info("Transcript endpoint: POST /transcript")
     logger.info("Health check: GET /health")
     logger.info("Stats: GET /stats")
+    logger.info(f"Transcripts will be saved to: {TRANSCRIPT_FILE}")
     
     # Start background agent processing loop
     loop = asyncio.get_event_loop()

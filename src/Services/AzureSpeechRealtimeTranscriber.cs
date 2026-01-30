@@ -22,6 +22,12 @@ public sealed class AzureSpeechRealtimeTranscriber : IAsyncDisposable
     private SpeechRecognizer? _recognizer;
     private long _framesReceived;
     private long _bytesReceived;
+    
+    // Transcript file path - save to Desktop for easy viewing
+    private static readonly string TranscriptFilePath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
+        "meeting_transcript.txt");
+    private static readonly object _fileLock = new();
 
     public AzureSpeechRealtimeTranscriber(
         string speechKey,
@@ -172,11 +178,59 @@ public sealed class AzureSpeechRealtimeTranscriber : IAsyncDisposable
 
     /// <summary>
     /// Fire-and-forget publish to Python (don't block audio thread)
+    /// Also saves to desktop file for easy viewing
     /// </summary>
     private void FireAndForget(string kind, string? text, string? details = null)
     {
-        var evt = new TranscriptEvent(kind, text, DateTime.UtcNow.ToString("O"), details);
+        var timestamp = DateTime.UtcNow.ToString("O");
+        var evt = new TranscriptEvent(kind, text, timestamp, details);
+        
+        // Publish to Python endpoint
         _ = Task.Run(() => _publisher.PublishAsync(evt));
+        
+        // Also save to desktop file
+        _ = Task.Run(() => SaveToFile(kind, text, timestamp));
+    }
+    
+    /// <summary>
+    /// Save transcript to file on desktop
+    /// </summary>
+    private void SaveToFile(string kind, string? text, string timestamp)
+    {
+        try
+        {
+            lock (_fileLock)
+            {
+                using var writer = new StreamWriter(TranscriptFilePath, append: true);
+                
+                switch (kind)
+                {
+                    case "session_started":
+                        writer.WriteLine();
+                        writer.WriteLine(new string('=', 60));
+                        writer.WriteLine($"NEW SESSION STARTED: {timestamp}");
+                        writer.WriteLine(new string('=', 60));
+                        writer.WriteLine();
+                        _logger.LogInformation("Transcript file: {Path}", TranscriptFilePath);
+                        break;
+                        
+                    case "recognized" when !string.IsNullOrWhiteSpace(text):
+                        // Only save final transcripts (not partial)
+                        writer.WriteLine($"[{timestamp}] {text}");
+                        break;
+                        
+                    case "session_stopped":
+                        writer.WriteLine();
+                        writer.WriteLine($"--- Session ended: {timestamp} ---");
+                        writer.WriteLine();
+                        break;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to save transcript to file");
+        }
     }
 
     public async ValueTask DisposeAsync()
