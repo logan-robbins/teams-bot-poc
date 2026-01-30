@@ -12,38 +12,43 @@ namespace TeamsMediaBot.Services;
 /// </summary>
 public class TranscriberFactory
 {
-    private readonly string _speechKey;
-    private readonly string _speechRegion;
-    private readonly string _language;
+    private readonly SttConfiguration _stt;
     private readonly string _pythonEndpoint;
     private readonly ILoggerFactory _loggerFactory;
 
     public TranscriberFactory(
-        string speechKey,
-        string speechRegion,
-        string language,
+        SttConfiguration stt,
         string pythonEndpoint,
         ILoggerFactory loggerFactory)
     {
-        _speechKey = speechKey;
-        _speechRegion = speechRegion;
-        _language = language;
+        _stt = stt;
         _pythonEndpoint = pythonEndpoint;
         _loggerFactory = loggerFactory;
     }
 
-    public AzureSpeechRealtimeTranscriber Create()
+    public IRealtimeTranscriber Create()
     {
         var publisherLogger = _loggerFactory.CreateLogger<PythonTranscriptPublisher>();
         var publisher = new PythonTranscriptPublisher(_pythonEndpoint, publisherLogger);
         
-        var transcriberLogger = _loggerFactory.CreateLogger<AzureSpeechRealtimeTranscriber>();
-        return new AzureSpeechRealtimeTranscriber(
-            _speechKey,
-            _speechRegion,
-            _language,
-            publisher,
-            transcriberLogger);
+        var provider = (_stt.Provider ?? string.Empty).Trim();
+        if (provider.Equals("AzureSpeech", StringComparison.OrdinalIgnoreCase) ||
+            provider.Equals("Azure", StringComparison.OrdinalIgnoreCase))
+        {
+            var azure = _stt.AzureSpeech ?? throw new InvalidOperationException("STT provider 'AzureSpeech' selected but Stt.AzureSpeech is missing.");
+
+            var transcriberLogger = _loggerFactory.CreateLogger<AzureSpeechRealtimeTranscriber>();
+            return new AzureSpeechRealtimeTranscriber(
+                azure.Key,
+                azure.Region,
+                azure.RecognitionLanguage,
+                azure.EndpointId,
+                publisher,
+                transcriberLogger);
+        }
+
+        throw new NotSupportedException(
+            $"STT provider '{provider}' is not supported yet. Update config Stt.Provider to 'AzureSpeech' or implement a new provider.");
     }
 }
 
@@ -53,11 +58,12 @@ public class TranscriberFactory
 /// Based on Part I (I3) and Part B (B2) of the validated guide
 /// Sources: S15 (audio streams), S16 (PCM format), S17-S18 (continuous recognition)
 /// </summary>
-public sealed class AzureSpeechRealtimeTranscriber : IAsyncDisposable
+public sealed class AzureSpeechRealtimeTranscriber : IRealtimeTranscriber
 {
     private readonly string _speechKey;
     private readonly string _speechRegion;
     private readonly string _lang;
+    private readonly string? _endpointId;
     private readonly PythonTranscriptPublisher _publisher;
     private readonly ILogger<AzureSpeechRealtimeTranscriber> _logger;
 
@@ -76,12 +82,14 @@ public sealed class AzureSpeechRealtimeTranscriber : IAsyncDisposable
         string speechKey,
         string speechRegion,
         string language,
+        string? endpointId,
         PythonTranscriptPublisher publisher,
         ILogger<AzureSpeechRealtimeTranscriber> logger)
     {
         _speechKey = speechKey;
         _speechRegion = speechRegion;
         _lang = language;
+        _endpointId = string.IsNullOrWhiteSpace(endpointId) ? null : endpointId.Trim();
         _publisher = publisher;
         _logger = logger;
     }
@@ -108,6 +116,12 @@ public sealed class AzureSpeechRealtimeTranscriber : IAsyncDisposable
 
         var cfg = SpeechConfig.FromSubscription(_speechKey, _speechRegion);
         cfg.SpeechRecognitionLanguage = _lang;
+        if (_endpointId != null)
+        {
+            // Optional: Custom Speech model selection.
+            // When provided, the recognizer targets that specific model endpoint.
+            cfg.EndpointId = _endpointId;
+        }
 
         _recognizer = new SpeechRecognizer(cfg, audio);
 

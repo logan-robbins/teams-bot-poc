@@ -24,7 +24,7 @@ namespace TeamsMediaBot.Services;
 public class CallHandler : HeartbeatHandler
 {
     private readonly ILogger _logger;
-    private readonly AzureSpeechRealtimeTranscriber _transcriber;
+    private readonly IRealtimeTranscriber _transcriber;
     private bool _isTranscriberStarted;
     private long _audioFramesReceived;
 
@@ -53,7 +53,7 @@ public class CallHandler : HeartbeatHandler
     public CallHandler(
         ICall call,
         ILocalMediaSession mediaSession,
-        AzureSpeechRealtimeTranscriber transcriber,
+        IRealtimeTranscriber transcriber,
         ILogger logger)
         : base(TimeSpan.FromMinutes(10), call.GraphLogger) // Heartbeat every 10 minutes (Microsoft uses 10 min)
     {

@@ -24,82 +24,112 @@ Teams calling bot that joins meetings, receives real-time audio, transcribes wit
                     │   (teams-media-bot-poc)    │
                     └────────────┬───────────────┘
                                  │
-                                 │ Webhook POST
-                                 │ https://teamsbot.qmachina.com/api/calling
+                                 │ Webhook POST (public)
+                                 │ https://teamsbot.qmachina.com/api/calling  (TLS :443)
                                  ↓
 ┌────────────────────────────────────────────────────────────────────────┐
 │                  Azure Windows VM (52.188.117.153)                      │
 │                         Windows Server 2022 D4s_v3                      │
 │                                                                          │
 │  ┌───────────────────────────────────────────────────────────────┐     │
-│  │  TeamsMediaBot Windows Service (C# .NET 8)                    │     │
-│  │  Running as .\azureuser with SSL cert access                  │     │
-│  │                                                                │     │
-│  │  ┌─────────────────────────────────────────────────────────┐ │     │
-│  │  │ CallingController.cs                                     │ │     │
-│  │  │  • /api/calling (webhook endpoint) :443                  │ │     │
-│  │  │  • /api/calling/join (manual curl trigger)               │ │     │
-│  │  │  • /api/calling/health (status check)                    │ │     │
-│  │  └──────────────────┬──────────────────────────────────────┘ │     │
-│  │                     │                                          │     │
-│  │                     ↓                                          │     │
-│  │  ┌─────────────────────────────────────────────────────────┐ │     │
-│  │  │ TeamsCallingBotService.cs                                │ │     │
-│  │  │  • Joins meeting via Graph Communications SDK            │ │     │
-│  │  │  • Creates MediaPlatform with SSL cert                   │ │     │
-│  │  │  • Receives real-time audio on :8445                     │ │     │
-│  │  └──────────────────┬──────────────────────────────────────┘ │     │
-│  │                     │                                          │     │
-│  │                     │ Raw audio frames (PCM 16kHz)            │     │
-│  │                     ↓                                          │     │
-│  │  ┌─────────────────────────────────────────────────────────┐ │     │
-│  │  │ CallHandler.cs                                           │ │     │
-│  │  │  • Buffers audio in 100ms chunks                         │ │     │
-│  │  │  • ~50 frames/sec from Teams media stream               │ │     │
-│  │  └──────────────────┬──────────────────────────────────────┘ │     │
-│  │                     │                                          │     │
-│  │                     ↓                                          │     │
-│  │  ┌─────────────────────────────────────────────────────────┐ │     │
-│  │  │ AzureSpeechRealtimeTranscriber.cs                        │ │     │
-│  │  │  • Streams audio to Azure Speech Service                 │ │     │
-│  │  │  • Receives partial + final transcripts                  │ │     │
-│  │  └──────────────────┬──────────────────────────────────────┘ │     │
-│  │                     │                                          │     │
-│  │                     ↓                                          │     │
-│  │  ┌─────────────────────────────────────────────────────────┐ │     │
-│  │  │ PythonTranscriptPublisher.cs                             │ │     │
-│  │  │  • Currently: Saves to C:\Users\azureuser\Desktop\      │ │     │
-│  │  │               transcripts.txt                            │ │     │
-│  │  │  • Future: POST to http://localhost:5000/transcript      │ │     │
-│  │  └─────────────────────────────────────────────────────────┘ │     │
+│  │ Ingress / TLS termination                                     │     │
+│  │  • Public endpoint: :443                                      │     │
+│  │  • Forwards to bot listener: https://127.0.0.1:9443           │     │
 │  └───────────────────────────────────────────────────────────────┘     │
 │                                                                          │
 │  ┌───────────────────────────────────────────────────────────────┐     │
-│  │  Python Transcript Service (Scoped, Not Running)              │     │
+│  │ TeamsMediaBot Windows Service (C# .NET 8, ASP.NET Core)        │     │
+│  │ Running as .\azureuser (required for LocalMachine\\My cert)     │     │
 │  │                                                                │     │
-│  │  ┌─────────────────────────────────────────────────────────┐ │     │
-│  │  │ transcript_sink.py (FastAPI)                             │ │     │
-│  │  │  • POST /transcript endpoint :5000                       │ │     │
-│  │  │  • Async queue for multi-agent processing                │ │     │
-│  │  │  • TODO: Connect your agent framework here               │ │     │
-│  │  └─────────────────────────────────────────────────────────┘ │     │
+│  │  ┌─────────────────────────────────────────────────────────┐  │     │
+│  │  │ Kestrel HTTPS backend (internal)                         │  │     │
+│  │  │  • https://0.0.0.0:9443                                  │  │     │
+│  │  │  • Certificate loaded by thumbprint                      │  │     │
+│  │  └──────────────────┬──────────────────────────────────────┘  │     │
+│  │                     │                                          │     │
+│  │                     ↓                                          │     │
+│  │  ┌─────────────────────────────────────────────────────────┐  │     │
+│  │  │ CallingController.cs                                     │  │     │
+│  │  │  • POST /api/calling (Graph notifications)               │  │     │
+│  │  │  • POST /api/calling/join (manual trigger)               │  │     │
+│  │  │  • GET  /api/calling/health                              │  │     │
+│  │  └──────────────────┬──────────────────────────────────────┘  │     │
+│  │                     │                                          │     │
+│  │                     ↓                                          │     │
+│  │  ┌─────────────────────────────────────────────────────────┐  │     │
+│  │  │ TeamsCallingBotService.cs / Media SDK                    │  │     │
+│  │  │  • Joins meeting via Graph Communications SDK            │  │     │
+│  │  │  • Receives real-time audio on :8445                     │  │     │
+│  │  └──────────────────┬──────────────────────────────────────┘  │     │
+│  │                     │ Raw audio frames (PCM 16kHz)            │     │
+│  │                     ↓                                          │     │
+│  │  ┌─────────────────────────────────────────────────────────┐  │     │
+│  │  │ CallHandler.cs                                           │  │     │
+│  │  │  • Buffers audio and pushes to transcriber               │  │     │
+│  │  └──────────────────┬──────────────────────────────────────┘  │     │
+│  │                     │                                          │     │
+│  │                     ↓                                          │     │
+│  │  ┌─────────────────────────────────────────────────────────┐  │     │
+│  │  │ AzureSpeechRealtimeTranscriber.cs                        │  │     │
+│  │  │  • Speech SDK continuous recognition                     │  │     │
+│  │  │  • Emits partial + final transcripts                     │  │     │
+│  │  └──────────────────┬──────────────────────────────────────┘  │     │
+│  │                     │                                          │     │
+│  │                     ↓                                          │     │
+│  │  ┌─────────────────────────────────────────────────────────┐  │     │
+│  │  │ PythonTranscriptPublisher.cs                             │  │     │
+│  │  │  • POST → http://127.0.0.1:8765/transcript               │  │     │
+│  │  │  • Also saves: Desktop\\meeting_transcript.txt           │  │     │
+│  │  └─────────────────────────────────────────────────────────┘  │     │
+│  └───────────────────────────────────────────────────────────────┘     │
+│                                                                          │
+│  ┌───────────────────────────────────────────────────────────────┐     │
+│  │ Python Transcript Sink (optional, same VM or elsewhere)        │     │
+│  │  • `python/transcript_sink.py` (FastAPI)                       │     │
+│  │  • POST /transcript :8765                                      │     │
 │  └───────────────────────────────────────────────────────────────┘     │
 └────────────────────────────────────────────────────────────────────────┘
-                                 │
-                                 │ WebSocket connection
-                                 │ (Speech Recognition Protocol)
-                                 ↓
-                    ┌────────────────────────────┐
-                    │  Azure Speech Service       │
-                    │  (speech-teams-bot-poc)     │
-                    │  Region: eastus             │
-                    └────────────────────────────┘
+                                                     wss:// (Speech SDK)
+                                             ┌────────────────────────────┐
+                                             │  Azure Speech Service       │
+                                             │  (speech-teams-bot-poc)     │
+                                             │  Region: eastus             │
+                                             └────────────────────────────┘
 
 
 Current Trigger Method:
   curl -X POST https://teamsbot.qmachina.com/api/calling/join \
     -H "Content-Type: application/json" \
     -d '{"joinUrl":"TEAMS_MEETING_URL","displayName":"Transcription Bot"}'
+```
+
+### Ingress / :443 forwarding (what the code expects)
+
+The repo’s current configuration binds the bot’s **Kestrel backend to `https://0.0.0.0:9443`** (see `src/Config/appsettings.json`). Because the Azure NSG opens **:443** publicly (and the webhook URL is `https://teamsbot.qmachina.com/...`), production requires a **reverse proxy on the VM** to accept public TLS on :443 and forward traffic to the local bot backend on :9443.
+
+Implementation-wise this can be IIS, nginx, Caddy, or any other layer that performs **:443 → :9443** forwarding. The important point is: **the bot process itself is not listening on :443 in the current config**.
+
+### STT provider/model selection (no fan-out)
+
+- **Source of truth**: the C# code creates **one transcriber per call** and pushes Teams PCM frames into it.
+- **Choosing provider**: STT selection is now config-driven via `Stt.Provider` (currently supports `AzureSpeech`; other providers can be added behind the same interface).
+- **Choosing model (Azure Speech)**: you can select a specific Custom Speech model by setting an **EndpointId** in `Stt.AzureSpeech.EndpointId` (optional).
+- **No fan-out**: the bot does **not** stream the same audio to multiple STT providers/models.
+
+Example (Azure Speech with optional Custom Speech model):
+
+```json
+{
+  "Stt": {
+    "Provider": "AzureSpeech",
+    "AzureSpeech": {
+      "Key": "YOUR_SPEECH_KEY",
+      "Region": "eastus",
+      "RecognitionLanguage": "en-US",
+      "EndpointId": "OPTIONAL_CUSTOM_SPEECH_ENDPOINT_ID"
+    }
+  }
+}
 ```
 
 ---
@@ -207,20 +237,32 @@ Update `C:\teams-bot-poc\src\Config\appsettings.json`:
 
 ```json
 {
-  "MediaPlatformSettings": {
-    "CertificateThumbprint": "YOUR_CERT_THUMBPRINT",
-    "LocalHttpListenUrl": "https://0.0.0.0:443",
-    "PublicHttpUrl": "https://teamsbot.yourdomain.com",
-    "MediaHttpUrl": "https://media.yourdomain.com"
-  },
-  "AzureSettings": {
+  "Bot": {
     "TenantId": "YOUR_TENANT_ID",
     "AppId": "YOUR_APP_ID",
-    "AppSecret": "YOUR_APP_SECRET"
+    "AppSecret": "YOUR_APP_SECRET",
+    "NotificationUrl": "https://teamsbot.yourdomain.com/api/calling",
+    "LocalHttpListenUrl": "https://0.0.0.0:9443",
+    "LocalHttpListenPort": 9443
   },
-  "SpeechSettings": {
+  "Stt": {
+    "Provider": "AzureSpeech"
+  },
+  "MediaPlatformSettings": {
+    "ApplicationId": "YOUR_APP_ID",
+    "CertificateThumbprint": "YOUR_CERT_THUMBPRINT",
+    "InstanceInternalPort": 8445,
+    "InstancePublicPort": 8445,
+    "ServiceFqdn": "media.yourdomain.com",
+    "InstancePublicIPAddress": "0.0.0.0"
+  },
+  "Speech": {
     "Key": "YOUR_SPEECH_KEY",
-    "Region": "eastus"
+    "Region": "eastus",
+    "RecognitionLanguage": "en-US"
+  },
+  "TranscriptSink": {
+    "PythonEndpoint": "http://127.0.0.1:8765/transcript"
   }
 }
 ```
@@ -336,7 +378,7 @@ pip install -r requirements.txt
 python transcript_sink.py
 ```
 
-Runs FastAPI server on port 5000. Bot POSTs transcripts to `http://localhost:5000/transcript`.
+Runs FastAPI server on port 8765. Bot POSTs transcripts to `http://127.0.0.1:8765/transcript` (configurable via `TranscriptSink.PythonEndpoint`).
 
 ### Integration
 
@@ -420,11 +462,13 @@ Teams Meeting
     ↓
 [Bot Signaling: port 443]  ← Azure Bot webhook
     ↓
+[Ingress / TLS termination: :443 → Bot listener :9443]
+    ↓
 [Media Stream: port 8445]
     ↓
 [Azure Speech Service]
     ↓
-[Python Service: port 5000] ← Your agent framework
+[Python Service: port 8765] ← Your agent framework
 ```
 
 **Key Components:**
@@ -436,7 +480,7 @@ Teams Meeting
 **Dependencies:**
 - `Microsoft.Skype.Bots.Media` 1.31.0.225-preview (Windows Server 2022 compatible)
 - `Microsoft.Graph.Communications.*` 1.2.0.15690
-- Azure Speech SDK 1.41.1
+- Azure Speech SDK 1.40.*
 
 ---
 
@@ -445,10 +489,10 @@ Teams Meeting
 
 ### Costs
 
-- VM (D4s_v3): ~$120/month
+- VM (D4s_v3): ~$140/month (region/pricing dependent)
 - Speech Service (Pay-as-you-go): ~$1-25/month depending on usage
 - Azure Bot: Free (Standard channel)
-- Total: ~$145/month
+- Total: ~$141-165/month depending on Speech usage
 
 Stop VM when not in use to reduce costs.
 

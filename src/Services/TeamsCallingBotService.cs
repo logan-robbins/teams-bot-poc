@@ -281,7 +281,7 @@ public class TeamsCallingBotService : IAsyncDisposable
         string joinUrl,
         string displayName,
         bool joinAsGuest,
-        AzureSpeechRealtimeTranscriber transcriber)
+        IRealtimeTranscriber transcriber)
     {
         if (_client == null)
         {
@@ -402,12 +402,12 @@ public class TeamsCallingBotService : IAsyncDisposable
     }
 
     // Temporary storage for transcribers while CallHandler is being created
-    private readonly ConcurrentDictionary<string, AzureSpeechRealtimeTranscriber> _pendingTranscribers = new();
+    private readonly ConcurrentDictionary<string, IRealtimeTranscriber> _pendingTranscribers = new();
 
     /// <summary>
     /// Gets or creates a transcriber for the given thread
     /// </summary>
-    internal AzureSpeechRealtimeTranscriber GetOrCreateTranscriber(string threadId)
+    internal IRealtimeTranscriber GetOrCreateTranscriber(string threadId)
     {
         if (_pendingTranscribers.TryRemove(threadId, out var transcriber))
         {

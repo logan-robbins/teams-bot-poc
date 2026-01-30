@@ -27,8 +27,48 @@ var botConfig = builder.Configuration.GetSection("Bot").Get<BotConfiguration>()
 var mediaConfig = builder.Configuration.GetSection("MediaPlatformSettings").Get<MediaPlatformConfiguration>()
     ?? throw new InvalidOperationException("MediaPlatformSettings configuration is missing");
 
-var speechConfig = builder.Configuration.GetSection("Speech").Get<SpeechConfiguration>()
-    ?? throw new InvalidOperationException("Speech configuration is missing");
+// STT configuration:
+// - Prefer new "Stt" section (provider selection)
+// - Fall back to legacy "Speech" section for backward compatibility
+var sttConfig = builder.Configuration.GetSection("Stt").Get<SttConfiguration>();
+if (sttConfig == null)
+{
+    var speechConfig = builder.Configuration.GetSection("Speech").Get<SpeechConfiguration>()
+        ?? throw new InvalidOperationException("STT configuration is missing. Provide either 'Stt' or legacy 'Speech' section.");
+
+    sttConfig = new SttConfiguration
+    {
+        Provider = "AzureSpeech",
+        AzureSpeech = new AzureSpeechProviderConfiguration
+        {
+            Key = speechConfig.Key,
+            Region = speechConfig.Region,
+            RecognitionLanguage = speechConfig.RecognitionLanguage,
+            EndpointId = null
+        }
+    };
+}
+else
+{
+    // Allow selecting provider via Stt.Provider without duplicating secrets:
+    // If Stt.Provider selects AzureSpeech but Stt.AzureSpeech is missing, fall back to legacy Speech section.
+    var provider = (sttConfig.Provider ?? string.Empty).Trim();
+    var isAzure = provider.Equals("AzureSpeech", StringComparison.OrdinalIgnoreCase) ||
+                  provider.Equals("Azure", StringComparison.OrdinalIgnoreCase);
+    if (isAzure && sttConfig.AzureSpeech == null)
+    {
+        var speechConfig = builder.Configuration.GetSection("Speech").Get<SpeechConfiguration>()
+            ?? throw new InvalidOperationException("Stt.Provider='AzureSpeech' but no Stt.AzureSpeech and no legacy Speech section found.");
+
+        sttConfig.AzureSpeech = new AzureSpeechProviderConfiguration
+        {
+            Key = speechConfig.Key,
+            Region = speechConfig.Region,
+            RecognitionLanguage = speechConfig.RecognitionLanguage,
+            EndpointId = null
+        };
+    }
+}
 
 var transcriptSinkConfig = builder.Configuration.GetSection("TranscriptSink").Get<TranscriptSinkConfiguration>()
     ?? throw new InvalidOperationException("TranscriptSink configuration is missing");
@@ -55,7 +95,7 @@ builder.WebHost.ConfigureKestrel(options =>
 // Register configuration as singletons
 builder.Services.AddSingleton(botConfig);
 builder.Services.AddSingleton(mediaConfig);
-builder.Services.AddSingleton(speechConfig);
+builder.Services.AddSingleton(sttConfig);
 builder.Services.AddSingleton(transcriptSinkConfig);
 
 // Register Graph logger (use SDK GraphLogger to satisfy IGraphLogger interface)
@@ -80,9 +120,7 @@ builder.Services.AddSingleton<TranscriberFactory>(sp =>
 {
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
     return new TranscriberFactory(
-        speechConfig.Key,
-        speechConfig.Region,
-        speechConfig.RecognitionLanguage,
+        sttConfig,
         transcriptSinkConfig.PythonEndpoint,
         loggerFactory);
 });
