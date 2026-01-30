@@ -36,6 +36,10 @@ var transcriptSinkConfig = builder.Configuration.GetSection("TranscriptSink").Ge
 // Configure Kestrel to listen on the specified URL.
 // If HTTPS is specified, bind the installed certificate by thumbprint.
 var listenUri = new Uri(botConfig.LocalHttpListenUrl);
+if (listenUri.Scheme.Equals("http", StringComparison.OrdinalIgnoreCase) && listenUri.Port == 443)
+{
+    throw new InvalidOperationException("LocalHttpListenUrl is HTTP on port 443. Use https:// for TLS or change the port.");
+}
 builder.WebHost.ConfigureKestrel(options =>
 {
     options.ListenAnyIP(listenUri.Port, listenOptions =>

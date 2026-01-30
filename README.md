@@ -1,11 +1,20 @@
 # Teams Media Bot - Real-time Meeting Transcription
 
 **Created:** 2026-01-29  
-**Last Updated:** 2026-01-29 (GRUNT validation complete - code aligned with Microsoft samples)
+**Last Updated:** 2026-01-30 (Standardized for Windows Server 2022 with validated dependencies)
 
 POC only (non-commercial). Optimize for speed and validation over hardening.
 
 A POC bot that joins Microsoft Teams meetings, receives real-time audio, transcribes with Azure Speech, and streams transcripts to a Python agent framework.
+
+## 🎯 Standardization Status
+
+This bot has been aligned with **validated 2025/2026 Microsoft standards** for Application-Hosted Media on Windows Server 2022:
+
+- ✅ **Media Platform:** `Microsoft.Skype.Bots.Media` version `1.31.0.225-preview` (verified compatible with Windows Server 2022)
+- ✅ **Service Account:** Windows Service configured to run as `.\azureuser` for proper certificate access
+- ✅ **Deployment Pipeline:** Robust process termination, clean build, and native asset verification
+- ✅ **Native Dependencies:** `NativeMedia.dll` verified post-build to prevent runtime errors
 
 ---
 
@@ -33,6 +42,7 @@ A POC bot that joins Microsoft Teams meetings, receives real-time audio, transcr
 - ✅ Latest code pulled/rebuilt on VM (Program.cs config load fix)
 - ✅ Windows Service running (TeamsMediaBot)
 - ✅ Config pinned in git (`Config/appsettings.json` has production thumbprint/URLs)
+- ✅ Deployment script aligns HTTPS on port 443; startup fails fast if HTTP is configured on 443
 
 ### What is NOT Done:
 - ❌ Python transcript sink running (if you want live transcripts)
@@ -88,6 +98,62 @@ The `az vm run-command invoke` that was cloning and building the project is stuc
 - Graph communications calling SDK samples repo: https://github.com/microsoftgraph/microsoft-graph-comms-samples
 - PolicyRecordingBot sample (app-hosted media): https://github.com/microsoftgraph/microsoft-graph-comms-samples/tree/master/Samples/V1.0Samples/LocalMediaSamples/PolicyRecordingBot
 - Graph calling SDK docs: https://microsoftgraph.github.io/microsoft-graph-comms-samples/docs/articles/index.html
+
+---
+
+## 🔍 End-to-End Verification
+
+After deploying with the standardized configuration, verify functionality:
+
+### 1. Service Health Check
+```powershell
+# On the VM, verify service is running
+Get-Service TeamsMediaBot
+# Status should be "Running"
+
+# Check service account
+nssm get TeamsMediaBot ObjectName
+# Should return ".\azureuser"
+```
+
+### 2. Native Asset Verification
+```powershell
+# Verify NativeMedia.dll is present in output directory
+Test-Path "C:\teams-bot-poc\src\bin\Release\net8.0\NativeMedia.dll"
+# Should return True
+```
+
+### 3. Health Endpoint Check
+```bash
+# From any machine with network access
+curl https://teamsbot.qmachina.com/api/calling/health
+# Should return: {"Status":"Healthy","Timestamp":"...","Service":"Teams Media Bot POC"}
+```
+
+### 4. Live Meeting Test
+```bash
+# Join the bot to a live Teams meeting
+curl -X POST https://teamsbot.qmachina.com/api/calling/join \
+  -H "Content-Type: application/json" \
+  -d '{"joinUrl":"<TEAMS_MEETING_JOIN_URL>","displayName":"Transcription Bot"}'
+```
+
+**Expected behavior:**
+- Bot joins the meeting within 5-10 seconds
+- Audio frames logged at ~50 frames/second
+- Real-time transcripts appear in logs
+- No "Procedure Not Found" or native DLL errors
+
+### 5. Log Verification
+```powershell
+# Check for successful audio stream processing
+Get-Content "C:\teams-bot-poc\logs\service-output.log" -Tail 50 | Select-String "Audio stats"
+# Should show audio frame processing
+
+# Verify no critical errors
+Get-Content "C:\teams-bot-poc\logs\service-output.log" -Tail 100 | Select-String "Error|Exception"
+# Should show no DLL loading errors or media platform failures
+```
 
 ---
 
@@ -376,7 +442,7 @@ Speech Key: 4PMljn6sqJzjGUoNu2WXt64Aqmrl6PN1Ev9cbx9tGad1S5wmUn2bJQQJ99CAACYeBjFX
 ```
 teams-bot-poc/
 ├── src/                          # C# bot code
-│   ├── TeamsMediaBot.csproj
+│   ├── TeamsMediaBot.csproj      # Standardized dependencies (Media SDK 1.31.0.225-preview)
 │   ├── Program.cs
 │   ├── Controllers/
 │   ├── Services/
@@ -385,11 +451,51 @@ teams-bot-poc/
 │   ├── transcript_sink.py
 │   └── requirements.txt
 ├── scripts/                      # Deployment
-│   ├── deploy-azure-vm.sh        # Run this tomorrow
-│   └── deploy-production.ps1
+│   ├── deploy-azure-vm.sh        
+│   └── deploy-production.ps1     # Standardized deployment with clean build & validation
 ├── manifest/                     # Teams app
 │   └── manifest.json
 └── README.md                     # This file
+```
+
+### Critical Version Requirements
+
+**⚠️ IMPORTANT:** These versions are validated for Windows Server 2022 compatibility:
+
+```xml
+<!-- Media Platform SDK - MUST use this version -->
+<PackageReference Include="Microsoft.Skype.Bots.Media" Version="1.31.0.225-preview" />
+
+<!-- Communications SDK -->
+<PackageReference Include="Microsoft.Graph.Communications.Calls" Version="1.2.0.15690" />
+<PackageReference Include="Microsoft.Graph.Communications.Calls.Media" Version="1.2.0.15690" />
+<PackageReference Include="Microsoft.Graph.Communications.Client" Version="1.2.0.15690" />
+<PackageReference Include="Microsoft.Graph.Communications.Common" Version="1.2.0.15690" />
+```
+
+**Why 1.31.0.225-preview?**
+- Version 1.32.x causes "Procedure Not Found" (error 127) when loading `NativeMedia.dll` on Windows Server 2022
+- Version 1.31.0.225-preview successfully loads native dependencies and processes audio streams
+- Validated through testing on the production VM environment
+
+### Service Configuration Standard
+
+**Windows Service Account:** The `TeamsMediaBot` service MUST run as `.\azureuser`
+
+**Why this matters:**
+- Certificate access: The service needs permission to access the SSL certificate in the LocalMachine store
+- Environment context: Manual test runs succeed because they inherit the azureuser environment
+- File permissions: Ensures consistent access to logs, config files, and native binaries
+
+**The deployment script automatically:**
+1. Verifies the service account configuration
+2. Updates it to `.\azureuser` if incorrect
+3. Uses the password configured during VM setup
+
+**Manual service account update (if needed):**
+```powershell
+nssm set TeamsMediaBot ObjectName ".\azureuser" "SecureTeamsBot2026!"
+Restart-Service TeamsMediaBot
 ```
 
 ### Costs
