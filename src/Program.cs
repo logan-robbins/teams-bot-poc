@@ -71,25 +71,20 @@ builder.Services.AddSingleton<IGraphLogger>(sp =>
     return graphLogger;
 });
 
-// Register Python transcript publisher as transient (each transcriber gets its own)
-builder.Services.AddTransient(sp =>
+// Register a factory for creating transcribers
+// We use a factory instead of registering the transcriber directly because:
+// 1. The transcriber implements IAsyncDisposable
+// 2. DI container tracks IAsyncDisposable objects and tries to dispose them
+// 3. The transcriber's lifetime is managed by CallHandler, not by DI
+builder.Services.AddSingleton<TranscriberFactory>(sp =>
 {
-    var logger = sp.GetRequiredService<ILogger<PythonTranscriptPublisher>>();
-    return new PythonTranscriptPublisher(transcriptSinkConfig.PythonEndpoint, logger);
-});
-
-// Register Azure Speech transcriber as transient
-// Lifetime is managed by CallHandler, not by DI container
-builder.Services.AddTransient(sp =>
-{
-    var publisher = sp.GetRequiredService<PythonTranscriptPublisher>();
-    var logger = sp.GetRequiredService<ILogger<AzureSpeechRealtimeTranscriber>>();
-    return new AzureSpeechRealtimeTranscriber(
+    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+    return new TranscriberFactory(
         speechConfig.Key,
         speechConfig.Region,
         speechConfig.RecognitionLanguage,
-        publisher,
-        logger);
+        transcriptSinkConfig.PythonEndpoint,
+        loggerFactory);
 });
 
 // Register bot service as singleton

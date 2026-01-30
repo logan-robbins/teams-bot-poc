@@ -45,6 +45,7 @@ public class TeamsCallingBotService : IAsyncDisposable
     private readonly ILogger<TeamsCallingBotService> _logger;
     private readonly IGraphLogger _graphLogger;
     private readonly IServiceProvider _serviceProvider;
+    private readonly TranscriberFactory _transcriberFactory;
 
     private ICommunicationsClient? _client;
     
@@ -66,13 +67,15 @@ public class TeamsCallingBotService : IAsyncDisposable
         MediaPlatformConfiguration mediaConfig,
         ILogger<TeamsCallingBotService> logger,
         IGraphLogger graphLogger,
-        IServiceProvider serviceProvider)
+        IServiceProvider serviceProvider,
+        TranscriberFactory transcriberFactory)
     {
         _botConfig = botConfig;
         _mediaConfig = mediaConfig;
         _logger = logger;
         _graphLogger = graphLogger;
         _serviceProvider = serviceProvider;
+        _transcriberFactory = transcriberFactory;
     }
 
     /// <summary>
@@ -267,12 +270,17 @@ public class TeamsCallingBotService : IAsyncDisposable
     /// Join a Teams meeting using join URL
     /// Per S6: POST /communications/calls with meeting info
     /// 
+    /// Supports two URL formats:
+    /// 1. New format: https://teams.microsoft.com/meet/{meetingId}?p={passcode}
+    /// 2. Old format: https://teams.microsoft.com/l/meetup-join/{thread}/{message}?context={...}
+    /// 
     /// Note: CallHandler creation is now handled by OnCallsUpdated event
     /// This method just initiates the join; SDK events handle the rest
     /// </summary>
     public async Task<string> JoinMeetingAsync(
         string joinUrl,
         string displayName,
+        bool joinAsGuest,
         AzureSpeechRealtimeTranscriber transcriber)
     {
         if (_client == null)
@@ -285,47 +293,108 @@ public class TeamsCallingBotService : IAsyncDisposable
         // A tracking id for logging purposes. Helps identify this call in logs.
         var scenarioId = Guid.NewGuid();
 
-        // Parse join URL to extract meeting info per S7
-        var (chatInfo, meetingInfo) = ParseJoinUrl(joinUrl);
-
         // Create media session with both audio and video settings
         var mediaSession = CreateMediaSession();
 
-        var tenantId = meetingInfo.Organizer?.GetPrimaryIdentity()?.GetTenantId();
-        var joinParams = new JoinMeetingParameters(chatInfo, meetingInfo, mediaSession)
-        {
-            TenantId = string.IsNullOrWhiteSpace(tenantId) ? _botConfig.TenantId : tenantId
-        };
+        ICall call;
+        string threadId;
 
-        // If display name is specified, join as guest
-        if (!string.IsNullOrWhiteSpace(displayName))
+        // Check if this is the new short URL format: https://teams.microsoft.com/meet/{meetingId}?p={passcode}
+        var shortUrlMatch = Regex.Match(joinUrl, @"teams\.microsoft\.com/meet/(?<meetingId>[^?]+)(\?p=(?<passcode>[^&]+))?");
+        
+        if (shortUrlMatch.Success)
         {
-            joinParams.GuestIdentity = new Identity
+            // New format - use JoinMeetingIdMeetingInfo
+            var meetingId = shortUrlMatch.Groups["meetingId"].Value;
+            var passcode = shortUrlMatch.Groups["passcode"].Success ? shortUrlMatch.Groups["passcode"].Value : null;
+            
+            _logger.LogInformation("Using JoinMeetingId format: MeetingId={MeetingId}, HasPasscode={HasPasscode}", 
+                meetingId, !string.IsNullOrEmpty(passcode));
+
+            var meetingInfo = new JoinMeetingIdMeetingInfo
             {
-                Id = Guid.NewGuid().ToString(),
-                DisplayName = displayName
+                JoinMeetingId = meetingId,
+                Passcode = passcode
             };
-        }
 
-        // Check if we already have a handler for this thread
-        if (string.IsNullOrWhiteSpace(chatInfo.ThreadId))
+            // For short URLs, we don't have chatInfo, so use a generated thread ID
+            threadId = $"meet-{meetingId}";
+
+            // Check if we already have a handler
+            if (CallHandlers.ContainsKey(threadId))
+            {
+                _logger.LogWarning("Call handler already exists for meeting: {MeetingId}", meetingId);
+                throw new InvalidOperationException($"Bot is already in this meeting: {meetingId}");
+            }
+
+            // Store transcriber for when CallHandler is created
+            _pendingTranscribers[threadId] = transcriber;
+
+            var joinParams = new JoinMeetingParameters(null, meetingInfo, mediaSession)
+            {
+                TenantId = _botConfig.TenantId
+            };
+
+            // If display name is specified, join as guest
+            if (joinAsGuest && !string.IsNullOrWhiteSpace(displayName))
+            {
+                joinParams.GuestIdentity = new Identity
+                {
+                    Id = Guid.NewGuid().ToString(),
+                    DisplayName = displayName
+                };
+            }
+            else if (!joinAsGuest && !string.IsNullOrWhiteSpace(displayName))
+            {
+                _logger.LogInformation(
+                    "DisplayName provided but joinAsGuest=false; joining as app identity. DisplayName ignored.");
+            }
+
+            call = await _client.Calls().AddAsync(joinParams, scenarioId).ConfigureAwait(false);
+        }
+        else
         {
-            throw new InvalidOperationException("Join URL did not contain a valid threadId");
-        }
-        var threadId = chatInfo.ThreadId;
-        if (CallHandlers.ContainsKey(threadId))
-        {
-            _logger.LogWarning("Call handler already exists for thread: {ThreadId}", threadId);
-            throw new InvalidOperationException($"Bot is already in a call for thread: {threadId}");
-        }
+            // Old format - use OrganizerMeetingInfo
+            var (chatInfo, meetingInfo) = ParseJoinUrl(joinUrl);
 
-        // Store transcriber for when CallHandler is created by OnCallsUpdated
-        // We need to pre-register the transcriber since OnCallsUpdated won't have access to it
-        // Note: This is a simplification - in production, you'd use a more robust pattern
-        _pendingTranscribers[threadId] = transcriber;
+            var tenantId = meetingInfo.Organizer?.GetPrimaryIdentity()?.GetTenantId();
+            var joinParams = new JoinMeetingParameters(chatInfo, meetingInfo, mediaSession)
+            {
+                TenantId = string.IsNullOrWhiteSpace(tenantId) ? _botConfig.TenantId : tenantId
+            };
 
-        // Join the call - this will trigger OnCallsUpdated which creates the CallHandler
-        var call = await _client.Calls().AddAsync(joinParams, scenarioId).ConfigureAwait(false);
+            // If display name is specified, join as guest
+            if (joinAsGuest && !string.IsNullOrWhiteSpace(displayName))
+            {
+                joinParams.GuestIdentity = new Identity
+                {
+                    Id = Guid.NewGuid().ToString(),
+                    DisplayName = displayName
+                };
+            }
+            else if (!joinAsGuest && !string.IsNullOrWhiteSpace(displayName))
+            {
+                _logger.LogInformation(
+                    "DisplayName provided but joinAsGuest=false; joining as app identity. DisplayName ignored.");
+            }
+
+            // Check if we already have a handler for this thread
+            if (string.IsNullOrWhiteSpace(chatInfo.ThreadId))
+            {
+                throw new InvalidOperationException("Join URL did not contain a valid threadId");
+            }
+            threadId = chatInfo.ThreadId;
+            if (CallHandlers.ContainsKey(threadId))
+            {
+                _logger.LogWarning("Call handler already exists for thread: {ThreadId}", threadId);
+                throw new InvalidOperationException($"Bot is already in a call for thread: {threadId}");
+            }
+
+            // Store transcriber for when CallHandler is created
+            _pendingTranscribers[threadId] = transcriber;
+
+            call = await _client.Calls().AddAsync(joinParams, scenarioId).ConfigureAwait(false);
+        }
 
         _logger.LogInformation("Call created: {CallId}, ThreadId: {ThreadId}", call.Id, threadId);
 
@@ -345,9 +414,8 @@ public class TeamsCallingBotService : IAsyncDisposable
             return transcriber;
         }
 
-        // If no pending transcriber, create a new one via DI
-        using var scope = _serviceProvider.CreateScope();
-        return scope.ServiceProvider.GetRequiredService<AzureSpeechRealtimeTranscriber>();
+        // If no pending transcriber, create a new one using the factory
+        return _transcriberFactory.Create();
     }
 
     /// <summary>

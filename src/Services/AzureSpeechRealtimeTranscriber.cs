@@ -1,8 +1,51 @@
 using Microsoft.CognitiveServices.Speech;
 using Microsoft.CognitiveServices.Speech.Audio;
+using Microsoft.Extensions.Logging;
 using TeamsMediaBot.Models;
 
 namespace TeamsMediaBot.Services;
+
+/// <summary>
+/// Factory for creating AzureSpeechRealtimeTranscriber instances
+/// This avoids DI disposal issues since the transcriber implements IAsyncDisposable
+/// and its lifetime is managed by CallHandler, not the DI container
+/// </summary>
+public class TranscriberFactory
+{
+    private readonly string _speechKey;
+    private readonly string _speechRegion;
+    private readonly string _language;
+    private readonly string _pythonEndpoint;
+    private readonly ILoggerFactory _loggerFactory;
+
+    public TranscriberFactory(
+        string speechKey,
+        string speechRegion,
+        string language,
+        string pythonEndpoint,
+        ILoggerFactory loggerFactory)
+    {
+        _speechKey = speechKey;
+        _speechRegion = speechRegion;
+        _language = language;
+        _pythonEndpoint = pythonEndpoint;
+        _loggerFactory = loggerFactory;
+    }
+
+    public AzureSpeechRealtimeTranscriber Create()
+    {
+        var publisherLogger = _loggerFactory.CreateLogger<PythonTranscriptPublisher>();
+        var publisher = new PythonTranscriptPublisher(_pythonEndpoint, publisherLogger);
+        
+        var transcriberLogger = _loggerFactory.CreateLogger<AzureSpeechRealtimeTranscriber>();
+        return new AzureSpeechRealtimeTranscriber(
+            _speechKey,
+            _speechRegion,
+            _language,
+            publisher,
+            transcriberLogger);
+    }
+}
 
 /// <summary>
 /// Real-time speech transcription using Azure Speech SDK

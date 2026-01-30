@@ -15,16 +15,16 @@ namespace TeamsMediaBot.Controllers;
 public class CallingController : ControllerBase
 {
     private readonly TeamsCallingBotService _botService;
-    private readonly IServiceProvider _serviceProvider;
+    private readonly TranscriberFactory _transcriberFactory;
     private readonly ILogger<CallingController> _logger;
 
     public CallingController(
         TeamsCallingBotService botService,
-        IServiceProvider serviceProvider,
+        TranscriberFactory transcriberFactory,
         ILogger<CallingController> logger)
     {
         _botService = botService;
-        _serviceProvider = serviceProvider;
+        _transcriberFactory = transcriberFactory;
         _logger = logger;
     }
 
@@ -110,15 +110,15 @@ public class CallingController : ControllerBase
         {
             _logger.LogInformation("Received join meeting request: {JoinUrl}", request.JoinUrl);
 
-            // Create a new transcriber for this call
-            // Note: We create it manually (not via scoped DI) because the transcriber's lifetime
-            // extends beyond this HTTP request - it lives for the duration of the call.
-            // The CallHandler will dispose it when the call ends.
-            var transcriber = _serviceProvider.GetRequiredService<AzureSpeechRealtimeTranscriber>();
+            // Create a new transcriber for this call using the factory
+            // The factory creates the transcriber outside of DI tracking,
+            // so the DI container won't try to dispose it
+            var transcriber = _transcriberFactory.Create();
 
             var callId = await _botService.JoinMeetingAsync(
                 request.JoinUrl,
                 request.DisplayName ?? "Transcription Bot",
+                request.JoinAsGuest,
                 transcriber);
 
             return Ok(new
@@ -235,4 +235,131 @@ public class JoinMeetingRequest
 
     [JsonProperty("displayName")]
     public string? DisplayName { get; set; }
+
+    [JsonProperty("joinAsGuest")]
+    public bool JoinAsGuest { get; set; } = false;
+}
+
+/// <summary>
+/// Controller for Teams configurable tab configuration page
+/// This is loaded when users try to add the bot/tab to a meeting
+/// </summary>
+[ApiController]
+[Route("")]
+public class ConfigureController : ControllerBase
+{
+    private readonly ILogger<ConfigureController> _logger;
+
+    public ConfigureController(ILogger<ConfigureController> logger)
+    {
+        _logger = logger;
+    }
+
+    /// <summary>
+    /// Configuration page for Teams configurable tab
+    /// Returns HTML that Teams displays in the configuration modal
+    /// </summary>
+    [HttpGet("configure")]
+    public IActionResult Configure()
+    {
+        _logger.LogInformation("Configuration page requested");
+
+        var html = @"<!DOCTYPE html>
+<html>
+<head>
+    <meta charset=""utf-8"">
+    <meta name=""viewport"" content=""width=device-width, initial-scale=1.0"">
+    <title>Teams Media Bot Configuration</title>
+    <script src=""https://res.cdn.office.net/teams-js/2.0.0/js/MicrosoftTeams.min.js"" crossorigin=""anonymous""></script>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            padding: 20px;
+            max-width: 600px;
+            margin: 0 auto;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #6264A7;
+            margin-top: 0;
+        }
+        p {
+            color: #333;
+            line-height: 1.6;
+        }
+        .info-box {
+            background: #E8F0FE;
+            border-left: 4px solid #6264A7;
+            padding: 15px;
+            margin: 20px 0;
+        }
+        .button {
+            background-color: #6264A7;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            margin-top: 20px;
+        }
+        .button:hover {
+            background-color: #5051A3;
+        }
+        .button:disabled {
+            background-color: #ccc;
+            cursor: not-allowed;
+        }
+    </style>
+</head>
+<body>
+    <div class=""container"">
+        <h1>Teams Media Bot</h1>
+        <p>This bot automatically joins Teams meetings to provide real-time audio transcription.</p>
+        
+        <div class=""info-box"">
+            <strong>About:</strong>
+            <ul>
+                <li>Automatically joins meetings when added</li>
+                <li>Transcribes audio in real-time</li>
+                <li>Transcripts are saved to the meeting organizer's desktop</li>
+            </ul>
+        </div>
+
+        <p><strong>Note:</strong> This is a calling bot. It will join the meeting as a participant to transcribe audio.</p>
+        
+        <button class=""button"" id=""saveButton"" onclick=""save()"">Save</button>
+    </div>
+
+    <script>
+        microsoftTeams.app.initialize().then(() => {
+            // Enable the save button once Teams SDK is ready
+            document.getElementById('saveButton').disabled = false;
+            microsoftTeams.settings.setValidityState(true);
+        });
+
+        function save() {
+            // Save configuration (no settings needed for this bot)
+            microsoftTeams.settings.setSettings({
+                contentUrl: window.location.origin + '/configure',
+                suggestedDisplayName: 'Teams Media Bot',
+                websiteUrl: window.location.origin
+            });
+            
+            // Notify Teams that settings are saved
+            microsoftTeams.settings.setValidityState(true);
+            microsoftTeams.settings.save();
+        }
+    </script>
+</body>
+</html>";
+
+        return Content(html, "text/html");
+    }
 }
