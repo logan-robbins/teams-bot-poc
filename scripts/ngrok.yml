@@ -4,8 +4,9 @@ authtoken: YOUR_NGROK_AUTHTOKEN_HERE
 tunnels:
   signaling:
     proto: http
-    addr: 9441
+    addr: 9443
     # The bot listens on HTTP locally, ngrok provides HTTPS publicly per S2
+    # NOTE: If running directly on VM (not through ngrok), use HTTPS in appsettings.json
     
   media:
     proto: tcp

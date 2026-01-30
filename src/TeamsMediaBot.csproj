@@ -19,7 +19,7 @@
     <PackageReference Include="Microsoft.Graph.Communications.Client" Version="1.2.0.15690" />
     <PackageReference Include="Microsoft.Graph.Communications.Common" Version="1.2.0.15690" />
     
-    <!-- Media Platform SDK - .NET 8.0 native support version (pinned to 1.31 for Server 2022 compatibility) -->
+    <!-- Media Platform SDK - Version that loads when run directly via .exe -->
     <PackageReference Include="Microsoft.Skype.Bots.Media" Version="1.31.0.225-preview" />
     
     <!-- Microsoft Graph - required by Communications.Core (explicit for version clarity) -->
