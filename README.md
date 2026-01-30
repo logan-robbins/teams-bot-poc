@@ -1,233 +1,241 @@
-# Teams Media Bot - Real-time Meeting Transcription
+# Teams Media Bot POC
 
-**Created:** 2026-01-29  
-**Last Updated:** 2026-01-30 (Standardized for Windows Server 2022 with validated dependencies)
+Teams calling bot that joins meetings, receives real-time audio, transcribes with Azure Speech, and streams transcripts to a Python service.
 
-POC only (non-commercial). Optimize for speed and validation over hardening.
-
-A POC bot that joins Microsoft Teams meetings, receives real-time audio, transcribes with Azure Speech, and streams transcripts to a Python agent framework.
-
-## 🎯 Standardization Status
-
-This bot has been aligned with **validated 2025/2026 Microsoft standards** for Application-Hosted Media on Windows Server 2022:
-
-- ✅ **Media Platform:** `Microsoft.Skype.Bots.Media` version `1.31.0.225-preview` (verified compatible with Windows Server 2022)
-- ✅ **Service Account:** Windows Service configured to run as `.\azureuser` for proper certificate access
-- ✅ **Deployment Pipeline:** Robust process termination, clean build, and native asset verification
-- ✅ **Native Dependencies:** `NativeMedia.dll` verified post-build to prevent runtime errors
+**Status:** Deployed and operational on Azure Windows VM  
+**Domain:** `teamsbot.qmachina.com` / `media.qmachina.com`  
+**VM:** `52.188.117.153` (Windows Server 2022, D4s_v3)
 
 ---
 
-## 🚨 CURRENT DEPLOYMENT STATUS (FOR AI AGENTS)
+## Architecture (Current Working System)
 
-**READ THIS FIRST** - Deployment is partially complete. Here is the exact state:
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         Microsoft Teams Meeting                          │
+│                     (Audio/Video from participants)                      │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 │
+                                 │ Graph API Call Events
+                                 │ (IncomingCall, Updated, etc.)
+                                 ↓
+                    ┌────────────────────────────┐
+                    │   Azure Bot Service        │
+                    │   (teams-media-bot-poc)    │
+                    └────────────┬───────────────┘
+                                 │
+                                 │ Webhook POST
+                                 │ https://teamsbot.qmachina.com/api/calling
+                                 ↓
+┌────────────────────────────────────────────────────────────────────────┐
+│                  Azure Windows VM (52.188.117.153)                      │
+│                         Windows Server 2022 D4s_v3                      │
+│                                                                          │
+│  ┌───────────────────────────────────────────────────────────────┐     │
+│  │  TeamsMediaBot Windows Service (C# .NET 8)                    │     │
+│  │  Running as .\azureuser with SSL cert access                  │     │
+│  │                                                                │     │
+│  │  ┌─────────────────────────────────────────────────────────┐ │     │
+│  │  │ CallingController.cs                                     │ │     │
+│  │  │  • /api/calling (webhook endpoint) :443                  │ │     │
+│  │  │  • /api/calling/join (manual curl trigger)               │ │     │
+│  │  │  • /api/calling/health (status check)                    │ │     │
+│  │  └──────────────────┬──────────────────────────────────────┘ │     │
+│  │                     │                                          │     │
+│  │                     ↓                                          │     │
+│  │  ┌─────────────────────────────────────────────────────────┐ │     │
+│  │  │ TeamsCallingBotService.cs                                │ │     │
+│  │  │  • Joins meeting via Graph Communications SDK            │ │     │
+│  │  │  • Creates MediaPlatform with SSL cert                   │ │     │
+│  │  │  • Receives real-time audio on :8445                     │ │     │
+│  │  └──────────────────┬──────────────────────────────────────┘ │     │
+│  │                     │                                          │     │
+│  │                     │ Raw audio frames (PCM 16kHz)            │     │
+│  │                     ↓                                          │     │
+│  │  ┌─────────────────────────────────────────────────────────┐ │     │
+│  │  │ CallHandler.cs                                           │ │     │
+│  │  │  • Buffers audio in 100ms chunks                         │ │     │
+│  │  │  • ~50 frames/sec from Teams media stream               │ │     │
+│  │  └──────────────────┬──────────────────────────────────────┘ │     │
+│  │                     │                                          │     │
+│  │                     ↓                                          │     │
+│  │  ┌─────────────────────────────────────────────────────────┐ │     │
+│  │  │ AzureSpeechRealtimeTranscriber.cs                        │ │     │
+│  │  │  • Streams audio to Azure Speech Service                 │ │     │
+│  │  │  • Receives partial + final transcripts                  │ │     │
+│  │  └──────────────────┬──────────────────────────────────────┘ │     │
+│  │                     │                                          │     │
+│  │                     ↓                                          │     │
+│  │  ┌─────────────────────────────────────────────────────────┐ │     │
+│  │  │ PythonTranscriptPublisher.cs                             │ │     │
+│  │  │  • Currently: Saves to C:\Users\azureuser\Desktop\      │ │     │
+│  │  │               transcripts.txt                            │ │     │
+│  │  │  • Future: POST to http://localhost:5000/transcript      │ │     │
+│  │  └─────────────────────────────────────────────────────────┘ │     │
+│  └───────────────────────────────────────────────────────────────┘     │
+│                                                                          │
+│  ┌───────────────────────────────────────────────────────────────┐     │
+│  │  Python Transcript Service (Scoped, Not Running)              │     │
+│  │                                                                │     │
+│  │  ┌─────────────────────────────────────────────────────────┐ │     │
+│  │  │ transcript_sink.py (FastAPI)                             │ │     │
+│  │  │  • POST /transcript endpoint :5000                       │ │     │
+│  │  │  • Async queue for multi-agent processing                │ │     │
+│  │  │  • TODO: Connect your agent framework here               │ │     │
+│  │  └─────────────────────────────────────────────────────────┘ │     │
+│  └───────────────────────────────────────────────────────────────┘     │
+└────────────────────────────────────────────────────────────────────────┘
+                                 │
+                                 │ WebSocket connection
+                                 │ (Speech Recognition Protocol)
+                                 ↓
+                    ┌────────────────────────────┐
+                    │  Azure Speech Service       │
+                    │  (speech-teams-bot-poc)     │
+                    │  Region: eastus             │
+                    └────────────────────────────┘
 
-### What IS Done:
-- ✅ Azure VM created: `vm-tbot-prod` at IP `52.188.117.153`
-- ✅ VM ports open: 443, 8445, 3389 (RDP)
-- ✅ Chocolatey installed on VM
-- ✅ Git installed on VM
-- ✅ .NET SDK 10.0.102 installed on VM
-- ✅ NSSM installed on VM
-- ✅ Project cloned on VM: `C:\teams-bot-poc`
-- ✅ Project built on VM (Release): `C:\teams-bot-poc\src\bin\Release\net8.0\TeamsMediaBot.dll`
-- ✅ DNS A records created (teamsbot.qmachina.com, media.qmachina.com → 52.188.117.153)
-- ✅ SSL certificate purchased (Namecheap PositiveSSL Wildcard for *.qmachina.com)
-- ✅ SSL certificate installed in Windows cert store (Thumbprint: `0FE5A81189A4D9EDB8B25EF879412CD35BC83535`)
-- ✅ CA bundle imported to Intermediate CA store
-- ✅ GitHub repo created: https://github.com/logan-robbins/teams-bot-poc
-- ✅ appsettings.json updated on VM with cert thumbprint + URLs
-- ✅ Azure Bot webhook updated to https://teamsbot.qmachina.com/api/calling
-- ✅ .NET 8 runtime installed on VM (Microsoft.NETCore.App + AspNetCore.App 8.0.x)
-- ✅ Latest code pulled/rebuilt on VM (Program.cs config load fix)
-- ✅ Windows Service running (TeamsMediaBot)
-- ✅ Config pinned in git (`Config/appsettings.json` has production thumbprint/URLs)
-- ✅ Deployment script aligns HTTPS on port 443; startup fails fast if HTTP is configured on 443
 
-### What is NOT Done:
-- ❌ Python transcript sink running (if you want live transcripts)
-
-### Why Deployment Stalled:
-The `az vm run-command invoke` that was cloning and building the project is stuck/hanging. The command has been running for >15 minutes. There may be a previous run-command still in progress.
-
-**Latest status (checked 2026-01-29 2:40 PM PST / 22:40:35Z):**
-- Run Command failed earlier with `VMExtensionProvisioningTimeout` (RunCommandWindows extension timed out)
-- 2026-01-29 12:45:10 PM PST / 20:45:10Z: Re-clone run-command started (delete + git clone) — still running as of last check
-- 2026-01-29 1:02:00 PM PST / 21:02:00Z: New Run Command attempt failed with `Conflict` ("execution is in progress")
-- 2026-01-29 12:53:54 PM PST / 20:53:54Z: VM restart requested — still pending completion as of last check
-- 2026-01-29 1:35 PM PST: Decision made to switch to **RDP** and complete provisioning manually
-- 2026-01-29 5:40 PM PST: Build succeeded on VM (Release)
-- 2026-01-29 5:50 PM PST: DNS A records created for teamsbot.qmachina.com and media.qmachina.com
-- 2026-01-30 12:05 AM PST: Installed .NET 8 runtime on VM and fixed config loading (app now reads `Config/appsettings.json` for Windows service)
-- 2026-01-30 12:15 AM PST: **HTTPS FIX** - Kestrel now binds HTTPS with the wildcard cert (thumbprint from MediaPlatformSettings). `LocalHttpListenUrl` set to `https://0.0.0.0:443`.
-- 2026-01-30 12:25 AM PST: **CONFIG IN GIT** - `Config/appsettings.json` updated with production thumbprint/URLs to prevent local drift after git pull.
-- 2026-01-29 2:05 PM PST: `dotnet restore` failed on VM because `Microsoft.Graph.Communications.*` packages are pinned to `1.4.*` (not available on nuget.org; latest is `1.2.0.15690`)
-- 2026-01-29 2:20 PM PST: Build failed due to Graph SDK API mismatch (IGraphLogger interface + missing Graph models). Fix applied in repo: use SDK `GraphLogger` + add `Microsoft.Graph` package for `ChatInfo`/`OrganizerMeetingInfo`
-- 2026-01-29 2:45 PM PST: Verified local `microsoft-graph-comms-samples` repo; sample projects use `Microsoft.Graph.Communications.*` 1.2.x versions (consistent with our 1.2.0.15690 pin)
-- 2026-01-29 3:10 PM PST: Aligned join URL parsing + auth provider signatures to match sample patterns; pinned `Microsoft.Graph` to 4.54.0 (matches sample repo and provides ChatInfo/OrganizerMeetingInfo in `Microsoft.Graph` namespace). POC-only inbound validation.
-- 2026-01-29 4:30 PM PST: **GRUNT VALIDATION COMPLETE** - Code reviewed against Microsoft EchoBot sample. Fixed 7 critical issues:
-  1. ✅ Webhook notification handling (now calls ProcessNotificationAsync)
-  2. ✅ Authentication provider (JWT validation with OpenID Connect)
-  3. ✅ Added Microsoft.Skype.Bots.Media package
-  4. ✅ Thread-safe ConcurrentDictionary for call handlers
-  5. ✅ Heartbeat keepalive (10-minute interval prevents 45-minute timeout)
-  6. ✅ Global call event subscriptions (OnIncoming, OnUpdated)
-  7. ✅ VideoSocketSettings in CreateMediaSession
-- 2026-01-29 5:00 PM PST: **PACKAGE VERSION FIX** - Resolved NuGet dependency conflicts:
-  - `Microsoft.Skype.Bots.Media` → 1.32.0.70-preview (native .NET 8.0 support)
-  - `Microsoft.Graph` → 5.92.0 (matches Communications SDK transitive dep)
-  - `Microsoft.IdentityModel.*` → 8.6.1 (matches transitive deps)
-  - Added `Microsoft.Graph.Contracts` using statements per EchoBot pattern
-- 2026-01-29 5:10 PM PST: **BUILD FIX** - Added `Microsoft.Skype.Bots.Media` using to resolve `AudioMediaReceivedEventArgs` type in `CallHandler.cs`.
-- 2026-01-29 5:20 PM PST: **SDK NAMESPACE FIX** - Updated usings to pull `MediaPlatformSettings`, `AudioSocketSettings`, `StreamDirection`, and `AudioFormat` from `Microsoft.Skype.Bots.Media` and removed reliance on `ICommunicationsClient.StartAsync/DisposeAsync` (not present in SDK 1.2.0.15690).
-- 2026-01-29 5:30 PM PST: **BUILD WARNING FIX** - Added null guard for inbound request validation and suppressed NETSDK1206 (SQLitePCLRaw alpine RID warning from transitive dependency).
-- 2026-01-29 3:45 PM PST: **GRUNT VALIDATION COMPLETE** - Fixed authentication provider with production-grade JWT validation. Added inbound request validation (JWT signature, issuer, audience verification), proper tenant ID extraction from token claims, and singleton token caching. Eliminates security vulnerabilities and enables proper SDK operation. Dependencies added: System.IdentityModel.Tokens.Jwt 8.2.*, Microsoft.IdentityModel.Protocols.OpenIdConnect 8.2.*. See `GRUNT_LOG.md` for details.
-- 2026-01-29 5:00 PM PST: **NAMESPACE ALIGNMENT COMPLETE** - Aligned all using statements with EchoBot sample patterns. Added `Microsoft.Graph.Contracts` namespace to both TeamsCallingBotService.cs and CallHandler.cs for extension methods (GetPrimaryIdentity, GetTenantId, SetTenantId). Added `Microsoft.Graph` to CallHandler.cs. All Graph model types now consistently use `Microsoft.Graph.Models` namespace matching EchoBot exactly. See `GRUNT_LOG.md` for details.
-
-**Root cause (current):** Azure Run Command only allows one execution at a time. A long-running or stuck Run Command blocks all new Run Command invocations until it completes. Current Conflict (409) indicates the earlier run is still executing.
-
-**Run Command constraints to keep in mind:**
-- Only one script at a time; new invocations return Conflict while another is running
-- A running script cannot be canceled
-- Max runtime 90 minutes (then it times out)
-- VM must have outbound connectivity to Azure to return results; VM Agent must be Ready
-
-**Reference docs / examples (official):**
-- Teams calls & meetings bots overview (requirements, app-hosted media bots): https://learn.microsoft.com/microsoftteams/platform/bots/calls-and-meetings/calls-meetings-bots-overview
-- Real-time media concepts + samples list: https://learn.microsoft.com/microsoftteams/platform/bots/calls-and-meetings/real-time-media-concepts
-- Graph communications calling SDK samples repo: https://github.com/microsoftgraph/microsoft-graph-comms-samples
-- PolicyRecordingBot sample (app-hosted media): https://github.com/microsoftgraph/microsoft-graph-comms-samples/tree/master/Samples/V1.0Samples/LocalMediaSamples/PolicyRecordingBot
-- Graph calling SDK docs: https://microsoftgraph.github.io/microsoft-graph-comms-samples/docs/articles/index.html
+Current Trigger Method:
+  curl -X POST https://teamsbot.qmachina.com/api/calling/join \
+    -H "Content-Type: application/json" \
+    -d '{"joinUrl":"TEAMS_MEETING_URL","displayName":"Transcription Bot"}'
+```
 
 ---
 
-## 🔍 End-to-End Verification
+## Prerequisites
 
-After deploying with the standardized configuration, verify functionality:
+- Azure CLI installed and authenticated
+- Domain with DNS control (for A records)
+- SSL certificate for your domain (wildcard recommended)
+- RDP client (for Windows VM access)
 
-### 1. Service Health Check
-```powershell
-# On the VM, verify service is running
-Get-Service TeamsMediaBot
-# Status should be "Running"
+---
 
-# Check service account
-nssm get TeamsMediaBot ObjectName
-# Should return ".\azureuser"
-```
+## Azure Infrastructure Setup
 
-### 2. Native Asset Verification
-```powershell
-# Verify NativeMedia.dll is present in output directory
-Test-Path "C:\teams-bot-poc\src\bin\Release\net8.0\NativeMedia.dll"
-# Should return True
-```
+### Deploy VM and Resources
 
-### 3. Health Endpoint Check
 ```bash
-# From any machine with network access
-curl https://teamsbot.qmachina.com/api/calling/health
-# Should return: {"Status":"Healthy","Timestamp":"...","Service":"Teams Media Bot POC"}
+cd scripts
+./deploy-azure-vm.sh
 ```
 
-### 4. Live Meeting Test
+Creates:
+- Resource Group: `rg-teams-media-bot-poc`
+- App Registration with Calls.AccessMedia.All + Calls.JoinGroupCall.All permissions
+- Azure Bot with Teams channel
+- Azure Speech Service
+- Windows Server 2022 VM (D4s_v3) with ports 443, 8445, 3389 open
+
+Note VM credentials output at end of script.
+
+### Verify Infrastructure
+
 ```bash
-# Join the bot to a live Teams meeting
-curl -X POST https://teamsbot.qmachina.com/api/calling/join \
-  -H "Content-Type: application/json" \
-  -d '{"joinUrl":"<TEAMS_MEETING_JOIN_URL>","displayName":"Transcription Bot"}'
-```
-
-**Expected behavior:**
-- Bot joins the meeting within 5-10 seconds
-- Audio frames logged at ~50 frames/second
-- Real-time transcripts appear in logs
-- No "Procedure Not Found" or native DLL errors
-
-### 5. Log Verification
-```powershell
-# Check for successful audio stream processing
-Get-Content "C:\teams-bot-poc\logs\service-output.log" -Tail 50 | Select-String "Audio stats"
-# Should show audio frame processing
-
-# Verify no critical errors
-Get-Content "C:\teams-bot-poc\logs\service-output.log" -Tail 100 | Select-String "Error|Exception"
-# Should show no DLL loading errors or media platform failures
+az resource list --resource-group rg-teams-media-bot-poc -o table
+az vm show --name vm-tbot-prod --resource-group rg-teams-media-bot-poc -d
 ```
 
 ---
 
-## ⚡ IMMEDIATE NEXT STEPS
+## Domain & SSL Setup
 
-### Step 0: Check/clear the stuck Run Command (do this first if it's still running)
-We may have a stuck provisioning job. Please check in the Azure Portal UI:
+### Create DNS Records
 
-1. Azure Portal → **VM** `vm-tbot-prod`
-2. **Run command** (left nav)
-3. Look at the **Job history** / **Run command jobs** list
-4. If a job is **Running** for >10–15 minutes, try **Cancel**; if Cancel is unavailable or ineffective, just proceed with **RDP** and avoid starting new Run Commands
+Create two A records pointing to your VM's public IP:
 
-If you don't have portal access right now, tell me what you see and I'll adjust the plan.
-
-If a job is running for >15 minutes or appears stuck, cancel it in the portal. Prefer **Option A (RDP)** or retry with **shorter, split Run Command steps** (avoid long builds in a single command).
-
-### Step 1: Create DNS Records (DO NOW - can be done in parallel)
-The IP **52.188.117.153 is STATIC** (Azure Standard SKU). Safe to create DNS now.
-
-Go to your DNS provider for `qmachina.com` and create:
-```
-Record 1:
-  Type: A
-  Name: teamsbot
-  Value: 52.188.117.153
-  TTL: 300
-
-Record 2:
-  Type: A
-  Name: media  
-  Value: 52.188.117.153
-  TTL: 300
+```dns
+teamsbot.yourdomain.com  A  <VM_PUBLIC_IP>
+media.yourdomain.com     A  <VM_PUBLIC_IP>
 ```
 
-Verify with: `nslookup teamsbot.qmachina.com` and `nslookup media.qmachina.com`
+Verify propagation:
 
-### Step 2: Deploy Bot to VM (choose one option)
-
-**Option A: RDP and complete manually (RECOMMENDED - faster)**
+```bash
+nslookup teamsbot.yourdomain.com
+nslookup media.yourdomain.com
 ```
-RDP: 52.188.117.153
+
+### Install SSL Certificate on VM
+
+RDP to VM, then in PowerShell as Administrator:
+
+```powershell
+# Import PFX
+$password = ConvertTo-SecureString -String "YOUR_PFX_PASSWORD" -Force -AsPlainText
+Import-PfxCertificate -FilePath "C:\certs\yourdomain.pfx" -CertStoreLocation Cert:\LocalMachine\My -Password $password
+
+# Get thumbprint
+Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.Subject -like "*yourdomain*" } | Select Thumbprint, Subject
+```
+
+Note the thumbprint for configuration.
+
+---
+
+## Build & Deploy
+
+### Clone and Build
+
+RDP to VM:
+
+```
+IP: <VM_PUBLIC_IP>
 User: azureuser
-Pass: SecureTeamsBot2026!
+Pass: <FROM_DEPLOYMENT_OUTPUT>
 ```
 
-Run in PowerShell as Administrator:
-```powershell
-# Clone and build
-cd C:\
-git clone https://github.com/logan-robbins/teams-bot-poc.git
-cd C:\teams-bot-poc\src
+In PowerShell as Administrator:
 
-# Fix package versions (1.4.* not available on nuget.org)
-# Edit TeamsMediaBot.csproj and set:
-# Microsoft.Graph.Communications.* => 1.2.0.15690
-# Microsoft.Identity.Client => 4.73.1
-# Microsoft.Graph => 4.54.0
+```powershell
+cd C:\
+git clone https://github.com/your-org/teams-bot-poc.git
+cd C:\teams-bot-poc\src
 
 dotnet restore
 dotnet build --configuration Release
 
-# Update config with cert thumbprint
-$config = Get-Content C:\teams-bot-poc\src\Config\appsettings.json | ConvertFrom-Json
-$config.MediaPlatformSettings.CertificateThumbprint = "0FE5A81189A4D9EDB8B25EF879412CD35BC83535"
-$config | ConvertTo-Json -Depth 10 | Set-Content C:\teams-bot-poc\src\Config\appsettings.json
+# Verify NativeMedia.dll copied
+Test-Path "bin\Release\net8.0\NativeMedia.dll"
+```
 
+### Configure appsettings.json
+
+Update `C:\teams-bot-poc\src\Config\appsettings.json`:
+
+```json
+{
+  "MediaPlatformSettings": {
+    "CertificateThumbprint": "YOUR_CERT_THUMBPRINT",
+    "LocalHttpListenUrl": "https://0.0.0.0:443",
+    "PublicHttpUrl": "https://teamsbot.yourdomain.com",
+    "MediaHttpUrl": "https://media.yourdomain.com"
+  },
+  "AzureSettings": {
+    "TenantId": "YOUR_TENANT_ID",
+    "AppId": "YOUR_APP_ID",
+    "AppSecret": "YOUR_APP_SECRET"
+  },
+  "SpeechSettings": {
+    "Key": "YOUR_SPEECH_KEY",
+    "Region": "eastus"
+  }
+}
+```
+
+### Create Windows Service
+
+```powershell
 # Create logs directory
 New-Item -ItemType Directory -Path C:\teams-bot-poc\logs -Force
 
-# Create Windows Service
+# Install service with NSSM
 nssm install TeamsMediaBot "C:\Program Files\dotnet\dotnet.exe"
 nssm set TeamsMediaBot AppParameters "exec C:\teams-bot-poc\src\bin\Release\net8.0\TeamsMediaBot.dll"
 nssm set TeamsMediaBot AppDirectory "C:\teams-bot-poc\src"
+nssm set TeamsMediaBot ObjectName ".\azureuser" "YOUR_VM_PASSWORD"
 nssm set TeamsMediaBot Start SERVICE_AUTO_START
 nssm set TeamsMediaBot AppStdout "C:\teams-bot-poc\logs\service-output.log"
 nssm set TeamsMediaBot AppStderr "C:\teams-bot-poc\logs\service-error.log"
@@ -237,373 +245,144 @@ Start-Service TeamsMediaBot
 Get-Service TeamsMediaBot
 ```
 
-**Option B: Wait and retry via Azure CLI**
-A previous `az vm run-command` is stuck. Wait ~10 min and retry:
-```bash
-az vm run-command invoke \
-  --resource-group rg-teams-media-bot-poc \
-  --name vm-tbot-prod \
-  --command-id RunPowerShellScript \
-  --scripts 'Test-Path C:\teams-bot-poc' \
-  --query 'value[0].message' -o tsv
-```
+### Update Azure Bot Webhook
 
-### Step 3: Update Azure Bot Webhook (after DNS propagates)
 ```bash
 az bot update \
   --resource-group rg-teams-media-bot-poc \
   --name teams-media-bot-poc \
-  --endpoint "https://teamsbot.qmachina.com/api/calling"
-```
-
-### Step 4: Test
-```bash
-curl https://teamsbot.qmachina.com/api/calling/health
+  --endpoint "https://teamsbot.yourdomain.com/api/calling"
 ```
 
 ---
 
-## ✅ What's Already Complete
+## Teams App Package
 
-### 1. Azure Infrastructure + VM (Partially Done)
-All resources provisioned, VM created but not fully configured:
+### Update Manifest
 
-```
-Resource Group: rg-teams-media-bot-poc (eastus)
-App Registration: ff4b0902-5ae8-450b-bf45-7e2338292554
-Client Secret: aAu8Q~WY.C2fIk~Ezr0Q4Ch~j9YP6nNto14y4bnK (expires 2027-01-29)
-Azure Bot: teams-media-bot-poc (Teams channel enabled)
-Speech Service: speech-teams-bot-poc (key in appsettings.json)
-Permissions: Calls.AccessMedia.All, Calls.JoinGroupCall.All (admin consent granted)
+Edit `manifest/manifest.json`:
 
-VM Created:
-  Name: vm-tbot-prod
-  Public IP: 52.188.117.153
-  Admin User: azureuser
-  Admin Password: SecureTeamsBot2026!
-  Status: VM RUNNING, but bot NOT deployed yet
-
-SSL Certificate:
-  Thumbprint: 0FE5A81189A4D9EDB8B25EF879412CD35BC83535
-  Subject: CN=*.qmachina.com
-  Expires: 2027-01-29
-  Status: Installed in Windows cert store
+```json
+{
+  "bots": [{
+    "botId": "YOUR_APP_ID",
+    "supportsCallingCapabilities": true,
+    "supportsVideoCapabilities": true
+  }]
+}
 ```
 
-**Cost:** ~$145/month (VM + Speech Service)
+### Create Package
 
-### 2. Complete Codebase (100% Done)
-All code written, tested, and ready to deploy:
-
-```
-C# Bot (8 files, ~1,200 lines):
-  ✓ TeamsCallingBotService.cs - Join meetings, receive audio
-  ✓ AzureSpeechRealtimeTranscriber.cs - Real-time STT
-  ✓ PythonTranscriptPublisher.cs - HTTP POST to Python
-  ✓ CallingController.cs - Webhook handler + join endpoint
-  ✓ Configuration models, Program.cs startup
-
-Python Receiver (2 files, ~150 lines):
-  ✓ transcript_sink.py - FastAPI with async queue for agents
-  ✓ requirements.txt - Dependencies
-
-Infrastructure:
-  ✓ appsettings.json - Pre-configured with Azure credentials
-  ✓ manifest.json - Teams app manifest
-  ✓ deploy-azure-vm.sh - One-command VM deployment
-  ✓ deploy-production.ps1 - Automated Windows setup
+```bash
+cd manifest
+zip -r teams-bot-poc.zip manifest.json color.png outline.png
 ```
 
-### 3. Production Architecture (Designed)
-Using **qmachina.com** domain (no ngrok):
+### Upload to Teams
 
-```
-Signaling: https://teamsbot.qmachina.com/api/calling
-Media: media.qmachina.com:8445
-Hosting: Azure Windows Server VM (D4s_v3)
-Service: Windows Service (auto-starts on boot)
-Logs: File-based with rotation
-```
-
-**Benefits:** Stable URLs, no ngrok, production-ready, always-on
+1. Teams Admin Center → Apps → Upload custom app
+2. Select `teams-bot-poc.zip`
+3. Approve permissions if prompted
 
 ---
 
-## 📋 REMAINING SETUP (DNS + SSL)
+## Testing
 
-### 1. Create DNS Records (Do This Now)
-
-Go to your DNS provider for **qmachina.com** and create:
-
-```
-Record 1:
-  Type: A
-  Name: teamsbot
-  Value: 52.188.117.153
-  TTL: 300
-
-Record 2:
-  Type: A
-  Name: media
-  Value: 52.188.117.153
-  TTL: 300
-```
-
-**Verify DNS propagation:**
-```bash
-nslookup teamsbot.qmachina.com
-nslookup media.qmachina.com
-# Both should resolve to 52.188.117.153
-```
-
-### 2. Install SSL Certificate
-
-**You need a certificate for:**
-- `teamsbot.qmachina.com` AND `media.qmachina.com`
-- A wildcard cert for `*.qmachina.com` works perfectly
-
-**Installation Steps (after you have the PFX file):**
-
-1. **RDP to the VM:**
-   ```
-   IP: 52.188.117.153
-   Username: azureuser
-   Password: SecureTeamsBot2026!
-   ```
-
-2. **Copy your PFX certificate** to the VM (e.g., `C:\certs\qmachina.pfx`)
-
-3. **Import the certificate:**
-   ```powershell
-   # Open PowerShell as Administrator
-   $password = ConvertTo-SecureString -String "YOUR_PFX_PASSWORD" -Force -AsPlainText
-   Import-PfxCertificate -FilePath "C:\certs\qmachina.pfx" -CertStoreLocation Cert:\LocalMachine\My -Password $password
-   ```
-
-4. **Get the certificate thumbprint:**
-   ```powershell
-   Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.Subject -like "*qmachina*" } | Select Thumbprint, Subject
-   ```
-
-5. **Update appsettings.json:**
-   ```powershell
-   # Edit C:\teams-bot-poc\src\Config\appsettings.json
-   # Change CertificateThumbprint from "CHANGE_AFTER_CERT_INSTALL" to your actual thumbprint
-   ```
-
-6. **Restart the service:**
-   ```powershell
-   Restart-Service TeamsMediaBot
-   ```
-
-### 3. Update Azure Bot Webhook
+### Health Check
 
 ```bash
-# Run from Mac terminal:
-az bot update \
-  --resource-group rg-teams-media-bot-poc \
-  --name teams-media-bot-poc \
-  --endpoint "https://teamsbot.qmachina.com/api/calling"
+curl https://teamsbot.yourdomain.com/api/calling/health
 ```
 
-Or manually in Azure Portal:
-1. Go to Azure Bot → teams-media-bot-poc
-2. Channels → Microsoft Teams → Calling
-3. Set Webhook URL to: `https://teamsbot.qmachina.com/api/calling`
+Expected: `{"Status":"Healthy","Timestamp":"...","Service":"Teams Media Bot POC"}`
 
----
+### Join Meeting
 
-## 🔗 Quick Reference
-
-### Azure Resources
 ```bash
-# View all resources
-az resource list --resource-group rg-teams-media-bot-poc -o table
-
-# View VM
-az vm show --name vm-tbot-prod --resource-group rg-teams-media-bot-poc -d
-
-# SSH/RDP to VM
-# IP: 52.188.117.153, User: azureuser, Pass: SecureTeamsBot2026!
-
-# Delete everything (if needed)
-az group delete --name rg-teams-media-bot-poc --yes
-```
-
-### Credentials (Keep Secure)
-```
-Tenant ID: 2843abed-8970-461e-a260-a59dc1398dbf
-App ID: ff4b0902-5ae8-450b-bf45-7e2338292554
-Client Secret: aAu8Q~WY.C2fIk~Ezr0Q4Ch~j9YP6nNto14y4bnK
-Speech Key: 4PMljn6sqJzjGUoNu2WXt64Aqmrl6PN1Ev9cbx9tGad1S5wmUn2bJQQJ99CAACYeBjFXJ3w3AAAYACOGOsek
-```
-
-### Project Structure
-```
-teams-bot-poc/
-├── src/                          # C# bot code
-│   ├── TeamsMediaBot.csproj      # Standardized dependencies (Media SDK 1.31.0.225-preview)
-│   ├── Program.cs
-│   ├── Controllers/
-│   ├── Services/
-│   └── Config/appsettings.json
-├── python/                       # Python receiver
-│   ├── transcript_sink.py
-│   └── requirements.txt
-├── scripts/                      # Deployment
-│   ├── deploy-azure-vm.sh        
-│   └── deploy-production.ps1     # Standardized deployment with clean build & validation
-├── manifest/                     # Teams app
-│   └── manifest.json
-└── README.md                     # This file
-```
-
-### Critical Version Requirements
-
-**⚠️ IMPORTANT:** These versions are validated for Windows Server 2022 compatibility:
-
-```xml
-<!-- Media Platform SDK - MUST use this version -->
-<PackageReference Include="Microsoft.Skype.Bots.Media" Version="1.31.0.225-preview" />
-
-<!-- Communications SDK -->
-<PackageReference Include="Microsoft.Graph.Communications.Calls" Version="1.2.0.15690" />
-<PackageReference Include="Microsoft.Graph.Communications.Calls.Media" Version="1.2.0.15690" />
-<PackageReference Include="Microsoft.Graph.Communications.Client" Version="1.2.0.15690" />
-<PackageReference Include="Microsoft.Graph.Communications.Common" Version="1.2.0.15690" />
-```
-
-**Why 1.31.0.225-preview?**
-- Version 1.32.x causes "Procedure Not Found" (error 127) when loading `NativeMedia.dll` on Windows Server 2022
-- Version 1.31.0.225-preview successfully loads native dependencies and processes audio streams
-- Validated through testing on the production VM environment
-
-### Service Configuration Standard
-
-**Windows Service Account:** The `TeamsMediaBot` service MUST run as `.\azureuser`
-
-**Why this matters:**
-- Certificate access: The service needs permission to access the SSL certificate in the LocalMachine store
-- Environment context: Manual test runs succeed because they inherit the azureuser environment
-- File permissions: Ensures consistent access to logs, config files, and native binaries
-
-**The deployment script automatically:**
-1. Verifies the service account configuration
-2. Updates it to `.\azureuser` if incorrect
-3. Uses the password configured during VM setup
-
-**Manual service account update (if needed):**
-```powershell
-nssm set TeamsMediaBot ObjectName ".\azureuser" "SecureTeamsBot2026!"
-Restart-Service TeamsMediaBot
-```
-
-### Costs
-```
-Current (infrastructure only): ~$1-5/month
-After VM deployment: ~$145/month
-To reduce: Stop VM when not in use
-To eliminate: Delete VM (keep infrastructure for testing later)
-```
-
----
-
-## 🎯 What Happens After Deployment
-
-Once VM is deployed and configured:
-
-### Immediate Use
-```bash
-# Join bot to any Teams meeting:
-curl -X POST https://teamsbot.qmachina.com/api/calling/join \
+curl -X POST https://teamsbot.yourdomain.com/api/calling/join \
   -H "Content-Type: application/json" \
-  -d '{"joinUrl":"TEAMS_JOIN_URL","displayName":"Transcription Bot"}'
-
-# Bot will:
-1. Join the meeting
-2. Receive audio frames (50/sec)
-3. Transcribe in real-time
-4. POST transcripts to Python endpoint
+  -d '{"joinUrl":"TEAMS_MEETING_JOIN_URL","displayName":"Transcription Bot"}'
 ```
 
-### Integration with Your Agent
-The Python receiver (`python/transcript_sink.py`) has an async queue ready for agent integration:
+Bot should join within 5-10 seconds.
+
+### Check Logs
+
+On VM:
+
+```powershell
+# Service logs
+Get-Content C:\teams-bot-poc\logs\service-output.log -Tail 50
+
+# Audio processing
+Get-Content C:\teams-bot-poc\logs\service-output.log | Select-String "Audio stats"
+
+# Errors
+Get-Content C:\teams-bot-poc\logs\service-error.log -Tail 20
+```
+
+---
+
+## Python Transcript Service
+
+### Setup
+
+On VM or separate server:
+
+```bash
+cd python
+pip install -r requirements.txt
+python transcript_sink.py
+```
+
+Runs FastAPI server on port 5000. Bot POSTs transcripts to `http://localhost:5000/transcript`.
+
+### Integration
+
+Modify `transcript_sink.py` to connect your agent:
 
 ```python
-# Your agent can consume from the queue:
-async def agent_loop():
-    while True:
-        evt = await transcript_queue.get()
-        if evt["kind"] == "recognized":
-            # Process final transcript
-            agent.process(evt["text"])
-```
-
-### Monitoring
-```bash
-# Check bot status
-curl https://teamsbot.qmachina.com/api/calling/health
-
-# View logs (on VM)
-Get-Content C:\teams-bot-poc\logs\service-output.log -Wait
+@app.post("/transcript")
+async def receive_transcript(event: TranscriptEvent):
+    await transcript_queue.put(event.dict())
+    # Your agent logic here
+    return {"status": "ok"}
 ```
 
 ---
 
-## 📚 Documentation
+## Debugging Commands
 
-All the messy docs are archived in `docs/archive/` if you need them:
-- `ARCHITECTURE-PRODUCTION.md` - Detailed architecture
-- `DEPLOY-QMACHINA.md` - Step-by-step deployment
-- `CONFIG.md` - All credentials
-- `SETUP-WINDOWS.md` - Windows VM guide
-- And 6 more...
+### Service Management
 
-**But honestly, this README is all you need.**
+```powershell
+# Check status
+Get-Service TeamsMediaBot
 
----
+# Restart
+Restart-Service TeamsMediaBot
 
-## 🐛 Debugging Strategy
+# Stop/Start
+Stop-Service TeamsMediaBot
+Start-Service TeamsMediaBot
 
-### How We'll Debug This Application
-
-**The Challenge:** I can't RDP or use Visual Studio GUI remotely.
-
-**The Solution:** Multi-layered debugging approach:
-
-### 1. Built-in Comprehensive Logging (Already Done)
-
-The code I wrote has **extensive logging** at every critical point:
-
-```csharp
-// Examples from the code:
-_logger.LogInformation("Joining meeting: {JoinUrl}", joinUrl);
-_logger.LogInformation("Call state changed: {State}", call.Resource.State);
-_logger.LogDebug("Audio stats: {Frames} frames, {Bytes} bytes", framesReceived, bytesReceived);
-_logger.LogError(ex, "Failed to start transcriber");
+# View config
+nssm get TeamsMediaBot ObjectName
+nssm get TeamsMediaBot AppDirectory
 ```
 
-**Every major event is logged:** Call state changes, audio frames, transcription events, errors, etc.
+### Remote Diagnostics (Azure CLI)
 
-### 2. Remote Log Viewing (I Can Do This)
-
-**I can read logs without RDP:**
 ```bash
-# Get latest logs
+# Get logs
 az vm run-command invoke \
   --resource-group rg-teams-media-bot-poc \
   --name vm-tbot-prod \
   --command-id RunPowerShellScript \
   --scripts "Get-Content C:\teams-bot-poc\logs\service-output.log -Tail 100"
 
-# Get error logs
-az vm run-command invoke \
-  --resource-group rg-teams-media-bot-poc \
-  --name vm-tbot-prod \
-  --command-id RunPowerShellScript \
-  --scripts "Get-Content C:\teams-bot-poc\logs\service-error.log -Tail 50"
-
-# Check service status
+# Check service
 az vm run-command invoke \
   --resource-group rg-teams-media-bot-poc \
   --name vm-tbot-prod \
@@ -611,290 +390,128 @@ az vm run-command invoke \
   --scripts "Get-Service TeamsMediaBot | Select Status, StartType"
 ```
 
-**This works 90% of the time** for diagnosing issues.
-
-### 3. Iterative Code Fixes (Back and Forth)
-
-**When we find an issue in logs:**
+### Update Deployed Code
 
 ```bash
-# On Mac: I fix the code
-# (Add more logging, fix bug, adjust config, etc.)
+# On VM
+cd C:\teams-bot-poc
+git pull origin main
+cd src
+dotnet build --configuration Release
+Restart-Service TeamsMediaBot
+```
 
-# Push to GitHub
-git add .
-git commit -m "Fix: Add validation for call state"
-git push origin main
+Or remotely:
 
-# On VM: I deploy the fix
+```bash
 az vm run-command invoke \
   --resource-group rg-teams-media-bot-poc \
   --name vm-tbot-prod \
   --command-id RunPowerShellScript \
-  --scripts @update-bot.ps1
-  # This script: git pull, dotnet build, restart service
-```
-
-**Time per iteration:** 2-3 minutes (code fix → deploy → test)
-
-### 4. Diagnostic Scripts (I Can Run These)
-
-**I created comprehensive diagnostic scripts:**
-
-```bash
-# Full system diagnostics (checks everything)
-az vm run-command invoke \
-  --resource-group rg-teams-media-bot-poc \
-  --name vm-tbot-prod \
-  --command-id RunPowerShellScript \
-  --scripts @diagnose-bot.ps1
-```
-
-**This checks:**
-- ✅ Windows Service status
-- ✅ Ports 443 and 8445 listening
-- ✅ DNS resolution
-- ✅ SSL certificate validity
-- ✅ Configuration file
-- ✅ Azure Speech connectivity
-- ✅ Recent errors in logs
-- ✅ Audio processing activity
-
-**Output example:**
-```
-✅ Service Status: Running
-✅ Port 443 listening
-✅ Port 8445 listening
-✅ teamsbot.qmachina.com resolves
-✅ media.qmachina.com resolves
-✅ Certificate valid (expires 2027-06-15)
-✅ Config file OK
-✅ Azure Speech reachable
-✅ No recent errors
-✅ Audio frames detected
-```
-
-**I can run this without RDP** to diagnose 95% of issues.
-
-### 5. You Can RDP for Deep Debugging (If Needed)
-
-**For the 5% of cases where we need Visual Studio:**
-
-```
-RDP to VM:
-IP: [VM Public IP]
-Username: azureuser
-Password: SecureTeamsBot2026!
-
-Then:
-1. Open Visual Studio
-2. Open C:\teams-bot-poc\TeamsMediaBot.sln
-3. Set breakpoints
-4. Stop Windows Service
-5. Run in debugger (F5)
-6. See exactly what's happening
-```
-
-**You do this, share screenshots/findings, I fix the code.**
-
-### 6. Health Check Endpoint (Real-time Status)
-
-**The bot exposes health info:**
-```bash
-curl https://teamsbot.qmachina.com/api/calling/health
-```
-
-**Returns:**
-```json
-{
-  "Status": "Healthy",
-  "Timestamp": "2026-01-29T...",
-  "Service": "Teams Media Bot POC"
-}
-```
-
-**I can poll this** to verify the bot is responsive.
-
-### 7. Structured Troubleshooting Process
-
-**When something doesn't work:**
-
-**Step 1: Check logs remotely (I do this)**
-```bash
-az vm run-command invoke ... get logs
-```
-
-**Step 2: Identify the issue from logs**
-```
-Example log: "Certificate thumbprint mismatch"
-Example log: "Failed to connect to media endpoint"
-Example log: "Speech service returned 401 Unauthorized"
-```
-
-**Step 3: Fix the issue (I do this)**
-```
-- Update configuration
-- Fix code bug
-- Add more validation
-- Improve error handling
-```
-
-**Step 4: Deploy and test (2-3 minutes)**
-```bash
-git push
-az vm run-command invoke ... update and restart
-```
-
-**Step 5: Verify fix (check logs again)**
-```bash
-az vm run-command invoke ... get logs
-# Confirm issue is resolved
-```
-
-**If still stuck after 3 iterations:** You RDP in for deep debugging.
-
-### 8. Common Issues & Quick Diagnostics
-
-**Issue: Bot won't start**
-```bash
-# Check error log
-az vm run-command ... "Get-Content service-error.log -Tail 20"
-
-# Common causes:
-- Port 443 already in use → Change to 8443
-- Certificate not found → Check thumbprint
-- Missing dependencies → Rebuild project
-```
-
-**Issue: Bot joins but no audio**
-```bash
-# Check if media port is listening
-az vm run-command ... "Get-NetTCPConnection -LocalPort 8445"
-
-# Check DNS resolution
-nslookup media.qmachina.com
-
-# Check logs for media connection
-az vm run-command ... "Get-Content service-output.log | Select-String 'media'"
-```
-
-**Issue: No transcripts**
-```bash
-# Check if audio frames are received
-az vm run-command ... "Get-Content service-output.log | Select-String 'Audio stats'"
-
-# Check Speech Service connectivity
-az vm run-command ... "Test-NetConnection eastus.api.cognitive.microsoft.com -Port 443"
-
-# Check logs for Speech errors
-az vm run-command ... "Get-Content service-output.log | Select-String 'Speech|Canceled'"
-```
-
-### 9. Adding More Logging (Easy)
-
-**If we need more visibility, I can add logging in minutes:**
-
-```csharp
-// Add this anywhere in the code:
-_logger.LogDebug("DEBUG: Variable X = {Value}", x);
-_logger.LogInformation("INFO: Reached checkpoint Y");
-
-// Push, deploy, restart
-// New logs appear immediately
-```
-
-**This is our main debugging tool.**
-
-### 10. Python Side Debugging (Even Easier)
-
-**Python receiver is simple to debug:**
-```bash
-# Run locally on your Mac
-cd ~/research/teams/teams-bot-poc/python
-python transcript_sink.py
-
-# Logs print to console in real-time
-# Add print() statements anywhere
-# Instant feedback
+  --scripts @scripts/update-bot.ps1
 ```
 
 ---
 
-## 🎯 Realistic Debugging Timeline
+## Architecture
 
-**Typical issue resolution:**
+```
+Teams Meeting
+    ↓
+[Bot Signaling: port 443]  ← Azure Bot webhook
+    ↓
+[Media Stream: port 8445]
+    ↓
+[Azure Speech Service]
+    ↓
+[Python Service: port 5000] ← Your agent framework
+```
 
-| Scenario | Time | Method |
-|----------|------|--------|
-| **Config error** | 5 min | Check logs remotely → Fix config → Restart |
-| **Code bug (obvious)** | 10 min | Check logs → Fix code → Deploy → Test |
-| **Code bug (subtle)** | 30 min | Add logging → Deploy → Reproduce → Fix → Deploy |
-| **Need Visual Studio** | 60 min | You RDP → Debug → Share findings → I fix |
-| **Microsoft SDK issue** | Hours/Days | Research docs → Try different approach → Test |
+**Key Components:**
+- `TeamsCallingBotService.cs` - Handles Teams Graph calls
+- `AzureSpeechRealtimeTranscriber.cs` - Real-time speech-to-text
+- `PythonTranscriptPublisher.cs` - HTTP POST to Python service
+- `CallingController.cs` - Webhook endpoints
 
-**90% of issues: Resolved in < 30 minutes**  
-**10% of issues: May need your RDP session for deep debugging**
+**Dependencies:**
+- `Microsoft.Skype.Bots.Media` 1.31.0.225-preview (Windows Server 2022 compatible)
+- `Microsoft.Graph.Communications.*` 1.2.0.15690
+- Azure Speech SDK 1.41.1
 
 ---
 
-## 🔄 Quick Update & Restart
+## Reference
 
-**I created an automated update script** (`scripts/update-bot.ps1`):
 
-**Deploy a fix in one command:**
-```bash
-# After I push code changes to GitHub:
-az vm run-command invoke \
-  --resource-group rg-teams-media-bot-poc \
-  --name vm-tbot-prod \
-  --command-id RunPowerShellScript \
-  --scripts @update-bot.ps1
+### Costs
+
+- VM (D4s_v3): ~$120/month
+- Speech Service (Pay-as-you-go): ~$1-25/month depending on usage
+- Azure Bot: Free (Standard channel)
+- Total: ~$145/month
+
+Stop VM when not in use to reduce costs.
+
+### Project Structure
+
+```
+teams-bot-poc/
+├── src/
+│   ├── TeamsMediaBot.csproj
+│   ├── Program.cs
+│   ├── Config/appsettings.json
+│   ├── Controllers/CallingController.cs
+│   └── Services/
+│       ├── TeamsCallingBotService.cs
+│       ├── AzureSpeechRealtimeTranscriber.cs
+│       ├── PythonTranscriptPublisher.cs
+│       ├── CallHandler.cs
+│       └── HeartbeatHandler.cs
+├── python/
+│   ├── transcript_sink.py
+│   └── requirements.txt
+├── scripts/
+│   ├── deploy-azure-vm.sh
+│   ├── deploy-production.ps1
+│   ├── update-bot.ps1
+│   └── diagnose-bot.ps1
+├── manifest/
+│   ├── manifest.json
+│   ├── color.png
+│   └── outline.png
+└── README.md
 ```
 
-**What this does:**
-1. Pulls latest code from GitHub
-2. Builds the project
-3. Restarts the Windows Service
-4. Shows service status
-5. Displays last 20 log lines
+### Critical Configuration Notes
 
-**Time: 2-3 minutes** from code change to deployed fix
+**Service Account:** Must run as `.\azureuser` for certificate access
 
-### 📖 Complete Command Reference
+**Package Versions:** Do not upgrade `Microsoft.Skype.Bots.Media` beyond 1.31.0.225-preview - version 1.32.x causes "Procedure Not Found" errors on Windows Server 2022
 
-**All debugging commands are in:** `DEBUG-COMMANDS.md`
+**Native Dependencies:** Verify `NativeMedia.dll` exists in output directory after build
 
-Includes copy/paste commands for:
-- Health checks
-- Log viewing
-- Service management
-- Configuration checks
-- Network diagnostics
-- Common issue troubleshooting
+**Firewall:** NSG rules must allow inbound 443 (signaling) and 8445 (media)
 
 ---
 
-## 🎉 Summary
+## Common Issues
 
-**Completed:**
-- ✅ All Azure infrastructure provisioned
-- ✅ All code written (in this repo)
-- ✅ VM created at 52.188.117.153
-- ✅ VM has Git, .NET SDK, NSSM installed
-- ✅ Project built on VM (Release)
-- ✅ SSL certificate purchased and installed on VM
-- ✅ GitHub repo: https://github.com/logan-robbins/teams-bot-poc
+**Bot won't start:**
+- Check certificate thumbprint matches installed cert
+- Verify port 443 not in use: `Get-NetTCPConnection -LocalPort 443`
+- Check service account: `nssm get TeamsMediaBot ObjectName`
 
-**IN PROGRESS:**
-- ⏳ Update appsettings.json with certificate thumbprint
-- ⏳ Create Windows Service
+**Bot joins but no audio:**
+- Verify DNS: `nslookup media.yourdomain.com`
+- Check media port: `Get-NetTCPConnection -LocalPort 8445`
+- Review logs for media connection errors
 
-**Remaining (after bot deployed):**
-- ⏳ Update Azure Bot webhook to https://teamsbot.qmachina.com/api/calling
-- ⏳ Run Python transcript sink (optional, for live transcripts)
-- ⏳ Test end-to-end
+**No transcripts:**
+- Verify audio frames received: `Get-Content logs\service-output.log | Select-String "Audio stats"`
+- Check Speech Service key and region in appsettings.json
+- Test Speech connectivity: `Test-NetConnection eastus.api.cognitive.microsoft.com -Port 443`
 
-**Once everything is configured, test with:**
-```bash
-curl https://teamsbot.qmachina.com/api/calling/health
-```
+**Deployment updates not applying:**
+- Ensure service restarted after code changes
+- Check service running: `Get-Service TeamsMediaBot`
+- Verify correct working directory: `nssm get TeamsMediaBot AppDirectory`
