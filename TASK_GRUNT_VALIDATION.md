@@ -104,6 +104,11 @@ After deployment, verify:
 - **Fix:** Added null guard in ValidateInboundRequestAsync and suppressed NETSDK1206 in csproj
 - **Files:** `TeamsCallingBotService.cs`, `TeamsMediaBot.csproj`
 
+### 13. ✅ FIXED - Windows Service Config Loading
+- **Problem:** Service crashed with "Bot configuration is missing" because `appsettings.json` lives in `Config/`
+- **Fix:** Explicitly load `Config/appsettings.json` in `Program.cs`
+- **File:** `Program.cs`
+
 ## Final Package Configuration (reference)
 - `Microsoft.Graph.Communications.Calls.Media` 1.2.0.15690
 - `Microsoft.Skype.Bots.Media` 1.32.0.70-preview

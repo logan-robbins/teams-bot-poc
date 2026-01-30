@@ -6,6 +6,9 @@ using TeamsMediaBot.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// Load configuration from Config/appsettings.json (required for VM/service)
+builder.Configuration.AddJsonFile("Config/appsettings.json", optional: false, reloadOnChange: true);
+
 // Configure Serilog
 Log.Logger = new LoggerConfiguration()
     .ReadFrom.Configuration(builder.Configuration)

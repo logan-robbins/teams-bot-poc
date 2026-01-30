@@ -21,16 +21,16 @@ A POC bot that joins Microsoft Teams meetings, receives real-time audio, transcr
 - ✅ .NET SDK 10.0.102 installed on VM
 - ✅ NSSM installed on VM
 - ✅ Project cloned on VM: `C:\teams-bot-poc`
+- ✅ Project built on VM (Release): `C:\teams-bot-poc\src\bin\Release\net8.0\TeamsMediaBot.dll`
+- ✅ DNS A records created (teamsbot.qmachina.com, media.qmachina.com → 52.188.117.153)
 - ✅ SSL certificate purchased (Namecheap PositiveSSL Wildcard for *.qmachina.com)
 - ✅ SSL certificate installed in Windows cert store (Thumbprint: `0FE5A81189A4D9EDB8B25EF879412CD35BC83535`)
 - ✅ CA bundle imported to Intermediate CA store
 - ✅ GitHub repo created: https://github.com/logan-robbins/teams-bot-poc
 
 ### What is NOT Done:
-- ❌ Project NOT built on VM
 - ❌ Windows Service NOT created (TeamsMediaBot service does not exist)
 - ❌ appsettings.json NOT updated with certificate thumbprint on VM
-- ❌ DNS records NOT created (teamsbot.qmachina.com, media.qmachina.com)
 - ❌ Azure Bot webhook NOT updated
 
 ### Why Deployment Stalled:
@@ -42,6 +42,9 @@ The `az vm run-command invoke` that was cloning and building the project is stuc
 - 2026-01-29 1:02:00 PM PST / 21:02:00Z: New Run Command attempt failed with `Conflict` ("execution is in progress")
 - 2026-01-29 12:53:54 PM PST / 20:53:54Z: VM restart requested — still pending completion as of last check
 - 2026-01-29 1:35 PM PST: Decision made to switch to **RDP** and complete provisioning manually
+- 2026-01-29 5:40 PM PST: Build succeeded on VM (Release)
+- 2026-01-29 5:50 PM PST: DNS A records created for teamsbot.qmachina.com and media.qmachina.com
+- 2026-01-30 12:05 AM PST: Installed .NET 8 runtime on VM and fixed config loading (app now reads `Config/appsettings.json` for Windows service)
 - 2026-01-29 2:05 PM PST: `dotnet restore` failed on VM because `Microsoft.Graph.Communications.*` packages are pinned to `1.4.*` (not available on nuget.org; latest is `1.2.0.15690`)
 - 2026-01-29 2:20 PM PST: Build failed due to Graph SDK API mismatch (IGraphLogger interface + missing Graph models). Fix applied in repo: use SDK `GraphLogger` + add `Microsoft.Graph` package for `ChatInfo`/`OrganizerMeetingInfo`
 - 2026-01-29 2:45 PM PST: Verified local `microsoft-graph-comms-samples` repo; sample projects use `Microsoft.Graph.Communications.*` 1.2.x versions (consistent with our 1.2.0.15690 pin)
@@ -766,16 +769,15 @@ Includes copy/paste commands for:
 - ✅ All code written (in this repo)
 - ✅ VM created at 52.188.117.153
 - ✅ VM has Git, .NET SDK, NSSM installed
+- ✅ Project built on VM (Release)
 - ✅ SSL certificate purchased and installed on VM
 - ✅ GitHub repo: https://github.com/logan-robbins/teams-bot-poc
 
-**IN PROGRESS (stalled - see top of README):**
-- ⏳ Clone project to VM
-- ⏳ Build project on VM
+**IN PROGRESS:**
+- ⏳ Update appsettings.json with certificate thumbprint
 - ⏳ Create Windows Service
 
 **Remaining (after bot deployed):**
-- ⏳ Create DNS records (teamsbot.qmachina.com, media.qmachina.com → 52.188.117.153)
 - ⏳ Update Azure Bot webhook to https://teamsbot.qmachina.com/api/calling
 - ⏳ Test end-to-end
 
