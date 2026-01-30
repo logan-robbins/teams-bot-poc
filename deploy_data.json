@@ -1,6 +1,6 @@
 {
   "task": "Unblock Run Command conflict and complete VM provisioning",
-  "updated_utc": "2026-01-29T23:08:14Z",
+  "updated_utc": "2026-01-30T00:26:00Z",
   "plan": [
     {
       "step": 1,
@@ -35,12 +35,12 @@
     {
       "step": 7,
       "title": "Update appsettings.json cert thumbprint and create logs dir",
-      "status": "pending"
+      "status": "completed"
     },
     {
       "step": 8,
       "title": "Create/verify Windows service and capture logs",
-      "status": "pending"
+      "status": "completed"
     },
     {
       "step": 9,
@@ -60,6 +60,21 @@
     {
       "step": 12,
       "title": "Align join URL parsing + auth provider signatures to samples (POC-safe) and pin Microsoft.Graph to 4.54.0",
+      "status": "completed"
+    },
+    {
+      "step": 13,
+      "title": "Install .NET 8 runtime on VM (Microsoft.NETCore.App + AspNetCore.App)",
+      "status": "completed"
+    },
+    {
+      "step": 14,
+      "title": "Bind HTTPS in Kestrel with cert thumbprint",
+      "status": "completed"
+    },
+    {
+      "step": 15,
+      "title": "Pin production config in git (Config/appsettings.json)",
       "status": "completed"
     }
   ]

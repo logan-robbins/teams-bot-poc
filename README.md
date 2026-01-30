@@ -32,6 +32,7 @@ A POC bot that joins Microsoft Teams meetings, receives real-time audio, transcr
 - ✅ .NET 8 runtime installed on VM (Microsoft.NETCore.App + AspNetCore.App 8.0.x)
 - ✅ Latest code pulled/rebuilt on VM (Program.cs config load fix)
 - ✅ Windows Service running (TeamsMediaBot)
+- ✅ Config pinned in git (`Config/appsettings.json` has production thumbprint/URLs)
 
 ### What is NOT Done:
 - ❌ Python transcript sink running (if you want live transcripts)
@@ -49,6 +50,7 @@ The `az vm run-command invoke` that was cloning and building the project is stuc
 - 2026-01-29 5:50 PM PST: DNS A records created for teamsbot.qmachina.com and media.qmachina.com
 - 2026-01-30 12:05 AM PST: Installed .NET 8 runtime on VM and fixed config loading (app now reads `Config/appsettings.json` for Windows service)
 - 2026-01-30 12:15 AM PST: **HTTPS FIX** - Kestrel now binds HTTPS with the wildcard cert (thumbprint from MediaPlatformSettings). `LocalHttpListenUrl` set to `https://0.0.0.0:443`.
+- 2026-01-30 12:25 AM PST: **CONFIG IN GIT** - `Config/appsettings.json` updated with production thumbprint/URLs to prevent local drift after git pull.
 - 2026-01-29 2:05 PM PST: `dotnet restore` failed on VM because `Microsoft.Graph.Communications.*` packages are pinned to `1.4.*` (not available on nuget.org; latest is `1.2.0.15690`)
 - 2026-01-29 2:20 PM PST: Build failed due to Graph SDK API mismatch (IGraphLogger interface + missing Graph models). Fix applied in repo: use SDK `GraphLogger` + add `Microsoft.Graph` package for `ChatInfo`/`OrganizerMeetingInfo`
 - 2026-01-29 2:45 PM PST: Verified local `microsoft-graph-comms-samples` repo; sample projects use `Microsoft.Graph.Communications.*` 1.2.x versions (consistent with our 1.2.0.15690 pin)
