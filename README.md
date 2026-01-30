@@ -27,11 +27,14 @@ A POC bot that joins Microsoft Teams meetings, receives real-time audio, transcr
 - ✅ SSL certificate installed in Windows cert store (Thumbprint: `0FE5A81189A4D9EDB8B25EF879412CD35BC83535`)
 - ✅ CA bundle imported to Intermediate CA store
 - ✅ GitHub repo created: https://github.com/logan-robbins/teams-bot-poc
+- ✅ appsettings.json updated on VM with cert thumbprint + URLs
+- ✅ Azure Bot webhook updated to https://teamsbot.qmachina.com/api/calling
+- ✅ .NET 8 runtime installed on VM (Microsoft.NETCore.App + AspNetCore.App 8.0.x)
+- ✅ Latest code pulled/rebuilt on VM (Program.cs config load fix)
+- ✅ Windows Service running (TeamsMediaBot)
 
 ### What is NOT Done:
-- ❌ Windows Service NOT created (TeamsMediaBot service does not exist)
-- ❌ appsettings.json NOT updated with certificate thumbprint on VM
-- ❌ Azure Bot webhook NOT updated
+- ❌ Python transcript sink running (if you want live transcripts)
 
 ### Why Deployment Stalled:
 The `az vm run-command invoke` that was cloning and building the project is stuck/hanging. The command has been running for >15 minutes. There may be a previous run-command still in progress.
@@ -45,6 +48,7 @@ The `az vm run-command invoke` that was cloning and building the project is stuc
 - 2026-01-29 5:40 PM PST: Build succeeded on VM (Release)
 - 2026-01-29 5:50 PM PST: DNS A records created for teamsbot.qmachina.com and media.qmachina.com
 - 2026-01-30 12:05 AM PST: Installed .NET 8 runtime on VM and fixed config loading (app now reads `Config/appsettings.json` for Windows service)
+- 2026-01-30 12:15 AM PST: **HTTPS FIX** - Kestrel now binds HTTPS with the wildcard cert (thumbprint from MediaPlatformSettings). `LocalHttpListenUrl` set to `https://0.0.0.0:443`.
 - 2026-01-29 2:05 PM PST: `dotnet restore` failed on VM because `Microsoft.Graph.Communications.*` packages are pinned to `1.4.*` (not available on nuget.org; latest is `1.2.0.15690`)
 - 2026-01-29 2:20 PM PST: Build failed due to Graph SDK API mismatch (IGraphLogger interface + missing Graph models). Fix applied in repo: use SDK `GraphLogger` + add `Microsoft.Graph` package for `ChatInfo`/`OrganizerMeetingInfo`
 - 2026-01-29 2:45 PM PST: Verified local `microsoft-graph-comms-samples` repo; sample projects use `Microsoft.Graph.Communications.*` 1.2.x versions (consistent with our 1.2.0.15690 pin)
@@ -779,6 +783,7 @@ Includes copy/paste commands for:
 
 **Remaining (after bot deployed):**
 - ⏳ Update Azure Bot webhook to https://teamsbot.qmachina.com/api/calling
+- ⏳ Run Python transcript sink (optional, for live transcripts)
 - ⏳ Test end-to-end
 
 **Once everything is configured, test with:**

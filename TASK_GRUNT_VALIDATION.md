@@ -109,6 +109,11 @@ After deployment, verify:
 - **Fix:** Explicitly load `Config/appsettings.json` in `Program.cs`
 - **File:** `Program.cs`
 
+### 14. ✅ FIXED - HTTPS Binding for Webhook
+- **Problem:** Service listened on HTTP port 443; HTTPS requests hung/failed
+- **Fix:** Configure Kestrel HTTPS with LocalMachine cert by thumbprint; set `LocalHttpListenUrl` to `https://0.0.0.0:443`
+- **Files:** `Program.cs`, `Config/appsettings.json`
+
 ## Final Package Configuration (reference)
 - `Microsoft.Graph.Communications.Calls.Media` 1.2.0.15690
 - `Microsoft.Skype.Bots.Media` 1.32.0.70-preview

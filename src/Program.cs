@@ -1,6 +1,7 @@
 using Microsoft.Graph.Communications.Common.Telemetry;
 using Microsoft.Extensions.Logging;
 using Serilog;
+using System.Security.Cryptography.X509Certificates;
 using TeamsMediaBot.Models;
 using TeamsMediaBot.Services;
 
@@ -31,6 +32,21 @@ var speechConfig = builder.Configuration.GetSection("Speech").Get<SpeechConfigur
 
 var transcriptSinkConfig = builder.Configuration.GetSection("TranscriptSink").Get<TranscriptSinkConfiguration>()
     ?? throw new InvalidOperationException("TranscriptSink configuration is missing");
+
+// Configure Kestrel to listen on the specified URL.
+// If HTTPS is specified, bind the installed certificate by thumbprint.
+var listenUri = new Uri(botConfig.LocalHttpListenUrl);
+builder.WebHost.ConfigureKestrel(options =>
+{
+    options.ListenAnyIP(listenUri.Port, listenOptions =>
+    {
+        if (listenUri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase))
+        {
+            var cert = LoadCertificateFromStore(mediaConfig.CertificateThumbprint);
+            listenOptions.UseHttps(cert);
+        }
+    });
+});
 
 // Register configuration as singletons
 builder.Services.AddSingleton(botConfig);
@@ -97,12 +113,32 @@ Log.Information("Teams Media Bot POC starting on {Url}", botConfig.LocalHttpList
 Log.Information("Notification URL configured: {NotificationUrl}", botConfig.NotificationUrl);
 Log.Information("Media endpoint: {ServiceFqdn}:{PublicPort}", mediaConfig.ServiceFqdn, mediaConfig.InstancePublicPort);
 
-// Configure Kestrel to listen on the specified port per S2
-app.Urls.Clear();
-app.Urls.Add(botConfig.LocalHttpListenUrl);
-
 await app.RunAsync();
 
 // Cleanup
 await botService.DisposeAsync();
 Log.CloseAndFlush();
+
+static X509Certificate2 LoadCertificateFromStore(string thumbprint)
+{
+    if (string.IsNullOrWhiteSpace(thumbprint) || thumbprint == "CHANGE_AFTER_CERT_INSTALL")
+    {
+        throw new InvalidOperationException("CertificateThumbprint is not set. Update Config/appsettings.json.");
+    }
+
+    var normalized = thumbprint.Replace(" ", string.Empty).ToUpperInvariant();
+    using var store = new X509Store(StoreName.My, StoreLocation.LocalMachine);
+    store.Open(OpenFlags.ReadOnly);
+
+    var certs = store.Certificates.Find(
+        X509FindType.FindByThumbprint,
+        normalized,
+        validOnly: false);
+
+    if (certs.Count == 0)
+    {
+        throw new InvalidOperationException($"Certificate with thumbprint {normalized} not found in LocalMachine/My.");
+    }
+
+    return certs[0];
+}
