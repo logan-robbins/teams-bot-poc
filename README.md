@@ -13,7 +13,8 @@ Teams calling bot that joins meetings, receives real-time diarized audio transcr
 - **Diarized Transcription**: Identifies who is speaking (`speaker_0`, `speaker_1`, etc.)
 - **Provider Choice**: Deepgram (primary, best diarization) or Azure ConversationTranscriber (fallback)
 - **Real-Time Streaming**: ~100-300ms latency to Python endpoint
-- **Agent Integration**: FastAPI sink with async queue for LangGraph/custom agents
+- **Interview Analysis Agent**: OpenAI Agents SDK-based analyzer scores candidate responses
+- **External Deployment**: Python agent at `agent.qmachina.com` (separate from C# bot)
 
 ---
 
@@ -388,18 +389,100 @@ uv pip install -r requirements.txt
 uv run transcript_sink.py
 ```
 
-Runs FastAPI server on port 8765. Bot POSTs transcripts to `http://127.0.0.1:8765/transcript` (configurable via `TranscriptSink.PythonEndpoint`).
+Runs FastAPI server on `http://0.0.0.0:8765`. Target deployment: `https://agent.qmachina.com` (behind TLS proxy).
 
-### Integration
+### Endpoints
 
-Modify `python/transcript_sink.py` to connect your agent. The intended integration point is the background loop that already filters to final transcripts:
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/transcript` | POST | Receive transcript events (v1 and v2 format) |
+| `/session/start` | POST | Start interview session with candidate_name, meeting_url |
+| `/session/map-speaker` | POST | Map speaker_id to role (candidate/interviewer) |
+| `/session/status` | GET | Get current session info |
+| `/session/end` | POST | End session, finalize analysis |
+| `/health` | GET | Health check |
+| `/stats` | GET | Statistics |
+
+### Session Workflow
+
+```bash
+# 1. Start session before meeting
+curl -X POST http://localhost:8765/session/start \
+  -H "Content-Type: application/json" \
+  -d '{"candidate_name":"John Doe","meeting_url":"https://teams.microsoft.com/..."}'
+
+# 2. Map speakers as they are identified by diarization
+curl -X POST http://localhost:8765/session/map-speaker \
+  -H "Content-Type: application/json" \
+  -d '{"speaker_id":"speaker_0","role":"interviewer"}'
+
+curl -X POST http://localhost:8765/session/map-speaker \
+  -H "Content-Type: application/json" \
+  -d '{"speaker_id":"speaker_1","role":"candidate"}'
+
+# 3. Check session status
+curl http://localhost:8765/session/status
+
+# 4. End session after interview
+curl -X POST http://localhost:8765/session/end
+```
+
+### Agent Integration (OpenAI Agents SDK)
+
+The sink integrates with `interview_agent` package:
+- `interview_agent.models.TranscriptEvent` - v2 transcript format with diarization
+- `interview_agent.session.InterviewSessionManager` - session state management
+- `interview_agent.output.AnalysisOutputWriter` - analysis JSON output to `python/output/`
+- `interview_agent.agent.InterviewAnalyzer` - OpenAI Agents SDK interview analyzer
+
+**Real-time analysis is enabled via `interview_agent/agent.py`:**
 
 ```python
-if kind == "recognized" and text:
-    # Replace with your agent framework integration.
-    # Example: await agent.process(text)
-    pass
+from interview_agent import InterviewAnalyzer, create_interview_analyzer
+
+# Initialize analyzer (requires OPENAI_API_KEY env var)
+analyzer = create_interview_analyzer(model="gpt-4o", output_dir="./output")
+
+# Analyze a candidate response
+result = await analyzer.analyze_async(
+    response_text="I have 5 years of Python experience...",
+    context={"candidate_name": "John Doe", "conversation_history": [...]}
+)
+
+print(result.relevance_score)  # 0.85
+print(result.clarity_score)    # 0.90
+print(result.key_points)       # ["5 years experience", "Backend development"]
 ```
+
+**Environment Setup:**
+```bash
+export OPENAI_API_KEY="sk-..."
+```
+
+### Output
+
+- Transcripts: `~/Desktop/meeting_transcript.txt` (Windows VM)
+- Analysis JSON: `python/output/{session_id}_analysis.json`
+
+### Testing
+
+Run the test suite:
+
+```bash
+cd python
+uv run pytest tests/ -v
+```
+
+**Test Modules:**
+- `tests/mock_data.py` - Mock data generators for TranscriptEvent, AnalysisItem, interview conversations
+- `tests/test_interview.py` - Tests for InterviewSessionManager, AnalysisOutputWriter, models
+- `tests/test_sink.py` - FastAPI endpoint tests for transcript_sink.py
+
+**Mock Data Functions:**
+- `generate_session_start_event()` / `generate_session_stop_event()` - Session lifecycle events
+- `generate_transcript_event(speaker_id, text, event_type)` - Single transcript event
+- `generate_interview_conversation(candidate_name, num_exchanges)` - Full interview simulation
+- `generate_v2_event_dict()` / `generate_v1_event_dict()` - Raw JSON format matching C# bot output
 
 ---
 
@@ -511,8 +594,19 @@ teams-bot-poc/
 │       ├── CallHandler.cs
 │       └── HeartbeatHandler.cs
 ├── python/
-│   ├── transcript_sink.py
-│   └── requirements.txt
+│   ├── pyproject.toml              # uv project config
+│   ├── transcript_sink.py          # FastAPI transcript receiver
+│   ├── interview_agent/            # Interview analysis agent package
+│   │   ├── __init__.py             # Package exports (InterviewAnalyzer, etc.)
+│   │   ├── agent.py                # OpenAI Agents SDK interview analyzer
+│   │   ├── models.py               # Pydantic models (TranscriptEvent, AnalysisItem, etc.)
+│   │   ├── session.py              # InterviewSessionManager
+│   │   └── output.py               # AnalysisOutputWriter (JSON persistence)
+│   └── tests/                      # Test suite
+│       ├── __init__.py
+│       ├── mock_data.py            # Mock data generators for testing
+│       ├── test_interview.py       # InterviewSessionManager, AnalysisOutputWriter tests
+│       └── test_sink.py            # FastAPI endpoint tests
 ├── scripts/
 │   ├── deploy-azure-vm.sh
 │   ├── deploy-production.ps1
@@ -524,6 +618,40 @@ teams-bot-poc/
 │   └── outline.png
 └── README.md
 ```
+
+### Interview Analysis Agent
+
+The `interview_agent` package uses the OpenAI Agents SDK to analyze candidate responses in real-time.
+
+**Setup:**
+```bash
+cd python
+uv sync  # Install dependencies
+export OPENAI_API_KEY=sk-...
+```
+
+**Usage in transcript_sink:**
+```python
+from interview_agent import InterviewAnalyzer
+
+analyzer = InterviewAnalyzer(model="gpt-4o")
+result = await analyzer.analyze_async(
+    response_text="I have 5 years of Python experience...",
+    context={
+        "candidate_name": "John Smith",
+        "conversation_history": [
+            {"role": "interviewer", "text": "Tell me about your Python experience."}
+        ]
+    }
+)
+print(f"Relevance: {result.relevance_score}, Clarity: {result.clarity_score}")
+```
+
+**Analysis Output:**
+- `relevance_score` (0-1): How relevant the response is to the question
+- `clarity_score` (0-1): How clearly the response is articulated
+- `key_points`: Extracted key points from the response
+- `follow_up_suggestions`: Suggested follow-up questions
 
 ### Critical Configuration Notes
 

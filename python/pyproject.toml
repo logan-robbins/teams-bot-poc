@@ -1,0 +1,18 @@
+[project]
+name = "teams-bot-python"
+version = "0.1.0"
+description = "Python services for Teams Media Bot - transcript sink and interview analysis agent"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "httpx>=0.28.0",
+    "uvicorn[standard]>=0.32.0",
+    "openai-agents>=0.0.16",
+    "pydantic>=2.0.0",
+]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+]
