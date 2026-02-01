@@ -1,10 +1,19 @@
 # Teams Media Bot POC
 
-Teams calling bot that joins meetings, receives real-time audio, transcribes with Azure Speech, and streams transcripts to a Python service.
+Teams calling bot that joins meetings, receives real-time diarized audio transcription, and streams speaker-attributed transcripts to a Python agent endpoint.
 
 **Status:** Deployed and operational on Azure Windows VM  
 **Domain:** `teamsbot.qmachina.com` / `media.qmachina.com`  
 **VM:** `52.188.117.153` (Windows Server 2022, D4s_v3)
+
+**Implementation Guide:** See `PLAN.md` for step-by-step coding instructions (AI/LLM agent ready)
+
+## Key Features (v2)
+
+- **Diarized Transcription**: Identifies who is speaking (`speaker_0`, `speaker_1`, etc.)
+- **Provider Choice**: Deepgram (primary, best diarization) or Azure ConversationTranscriber (fallback)
+- **Real-Time Streaming**: ~100-300ms latency to Python endpoint
+- **Agent Integration**: FastAPI sink with async queue for LangGraph/custom agents
 
 ---
 
