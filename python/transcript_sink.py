@@ -374,9 +374,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Teams Transcript Sink",
+    title="Talestral Transcript Service",
     version="2.0.0",
-    description="Receives diarized transcripts and integrates with interview analysis agent",
+    description="Receives diarized transcripts from Talestral by Talestry and integrates with interview analysis agent",
     lifespan=lifespan,
 )
 
@@ -656,7 +656,7 @@ async def health():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "service": "Teams Transcript Sink",
+        "service": "Talestral Transcript Service",
         "version": "2.0.0",
         "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "agent_available": AGENT_AVAILABLE,
@@ -691,7 +691,7 @@ async def get_stats():
 
 if __name__ == "__main__":
     logger.info("=" * 60)
-    logger.info("Teams Transcript Sink v2")
+    logger.info("Talestral Transcript Service v2")
     logger.info("=" * 60)
     logger.info(f"Binding to: http://0.0.0.0:8765")
     logger.info(f"Target FQDN: https://agent.qmachina.com")

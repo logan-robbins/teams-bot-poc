@@ -1,5 +1,5 @@
 """
-Tests package for Teams Interview Bot Python services.
+Tests package for Talestral Python services.
 
 Last Grunted: 01/31/2026
 """

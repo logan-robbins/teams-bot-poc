@@ -6,7 +6,7 @@ using TeamsMediaBot.Models;
 namespace TeamsMediaBot.Services;
 
 /// <summary>
-/// Factory for creating AzureSpeechRealtimeTranscriber instances
+/// Factory for creating IRealtimeTranscriber instances (Deepgram or Azure ConversationTranscriber).
 /// This avoids DI disposal issues since the transcriber implements IAsyncDisposable
 /// and its lifetime is managed by CallHandler, not the DI container
 /// </summary>
@@ -31,29 +31,51 @@ public class TranscriberFactory
         var publisherLogger = _loggerFactory.CreateLogger<PythonTranscriptPublisher>();
         var publisher = new PythonTranscriptPublisher(_pythonEndpoint, publisherLogger);
         
-        var provider = (_stt.Provider ?? string.Empty).Trim();
+        var provider = (_stt.Provider ?? "Deepgram").Trim();
+
+        // PRIMARY: Deepgram (best diarization)
+        if (provider.Equals("Deepgram", StringComparison.OrdinalIgnoreCase))
+        {
+            var cfg = _stt.Deepgram ?? throw new InvalidOperationException(
+                "STT provider 'Deepgram' selected but Stt.Deepgram config is missing.");
+
+            var logger = _loggerFactory.CreateLogger<DeepgramRealtimeTranscriber>();
+            return new DeepgramRealtimeTranscriber(
+                cfg.ApiKey,
+                cfg.Model,
+                cfg.Diarize,
+                publisher,
+                logger);
+        }
+
+        // FALLBACK: Azure Speech ConversationTranscriber
         if (provider.Equals("AzureSpeech", StringComparison.OrdinalIgnoreCase) ||
             provider.Equals("Azure", StringComparison.OrdinalIgnoreCase))
         {
-            var azure = _stt.AzureSpeech ?? throw new InvalidOperationException("STT provider 'AzureSpeech' selected but Stt.AzureSpeech is missing.");
+            var cfg = _stt.AzureSpeech ?? throw new InvalidOperationException(
+                "STT provider 'AzureSpeech' selected but Stt.AzureSpeech config is missing.");
 
-            var transcriberLogger = _loggerFactory.CreateLogger<AzureSpeechRealtimeTranscriber>();
-            return new AzureSpeechRealtimeTranscriber(
-                azure.Key,
-                azure.Region,
-                azure.RecognitionLanguage,
-                azure.EndpointId,
+            var logger = _loggerFactory.CreateLogger<AzureConversationTranscriber>();
+            return new AzureConversationTranscriber(
+                cfg.Key,
+                cfg.Region,
+                cfg.RecognitionLanguage,
+                cfg.EndpointId,
                 publisher,
-                transcriberLogger);
+                logger);
         }
 
         throw new NotSupportedException(
-            $"STT provider '{provider}' is not supported yet. Update config Stt.Provider to 'AzureSpeech' or implement a new provider.");
+            $"STT provider '{provider}' is not supported. Use 'Deepgram' or 'AzureSpeech'.");
     }
 }
 
 /// <summary>
-/// Real-time speech transcription using Azure Speech SDK
+/// Real-time speech transcription using Azure Speech SDK (DEPRECATED - no diarization support).
+/// 
+/// NOTE: This class uses SpeechRecognizer which does NOT support diarization.
+/// Use AzureConversationTranscriber instead for speaker identification.
+/// 
 /// Implements streaming PCM audio → continuous recognition → transcript events
 /// Based on Part I (I3) and Part B (B2) of the validated guide
 /// Sources: S15 (audio streams), S16 (PCM format), S17-S18 (continuous recognition)
@@ -236,11 +258,37 @@ public sealed class AzureSpeechRealtimeTranscriber : IRealtimeTranscriber
     /// <summary>
     /// Fire-and-forget publish to Python (don't block audio thread)
     /// Also saves to desktop file for easy viewing
+    /// 
+    /// NOTE: This class is deprecated. Use AzureConversationTranscriber for diarization support.
     /// </summary>
     private void FireAndForget(string kind, string? text, string? details = null)
     {
         var timestamp = DateTime.UtcNow.ToString("O");
-        var evt = new TranscriptEvent(kind, text, timestamp, details);
+        
+        // Map old event types to new format
+        var eventType = kind switch
+        {
+            "recognizing" => "partial",
+            "recognized" => "final",
+            "session_started" => "session_started",
+            "session_stopped" => "session_stopped",
+            "canceled" => "error",
+            _ => kind
+        };
+        
+        EventError? error = null;
+        if (kind == "canceled" && !string.IsNullOrWhiteSpace(details))
+        {
+            error = new EventError("AZURE_SPEECH_ERROR", details);
+        }
+        
+        var evt = new TranscriptEvent(
+            EventType: eventType,
+            Text: text,
+            TimestampUtc: timestamp,
+            Metadata: new EventMetadata(Provider: "azure_speech", Model: null, SessionId: null),
+            Error: error
+        );
         
         // Publish to Python endpoint
         _ = Task.Run(() => _publisher.PublishAsync(evt));

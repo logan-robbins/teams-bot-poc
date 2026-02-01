@@ -22,7 +22,7 @@ Usage (run from the python/ directory):
         --candidate-name "Jane Smith" \
         --bot-endpoint "https://teamsbot.qmachina.com" \
         --sink-endpoint "https://agent.qmachina.com" \
-        --display-name "Interview Bot"
+        --display-name "Talestral by Talestry"
 
 Note: This script requires httpx which is installed in the python/ venv.
 """
@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 # Default endpoints
 DEFAULT_BOT_ENDPOINT = "https://teamsbot.qmachina.com"
 DEFAULT_SINK_ENDPOINT = "https://agent.qmachina.com"  # External FQDN for Python agent
-DEFAULT_DISPLAY_NAME = "Interview Bot"
+DEFAULT_DISPLAY_NAME = "Talestral by Talestry"
 
 # HTTP timeout settings
 HTTP_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
@@ -195,7 +195,7 @@ async def auto_join(
         True if all steps successful, False otherwise
     """
     logger.info("=" * 60)
-    logger.info("Teams Interview Bot - Auto Join")
+    logger.info("Talestral by Talestry - Auto Join")
     logger.info("=" * 60)
     logger.info(f"Timestamp: {datetime.utcnow().isoformat()}Z")
     logger.info(f"Meeting URL: {meeting_url[:80]}..." if len(meeting_url) > 80 else f"Meeting URL: {meeting_url}")

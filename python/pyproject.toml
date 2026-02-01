@@ -1,7 +1,7 @@
 [project]
 name = "teams-bot-python"
 version = "0.1.0"
-description = "Python services for Teams Media Bot - transcript sink and interview analysis agent"
+description = "Python services for Talestral by Talestry - transcript sink and interview analysis agent"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115.0",

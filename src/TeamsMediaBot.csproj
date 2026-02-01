@@ -35,6 +35,10 @@
     <!-- Azure Speech SDK for Transcription -->
     <PackageReference Include="Microsoft.CognitiveServices.Speech" Version="1.40.*" />
     
+    <!-- Deepgram SDK for Real-time Transcription -->
+    <!-- Note: API may need adjustment when tested on Windows - verify against latest Deepgram docs -->
+    <PackageReference Include="Deepgram" Version="6.6.1" />
+    
     <!-- ASP.NET Core for webhook endpoints -->
     <PackageReference Include="Microsoft.AspNetCore.Mvc.NewtonsoftJson" Version="8.0.*" />
     

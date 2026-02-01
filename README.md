@@ -1,12 +1,12 @@
-# Teams Media Bot POC
+# Talestral by Talestry
 
-Teams calling bot that joins meetings, receives real-time diarized audio transcription, and streams speaker-attributed transcripts to a Python agent endpoint.
+AI-powered meeting transcription bot that joins Teams meetings, provides real-time diarized audio transcription with speaker identification, and streams speaker-attributed transcripts to a Python agent endpoint for interview analysis.
 
 **Status:** Deployed and operational on Azure Windows VM  
 **Domain:** `teamsbot.qmachina.com` / `media.qmachina.com`  
 **VM:** `52.188.117.153` (Windows Server 2022, D4s_v3)
 
-**Implementation Guide:** See `PLAN.md` (Python: ✅ COMPLETE | C#: ⏳ PENDING)
+**Implementation Status:** ✅ COMPLETE (Python: ✅ | C#: ✅)
 
 ## Key Features (v2)
 
@@ -80,9 +80,10 @@ Teams calling bot that joins meetings, receives real-time diarized audio transcr
 │  │                     │                                          │     │
 │  │                     ↓                                          │     │
 │  │  ┌─────────────────────────────────────────────────────────┐  │     │
-│  │  │ AzureSpeechRealtimeTranscriber.cs                        │  │     │
-│  │  │  • Speech SDK continuous recognition                     │  │     │
-│  │  │  • Emits partial + final transcripts                     │  │     │
+│  │  │ TranscriberFactory → IRealtimeTranscriber                │  │     │
+│  │  │  • DeepgramRealtimeTranscriber (PRIMARY - best diarization)│ │     │
+│  │  │  • AzureConversationTranscriber (FALLBACK - enterprise) │  │     │
+│  │  │  • Emits diarized transcripts with speaker IDs           │  │     │
 │  │  └──────────────────┬──────────────────────────────────────┘  │     │
 │  │                     │                                          │     │
 │  │                     ↓                                          │     │
@@ -99,18 +100,18 @@ Teams calling bot that joins meetings, receives real-time diarized audio transcr
 │  │  • POST /transcript :8765                                      │     │
 │  └───────────────────────────────────────────────────────────────┘     │
 └────────────────────────────────────────────────────────────────────────┘
-                                                     wss:// (Speech SDK)
-                                             ┌────────────────────────────┐
-                                             │  Azure Speech Service       │
-                                             │  (speech-teams-bot-poc)     │
-                                             │  Region: eastus             │
-                                             └────────────────────────────┘
+                                                     wss:// (STT APIs)
+                        ┌────────────────────────────┐  ┌────────────────────────────┐
+                        │  Deepgram API (PRIMARY)     │  │  Azure Speech Service      │
+                        │  • Real-time diarization    │  │  (speech-teams-bot-poc)    │
+                        │  • Speaker IDs per word     │  │  Region: eastus            │
+                        └────────────────────────────┘  └────────────────────────────┘
 
 
 Current Trigger Method:
   curl -X POST https://teamsbot.qmachina.com/api/calling/join \
     -H "Content-Type: application/json" \
-    -d '{"joinUrl":"TEAMS_MEETING_URL","displayName":"Transcription Bot"}'
+    -d '{"joinUrl":"TEAMS_MEETING_URL","displayName":"Talestral by Talestry"}'
 ```
 
 ### Ingress / :443 forwarding (what the code expects)
@@ -122,11 +123,33 @@ Implementation-wise this can be IIS, nginx, Caddy, or any other layer that perfo
 ### STT provider/model selection (no fan-out)
 
 - **Source of truth**: the C# code creates **one transcriber per call** and pushes Teams PCM frames into it.
-- **Choosing provider**: STT selection is now config-driven via `Stt.Provider` (currently supports `AzureSpeech`; other providers can be added behind the same interface).
-- **Choosing model (Azure Speech)**: you can select a specific Custom Speech model by setting an **EndpointId** in `Stt.AzureSpeech.EndpointId` (optional).
+- **Choosing provider**: STT selection is config-driven via `Stt.Provider` (supports `Deepgram` or `AzureSpeech`).
+- **Deepgram (recommended)**: Best-in-class diarization with speaker IDs on every word. Model selection via `Stt.Deepgram.Model` (default: "nova-3").
+- **Azure ConversationTranscriber (fallback)**: Enterprise-grade with real-time diarization. Supports Custom Speech models via `Stt.AzureSpeech.EndpointId` (optional).
 - **No fan-out**: the bot does **not** stream the same audio to multiple STT providers/models.
 
-Example (Azure Speech with optional Custom Speech model):
+Example configuration (Deepgram as primary):
+
+```json
+{
+  "Stt": {
+    "Provider": "Deepgram",
+    "Deepgram": {
+      "ApiKey": "YOUR_DEEPGRAM_API_KEY",
+      "Model": "nova-3",
+      "Diarize": true
+    },
+    "AzureSpeech": {
+      "Key": "YOUR_SPEECH_KEY",
+      "Region": "eastus",
+      "RecognitionLanguage": "en-US",
+      "EndpointId": null
+    }
+  }
+}
+```
+
+Example configuration (Azure Speech as fallback):
 
 ```json
 {
@@ -256,7 +279,18 @@ Update `C:\teams-bot-poc\src\Config\appsettings.json`:
     "LocalHttpListenPort": 9443
   },
   "Stt": {
-    "Provider": "AzureSpeech"
+    "Provider": "Deepgram",
+    "Deepgram": {
+      "ApiKey": "YOUR_DEEPGRAM_API_KEY",
+      "Model": "nova-3",
+      "Diarize": true
+    },
+    "AzureSpeech": {
+      "Key": "YOUR_AZURE_SPEECH_KEY",
+      "Region": "eastus",
+      "RecognitionLanguage": "en-US",
+      "EndpointId": null
+    }
   },
   "MediaPlatformSettings": {
     "ApplicationId": "YOUR_APP_ID",
@@ -265,11 +299,6 @@ Update `C:\teams-bot-poc\src\Config\appsettings.json`:
     "InstancePublicPort": 8445,
     "ServiceFqdn": "media.yourdomain.com",
     "InstancePublicIPAddress": "0.0.0.0"
-  },
-  "Speech": {
-    "Key": "YOUR_SPEECH_KEY",
-    "Region": "eastus",
-    "RecognitionLanguage": "en-US"
   },
   "TranscriptSink": {
     "PythonEndpoint": "http://127.0.0.1:8765/transcript"
@@ -347,14 +376,14 @@ zip -r teams-bot-poc.zip manifest.json color.png outline.png
 curl https://teamsbot.yourdomain.com/api/calling/health
 ```
 
-Expected: `{"Status":"Healthy","Timestamp":"...","Service":"Teams Media Bot POC"}`
+Expected: `{"Status":"Healthy","Timestamp":"...","Service":"Talestral by Talestry"}`
 
 ### Join Meeting
 
 ```bash
 curl -X POST https://teamsbot.yourdomain.com/api/calling/join \
   -H "Content-Type: application/json" \
-  -d '{"joinUrl":"TEAMS_MEETING_JOIN_URL","displayName":"Transcription Bot"}'
+  -d '{"joinUrl":"TEAMS_MEETING_JOIN_URL","displayName":"Talestral by Talestry"}'
 ```
 
 Bot should join within 5-10 seconds.
@@ -565,14 +594,17 @@ Teams Meeting
 
 **Key Components:**
 - `TeamsCallingBotService.cs` - Handles Teams Graph calls
-- `AzureSpeechRealtimeTranscriber.cs` - Real-time speech-to-text
-- `PythonTranscriptPublisher.cs` - HTTP POST to Python service
+- `TranscriberFactory.cs` - Creates provider-specific transcribers
+- `DeepgramRealtimeTranscriber.cs` - Primary STT provider (best diarization)
+- `AzureConversationTranscriber.cs` - Fallback STT provider (enterprise-grade diarization)
+- `PythonTranscriptPublisher.cs` - HTTP POST to Python service (snake_case JSON)
 - `CallingController.cs` - Webhook endpoints
 
 **Dependencies:**
 - `Microsoft.Skype.Bots.Media` 1.31.0.225-preview (Windows Server 2022 compatible)
 - `Microsoft.Graph.Communications.*` 1.2.0.15690
-- Azure Speech SDK 1.40.*
+- Azure Speech SDK 1.40.* (for ConversationTranscriber)
+- Deepgram SDK 3.0.0 (for primary transcription)
 
 ---
 
@@ -587,9 +619,15 @@ teams-bot-poc/
 │   ├── Program.cs
 │   ├── Config/appsettings.json
 │   ├── Controllers/CallingController.cs
+│   ├── Models/
+│   │   ├── TranscriptEvent.cs (v2 with diarization support)
+│   │   └── BotConfiguration.cs
 │   └── Services/
 │       ├── TeamsCallingBotService.cs
-│       ├── AzureSpeechRealtimeTranscriber.cs
+│       ├── TranscriberFactory.cs
+│       ├── DeepgramRealtimeTranscriber.cs (PRIMARY)
+│       ├── AzureConversationTranscriber.cs (FALLBACK)
+│       ├── AzureSpeechRealtimeTranscriber.cs (DEPRECATED - no diarization)
 │       ├── PythonTranscriptPublisher.cs
 │       ├── CallHandler.cs
 │       └── HeartbeatHandler.cs

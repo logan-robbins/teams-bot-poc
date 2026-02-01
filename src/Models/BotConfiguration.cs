@@ -43,27 +43,29 @@ public class SpeechConfiguration
 /// </summary>
 public class SttConfiguration
 {
-    /// <summary>
-    /// Provider name (e.g. "AzureSpeech").
-    /// </summary>
-    public required string Provider { get; set; }
-
-    /// <summary>
-    /// Azure Speech provider settings (used when Provider == "AzureSpeech").
-    /// </summary>
-    public AzureSpeechProviderConfiguration? AzureSpeech { get; set; }
+    /// <summary>"Deepgram" (recommended) or "AzureSpeech"</summary>
+    public string Provider { get; set; } = "Deepgram";
+    
+    public DeepgramConfiguration? Deepgram { get; set; }
+    public AzureSpeechConfiguration? AzureSpeech { get; set; }
 }
 
-public class AzureSpeechProviderConfiguration
+public class DeepgramConfiguration
+{
+    public required string ApiKey { get; set; }
+    
+    /// <summary>Model to use. Recommended: "nova-3" (2025/2026)</summary>
+    public string Model { get; set; } = "nova-3";
+    
+    /// <summary>Enable speaker diarization. MUST be true for this use case.</summary>
+    public bool Diarize { get; set; } = true;
+}
+
+public class AzureSpeechConfiguration
 {
     public required string Key { get; set; }
     public required string Region { get; set; }
-    public required string RecognitionLanguage { get; set; }
-
-    /// <summary>
-    /// Optional Custom Speech model endpoint ID (model selection).
-    /// If set, Speech SDK will target this custom model.
-    /// </summary>
+    public string RecognitionLanguage { get; set; } = "en-US";
     public string? EndpointId { get; set; }
 }
 
