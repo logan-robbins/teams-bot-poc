@@ -1,8 +1,24 @@
 # IMPLEMENTATION GUIDE: Teams Meeting → Diarized Transcription → Python Agent
 
-**Version**: 2.0 (2026-01-31)  
-**Status**: Ready for AI/LLM Coding Agent Implementation  
+**Version**: 2.1 (2026-02-01)  
+**Status**: Python COMPLETE ✅ | C# PENDING (requires Windows/.NET)  
 **Documentation Sources**: All implementations MUST use 2025/2026 documentation only
+
+---
+
+## IMPLEMENTATION STATUS
+
+| Step | Component | Status | Notes |
+|------|-----------|--------|-------|
+| 7 | Python Transcript Sink | ✅ COMPLETE | Exceeds spec with session mgmt, agent integration |
+| 10 | Python requirements.txt | ✅ COMPLETE | Using pyproject.toml with proper deps |
+| 1-6 | C# Bot Code | ⏳ PENDING | Requires Windows/.NET environment |
+| 8-9 | C# Configuration | ⏳ PENDING | Requires Windows/.NET environment |
+
+**Python Validation (2026-02-01):**
+- 67/67 tests pass
+- End-to-end simulation successful
+- Agent gracefully degrades without OPENAI_API_KEY
 
 ---
 
@@ -839,226 +855,23 @@ public class PythonTranscriptPublisher
 
 ---
 
-### STEP 7: Update Python Transcript Sink
+### ~~STEP 7: Update Python Transcript Sink~~ ✅ COMPLETE
 
-**File**: `python/transcript_sink.py`
+**Status**: IMPLEMENTED and TESTED (2026-02-01)
 
-Replace with diarization-aware version:
+The Python transcript sink at `python/transcript_sink.py` **exceeds** the original specification:
+- Session management endpoints (`/session/start`, `/session/end`, `/session/map-speaker`)
+- v1/v2 format normalization (backward compatible with legacy C# bot format)
+- Interview agent integration (`interview_agent/` package)
+- Comprehensive test suite (67 tests pass)
+- File-based transcript persistence
 
-```python
-"""
-Python Transcript Receiver with Diarization Support
-
-Receives real-time diarized transcript events from C# bot.
-Filters to final events with speaker IDs for agent processing.
-
-Last Grunted: 01/31/2026 12:00:00 PM PST
-"""
-from fastapi import FastAPI, Request
-from pydantic import BaseModel
-from typing import Optional, List
-import uvicorn
-import asyncio
-from datetime import datetime
-import logging
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-app = FastAPI(title="Teams Transcript Sink", version="2.0.0")
-
-
-class WordDetail(BaseModel):
-    word: str
-    start_ms: float
-    end_ms: float
-    confidence: Optional[float] = None
-    speaker_id: Optional[str] = None
-
-
-class EventMetadata(BaseModel):
-    provider: str
-    model: Optional[str] = None
-    session_id: Optional[str] = None
-
-
-class EventError(BaseModel):
-    code: str
-    message: str
-
-
-class TranscriptEvent(BaseModel):
-    """Provider-agnostic transcript event with diarization support."""
-    event_type: str  # "partial" | "final" | "session_started" | "session_stopped" | "error"
-    text: Optional[str] = None
-    timestamp_utc: str
-    speaker_id: Optional[str] = None  # "speaker_0", "speaker_1", etc.
-    audio_start_ms: Optional[float] = None
-    audio_end_ms: Optional[float] = None
-    confidence: Optional[float] = None
-    words: Optional[List[WordDetail]] = None
-    metadata: Optional[EventMetadata] = None
-    error: Optional[EventError] = None
-
-
-# Async queue for agent consumption
-transcript_queue: asyncio.Queue[TranscriptEvent] = asyncio.Queue()
-
-# Stats tracking
-stats = {
-    "events_received": 0,
-    "partial_transcripts": 0,
-    "final_transcripts": 0,
-    "speakers_detected": set(),
-    "errors": 0,
-    "sessions": 0,
-    "started_at": datetime.utcnow().isoformat()
-}
-
-
-@app.post("/transcript")
-async def receive_transcript(evt: TranscriptEvent):
-    """
-    Receive transcript events from C# bot.
-    
-    Event format (v2 with diarization):
-    {
-        "event_type": "final",
-        "text": "Hello everyone",
-        "timestamp_utc": "2026-01-31T12:34:56.789Z",
-        "speaker_id": "speaker_0",
-        "audio_start_ms": 1000.0,
-        "audio_end_ms": 2500.0,
-        "confidence": 0.95,
-        "metadata": {"provider": "deepgram", "model": "nova-3"}
-    }
-    """
-    stats["events_received"] += 1
-    
-    if evt.event_type == "partial":
-        stats["partial_transcripts"] += 1
-        if evt.speaker_id:
-            logger.debug(f"[PARTIAL] {evt.speaker_id}: {evt.text}")
-        else:
-            logger.debug(f"[PARTIAL] {evt.text}")
-            
-    elif evt.event_type == "final":
-        stats["final_transcripts"] += 1
-        if evt.speaker_id:
-            stats["speakers_detected"].add(evt.speaker_id)
-            logger.info(f"[FINAL] {evt.speaker_id}: {evt.text}")
-        else:
-            logger.info(f"[FINAL] (no speaker): {evt.text}")
-        
-        # Push to agent queue for processing
-        await transcript_queue.put(evt)
-        
-    elif evt.event_type == "session_started":
-        stats["sessions"] += 1
-        stats["speakers_detected"] = set()  # Reset for new session
-        logger.info(f"Session started (provider: {evt.metadata.provider if evt.metadata else 'unknown'})")
-        
-    elif evt.event_type == "session_stopped":
-        logger.info(f"Session stopped. Speakers detected: {stats['speakers_detected']}")
-        
-    elif evt.event_type == "error":
-        stats["errors"] += 1
-        logger.error(f"Transcription error: {evt.error}")
-    
-    return {"ok": True, "received_at": datetime.utcnow().isoformat()}
-
-
-@app.get("/health")
-async def health():
-    return {
-        "status": "healthy",
-        "service": "Teams Transcript Sink v2",
-        "timestamp": datetime.utcnow().isoformat()
-    }
-
-
-@app.get("/stats")
-async def get_stats():
-    return {
-        "stats": {
-            **stats,
-            "speakers_detected": list(stats["speakers_detected"])
-        },
-        "queue_size": transcript_queue.qsize()
-    }
-
-
-async def agent_processing_loop():
-    """
-    Background task that processes FINAL transcript events with speaker IDs.
-    
-    This is the integration point for your agentic framework.
-    Only final transcripts (not partial) are processed to reduce noise.
-    
-    Example integrations:
-    - LangGraph agent with speaker context
-    - Custom agent with speaker-aware memory
-    - Real-time meeting summarizer
-    """
-    logger.info("Agent processing loop started")
-    
-    while True:
-        try:
-            evt: TranscriptEvent = await transcript_queue.get()
-            
-            # Only process final transcripts with text
-            if evt.event_type == "final" and evt.text:
-                speaker = evt.speaker_id or "unknown"
-                text = evt.text
-                
-                logger.info(f"AGENT_INPUT | {speaker}: {text}")
-                
-                # ============================================
-                # YOUR AGENT INTEGRATION HERE
-                # ============================================
-                # Examples:
-                #
-                # 1. LangGraph with speaker context:
-                # await agent.invoke({
-                #     "speaker": speaker,
-                #     "message": text,
-                #     "timestamp": evt.timestamp_utc
-                # })
-                #
-                # 2. Custom agent with memory:
-                # await agent.process(speaker, text)
-                #
-                # 3. Forward to MCP server:
-                # await mcp_client.send_transcript(speaker, text)
-                #
-                # 4. Store in vector DB with speaker metadata:
-                # await vectordb.add(text, metadata={"speaker": speaker})
-                # ============================================
-                
-                pass
-                
-        except Exception as e:
-            logger.error(f"Error in agent processing loop: {e}", exc_info=True)
-            await asyncio.sleep(1)
-
-
-@app.on_event("startup")
-async def startup_event():
-    """Start background agent processing loop."""
-    asyncio.create_task(agent_processing_loop())
-
-
-if __name__ == "__main__":
-    logger.info("Starting Teams Transcript Sink v2 on http://0.0.0.0:8765")
-    logger.info("Endpoints:")
-    logger.info("  POST /transcript - Receive transcript events")
-    logger.info("  GET  /health    - Health check")
-    logger.info("  GET  /stats     - Statistics")
-    
-    uvicorn.run(app, host="0.0.0.0", port=8765, log_level="info")
+**To test locally:**
+```bash
+cd python
+uv sync
+uv run pytest tests/ -v  # Run tests
+uv run python transcript_sink.py  # Start server
 ```
 
 ---
@@ -1117,14 +930,25 @@ dotnet add package Deepgram
 
 ---
 
-### STEP 10: Update requirements.txt
+### ~~STEP 10: Update requirements.txt~~ ✅ COMPLETE
 
-**File**: `python/requirements.txt`
+**Status**: IMPLEMENTED via `pyproject.toml` (better than requirements.txt)
 
-```
-fastapi>=0.109.0
-uvicorn>=0.27.0
-pydantic>=2.5.0
+Current dependencies in `python/pyproject.toml`:
+```toml
+dependencies = [
+    "fastapi>=0.115.0",
+    "httpx>=0.28.0",
+    "uvicorn[standard]>=0.32.0",
+    "openai-agents>=0.0.16",
+    "pydantic>=2.0.0",
+]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+]
 ```
 
 ---
@@ -1133,16 +957,19 @@ pydantic>=2.5.0
 
 After implementation, verify:
 
-### C# Bot
+### C# Bot (Requires Windows/.NET)
 - [ ] `dotnet build --configuration Release` succeeds
 - [ ] No linter errors in new files
 - [ ] TranscriptEvent serializes to snake_case JSON
 
-### Python Sink
-- [ ] `uv run transcript_sink.py` starts without errors
-- [ ] Health check returns 200: `curl http://127.0.0.1:8765/health`
+### Python Sink ✅ VERIFIED (2026-02-01)
+- [x] `uv run transcript_sink.py` starts without errors
+- [x] Health check returns 200: `curl http://127.0.0.1:8765/health`
+- [x] 67/67 unit tests pass: `uv run pytest tests/ -v`
+- [x] Session management works (start/map-speaker/end)
+- [x] Agent integration works (graceful degradation without API key)
 
-### End-to-End
+### End-to-End (Requires deployed C# bot + Teams meeting)
 - [ ] Join a test meeting with bot
 - [ ] Verify speaker IDs appear in Python logs: `[FINAL] speaker_0: Hello`
 - [ ] Verify stats show multiple speakers: `curl http://127.0.0.1:8765/stats`
@@ -1194,17 +1021,17 @@ curl http://127.0.0.1:8765/stats
 
 ## FILE CHANGES SUMMARY
 
-| Action | File | Description |
-|--------|------|-------------|
-| REPLACE | `src/Models/TranscriptEvent.cs` | Add diarization fields |
-| CREATE | `src/Services/DeepgramRealtimeTranscriber.cs` | Primary STT provider |
-| CREATE | `src/Services/AzureConversationTranscriber.cs` | Fallback STT (replaces old SpeechRecognizer approach) |
-| UPDATE | `src/Models/BotConfiguration.cs` | Add Deepgram config section |
-| UPDATE | `src/Services/AzureSpeechRealtimeTranscriber.cs` | Update TranscriberFactory only |
-| UPDATE | `src/Services/PythonTranscriptPublisher.cs` | Snake_case JSON serialization |
-| REPLACE | `python/transcript_sink.py` | Diarization-aware receiver |
-| UPDATE | `src/Config/appsettings.json` | Add Deepgram config |
-| UPDATE | `python/requirements.txt` | Add pydantic |
+| Action | File | Description | Status |
+|--------|------|-------------|--------|
+| REPLACE | `src/Models/TranscriptEvent.cs` | Add diarization fields | ⏳ PENDING |
+| CREATE | `src/Services/DeepgramRealtimeTranscriber.cs` | Primary STT provider | ⏳ PENDING |
+| CREATE | `src/Services/AzureConversationTranscriber.cs` | Fallback STT (replaces old SpeechRecognizer approach) | ⏳ PENDING |
+| UPDATE | `src/Models/BotConfiguration.cs` | Add Deepgram config section | ⏳ PENDING |
+| UPDATE | `src/Services/AzureSpeechRealtimeTranscriber.cs` | Update TranscriberFactory only | ⏳ PENDING |
+| UPDATE | `src/Services/PythonTranscriptPublisher.cs` | Snake_case JSON serialization | ⏳ PENDING |
+| REPLACE | `python/transcript_sink.py` | Diarization-aware receiver | ✅ COMPLETE |
+| UPDATE | `src/Config/appsettings.json` | Add Deepgram config | ⏳ PENDING |
+| UPDATE | `python/pyproject.toml` | Dependencies (replaced requirements.txt) | ✅ COMPLETE |
 
 ---
 

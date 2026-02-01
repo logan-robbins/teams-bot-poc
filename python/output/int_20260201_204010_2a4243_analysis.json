@@ -1,0 +1,100 @@
+{
+  "session_id": "int_20260201_204010_2a4243",
+  "candidate_name": "Sarah Chen",
+  "started_at": "2026-02-01T20:40:10.559553+00:00Z",
+  "ended_at": "2026-02-01T20:40:40.708586Z",
+  "analysis_items": [
+    {
+      "response_id": "resp_3bbd0a8e",
+      "timestamp_utc": "2026-02-01T20:40:24.327847Z",
+      "question_text": "How are you doing today?",
+      "response_text": "Good morning David! I'm doing great, thank you for asking. I'm really excited about this opportunity and looking forward to our conversation.",
+      "speaker_id": "speaker_1",
+      "relevance_score": 1.0,
+      "clarity_score": 1.0,
+      "key_points": [
+        "Polite, concise greeting directly answering the question",
+        "Expresses enthusiasm for the opportunity and conversation",
+        "Professional tone and positive demeanor"
+      ],
+      "follow_up_suggestions": [
+        "Great—could you give a brief overview of your background and the key experiences most relevant to this role?",
+        "What specifically about this opportunity or our team excites you?"
+      ],
+      "raw_model_output": {
+        "reasoning": "The response directly and clearly addresses the greeting question and adds enthusiasm about the opportunity. While appropriate for an opener, it contains no substantive technical or experiential detail yet.",
+        "model": "gpt-5",
+        "running_assessment": {
+          "technical_competence": "Not yet demonstrated",
+          "communication": "Strong",
+          "problem_solving": "Not yet demonstrated",
+          "culture_fit": "Preliminary positive (enthusiastic, professional)",
+          "overall_signal": "Too early to tell",
+          "key_strengths": [
+            "Clear and professional communication",
+            "Positive, enthusiastic tone"
+          ],
+          "areas_of_concern": [
+            "No evidence of technical or problem-solving ability yet (expected at this stage)"
+          ],
+          "responses_analyzed": 1,
+          "avg_relevance": 1.0,
+          "avg_clarity": 1.0
+        }
+      }
+    },
+    {
+      "response_id": "resp_35414005",
+      "timestamp_utc": "2026-02-01T20:40:47.938022Z",
+      "question_text": "Can you walk me through your experience with Python and tell me about a project you're particularly proud of?",
+      "response_text": "Absolutely. I've been working with Python for about six years now, primarily in backend development. The project I'm most proud of is a real-time data pipeline I built at my current company. We were processing clickstream data from our e-commerce platform, handling about 50,000 events per second. I designed the architecture using Apache Kafka for ingestion and built custom consumers in Python with asyncio. The system reduced our data latency from hours to under 30 seconds.",
+      "speaker_id": "speaker_1",
+      "relevance_score": 0.98,
+      "clarity_score": 0.94,
+      "key_points": [
+        "6 years of Python experience focused on backend development",
+        "Built a real-time clickstream data pipeline handling ~50,000 events/second",
+        "Architecture used Apache Kafka for ingestion and Python asyncio consumers",
+        "Reduced latency from hours to under 30 seconds"
+      ],
+      "follow_up_suggestions": [
+        "What were your specific responsibilities versus the rest of the team on this pipeline, and which components did you personally design/implement?",
+        "How did you handle backpressure, ordering, and throughput in the asyncio consumers, and why choose asyncio over multiprocessing or a JVM-based consumer?"
+      ],
+      "raw_model_output": {
+        "reasoning": "Direct, concise answer that fully addresses Python experience and a flagship project with concrete scale and outcome metrics. Clear architecture and impact statements support high relevance and clarity scores.",
+        "model": "gpt-5",
+        "running_assessment": {
+          "technical_competence": "Strong",
+          "communication": "Strong",
+          "problem_solving": "Strong",
+          "culture_fit": "Strong",
+          "overall_signal": "Lean hire",
+          "key_strengths": [
+            "Real-time systems experience at significant scale (50k events/sec)",
+            "Reliability patterns (idempotency, dedup with Redis, DLQs, retries) and strong observability (Prometheus, PagerDuty)",
+            "System design breadth (WebSockets, message brokers, CRDT/OT tradeoffs)",
+            "Structured incident response and clear stakeholder communication"
+          ],
+          "areas_of_concern": [
+            "CRDT choice and implementation details not yet demonstrated (e.g., specific data types, conflict resolution, performance tradeoffs)",
+            "Operational nuances of Redis-based deduplication (memory/TTL strategy, windowing) not covered",
+            "Exactly-once/ordering guarantees and schema evolution approach not yet discussed",
+            "Depth in testing philosophy and code quality practices not yet demonstrated"
+          ],
+          "responses_analyzed": 2,
+          "avg_relevance": 0.99,
+          "avg_clarity": 0.97
+        }
+      }
+    }
+  ],
+  "overall_relevance": 0.99,
+  "overall_clarity": 0.97,
+  "total_responses_analyzed": 2,
+  "_meta": {
+    "written_at": "2026-02-01T20:40:40.709288Z",
+    "version": "1.0",
+    "last_updated_at": "2026-02-01T20:40:47.938346Z"
+  }
+}

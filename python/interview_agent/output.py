@@ -8,7 +8,7 @@ Last Grunted: 01/31/2026
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -84,7 +84,7 @@ class AnalysisOutputWriter:
         # Convert to dict and add metadata
         data = analysis.model_dump()
         data["_meta"] = {
-            "written_at": datetime.utcnow().isoformat() + "Z",
+            "written_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "version": "1.0",
         }
         
@@ -128,14 +128,14 @@ class AnalysisOutputWriter:
             data = {
                 "session_id": session_id,
                 "candidate_name": "Unknown",
-                "started_at": datetime.utcnow().isoformat() + "Z",
+                "started_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "ended_at": None,
                 "analysis_items": [],
                 "overall_relevance": None,
                 "overall_clarity": None,
                 "total_responses_analyzed": 0,
                 "_meta": {
-                    "created_at": datetime.utcnow().isoformat() + "Z",
+                    "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                     "version": "1.0",
                 },
             }
@@ -151,7 +151,7 @@ class AnalysisOutputWriter:
             data["overall_clarity"] = sum(i["clarity_score"] for i in items) / len(items)
         
         # Update metadata
-        data["_meta"]["last_updated_at"] = datetime.utcnow().isoformat() + "Z"
+        data["_meta"]["last_updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)

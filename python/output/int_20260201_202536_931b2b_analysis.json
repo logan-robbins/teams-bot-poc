@@ -1,0 +1,47 @@
+{
+  "session_id": "int_20260201_202536_931b2b",
+  "candidate_name": "Alex Johnson",
+  "started_at": "2026-02-01T20:25:36.647133Z",
+  "ended_at": "2026-02-01T20:26:07.287447Z",
+  "analysis_items": [
+    {
+      "response_id": "resp_9a4a2c2d",
+      "timestamp_utc": "2026-02-01T20:25:47.834516Z",
+      "question_text": null,
+      "response_text": "I have 5 years of Python experience primarily in backend development. Most recently I built a real-time analytics pipeline using FastAPI and Apache Kafka that processes over 2 million events per day.",
+      "speaker_id": null,
+      "relevance_score": 0.5,
+      "clarity_score": 0.5,
+      "key_points": [
+        "Analysis failed - manual review required"
+      ],
+      "follow_up_suggestions": [],
+      "raw_model_output": {
+        "error": "The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable"
+      }
+    },
+    {
+      "response_id": "resp_f7757fec",
+      "timestamp_utc": "2026-02-01T20:25:51.687165Z",
+      "question_text": null,
+      "response_text": "When debugging distributed systems I start by establishing a timeline of events across services using distributed tracing. I check logs from each service looking for correlation IDs. Most issues stem from network partitions or clock drift so I verify those early.",
+      "speaker_id": null,
+      "relevance_score": 0.5,
+      "clarity_score": 0.5,
+      "key_points": [
+        "Analysis failed - manual review required"
+      ],
+      "follow_up_suggestions": [],
+      "raw_model_output": {
+        "error": "The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable"
+      }
+    }
+  ],
+  "overall_relevance": 0.5,
+  "overall_clarity": 0.5,
+  "total_responses_analyzed": 2,
+  "_meta": {
+    "written_at": "2026-02-01T20:26:07.287603Z",
+    "version": "1.0"
+  }
+}

@@ -6,7 +6,7 @@ Teams calling bot that joins meetings, receives real-time diarized audio transcr
 **Domain:** `teamsbot.qmachina.com` / `media.qmachina.com`  
 **VM:** `52.188.117.153` (Windows Server 2022, D4s_v3)
 
-**Implementation Guide:** See `PLAN.md` for step-by-step coding instructions (AI/LLM agent ready)
+**Implementation Guide:** See `PLAN.md` (Python: ✅ COMPLETE | C#: ⏳ PENDING)
 
 ## Key Features (v2)
 

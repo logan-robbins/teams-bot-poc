@@ -8,7 +8,7 @@ Last Grunted: 01/31/2026
 """
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from .models import (
@@ -76,7 +76,7 @@ class InterviewSessionManager:
             self.end_session()
         
         # Generate session ID with timestamp and random suffix
-        timestamp = datetime.utcnow()
+        timestamp = datetime.now(timezone.utc)
         session_id = f"int_{timestamp.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
         
         self._session = InterviewSession(
@@ -101,7 +101,7 @@ class InterviewSessionManager:
         if self._session is None:
             return None
         
-        self._session.ended_at = datetime.utcnow().isoformat() + "Z"
+        self._session.ended_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         ended_session = self._session
         # Don't clear _session yet - allow retrieval of ended session data
         return ended_session

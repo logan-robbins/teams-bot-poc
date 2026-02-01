@@ -8,7 +8,7 @@ Last Grunted: 01/31/2026
 """
 
 import random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from interview_agent.models import (
@@ -77,7 +77,7 @@ FOLLOW_UP_QUESTIONS = [
 
 def _iso_timestamp(offset_seconds: float = 0) -> str:
     """Generate ISO 8601 UTC timestamp with optional offset."""
-    ts = datetime.utcnow() + timedelta(seconds=offset_seconds)
+    ts = datetime.now(timezone.utc) + timedelta(seconds=offset_seconds)
     return ts.strftime("%Y-%m-%dT%H:%M:%S.") + f"{ts.microsecond:06d}"[:3] + "Z"
 
 
@@ -408,7 +408,7 @@ def generate_session_analysis(
         SessionAnalysis with computed overall scores.
     """
     if session_id is None:
-        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         session_id = f"int_{ts}_{random.randint(1000, 9999):04x}"
     
     started_at = _iso_timestamp(-3600)  # 1 hour ago

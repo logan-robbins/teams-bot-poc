@@ -21,7 +21,7 @@ from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 import uvicorn
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 from contextlib import asynccontextmanager
 import logging
@@ -66,16 +66,19 @@ TRANSCRIPT_FILE = DESKTOP_PATH / "meeting_transcript.txt"
 
 
 # =============================================================================
-# Try to import InterviewAnalyzer (graceful if unavailable)
+# Try to import InterviewAnalyzer and Pub/Sub (graceful if unavailable)
 # =============================================================================
 
 try:
     from interview_agent.agent import InterviewAnalyzer
+    from interview_agent.pubsub import get_publisher, ThoughtType
     AGENT_AVAILABLE = True
-    logger.info("InterviewAnalyzer loaded successfully")
+    logger.info("InterviewAnalyzer loaded successfully (using GPT-5)")
 except ImportError as e:
     AGENT_AVAILABLE = False
     InterviewAnalyzer = None  # type: ignore
+    get_publisher = None  # type: ignore
+    ThoughtType = None  # type: ignore
     logger.warning(
         f"interview_agent.agent module not available: {e}. "
         "Agent analysis features disabled. Ensure openai-agents is installed and OPENAI_API_KEY is set."
@@ -148,7 +151,7 @@ stats = {
     "v1_events": 0,
     "v2_events": 0,
     "agent_analyses": 0,
-    "started_at": datetime.utcnow().isoformat() + "Z",
+    "started_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
 }
 
 # Background task handle
@@ -196,7 +199,7 @@ def normalize_v1_to_v2(payload: Dict[str, Any]) -> Dict[str, Any]:
         v2_payload = {
             "event_type": event_type_map.get(kind.lower(), kind.lower()),
             "text": payload.get("Text") or payload.get("text"),
-            "timestamp_utc": payload.get("TsUtc") or payload.get("tsUtc") or datetime.utcnow().isoformat() + "Z",
+            "timestamp_utc": payload.get("TsUtc") or payload.get("tsUtc") or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
 
         # Handle error details
@@ -248,15 +251,20 @@ async def agent_processing_loop() -> None:
     Only processes:
     - "final" transcript events
     - From speakers mapped as "candidate"
+    
+    Publishes real-time thoughts to the pub-sub system for Streamlit UI.
     """
     logger.info("Agent processing loop started")
 
     # Initialize analyzer if available
     analyzer = None
+    publisher = None
+    
     if AGENT_AVAILABLE and InterviewAnalyzer:
         try:
-            analyzer = InterviewAnalyzer()
-            logger.info("InterviewAnalyzer initialized")
+            analyzer = InterviewAnalyzer(publish_thoughts=True)
+            publisher = get_publisher() if get_publisher else None
+            logger.info("InterviewAnalyzer initialized with GPT-5 and real-time publishing")
         except Exception as e:
             logger.error(f"Failed to initialize InterviewAnalyzer: {e}")
 
@@ -292,7 +300,7 @@ async def agent_processing_loop() -> None:
                         "conversation_history": conversation_history,
                     }
 
-                    # Run analysis (returns AnalysisItem)
+                    # Run analysis (returns AnalysisItem, publishes to pub-sub automatically)
                     analysis_item = await analyzer.analyze_async(
                         response_text=event.text,
                         context=analysis_context,
@@ -310,12 +318,15 @@ async def agent_processing_loop() -> None:
                         )
 
                     logger.info(
-                        f"Analysis complete: relevance={analysis_item.relevance_score:.2f}, "
+                        f"Analysis #{response_counter} complete: "
+                        f"relevance={analysis_item.relevance_score:.2f}, "
                         f"clarity={analysis_item.clarity_score:.2f}"
                     )
 
                 except Exception as e:
                     logger.error(f"Agent analysis failed: {e}", exc_info=True)
+                    if publisher:
+                        await publisher.publish_error(f"Analysis failed: {str(e)}")
             else:
                 if not AGENT_AVAILABLE:
                     logger.debug("Skipping analysis - agent not available")
@@ -455,7 +466,7 @@ async def receive_transcript(req: Request):
         # Push to general transcript queue for other consumers
         await transcript_queue.put(event)
 
-        return {"ok": True, "received_at": datetime.utcnow().isoformat() + "Z"}
+        return {"ok": True, "received_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}
 
     except Exception as e:
         logger.error(f"Error processing transcript: {e}", exc_info=True)
@@ -505,6 +516,13 @@ async def start_session(request: SessionStartRequest):
             started_at=session.started_at,
         )
         output_writer.write_analysis(session.session_id, analysis)
+
+    # Publish session start to real-time stream
+    if AGENT_AVAILABLE and get_publisher:
+        publisher = get_publisher()
+        await publisher.publish_system(
+            f"Interview session started for {request.candidate_name}"
+        )
 
     logger.info(f"Interview session started for: {request.candidate_name} ({session.session_id})")
 
@@ -611,10 +629,18 @@ async def end_session():
         "session_id": session_id,
         "candidate_name": candidate_name,
         "started_at": started_at,
-        "ended_at": ended_session.ended_at if ended_session else datetime.utcnow().isoformat() + "Z",
+        "ended_at": ended_session.ended_at if ended_session else datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "total_events": len(ended_session.transcript_events) if ended_session else 0,
         "analyses_generated": stats["agent_analyses"],
     }
+
+    # Publish session end to real-time stream
+    if AGENT_AVAILABLE and get_publisher:
+        publisher = get_publisher()
+        await publisher.publish_system(
+            f"Interview session ended for {candidate_name}. "
+            f"Analyzed {stats['agent_analyses']} responses."
+        )
 
     logger.info(f"Session ended: {session_id}")
 
@@ -632,7 +658,7 @@ async def health():
         "status": "healthy",
         "service": "Teams Transcript Sink",
         "version": "2.0.0",
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "agent_available": AGENT_AVAILABLE,
         "session_active": session_manager.is_active,
     }

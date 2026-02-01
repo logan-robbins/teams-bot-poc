@@ -9,6 +9,9 @@ dependencies = [
     "uvicorn[standard]>=0.32.0",
     "openai-agents>=0.0.16",
     "pydantic>=2.0.0",
+    "python-dotenv>=1.2.1",
+    "streamlit>=1.53.1",
+    "websockets>=16.0",
 ]
 
 [tool.uv]

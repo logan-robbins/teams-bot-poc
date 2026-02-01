@@ -1,0 +1,175 @@
+{
+  "session_id": "int_20260201_203834_63f52b",
+  "candidate_name": "Sarah Chen",
+  "started_at": "2026-02-01T20:38:34.236832+00:00Z",
+  "ended_at": "2026-02-01T20:39:04.389788Z",
+  "analysis_items": [
+    {
+      "response_id": "resp_a7a384fa",
+      "timestamp_utc": "2026-02-01T20:38:36.252849Z",
+      "question_text": null,
+      "response_text": "Good morning David! I'm doing great, thank you for asking. I'm really excited about this opportunity and looking forward to our conversation.",
+      "speaker_id": null,
+      "relevance_score": 0.5,
+      "clarity_score": 0.5,
+      "key_points": [
+        "Analysis failed - manual review required"
+      ],
+      "follow_up_suggestions": [],
+      "raw_model_output": {
+        "error": "Error code: 401 - {'error': {'message': 'Missing bearer or basic authentication in header', 'type': 'invalid_request_error', 'param': None, 'code': None}}"
+      }
+    },
+    {
+      "response_id": "resp_f4695cd8",
+      "timestamp_utc": "2026-02-01T20:38:36.867563Z",
+      "question_text": null,
+      "response_text": "Absolutely. I've been working with Python for about six years now, primarily in backend development. The project I'm most proud of is a real-time data pipeline I built at my current company. We were processing clickstream data from our e-commerce platform, handling about 50,000 events per second. I designed the architecture using Apache Kafka for ingestion and built custom consumers in Python with asyncio. The system reduced our data latency from hours to under 30 seconds.",
+      "speaker_id": null,
+      "relevance_score": 0.5,
+      "clarity_score": 0.5,
+      "key_points": [
+        "Analysis failed - manual review required"
+      ],
+      "follow_up_suggestions": [],
+      "raw_model_output": {
+        "error": "Error code: 401 - {'error': {'message': 'Missing bearer or basic authentication in header', 'type': 'invalid_request_error', 'param': None, 'code': None}}"
+      }
+    },
+    {
+      "response_id": "resp_e7b720fd",
+      "timestamp_utc": "2026-02-01T20:38:39.415183Z",
+      "question_text": null,
+      "response_text": "Great question. We implemented several layers of reliability. First, Kafka's built-in replication handled broker failures. For our consumers, I used idempotent processing with deduplication based on event IDs stored in Redis. We also implemented dead letter queues for messages that failed processing after three retries. For monitoring, I set up Prometheus metrics and PagerDuty alerts for consumer lag and error rates. We achieved 99.97% data delivery reliability.",
+      "speaker_id": null,
+      "relevance_score": 0.5,
+      "clarity_score": 0.5,
+      "key_points": [
+        "Analysis failed - manual review required"
+      ],
+      "follow_up_suggestions": [],
+      "raw_model_output": {
+        "error": "Error code: 401 - {'error': {'message': 'Missing bearer or basic authentication in header', 'type': 'invalid_request_error', 'param': None, 'code': None}}"
+      }
+    },
+    {
+      "response_id": "resp_6cc21e90",
+      "timestamp_utc": "2026-02-01T20:38:41.885496Z",
+      "question_text": null,
+      "response_text": "I'd start by identifying the core challenges: real-time synchronization, conflict resolution, and scalability. For the sync layer, I'd use WebSockets with a message broker like Redis Pub/Sub for horizontal scaling. The key technical challenge is handling concurrent edits. I'd implement Operational Transformation or CRDTs, probably CRDTs since they're more mathematically sound for eventual consistency. For storage, I'd use a combination of PostgreSQL for document metadata and a specialized data structure for the document content itself. I'd also implement presence awareness so users can see who else is editing.",
+      "speaker_id": null,
+      "relevance_score": 0.5,
+      "clarity_score": 0.5,
+      "key_points": [
+        "Analysis failed - manual review required"
+      ],
+      "follow_up_suggestions": [],
+      "raw_model_output": {
+        "error": "Error code: 401 - {'error': {'message': 'Missing bearer or basic authentication in header', 'type': 'invalid_request_error', 'param': None, 'code': None}}"
+      }
+    },
+    {
+      "response_id": "resp_bccf4757",
+      "timestamp_utc": "2026-02-01T20:38:45.045004Z",
+      "question_text": null,
+      "response_text": "First, I'd check our monitoring dashboards to understand the scope. Is it all users or specific regions? Then I'd look at key metrics: WebSocket connection counts, message queue depth, database query latency, and CPU/memory on our servers. If the queue depth is high, we have a consumer bottleneck. If database latency spiked, I'd check for slow queries or locks. I'd also verify recent deployments. Once I identify the bottleneck, I'd either scale horizontally if it's capacity, rollback if it's a bad deploy, or implement a quick mitigation like rate limiting while we fix the root cause. Communication is key too. I'd update the status page and keep stakeholders informed.",
+      "speaker_id": null,
+      "relevance_score": 0.5,
+      "clarity_score": 0.5,
+      "key_points": [
+        "Analysis failed - manual review required"
+      ],
+      "follow_up_suggestions": [],
+      "raw_model_output": {
+        "error": "Error code: 401 - {'error': {'message': 'Missing bearer or basic authentication in header', 'type': 'invalid_request_error', 'param': None, 'code': None}}"
+      }
+    },
+    {
+      "response_id": "resp_410a247f",
+      "timestamp_utc": "2026-02-01T20:38:48.351070Z",
+      "question_text": null,
+      "response_text": "I follow the testing pyramid: lots of unit tests, fewer integration tests, and minimal end-to-end tests. For Python, I use pytest religiously. I aim for high coverage on business logic but don't obsess over 100% coverage. I also write property-based tests with Hypothesis for edge case discovery. Beyond testing, I enforce type hints with mypy in strict mode and use ruff for linting. Code reviews are crucial too. I believe every PR should be reviewed, and I try to give thorough, constructive feedback. Documentation is often overlooked but I make sure complex functions have docstrings explaining the why, not just the what.",
+      "speaker_id": null,
+      "relevance_score": 0.5,
+      "clarity_score": 0.5,
+      "key_points": [
+        "Analysis failed - manual review required"
+      ],
+      "follow_up_suggestions": [],
+      "raw_model_output": {
+        "error": "Error code: 401 - {'error': {'message': 'Missing bearer or basic authentication in header', 'type': 'invalid_request_error', 'param': None, 'code': None}}"
+      }
+    },
+    {
+      "response_id": "resp_82205223",
+      "timestamp_utc": "2026-02-01T20:38:51.768016Z",
+      "question_text": null,
+      "response_text": "Last year, we had a heated debate about microservices versus keeping our monolith. My colleague wanted to break everything into services immediately. I was concerned about the operational complexity and believed we should be more surgical. Instead of just arguing, I proposed we create a decision matrix. We listed criteria like deployment complexity, team expertise, latency requirements, and timeline. We scored each approach objectively. The data showed a hybrid approach was best: extract the highest-traffic component first while keeping the rest as a modular monolith. My colleague appreciated the structured approach, and we ended up with a better solution than either of us initially proposed.",
+      "speaker_id": null,
+      "relevance_score": 0.5,
+      "clarity_score": 0.5,
+      "key_points": [
+        "Analysis failed - manual review required"
+      ],
+      "follow_up_suggestions": [],
+      "raw_model_output": {
+        "error": "Error code: 401 - {'error': {'message': 'Missing bearer or basic authentication in header', 'type': 'invalid_request_error', 'param': None, 'code': None}}"
+      }
+    },
+    {
+      "response_id": "resp_cf76044c",
+      "timestamp_utc": "2026-02-01T20:38:55.109964Z",
+      "question_text": null,
+      "response_text": "I have a few strategies. I dedicate Friday afternoons to learning. Sometimes it's reading papers, sometimes building small prototypes. I follow key people on social media and read their blogs. I also participate in our internal tech talks, both presenting and attending. For deeper learning, I contribute to open source. I maintain a small library for async HTTP caching that has about 500 stars on GitHub. Teaching is learning, so when I learn something new, I try to write about it or present it to the team. Conferences are valuable too. I try to attend one major conference per year, even if just virtually.",
+      "speaker_id": null,
+      "relevance_score": 0.5,
+      "clarity_score": 0.5,
+      "key_points": [
+        "Analysis failed - manual review required"
+      ],
+      "follow_up_suggestions": [],
+      "raw_model_output": {
+        "error": "Error code: 401 - {'error': {'message': 'Missing bearer or basic authentication in header', 'type': 'invalid_request_error', 'param': None, 'code': None}}"
+      }
+    },
+    {
+      "response_id": "resp_e13c93d3",
+      "timestamp_utc": "2026-02-01T20:38:58.482578Z",
+      "question_text": null,
+      "response_text": "Oh, I have a good one. We had a memory leak that only appeared under sustained load. After hours of profiling, I discovered we were creating thousands of tasks but never awaiting them. The issue was a fire-and-forget pattern where we'd call create_task but the tasks would accumulate if they completed faster than we checked them. The fix was to use asyncio.TaskGroup, which was new in Python 3.11. It ensures all tasks are properly awaited and handles cancellation correctly. The deeper lesson was that async code requires careful lifecycle management. Now I always use structured concurrency patterns and have a linting rule that flags bare create_task calls.",
+      "speaker_id": null,
+      "relevance_score": 0.5,
+      "clarity_score": 0.5,
+      "key_points": [
+        "Analysis failed - manual review required"
+      ],
+      "follow_up_suggestions": [],
+      "raw_model_output": {
+        "error": "Error code: 401 - {'error': {'message': 'Missing bearer or basic authentication in header', 'type': 'invalid_request_error', 'param': None, 'code': None}}"
+      }
+    },
+    {
+      "response_id": "resp_aa32f6fe",
+      "timestamp_utc": "2026-02-01T20:39:01.869730Z",
+      "question_text": null,
+      "response_text": "Yes, I have a few. First, what does success look like in this role after six months? Second, how does the team handle technical debt? Is there dedicated time for refactoring, or is it more opportunistic? And finally, I'm curious about the team culture. How do you balance moving fast with maintaining quality?",
+      "speaker_id": null,
+      "relevance_score": 0.5,
+      "clarity_score": 0.5,
+      "key_points": [
+        "Analysis failed - manual review required"
+      ],
+      "follow_up_suggestions": [],
+      "raw_model_output": {
+        "error": "Error code: 401 - {'error': {'message': 'Missing bearer or basic authentication in header', 'type': 'invalid_request_error', 'param': None, 'code': None}}"
+      }
+    }
+  ],
+  "overall_relevance": 0.5,
+  "overall_clarity": 0.5,
+  "total_responses_analyzed": 10,
+  "_meta": {
+    "written_at": "2026-02-01T20:39:04.390206Z",
+    "version": "1.0"
+  }
+}

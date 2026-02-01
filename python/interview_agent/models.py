@@ -7,7 +7,7 @@ interview sessions, and analysis outputs.
 Last Grunted: 01/31/2026
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from pydantic import BaseModel, Field
 
@@ -165,7 +165,7 @@ class AnalysisItem(BaseModel):
     """
     response_id: str = Field(..., description="Unique identifier for this response")
     timestamp_utc: str = Field(
-        default_factory=lambda: datetime.utcnow().isoformat() + "Z",
+        default_factory=lambda: datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         description="When analysis was generated"
     )
     question_text: Optional[str] = Field(

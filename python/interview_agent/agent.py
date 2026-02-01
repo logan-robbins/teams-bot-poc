@@ -3,16 +3,19 @@ Interview Analysis Agent using OpenAI Agents SDK.
 
 Analyzes candidate interview responses in real-time using the openai-agents SDK.
 Provides relevance scoring, clarity scoring, key point extraction, and follow-up suggestions.
+Maintains a running assessment of the candidate and publishes thoughts in real-time.
 
-Last Grunted: 01/31/2026
+Last Grunted: 02/01/2026
 """
 
 import logging
 import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
+from pathlib import Path
 
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 from agents import Agent, Runner
@@ -20,14 +23,54 @@ from agents import Agent, Runner
 from .models import AnalysisItem
 from .session import InterviewSessionManager
 from .output import AnalysisOutputWriter
+from .pubsub import get_publisher, ThoughtType
 
+
+# Load environment variables from .env file
+_env_path = Path(__file__).parent.parent / ".env"
+load_dotenv(_env_path)
 
 logger = logging.getLogger(__name__)
+
+# Default model - use gpt-5 for best analysis
+DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5")
 
 
 # =============================================================================
 # Structured Output Models for Agent
 # =============================================================================
+
+class RunningAssessment(BaseModel):
+    """Running assessment of the candidate based on all responses so far."""
+    technical_competence: str = Field(
+        ...,
+        description="Assessment of technical foundation (e.g., 'Strong', 'Moderate', 'Weak', 'Not yet demonstrated')"
+    )
+    communication: str = Field(
+        ...,
+        description="Assessment of communication skills"
+    )
+    problem_solving: str = Field(
+        ...,
+        description="Assessment of structured thinking and problem-solving"
+    )
+    culture_fit: str = Field(
+        ...,
+        description="Assessment of collaboration and growth orientation"
+    )
+    overall_signal: str = Field(
+        ...,
+        description="Current hiring signal: 'Strong hire', 'Lean hire', 'Lean no', 'Strong no', or 'Too early to tell'"
+    )
+    key_strengths: list[str] = Field(
+        default_factory=list,
+        description="Top strengths observed so far"
+    )
+    areas_of_concern: list[str] = Field(
+        default_factory=list,
+        description="Any concerns or red flags"
+    )
+
 
 class InterviewAnalysisOutput(BaseModel):
     """
@@ -54,15 +97,19 @@ class InterviewAnalysisOutput(BaseModel):
     )
     key_points: list[str] = Field(
         default_factory=list,
-        description="Key points extracted from the candidate's response"
+        description="Key points extracted from the candidate's response (2-4 items)"
     )
     follow_up_suggestions: list[str] = Field(
         default_factory=list,
-        description="Suggested follow-up questions for the interviewer"
+        description="Suggested follow-up questions for the interviewer (1-2 items)"
     )
     reasoning: str = Field(
         ...,
         description="Brief explanation of the scoring rationale"
+    )
+    running_assessment: RunningAssessment = Field(
+        ...,
+        description="Updated running assessment of the candidate based on all responses"
     )
 
 
@@ -70,39 +117,61 @@ class InterviewAnalysisOutput(BaseModel):
 # Agent Instructions
 # =============================================================================
 
-INTERVIEW_ANALYZER_INSTRUCTIONS = """You are an expert interview analyst. Your job is to analyze candidate responses during job interviews in real-time.
+INTERVIEW_ANALYZER_INSTRUCTIONS = """You are an expert interview analyst providing REAL-TIME analysis during a job interview. You are watching the interview unfold and must maintain a RUNNING ASSESSMENT of the candidate.
 
-For each candidate response, you must:
+## Your Role
+You are the AI assistant to the hiring manager, providing instant insights as the candidate speaks. Your analysis should be:
+- **Immediate**: React to what was just said
+- **Cumulative**: Build on previous responses to form a holistic view
+- **Actionable**: Help the interviewer know what to probe next
 
-1. **Identify the Question**: Look at the recent conversation context to determine what question or topic the candidate is responding to. The interviewer's statements typically contain questions or prompts.
+## For Each Candidate Response, Analyze:
 
-2. **Score Relevance (0.0-1.0)**:
-   - 0.9-1.0: Directly addresses the question with specific, relevant examples
-   - 0.7-0.9: Addresses the question well but may lack some specificity
-   - 0.5-0.7: Partially addresses the question, some tangential content
-   - 0.3-0.5: Weakly connected to the question
-   - 0.0-0.3: Does not address the question at all
+### 1. RELEVANCE SCORE (0.0-1.0)
+How well does this response address the question?
+- 0.9-1.0: Directly addresses with specific, concrete examples
+- 0.7-0.9: Good coverage, minor gaps in specificity
+- 0.5-0.7: Partially relevant, some tangential content
+- 0.3-0.5: Weak connection to the question
+- 0.0-0.3: Off-topic or evasive
 
-3. **Score Clarity (0.0-1.0)**:
-   - 0.9-1.0: Crystal clear, well-structured, easy to follow
-   - 0.7-0.9: Clear with good structure
-   - 0.5-0.7: Understandable but could be clearer
-   - 0.3-0.5: Somewhat confusing or disorganized
-   - 0.0-0.3: Very unclear or incoherent
+### 2. CLARITY SCORE (0.0-1.0)
+How well-articulated is this response?
+- 0.9-1.0: Exceptionally clear, well-structured, easy to follow
+- 0.7-0.9: Clear communication with logical flow
+- 0.5-0.7: Understandable but could be more organized
+- 0.3-0.5: Confusing, disorganized, hard to follow
+- 0.0-0.3: Incoherent or rambling
 
-4. **Extract Key Points**: List the most important points the candidate made. Focus on:
-   - Skills and experiences mentioned
-   - Specific examples or achievements
-   - Technical knowledge demonstrated
-   - Soft skills or personality traits revealed
+### 3. KEY POINTS
+Extract the 2-4 most important takeaways:
+- Specific skills or technologies mentioned
+- Quantifiable achievements (numbers, metrics, scale)
+- Problem-solving approach demonstrated
+- Red flags or concerns raised
+- Soft skills or cultural fit indicators
 
-5. **Suggest Follow-ups**: Provide 1-3 follow-up questions that would help the interviewer:
-   - Dig deeper into vague claims
-   - Clarify technical details
-   - Explore related experiences
-   - Assess skills not yet demonstrated
+### 4. FOLLOW-UP SUGGESTIONS
+Suggest 1-2 probing questions the interviewer should ask:
+- Dig deeper into vague claims ("Tell me more about...")
+- Verify stated accomplishments ("What was your specific role...")
+- Explore gaps or inconsistencies
+- Test depth of knowledge
 
-Be objective and professional. Provide constructive analysis that helps assess the candidate fairly."""
+### 5. RUNNING ASSESSMENT UPDATE
+Based on ALL responses so far, provide your current overall impression:
+- **Technical Competence**: How strong is their technical foundation?
+- **Communication**: How well do they articulate complex ideas?
+- **Problem Solving**: Do they demonstrate structured thinking?
+- **Culture Fit**: Do they seem collaborative, growth-oriented?
+- **Overall Hire Signal**: Strong hire / Lean hire / Lean no / Strong no
+
+## Important Guidelines
+- Be objective and evidence-based
+- Note both strengths AND areas of concern
+- Your reasoning field should explain your scoring rationale
+- Remember context from previous responses when available
+- If this is early in the interview, note that assessment is preliminary"""
 
 
 # =============================================================================
@@ -117,8 +186,10 @@ class InterviewAnalyzer:
     analysis capabilities. It can be used synchronously or asynchronously.
     
     Features:
-        - Real-time response analysis
+        - Real-time response analysis with GPT-5
         - Structured output with scores and suggestions
+        - Running assessment tracking across all responses
+        - Real-time thought publishing to Streamlit UI
         - Context-aware (uses conversation history)
         - Integrates with InterviewSessionManager
     
@@ -139,17 +210,19 @@ class InterviewAnalyzer:
     
     def __init__(
         self,
-        model: str = "gpt-4o",
+        model: str = DEFAULT_MODEL,
         session_manager: Optional[InterviewSessionManager] = None,
         output_writer: Optional[AnalysisOutputWriter] = None,
+        publish_thoughts: bool = True,
     ) -> None:
         """
         Initialize the InterviewAnalyzer.
         
         Args:
-            model: OpenAI model to use (default: gpt-4o).
+            model: OpenAI model to use (default: gpt-5).
             session_manager: Optional session manager for context.
             output_writer: Optional output writer for persisting analyses.
+            publish_thoughts: Whether to publish thoughts to the pub-sub system.
             
         Raises:
             ValueError: If OPENAI_API_KEY environment variable is not set.
@@ -157,12 +230,20 @@ class InterviewAnalyzer:
         if not os.environ.get("OPENAI_API_KEY"):
             logger.warning(
                 "OPENAI_API_KEY not set. Agent will fail at runtime. "
-                "Set the environment variable before calling analyze methods."
+                "Set the environment variable or add it to .env file."
             )
         
         self.model = model
         self.session_manager = session_manager
         self.output_writer = output_writer
+        self.publish_thoughts = publish_thoughts
+        self._publisher = get_publisher() if publish_thoughts else None
+        
+        # Track running assessment across responses
+        self._response_count = 0
+        self._cumulative_relevance = 0.0
+        self._cumulative_clarity = 0.0
+        self._all_key_points: list[str] = []
         
         # Create the analysis agent with structured output
         self._agent = Agent(
@@ -173,6 +254,7 @@ class InterviewAnalyzer:
         )
         
         logger.info(f"InterviewAnalyzer initialized with model: {model}")
+        logger.info(f"Thought publishing: {'enabled' if publish_thoughts else 'disabled'}")
     
     def _build_prompt(
         self,
@@ -226,7 +308,7 @@ class InterviewAnalyzer:
         Analyze a candidate response asynchronously.
         
         This is the primary analysis method. It runs the agent and returns
-        a structured AnalysisItem.
+        a structured AnalysisItem. Also publishes thoughts to the real-time stream.
         
         Args:
             response_text: The candidate's response text.
@@ -248,6 +330,11 @@ class InterviewAnalyzer:
         """
         if not response_text or not response_text.strip():
             logger.warning("Empty response text provided, returning minimal analysis")
+            if self._publisher and self.publish_thoughts:
+                await self._publisher.publish_observation(
+                    "Received empty response - skipping analysis",
+                    speaker_id=speaker_id
+                )
             return AnalysisItem(
                 response_id=response_id or f"resp_{uuid.uuid4().hex[:8]}",
                 response_text=response_text or "",
@@ -255,6 +342,14 @@ class InterviewAnalyzer:
                 clarity_score=0.0,
                 key_points=[],
                 follow_up_suggestions=["Unable to analyze empty response"],
+            )
+        
+        # Publish observation that we're analyzing
+        if self._publisher and self.publish_thoughts:
+            candidate_name = context.get("candidate_name", "Candidate") if context else "Candidate"
+            await self._publisher.publish_observation(
+                f"Analyzing response from {candidate_name}...",
+                speaker_id=speaker_id
             )
         
         # Build the prompt
@@ -269,10 +364,31 @@ class InterviewAnalyzer:
             # Extract the structured output
             analysis_output: InterviewAnalysisOutput = result.final_output_as(InterviewAnalysisOutput)
             
+            # Update cumulative tracking
+            self._response_count += 1
+            self._cumulative_relevance += analysis_output.relevance_score
+            self._cumulative_clarity += analysis_output.clarity_score
+            self._all_key_points.extend(analysis_output.key_points)
+            
             # Create AnalysisItem from agent output
+            running_assessment_dict = None
+            if analysis_output.running_assessment:
+                running_assessment_dict = {
+                    "technical_competence": analysis_output.running_assessment.technical_competence,
+                    "communication": analysis_output.running_assessment.communication,
+                    "problem_solving": analysis_output.running_assessment.problem_solving,
+                    "culture_fit": analysis_output.running_assessment.culture_fit,
+                    "overall_signal": analysis_output.running_assessment.overall_signal,
+                    "key_strengths": analysis_output.running_assessment.key_strengths,
+                    "areas_of_concern": analysis_output.running_assessment.areas_of_concern,
+                    "responses_analyzed": self._response_count,
+                    "avg_relevance": self._cumulative_relevance / self._response_count,
+                    "avg_clarity": self._cumulative_clarity / self._response_count,
+                }
+            
             analysis_item = AnalysisItem(
                 response_id=response_id or f"resp_{uuid.uuid4().hex[:8]}",
-                timestamp_utc=datetime.utcnow().isoformat() + "Z",
+                timestamp_utc=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 question_text=analysis_output.identified_question,
                 response_text=response_text,
                 speaker_id=speaker_id,
@@ -283,6 +399,7 @@ class InterviewAnalyzer:
                 raw_model_output={
                     "reasoning": analysis_output.reasoning,
                     "model": self.model,
+                    "running_assessment": running_assessment_dict,
                 },
             )
             
@@ -291,6 +408,20 @@ class InterviewAnalyzer:
                 f"clarity: {analysis_item.clarity_score:.2f}, "
                 f"key_points: {len(analysis_item.key_points)}"
             )
+            
+            # Publish analysis to real-time stream
+            if self._publisher and self.publish_thoughts:
+                await self._publisher.publish_analysis(
+                    content=analysis_output.reasoning,
+                    speaker_id=speaker_id,
+                    speaker_role="candidate",
+                    response_text=response_text[:200] + ("..." if len(response_text) > 200 else ""),
+                    relevance_score=analysis_output.relevance_score,
+                    clarity_score=analysis_output.clarity_score,
+                    key_points=analysis_output.key_points,
+                    follow_up_suggestions=analysis_output.follow_up_suggestions,
+                    running_assessment=running_assessment_dict,
+                )
             
             # Optionally persist the analysis
             if self.output_writer and self.session_manager and self.session_manager.session:
@@ -303,6 +434,11 @@ class InterviewAnalyzer:
             
         except Exception as e:
             logger.error(f"Agent analysis failed: {e}", exc_info=True)
+            
+            # Publish error to stream
+            if self._publisher and self.publish_thoughts:
+                await self._publisher.publish_error(f"Analysis failed: {str(e)}")
+            
             # Return a fallback analysis item on error
             return AnalysisItem(
                 response_id=response_id or f"resp_{uuid.uuid4().hex[:8]}",
@@ -399,7 +535,7 @@ class InterviewAnalyzer:
                 history.append({
                     "role": "interviewer",
                     "text": last_question,
-                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                    "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 })
                 context["recent_conversation"] = history
         
@@ -415,17 +551,19 @@ class InterviewAnalyzer:
 # =============================================================================
 
 def create_interview_analyzer(
-    model: str = "gpt-4o",
+    model: str = DEFAULT_MODEL,
     session_manager: Optional[InterviewSessionManager] = None,
     output_dir: Optional[str] = None,
+    publish_thoughts: bool = True,
 ) -> InterviewAnalyzer:
     """
     Factory function to create a configured InterviewAnalyzer.
     
     Args:
-        model: OpenAI model to use.
+        model: OpenAI model to use (default: gpt-5).
         session_manager: Optional session manager for context.
         output_dir: Optional directory for analysis output files.
+        publish_thoughts: Whether to publish thoughts to real-time stream.
         
     Returns:
         Configured InterviewAnalyzer instance.
@@ -433,7 +571,7 @@ def create_interview_analyzer(
     Example:
         >>> from pathlib import Path
         >>> analyzer = create_interview_analyzer(
-        ...     model="gpt-4o",
+        ...     model="gpt-5",
         ...     output_dir="./analysis_output"
         ... )
     """
@@ -446,4 +584,5 @@ def create_interview_analyzer(
         model=model,
         session_manager=session_manager,
         output_writer=output_writer,
+        publish_thoughts=publish_thoughts,
     )
