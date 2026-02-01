@@ -105,7 +105,7 @@ Current Trigger Method:
 
 ### Ingress / :443 forwarding (what the code expects)
 
-The repo’s current configuration binds the bot’s **Kestrel backend to `https://0.0.0.0:9443`** (see `src/Config/appsettings.json`). Because the Azure NSG opens **:443** publicly (and the webhook URL is `https://teamsbot.qmachina.com/...`), production requires a **reverse proxy on the VM** to accept public TLS on :443 and forward traffic to the local bot backend on :9443.
+The repo’s current configuration binds the bot’s **Kestrel backend to `https://0.0.0.0:9443`** (see `src/Config/appsettings.json`). Because the webhook URL is `https://teamsbot.qmachina.com/...` and **:443** is exposed publicly, you need a **reverse proxy on the VM** to accept TLS on :443 and forward traffic to the local bot backend on :9443.
 
 Implementation-wise this can be IIS, nginx, Caddy, or any other layer that performs **:443 → :9443** forwarding. The important point is: **the bot process itself is not listening on :443 in the current config**.
 
@@ -374,22 +374,22 @@ On VM or separate server:
 
 ```bash
 cd python
-pip install -r requirements.txt
-python transcript_sink.py
+uv venv
+uv pip install -r requirements.txt
+uv run transcript_sink.py
 ```
 
 Runs FastAPI server on port 8765. Bot POSTs transcripts to `http://127.0.0.1:8765/transcript` (configurable via `TranscriptSink.PythonEndpoint`).
 
 ### Integration
 
-Modify `transcript_sink.py` to connect your agent:
+Modify `python/transcript_sink.py` to connect your agent. The intended integration point is the background loop that already filters to final transcripts:
 
 ```python
-@app.post("/transcript")
-async def receive_transcript(event: TranscriptEvent):
-    await transcript_queue.put(event.dict())
-    # Your agent logic here
-    return {"status": "ok"}
+if kind == "recognized" and text:
+    # Replace with your agent framework integration.
+    # Example: await agent.process(text)
+    pass
 ```
 
 ---
@@ -485,16 +485,6 @@ Teams Meeting
 ---
 
 ## Reference
-
-
-### Costs
-
-- VM (D4s_v3): ~$140/month (region/pricing dependent)
-- Speech Service (Pay-as-you-go): ~$1-25/month depending on usage
-- Azure Bot: Free (Standard channel)
-- Total: ~$141-165/month depending on Speech usage
-
-Stop VM when not in use to reduce costs.
 
 ### Project Structure
 

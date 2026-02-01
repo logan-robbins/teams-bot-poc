@@ -1,16 +1,16 @@
 # STT Provider Shortlist for Meeting Transcription (2025/2026)
 
+All providers listed support streaming diarization (speaker detection).
+
 ## Top Contenders
 
 | Provider | Latency | Diarization | Streaming | Best For |
 |----------|---------|-------------|-----------|----------|
-| **ElevenLabs Scribe v2** | **<150ms** ⚡ | ❌ No | ✅ Yes | Ultra-low latency, 90+ languages |
 | **Deepgram** | ~100-300ms | ✅ **Excellent** | ✅ Yes | Best diarization, developer-friendly |
 | **Azure Speech** ⭐ | ~200-500ms | ✅ Yes (GA) | ✅ Yes | Currently implemented, enterprise |
-| **OpenAI Whisper/Realtime** | ~200-500ms | ⚠️ Separate model | ✅ Yes | High accuracy, OpenAI ecosystem |
 | **Google Cloud (Chirp 3)** | ~200-500ms | ✅ Yes | ✅ Yes | Latest model (2025), 85+ languages |
 | **AWS Transcribe** | ~200-500ms | ✅ Yes (2-5 speakers) | ✅ Yes | AWS ecosystem, medical |
-| **AssemblyAI** | ~200-400ms | ❌ Batch only | ✅ Yes | Simple streaming (no diarization) |
+| **OpenAI Whisper/Realtime** | ~200-500ms | ⚠️ Separate model | ✅ Yes | High accuracy, OpenAI ecosystem |
 
 ⭐ = Currently implemented in codebase
 
@@ -20,13 +20,11 @@
 
 | Provider | Partial Results | Final Results | Word Timestamps | Speaker IDs |
 |----------|----------------|---------------|----------------|-------------|
-| ElevenLabs | ✅ Partial transcripts | ✅ Committed | ⚠️ Limited | ❌ No |
 | Deepgram | ✅ Interim | ✅ Finalized | ✅ Word-level | ✅ `speaker_0`, `speaker_1` |
 | Azure Speech | ✅ `Recognizing` | ✅ `Recognized` | ✅ Word-level | ✅ `GUEST1`, `GUEST2` |
-| OpenAI | ✅ `delta` events | ✅ `done` events | ✅ Word-level | ⚠️ Via separate model |
 | Google Cloud | ✅ Interim | ✅ Final | ✅ Word-level | ✅ Speaker numbers |
 | AWS Transcribe | ✅ Partial | ✅ Final | ✅ Word-level | ✅ `spk_0`, `spk_1` |
-| AssemblyAI | ✅ Partial | ✅ Final | ✅ Word-level | ❌ Not available |
+| OpenAI | ✅ `delta` events | ✅ `done` events | ✅ Word-level | ⚠️ Via separate model |
 
 ---
 
@@ -39,7 +37,7 @@
   "text": "transcribed text or null",
   "timestamp_utc": "2026-01-30T12:34:56.789Z",
   "metadata": {
-    "provider": "azure_speech" | "deepgram" | "elevenlabs" | "openai" | "google" | "aws" | "assemblyai"
+    "provider": "azure_speech" | "deepgram" | "openai" | "google" | "aws"
   }
 }
 ```
@@ -94,20 +92,8 @@
 
 ## Quick Decision Matrix
 
-**Choose ElevenLabs if**: You need ultra-low latency (<150ms) and don't need diarization
 **Choose Deepgram if**: You need best-in-class diarization and developer experience
 **Choose Azure Speech if**: You're already using it (current implementation) and need enterprise compliance
 **Choose Google Cloud if**: You need latest model (Chirp 3) and multilingual support
-**Choose OpenAI if**: You're in the OpenAI ecosystem and need high accuracy
 **Choose AWS if**: You're on AWS and need medical transcription features
-
----
-
-## Implementation Priority
-
-1. **Phase 1**: Standardize core fields (`event_type`, `text`, `timestamp_utc`, `metadata.provider`)
-2. **Phase 2**: Add diarization fields (`speaker_id`, `audio_start_ms`, `audio_end_ms`)
-3. **Phase 3**: Add word-level details (`words` array) for providers that support it
-4. **Phase 4**: Add optional fields (`confidence`, `language`, `metadata.model`)
-
-This keeps FastAPI provider-agnostic while enabling rich features when available.
+**Choose OpenAI if**: You're in the OpenAI ecosystem and need high accuracy

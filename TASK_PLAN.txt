@@ -1,6 +1,0 @@
-Task Plan
-1. Review service binding and deployment scripts for external HTTPS issues. (done)
-2. Align deployment script with HTTPS + cert binding expectations. (done)
-3. Add startup validation to catch invalid HTTP-on-443 config. (done)
-4. Update README.md with current state and corrected guidance. (done)
-5. Verify changes with a minimal local command. (done: dotnet build Release)
