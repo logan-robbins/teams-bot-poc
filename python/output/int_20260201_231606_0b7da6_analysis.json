@@ -1,0 +1,423 @@
+{
+  "session_id": "int_20260201_231606_0b7da6",
+  "candidate_name": "Sarah Chen",
+  "started_at": "2026-02-01T23:16:06.309744+00:00Z",
+  "ended_at": "2026-02-01T23:18:10.479241Z",
+  "analysis_items": [
+    {
+      "response_id": "resp_9ffe270b",
+      "timestamp_utc": "2026-02-01T23:16:20.519216Z",
+      "question_text": null,
+      "response_text": "Good morning David! I'm doing great, thank you for asking. I'm really excited about this opportunity and looking forward to our conversation.",
+      "speaker_id": "speaker_1",
+      "relevance_score": 0.4,
+      "clarity_score": 0.9,
+      "key_points": [
+        "Candidate reaffirmed enthusiasm but provided no new substantive information or specifics about background or motivations.",
+        "Response was concise and professional—suggests ability to answer succinctly when prompted.",
+        "No technical or role-related details were volunteered, so interviewer must lead to elicit relevant content."
+      ],
+      "follow_up_suggestions": [
+        "Acknowledge briefly, set the 2–3 minute agenda, then ask a focused opener: “Great — quick agenda: 2 minutes for your intro, 25 minutes technical, 10 minutes Q&A. Sound good? To start, could you give a 2-minute overview of your most relevant recent project and your role in it?”",
+        "If they begin a long answer, politely timebox: “Thanks — can you cover that in about 2 minutes so we have time for technical questions?”"
+      ],
+      "raw_model_output": {
+        "reasoning": "The candidate repeated a brief enthusiastic greeting without adding new details. That indicates readiness to engage but leaves the interviewer to steer the conversation toward substance. The immediate priority is to set expectations and prompt a targeted, timeboxed statement about the candidate's recent relevant work.",
+        "model": "gpt-5-mini",
+        "running_assessment": {
+          "technical_competence": "Not yet demonstrated",
+          "communication": "Strong",
+          "problem_solving": "Not yet demonstrated",
+          "culture_fit": "Promising (engaged, polite)",
+          "overall_signal": "Too early to tell",
+          "key_strengths": [
+            "Polite and concise communicator",
+            "Enthusiastic and engaged"
+          ],
+          "areas_of_concern": [
+            "Hasn't volunteered any role- or project-specific details yet"
+          ],
+          "responses_analyzed": 23,
+          "avg_relevance": 0.7391304347826085,
+          "avg_clarity": 0.9443478260869561
+        }
+      }
+    },
+    {
+      "response_id": "resp_eab0af1e",
+      "timestamp_utc": "2026-02-01T23:16:37.049952Z",
+      "question_text": "Tell me about your experience with Python and a project you're proud of (real-time pipeline).",
+      "response_text": "Absolutely. I've been working with Python for about six years now, primarily in backend development. The project I'm most proud of is a real-time data pipeline I built at my current company. We were processing clickstream data from our e-commerce platform, handling about 50,000 events per second. I designed the architecture using Apache Kafka for ingestion and built custom consumers in Python with asyncio. The system reduced our data latency from hours to under 30 seconds.",
+      "speaker_id": "speaker_1",
+      "relevance_score": 0.95,
+      "clarity_score": 0.95,
+      "key_points": [
+        "Built a real-time clickstream pipeline processing ~50,000 events/sec",
+        "Used Apache Kafka for ingestion and custom Python consumers implemented with asyncio",
+        "Concrete measurable impact: reduced data latency from hours to under 30 seconds"
+      ],
+      "follow_up_suggestions": [
+        "Dig into the concurrency/throughput details: “Can you walk me through how you achieved 50k events/sec with asyncio — partitioning, consumer group size, batching, and per-message processing latency?”",
+        "Probe operational robustness: “How did you handle failures, backpressure, monitoring, and schema evolution (replay or data loss scenarios) in that pipeline?”"
+      ],
+      "raw_model_output": {
+        "reasoning": "The candidate just supplied measurable scale, the core tech choices (Kafka + Python asyncio), and a clear latency improvement — all new and actionable. You should immediately pivot to technical depth on how asyncio was used to reach that throughput and to operational practices that ensured reliability; those details will separate a real implementer from someone who can only describe high-level outcomes.",
+        "model": "gpt-5-mini",
+        "running_assessment": {
+          "technical_competence": "Moderate-Strong",
+          "communication": "Strong",
+          "problem_solving": "Strong",
+          "culture_fit": "Moderate",
+          "overall_signal": "Lean hire",
+          "key_strengths": [
+            "Experience building production-scale streaming systems",
+            "Comfort with Python async programming and event-driven architectures",
+            "Delivers measurable impact (latency reduction)"
+          ],
+          "areas_of_concern": [
+            "No details yet on fault tolerance, scaling mechanics, or monitoring/operational practices — need to verify depth",
+            "Unclear whether rush to low latency impacted data guarantees (ordering, at-least-once vs exactly-once)"
+          ],
+          "responses_analyzed": 24,
+          "avg_relevance": 0.7479166666666665,
+          "avg_clarity": 0.944583333333333
+        }
+      }
+    },
+    {
+      "response_id": "resp_22767a19",
+      "timestamp_utc": "2026-02-01T23:16:52.458408Z",
+      "question_text": "How did you handle failures and ensure data consistency in that pipeline?",
+      "response_text": "Great question. We implemented several layers of reliability. First, Kafka's built-in replication handled broker failures. For our consumers, I used idempotent processing with deduplication based on event IDs stored in Redis. We also implemented dead letter queues for messages that failed processing after three retries. For monitoring, I set up Prometheus metrics and PagerDuty alerts for consumer lag and error rates. We achieved 99.97% data delivery reliability.",
+      "speaker_id": "speaker_1",
+      "relevance_score": 0.95,
+      "clarity_score": 0.95,
+      "key_points": [
+        "Retry policy: messages retried up to 3 times before being sent to a dead-letter queue",
+        "Monitoring/alerting: Prometheus metrics + PagerDuty alerts for consumer lag and error rates",
+        "Quantified reliability: claims 99.97% data delivery reliability"
+      ],
+      "follow_up_suggestions": [
+        "Drill into the retry/backoff and dedup mechanics: “Can you walk me through the exact retry/backoff strategy (sync vs. async delays, exponential backoff), and how dedup with Redis interacts with retries to avoid double-processing?”",
+        "Clarify the reliability metric and failure modes: “How do you measure the 99.97%—over what window and what counts as a failed delivery? What were the main causes of the remaining 0.03%, and how were those incidents handled end-to-end (detection, mitigation, and postmortem)?”"
+      ],
+      "raw_model_output": {
+        "reasoning": "The candidate added concrete operational details that were not in previous statements: a fixed retry limit of three attempts, a Prometheus + PagerDuty monitoring setup, and a quantified reliability figure (99.97%). These details let you evaluate operational rigor and whether their design closes the loop on incidents. The next step is to verify the correctness and scalability of the retry/dedup approach and to validate the reliability claim with measurement methodology and incident examples.",
+        "model": "gpt-5-mini",
+        "running_assessment": {
+          "technical_competence": "Strong",
+          "communication": "Clear",
+          "problem_solving": "Strong",
+          "culture_fit": "Good — operational ownership and monitoring focus",
+          "overall_signal": "Strong hire",
+          "key_strengths": [
+            "Built high-throughput pipeline with practical reliability mechanisms (DLQ, dedup, monitoring)",
+            "Quantified outcomes (latency and now reliability) and used standard monitoring/alerting tools",
+            "Demonstrates operational ownership (alerting, retries, DLQs)"
+          ],
+          "areas_of_concern": [
+            "Need clarity on retry/backoff and dedup scaling (Redis cardinality, TTL, memory/eviction strategy)",
+            "Need evidence for the 99.97% reliability claim and understanding of remaining failure modes"
+          ],
+          "responses_analyzed": 25,
+          "avg_relevance": 0.7559999999999998,
+          "avg_clarity": 0.9447999999999996
+        }
+      }
+    },
+    {
+      "response_id": "resp_32bda305",
+      "timestamp_utc": "2026-02-01T23:17:03.753831Z",
+      "question_text": "Design a real-time collaborative document editor",
+      "response_text": "I'd start by identifying the core challenges: real-time synchronization, conflict resolution, and scalability. For the sync layer, I'd use WebSockets with a message broker like Redis Pub/Sub for horizontal scaling. The key technical challenge is handling concurrent edits. I'd implement Operational Transformation or CRDTs, probably CRDTs since they're more mathematically sound for eventual consistency. For storage, I'd use a combination of PostgreSQL for document metadata and a specialized data structure for the document content itself.",
+      "speaker_id": "speaker_1",
+      "relevance_score": 0.9,
+      "clarity_score": 0.95,
+      "key_points": [
+        "Prefers CRDTs over OT for conflict resolution and eventual consistency",
+        "Proposes WebSockets for client sync and Redis Pub/Sub for horizontal scaling of the sync layer",
+        "Suggests hybrid storage: PostgreSQL for metadata and a specialized data structure for document content"
+      ],
+      "follow_up_suggestions": [
+        "Ask for specifics on the CRDT: which CRDT family (operation-based vs state-based, RGA, WOOT, LSEQ, Yjs/Automerge style) and how they'd handle tombstones/compaction and undo/redo.",
+        "Probe scaling and guarantees of the sync layer: how Redis Pub/Sub will handle ordering, persistence/durability, cross-region clients, and fallback for missed messages (e.g., sequence numbers, reconnect/resend, or using Kafka/streaming instead)."
+      ],
+      "raw_model_output": {
+        "reasoning": "The candidate moved from high-level challenges to concrete technology choices (WebSockets + Redis Pub/Sub, CRDTs, Postgres + specialized content store). That's new and important: it reveals their preference for eventual consistency solutions and a particular scaling approach. The interviewer should now press for implementation details that separate theoretical knowledge from production-readiness—specifically CRDT selection/maintenance and how the chosen messaging layer meets ordering, durability, and cross-region requirements.",
+        "model": "gpt-5-mini",
+        "running_assessment": {
+          "technical_competence": "Moderate-Strong",
+          "communication": "Clear",
+          "problem_solving": "Structured and pragmatic, but missing low-level design details",
+          "culture_fit": "Collaborative and pragmatic",
+          "overall_signal": "Lean hire",
+          "key_strengths": [
+            "Makes sensible high-level technology choices for real-time systems (WebSockets, CRDTs)",
+            "Understands separation of concerns between metadata and content storage"
+          ],
+          "areas_of_concern": [
+            "No details yet on which CRDT variant or how to manage tombstones/compaction and performance on large docs",
+            "Unclear how Redis Pub/Sub handles ordering, durability, cross-region scaling, and reconnect semantics in production"
+          ],
+          "responses_analyzed": 26,
+          "avg_relevance": 0.7615384615384613,
+          "avg_clarity": 0.9449999999999996
+        }
+      }
+    },
+    {
+      "response_id": "resp_0425d1da",
+      "timestamp_utc": "2026-02-01T23:17:12.384753Z",
+      "question_text": "On-call debugging for 10s delays in collaborative editor",
+      "response_text": "First, I'd check our monitoring dashboards to understand the scope. Is it all users or specific regions? Then I'd look at key metrics: WebSocket connection counts, message queue depth, database query latency, and CPU/memory on our servers. If the queue depth is high, we have a consumer bottleneck. If database latency spiked, I'd check for slow queries or locks. Communication is key too. I'd update the status page and keep stakeholders informed.",
+      "speaker_id": "speaker_1",
+      "relevance_score": 0.92,
+      "clarity_score": 0.95,
+      "key_points": [
+        "Uses monitoring dashboards to quickly scope the incident by region vs global impact",
+        "Lists concrete operational metrics to check: WebSocket connection counts, message queue depth, DB query latency, CPU/memory",
+        "Identifies likely causes mapped to metrics (high queue depth -> consumer bottleneck; DB latency -> slow queries or locks)",
+        "Emphasizes stakeholder communication (status page updates) during incident"
+      ],
+      "follow_up_suggestions": [
+        "Ask her to walk through the exact triage order and thresholds: e.g., which metric she checks first and what numeric thresholds or alerts would trigger escalation or mitigation?",
+        "Probe remediation actions: for a consumer bottleneck, what immediate mitigations would she perform (scale consumers, shed load, backpressure, replay strategy)? For DB latency, what rollback/fast-fix steps would she take at 3 AM?"
+      ],
+      "raw_model_output": {
+        "reasoning": "This response adds new operational detail not covered earlier: a concrete on-call triage checklist and a mapping from metrics to probable root causes plus attention to stakeholder comms. The interviewer should now move from high-level metrics to specifics (thresholds, runbook actions, and immediate mitigations) to test production experience and familiarity with emergency fixes.",
+        "model": "gpt-5-mini",
+        "running_assessment": {
+          "technical_competence": "Moderate",
+          "communication": "Strong",
+          "problem_solving": "Structured",
+          "culture_fit": "Collaborative / pragmatic",
+          "overall_signal": "Lean hire",
+          "key_strengths": [
+            "Clear operational mindset with relevant metrics for real-time systems",
+            "Good incident communication awareness"
+          ],
+          "areas_of_concern": [
+            "Hasn't yet described concrete mitigation steps, thresholds, or runbook actions for those failure modes",
+            "No mention yet of cross-region failover, persistence guarantees for messaging, or automated alerting and mitigation"
+          ],
+          "responses_analyzed": 27,
+          "avg_relevance": 0.7674074074074072,
+          "avg_clarity": 0.9451851851851848
+        }
+      }
+    },
+    {
+      "response_id": "resp_95b2a73f",
+      "timestamp_utc": "2026-02-01T23:17:24.703660Z",
+      "question_text": "How do you ensure code quality in your projects? What's your testing philosophy?",
+      "response_text": "I follow the testing pyramid: lots of unit tests, fewer integration tests, and minimal end-to-end tests. For Python, I use pytest religiously. I aim for high coverage on business logic but don't obsess over 100% coverage. I also write property-based tests with Hypothesis for edge case discovery. Beyond testing, I enforce type hints with mypy in strict mode and use ruff for linting.",
+      "speaker_id": "speaker_1",
+      "relevance_score": 0.9,
+      "clarity_score": 0.95,
+      "key_points": [
+        "Uses pytest as primary test framework and follows the testing pyramid (unit > integration > end-to-end).",
+        "Writes property-based tests with Hypothesis to find edge cases.",
+        "Enforces static typing with mypy in strict mode and uses ruff for linting/formatting."
+      ],
+      "follow_up_suggestions": [
+        "Ask for a concrete example: “Show me one property-based test you wrote with Hypothesis — what bug did it catch and how did you design the hypothesis (strategies, invariants)?”",
+        "Probe CI/gates and trade-offs: “How do you enforce mypy/ruff in CI (pre-commit, pipeline gate)? How do you decide when an end-to-end test is worth adding vs. relying on integration tests?”"
+      ],
+      "raw_model_output": {
+        "reasoning": "This response adds concrete tooling and practices (Hypothesis, mypy strict, ruff) that reveal depth in testing and static analysis. The best immediate probes are a concrete Hypothesis example to validate hands-on experience, and CI/enforcement questions to see if these are just preferences or part of an enforced quality process.",
+        "model": "gpt-5-mini",
+        "running_assessment": {
+          "technical_competence": "Strong",
+          "communication": "Strong",
+          "problem_solving": "Moderate to Strong",
+          "culture_fit": "Good (quality-oriented, pragmatic)",
+          "overall_signal": "Lean hire",
+          "key_strengths": [
+            "Solid testing philosophy with modern tools (Hypothesis, pytest)",
+            "Disciplined static typing and linting practices"
+          ],
+          "areas_of_concern": [
+            "Needs concrete examples showing Hypothesis/HCI enforcement in production pipelines",
+            "Unclear how she balances E2E test investment vs. risk — probe for decision framework"
+          ],
+          "responses_analyzed": 28,
+          "avg_relevance": 0.7721428571428569,
+          "avg_clarity": 0.9453571428571425
+        }
+      }
+    },
+    {
+      "response_id": "resp_38f05a8f",
+      "timestamp_utc": "2026-02-01T23:17:37.399927Z",
+      "question_text": "Tell me about a time you disagreed with a colleague on a technical decision. How did you handle it?",
+      "response_text": "Last year, we had a heated debate about microservices versus keeping our monolith. My colleague wanted to break everything into services immediately. I was concerned about the operational complexity. Instead of just arguing, I proposed we create a decision matrix. We listed criteria like deployment complexity, team expertise, and timeline. We scored each approach objectively. The data showed a hybrid approach was best.",
+      "speaker_id": "speaker_1",
+      "relevance_score": 0.9,
+      "clarity_score": 0.95,
+      "key_points": [
+        "Introduced a decision matrix to resolve the disagreement — indicates a data-driven/structured conflict-resolution approach.",
+        "Defined objective criteria (deployment complexity, team expertise, timeline) and scored options — shows ability to formalize trade-offs.",
+        "Reached a compromise (hybrid approach) based on the matrix rather than authority — demonstrates collaborative, evidence-based outcomes."
+      ],
+      "follow_up_suggestions": [
+        "Probe for specifics: “Walk me through the decision matrix — what criteria did you include, how did you weight and score them, and who contributed to the scoring?”",
+        "Ask about outcomes and ownership: “What concrete actions followed the decision (timeline, architecture changes, rollouts)? Were there measurable improvements or any regrets/lessons learned?”"
+      ],
+      "raw_model_output": {
+        "reasoning": "This reply reveals a concrete, repeatable method for resolving technical disputes (decision matrix + objective scoring) and that the candidate favors evidence over hierarchy. The interviewer should now validate authorship, depth (how rigorous the matrix was), stakeholder involvement, and the real-world impact of the decision to judge both technical judgment and influence skills.",
+        "model": "gpt-5-mini",
+        "running_assessment": {
+          "technical_competence": "Moderate",
+          "communication": "Strong",
+          "problem_solving": "Strong",
+          "culture_fit": "Strong",
+          "overall_signal": "Lean hire",
+          "key_strengths": [
+            "Uses structured, data-driven methods to resolve disagreements",
+            "Collaborative and able to reach pragmatic compromises",
+            "Communicates decisions clearly and objectively"
+          ],
+          "areas_of_concern": [
+            "Need to confirm depth of technical evaluation and measurable outcomes from the hybrid approach",
+            "Unclear whether the candidate led implementation and handled operational challenges afterward"
+          ],
+          "responses_analyzed": 29,
+          "avg_relevance": 0.7765517241379307,
+          "avg_clarity": 0.9455172413793099
+        }
+      }
+    },
+    {
+      "response_id": "resp_2d602043",
+      "timestamp_utc": "2026-02-01T23:17:49.091922Z",
+      "question_text": "How do you stay current with new technologies?",
+      "response_text": "I have a few strategies. I dedicate Friday afternoons to learning. Sometimes it's reading papers, sometimes building small prototypes. I also contribute to open source. I maintain a small library for async HTTP caching that has about 500 stars on GitHub. Teaching is learning, so when I learn something new, I try to write about it or present it to the team.",
+      "speaker_id": "speaker_1",
+      "relevance_score": 0.85,
+      "clarity_score": 0.95,
+      "key_points": [
+        "Has a disciplined cadence for learning (dedicates Friday afternoons)",
+        "Practices hands-on learning via prototypes",
+        "Active open-source contributor and maintainer of an async HTTP caching library with ~500 GitHub stars",
+        "Shares knowledge by writing or presenting to the team"
+      ],
+      "follow_up_suggestions": [
+        "Probe OSS impact and ownership: \"Tell me about that async HTTP caching library — did you create it? How widely is it used, how do you handle issues/PRs, and what trade-offs did you design for (consistency, eviction, performance)?\"",
+        "Ask for a concrete learning->impact example: \"Give one recent Friday-afternoon project that became production-ready or changed how your team works — what was the measurable outcome?\""
+      ],
+      "raw_model_output": {
+        "reasoning": "This response adds concrete signals of continuous learning and community contribution (the GitHub library) and shows knowledge-sharing behavior. The interviewer should validate ownership, technical decisions in the library, and whether prototypes translate into team or product impact.",
+        "model": "gpt-5-mini",
+        "running_assessment": {
+          "technical_competence": "Moderate-Strong",
+          "communication": "Strong",
+          "problem_solving": "Moderate",
+          "culture_fit": "Strong",
+          "overall_signal": "Lean hire",
+          "key_strengths": [
+            "Disciplined continuous learning and hands-on prototyping",
+            "Open-source contribution and knowledge sharing"
+          ],
+          "areas_of_concern": [
+            "Need to confirm depth of ownership and real-world impact of prototypes/OSS",
+            "Unclear whether learning routinely drives measurable product improvements"
+          ],
+          "responses_analyzed": 30,
+          "avg_relevance": 0.7789999999999998,
+          "avg_clarity": 0.9456666666666662
+        }
+      }
+    },
+    {
+      "response_id": "resp_28279b70",
+      "timestamp_utc": "2026-02-01T23:18:00.863263Z",
+      "question_text": null,
+      "response_text": "Oh, I have a good one. We had a memory leak that only appeared under sustained load. After hours of profiling, I discovered we were creating thousands of tasks but never awaiting them. The fix was to use asyncio.TaskGroup, which was new in Python 3.11. It ensures all tasks are properly awaited and handles cancellation correctly. The deeper lesson was that async code requires careful lifecycle management.",
+      "speaker_id": "speaker_1",
+      "relevance_score": 0.95,
+      "clarity_score": 0.95,
+      "key_points": [
+        "Diagnosed a production-only memory leak caused by creating thousands of un-awaited asyncio tasks",
+        "Used profiling to narrow root cause (implies familiarity with runtime diagnostics)",
+        "Applied asyncio.TaskGroup (Python 3.11) to ensure proper awaiting and cancellation handling",
+        "Articulates a higher-level lesson: async code needs explicit lifecycle management"
+      ],
+      "follow_up_suggestions": [
+        "Ask for concrete evidence and rollout details: “How did you profile to find the leak (which tools/metrics/traces)? After deploying the TaskGroup fix, what measurable change did you observe in memory/latency/CPU under load?”",
+        "Probe edge cases and maintainability: “Did you need to change any calling code or add tests to prevent regressions? How do you handle environments still on older Python versions that lack TaskGroup?”"
+      ],
+      "raw_model_output": {
+        "reasoning": "This response adds concrete technical remediation (TaskGroup) and signals practical debugging skills (profiling large-scale async behavior). The interviewer should now validate the depth of diagnostic work (tools and metrics), the measurable impact of the fix, and how the candidate ensured the fix is durable across environments and covered by tests.",
+        "model": "gpt-5-mini",
+        "running_assessment": {
+          "technical_competence": "Strong",
+          "communication": "Strong",
+          "problem_solving": "Strong",
+          "culture_fit": "Moderate to Strong",
+          "overall_signal": "Lean hire",
+          "key_strengths": [
+            "Hands-on debugging of production issues",
+            "Up-to-date with modern Python async features",
+            "Translates learning into practical fixes and team-shared lessons"
+          ],
+          "areas_of_concern": [
+            "Unclear whether fixes were accompanied by CI/test changes or monitoring to prevent regression",
+            "Unknown approach for backward compatibility on older Python runtimes"
+          ],
+          "responses_analyzed": 31,
+          "avg_relevance": 0.7845161290322579,
+          "avg_clarity": 0.9458064516129028
+        }
+      }
+    },
+    {
+      "response_id": "resp_c9de4e87",
+      "timestamp_utc": "2026-02-01T23:18:13.945455Z",
+      "question_text": "Candidate asked three questions about (1) success after six months, (2) handling technical debt/refactoring cadence, and (3) team culture.",
+      "response_text": "Yes, I have a few. First, what does success look like in this role after six months? Second, how does the team handle technical debt? Is there dedicated time for refactoring, or is it more opportunistic? And finally, I'm curious about the team culture.",
+      "speaker_id": "speaker_1",
+      "relevance_score": 0.85,
+      "clarity_score": 0.98,
+      "key_points": [
+        "Candidate cares about clear success metrics and impact within the first six months — indicates outcome-orientation.",
+        "Explicit interest in technical debt strategy (dedicated vs opportunistic) — signals engineering ownership and concern for maintainability.",
+        "Asks about team culture last — prioritizes working environment after role expectations and engineering practices."
+      ],
+      "follow_up_suggestions": [
+        "Answer each question concisely, then immediately turn one back to the candidate: 'Which of these matters most to you, and why?'",
+        "After they answer, probe for concrete examples: 'Tell me about a time you balanced shipping a feature vs paying down debt — how did you decide and what was the outcome?' (1 follow-up)"
+      ],
+      "raw_model_output": {
+        "reasoning": "These questions reveal what the candidate values (impact metrics, sustainable engineering, and team fit). The interviewer should both give clear role signals and extract the candidate's priorities and past behavior to check alignment. Asking which question matters most forces the candidate to reveal trade-offs and expectations, and the suggested behavioral follow-up elicits concrete evidence of how they make trade-offs under constraints.",
+        "model": "gpt-5-mini",
+        "running_assessment": {
+          "technical_competence": "Strong",
+          "communication": "Strong",
+          "problem_solving": "Strong",
+          "culture_fit": "Moderate to Strong",
+          "overall_signal": "Lean hire",
+          "key_strengths": [
+            "Shows ownership and outcome-focus by asking about six-month success metrics",
+            "Cares about maintainability and engineering practices",
+            "Communicates clearly and asks thoughtful, role-relevant questions"
+          ],
+          "areas_of_concern": [
+            "May expect structured time for refactoring — ensure team’s reality aligns with candidate expectations",
+            "Need to confirm how they prioritize trade-offs between delivery and paying down technical debt"
+          ],
+          "responses_analyzed": 32,
+          "avg_relevance": 0.7865624999999998,
+          "avg_clarity": 0.9468749999999996
+        }
+      }
+    }
+  ],
+  "overall_relevance": 0.857,
+  "overall_clarity": 0.9480000000000001,
+  "total_responses_analyzed": 10,
+  "_meta": {
+    "written_at": "2026-02-01T23:18:10.479776Z",
+    "version": "1.0",
+    "last_updated_at": "2026-02-01T23:18:13.946014Z"
+  }
+}

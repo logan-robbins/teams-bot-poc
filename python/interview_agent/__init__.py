@@ -5,6 +5,7 @@ Provides real-time interview analysis using the OpenAI Agents SDK (GPT-5).
 
 Components:
     - InterviewAnalyzer: Main agent for analyzing candidate responses
+    - ChecklistAgent: Parallel agent for tracking interview progress
     - InterviewSessionManager: Manages session state and transcript history
     - AnalysisOutputWriter: Persists analysis results to JSON files
     - AgentThoughtPublisher: Real-time pub/sub for streaming thoughts to UI
@@ -56,6 +57,15 @@ from .pubsub import (
     get_publisher,
 )
 
+from .checklist import (
+    ChecklistAgent,
+    ChecklistUpdate,
+    CHECKLIST_ITEMS,
+    TOPIC_KEYWORDS,
+    create_checklist_agent,
+    parallel_analysis,
+)
+
 
 __all__ = [
     # Models
@@ -80,6 +90,13 @@ __all__ = [
     "AgentThoughtPublisher",
     "ThoughtType",
     "get_publisher",
+    # Checklist
+    "ChecklistAgent",
+    "ChecklistUpdate",
+    "CHECKLIST_ITEMS",
+    "TOPIC_KEYWORDS",
+    "create_checklist_agent",
+    "parallel_analysis",
 ]
 
 __version__ = "0.2.0"

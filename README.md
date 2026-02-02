@@ -634,6 +634,8 @@ teams-bot-poc/
 ├── python/
 │   ├── pyproject.toml              # uv project config
 │   ├── transcript_sink.py          # FastAPI transcript receiver
+│   ├── simulate_interview.py       # CLI interview simulator
+│   ├── streamlit_ui.py             # Modern three-column UI with built-in simulation
 │   ├── interview_agent/            # Interview analysis agent package
 │   │   ├── __init__.py             # Package exports (InterviewAnalyzer, etc.)
 │   │   ├── agent.py                # OpenAI Agents SDK interview analyzer
@@ -691,6 +693,41 @@ print(f"Relevance: {result.relevance_score}, Clarity: {result.clarity_score}")
 - `key_points`: Extracted key points from the response
 - `follow_up_suggestions`: Suggested follow-up questions
 
+### Streamlit UI
+
+Modern three-column Streamlit interface with built-in interview simulation.
+
+**Launch:**
+```bash
+cd python
+uv run streamlit run streamlit_ui.py
+```
+
+**Layout:**
+| Column | Width | Contents |
+|--------|-------|----------|
+| Left | 20% | Meeting ID, participants, session stats |
+| Center | 50% | Chat-style transcript + agent analysis bubbles |
+| Right | 30% | Interview checklist with stoplight indicators |
+
+**Simulation Controls:**
+| Button | Action |
+|--------|--------|
+| ▶️ Simulate | Start 20-message interview simulation |
+| ⏹️ Stop | Pause simulation at current position |
+| 🔄 Restart | Reset and start fresh |
+
+**Checklist Items:**
+- Intro, Role Overview, Background, Python Question, Salary Expectations, Next Steps
+- Stoplight indicators: ⚪ pending, 🟡 analyzing, 🟢 complete
+- Auto-detection via keyword matching in transcripts
+
+**State Management (st.session_state):**
+- `simulation_running`: bool
+- `simulation_index`: int (0-19)
+- `messages`: list of ChatMessage objects
+- `checklist_status`: dict mapping item_id to status
+
 ### Critical Configuration Notes
 
 **Service Account:** Must run as `.\azureuser` for certificate access
@@ -700,6 +737,108 @@ print(f"Relevance: {result.relevance_score}, Clarity: {result.clarity_score}")
 **Native Dependencies:** Verify `NativeMedia.dll` exists in output directory after build
 
 **Firewall:** NSG rules must allow inbound 443 (signaling) and 8445 (media)
+
+---
+
+## Azure Agent Deployment (FastAPI + Streamlit)
+
+The Python agent (FastAPI transcript sink + Streamlit UI) can be deployed to Azure Container Apps with Azure OpenAI backend.
+
+### Deploy to Azure
+
+```bash
+cd scripts
+./deploy-azure-agent.sh
+```
+
+Creates:
+- Azure OpenAI resource with gpt-5 deployment (low reasoning effort for fast real-time analysis)
+- Container Apps Environment (serverless, scale-to-zero)
+- FastAPI container app (transcript sink)
+- Streamlit container app (interview analysis UI)
+
+**Estimated Cost:** ~$10-50/month (POC, usage-based, GPT-5)
+
+### GoDaddy DNS Setup
+
+After running the deployment script, create a CNAME record in GoDaddy:
+
+1. Go to [GoDaddy DNS Management](https://dcc.godaddy.com/manage/dns)
+2. Select your domain (e.g., qmachina.com)
+3. Add a CNAME record:
+
+| Type | Name | Value | TTL |
+|------|------|-------|-----|
+| CNAME | agent | ca-talestral-api.*.azurecontainerapps.io | 600 |
+
+For Streamlit UI (optional separate subdomain):
+
+| Type | Name | Value | TTL |
+|------|------|-------|-----|
+| CNAME | interview | ca-talestral-ui.*.azurecontainerapps.io | 600 |
+
+### Bind Custom Domain (After DNS Propagates)
+
+```bash
+# Verify DNS propagation (wait 5-15 minutes)
+nslookup agent.qmachina.com
+
+# Add custom domain to FastAPI app
+az containerapp hostname add \
+  --name ca-talestral-api \
+  --resource-group rg-teams-media-bot-poc \
+  --hostname agent.qmachina.com
+
+# Bind managed certificate (automatic TLS)
+az containerapp hostname bind \
+  --name ca-talestral-api \
+  --resource-group rg-teams-media-bot-poc \
+  --hostname agent.qmachina.com \
+  --environment cae-talestral-poc \
+  --validation-method CNAME
+```
+
+### Update C# Bot Configuration
+
+After deploying the agent, update the Windows VM bot to send transcripts to Azure:
+
+```json
+{
+  "TranscriptSink": {
+    "PythonEndpoint": "https://agent.qmachina.com/transcript"
+  }
+}
+```
+
+Then restart the service: `Restart-Service TeamsMediaBot`
+
+### Azure OpenAI Configuration
+
+The agent automatically detects Azure OpenAI when these environment variables are set:
+
+| Variable | Description |
+|----------|-------------|
+| `AZURE_OPENAI_ENDPOINT` | Azure OpenAI endpoint URL |
+| `AZURE_OPENAI_KEY` | Azure OpenAI API key |
+| `AZURE_OPENAI_DEPLOYMENT` | Model deployment name (e.g., gpt-5) |
+| `OPENAI_REASONING_EFFORT` | GPT-5 reasoning effort: low, medium, high (default: low) |
+| `AZURE_OPENAI_API_VERSION` | API version (default: 2024-08-01-preview) |
+| `OPENAI_API_TYPE` | Set to "azure" to force Azure mode |
+
+For standard OpenAI (local development), set `OPENAI_API_KEY` instead.
+
+### Test Deployment
+
+```bash
+# Health check
+curl https://agent.qmachina.com/health
+
+# Stats
+curl https://agent.qmachina.com/stats
+
+# Streamlit UI
+open https://interview.qmachina.com
+```
 
 ---
 
