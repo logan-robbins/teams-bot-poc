@@ -21,7 +21,7 @@
     Python sink endpoint (default: http://127.0.0.1:8765)
 
 .PARAMETER DisplayName
-    Bot display name in meeting (default: Talestral by Talestry)
+    Bot display name in meeting (default: Talestral)
 
 .PARAMETER DryRun
     Print what would be done without making actual requests
@@ -59,7 +59,7 @@ param(
     [string]$SinkEndpoint = "https://agent.qmachina.com",
 
     [Parameter(Mandatory=$false)]
-    [string]$DisplayName = "Talestral by Talestry",
+    [string]$DisplayName = "Talestral",
 
     [Parameter(Mandatory=$false)]
     [switch]$DryRun,
@@ -132,7 +132,7 @@ function Test-Prerequisites {
 
 function Invoke-AutoJoin {
     Write-Log "=========================================="
-    Write-Log "Talestral by Talestry - Auto Join (PowerShell)"
+    Write-Log "Talestral - Auto Join (PowerShell)"
     Write-Log "=========================================="
     Write-Log "Meeting URL: $MeetingUrl"
     Write-Log "Candidate: $CandidateName"

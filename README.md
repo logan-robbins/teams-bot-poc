@@ -1,4 +1,4 @@
-# Talestral by Talestry
+# Talestral
 
 AI-powered meeting transcription bot that joins Teams meetings, provides real-time diarized audio transcription with speaker identification, and streams speaker-attributed transcripts to a Python agent endpoint for interview analysis.
 
@@ -111,7 +111,7 @@ AI-powered meeting transcription bot that joins Teams meetings, provides real-ti
 Current Trigger Method:
   curl -X POST https://teamsbot.qmachina.com/api/calling/join \
     -H "Content-Type: application/json" \
-    -d '{"joinUrl":"TEAMS_MEETING_URL","displayName":"Talestral by Talestry"}'
+    -d '{"joinUrl":"TEAMS_MEETING_URL","displayName":"Talestral"}'
 ```
 
 ### Ingress / :443 forwarding (what the code expects)
@@ -376,14 +376,14 @@ zip -r teams-bot-poc.zip manifest.json color.png outline.png
 curl https://teamsbot.yourdomain.com/api/calling/health
 ```
 
-Expected: `{"Status":"Healthy","Timestamp":"...","Service":"Talestral by Talestry"}`
+Expected: `{"Status":"Healthy","Timestamp":"...","Service":"Talestral"}`
 
 ### Join Meeting
 
 ```bash
 curl -X POST https://teamsbot.yourdomain.com/api/calling/join \
   -H "Content-Type: application/json" \
-  -d '{"joinUrl":"TEAMS_MEETING_JOIN_URL","displayName":"Talestral by Talestry"}'
+  -d '{"joinUrl":"TEAMS_MEETING_JOIN_URL","displayName":"Talestral"}'
 ```
 
 Bot should join within 5-10 seconds.

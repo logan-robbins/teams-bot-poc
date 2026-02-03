@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Streamlit UI for Real-Time Interview Agent - Talestral by Talestry
+Streamlit UI for Real-Time Interview Agent - Talestral
 
 Usage:
     uv run python transcript_sink.py  # Terminal 1

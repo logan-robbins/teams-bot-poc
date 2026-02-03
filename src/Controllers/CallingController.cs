@@ -117,7 +117,7 @@ public class CallingController : ControllerBase
 
             var callId = await _botService.JoinMeetingAsync(
                 request.JoinUrl,
-                request.DisplayName ?? "Talestral by Talestry",
+                request.DisplayName ?? "Talestral",
                 request.JoinAsGuest,
                 transcriber);
 
@@ -145,7 +145,7 @@ public class CallingController : ControllerBase
         {
             Status = "Healthy",
             Timestamp = DateTime.UtcNow,
-            Service = "Talestral by Talestry"
+            Service = "Talestral"
         });
     }
 }
@@ -269,7 +269,7 @@ public class ConfigureController : ControllerBase
 <head>
     <meta charset=""utf-8"">
     <meta name=""viewport"" content=""width=device-width, initial-scale=1.0"">
-    <title>Talestral by Talestry Configuration</title>
+    <title>Talestral Configuration</title>
     <script src=""https://res.cdn.office.net/teams-js/2.0.0/js/MicrosoftTeams.min.js"" crossorigin=""anonymous""></script>
     <style>
         body {
@@ -320,7 +320,7 @@ public class ConfigureController : ControllerBase
 </head>
 <body>
     <div class=""container"">
-        <h1>Talestral by Talestry</h1>
+        <h1>Talestral</h1>
         <p>This bot automatically joins Teams meetings to provide real-time audio transcription.</p>
         
         <div class=""info-box"">
@@ -348,7 +348,7 @@ public class ConfigureController : ControllerBase
             // Save configuration (no settings needed for this bot)
             microsoftTeams.settings.setSettings({
                 contentUrl: window.location.origin + '/configure',
-                suggestedDisplayName: 'Talestral by Talestry',
+                suggestedDisplayName: 'Talestral',
                 websiteUrl: window.location.origin
             });
             

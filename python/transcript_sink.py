@@ -376,7 +376,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Talestral Transcript Service",
     version="2.0.0",
-    description="Receives diarized transcripts from Talestral by Talestry and integrates with interview analysis agent",
+    description="Receives diarized transcripts from Talestral and integrates with interview analysis agent",
     lifespan=lifespan,
 )
 
