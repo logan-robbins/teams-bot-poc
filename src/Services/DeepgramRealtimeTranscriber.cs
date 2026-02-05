@@ -8,12 +8,17 @@ namespace TeamsMediaBot.Services;
 /// <summary>
 /// Real-time diarized transcription using Deepgram WebSocket API.
 /// Implements streaming with speaker identification on every word.
-/// 
+/// </summary>
+/// <remarks>
+/// <para>
+/// This transcriber uses the Deepgram SDK v6+ ListenWebSocketClient for streaming audio.
+/// Audio is pushed as raw PCM 16kHz/16-bit/mono frames from Teams media SDK.
+/// </para>
+/// <para>
 /// Documentation: https://developers.deepgram.com/docs/dotnet-sdk-streaming-transcription
 /// Diarization: https://developers.deepgram.com/docs/diarization
-/// 
-/// Last Grunted: 01/31/2026 12:00:00 PM PST
-/// </summary>
+/// </para>
+/// </remarks>
 public sealed class DeepgramRealtimeTranscriber : IRealtimeTranscriber
 {
     private readonly string _apiKey;
@@ -26,8 +31,17 @@ public sealed class DeepgramRealtimeTranscriber : IRealtimeTranscriber
     private string? _sessionId;
     private long _framesReceived;
     private long _bytesReceived;
-    private double _audioOffsetMs; // Track cumulative audio position
+    private bool _isDisposed;
 
+    /// <summary>
+    /// Initializes a new instance of the <see cref="DeepgramRealtimeTranscriber"/> class.
+    /// </summary>
+    /// <param name="apiKey">The Deepgram API key.</param>
+    /// <param name="model">The Deepgram model to use (e.g., "nova-3").</param>
+    /// <param name="diarize">Whether to enable speaker diarization.</param>
+    /// <param name="publisher">The publisher for sending transcript events to Python.</param>
+    /// <param name="logger">The logger instance.</param>
+    /// <exception cref="ArgumentNullException">Thrown when required parameters are null.</exception>
     public DeepgramRealtimeTranscriber(
         string apiKey,
         string model,
@@ -35,6 +49,11 @@ public sealed class DeepgramRealtimeTranscriber : IRealtimeTranscriber
         PythonTranscriptPublisher publisher,
         ILogger<DeepgramRealtimeTranscriber> logger)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(apiKey);
+        ArgumentException.ThrowIfNullOrWhiteSpace(model);
+        ArgumentNullException.ThrowIfNull(publisher);
+        ArgumentNullException.ThrowIfNull(logger);
+        
         _apiKey = apiKey;
         _model = model;
         _diarize = diarize;
@@ -42,100 +61,129 @@ public sealed class DeepgramRealtimeTranscriber : IRealtimeTranscriber
         _logger = logger;
     }
 
+    /// <inheritdoc/>
     public async Task StartAsync(CancellationToken ct = default)
     {
+        ObjectDisposedException.ThrowIf(_isDisposed, this);
+        
         if (_client != null)
         {
             _logger.LogWarning("Deepgram transcriber already started");
             return;
         }
 
-        _logger.LogInformation("Starting Deepgram WebSocket connection (model={Model}, diarize={Diarize})", _model, _diarize);
+        _logger.LogInformation(
+            "Starting Deepgram WebSocket connection (Model={Model}, Diarize={Diarize})",
+            _model, _diarize);
         
-        // Initialize Deepgram client
+        // Initialize Deepgram client using factory pattern
+        // Per Deepgram SDK docs: https://developers.deepgram.com/docs/dotnet-sdk-streaming-transcription
         var deepgramClient = ClientFactory.CreateListenWebSocketClient(_apiKey);
         _client = deepgramClient;
 
         // Configure live transcription options
         // Source: https://developers.deepgram.com/reference/speech-to-text-api/listen-streaming
-        var options = new LiveSchema()
+        var options = new LiveSchema
         {
-            Model = _model,           // "nova-3" recommended for 2026
+            Model = _model,           // "nova-3" recommended for 2025/2026
             Language = "en-US",
             Punctuate = true,
             SmartFormat = true,
-            Diarize = _diarize,       // CRITICAL: Enables speaker detection
-            InterimResults = true,    // Get partial results
+            Diarize = _diarize,       // CRITICAL: Enables speaker detection per word
+            InterimResults = true,    // Get partial results for real-time UX
             UtteranceEnd = "1000",    // End utterance after 1s silence
-            Encoding = "linear16",    // PCM 16-bit
-            SampleRate = 16000        // Teams sends 16kHz
+            Encoding = "linear16",    // PCM 16-bit signed little-endian
+            SampleRate = 16000        // Teams Media SDK sends 16kHz
         };
 
-        // Subscribe to events
-        _client.Subscribe(new EventHandler<OpenResponse>((sender, e) =>
-        {
-            _sessionId = e.RequestId ?? Guid.NewGuid().ToString();
-            _logger.LogInformation("Deepgram session started: {SessionId}", _sessionId);
-            PublishEvent("session_started", null);
-        }));
+        // Subscribe to events using Deepgram's event-driven pattern
+        _client.Subscribe(new EventHandler<OpenResponse>(OnConnectionOpened));
+        _client.Subscribe(new EventHandler<ResultResponse>(OnTranscriptionResult));
+        _client.Subscribe(new EventHandler<CloseResponse>(OnConnectionClosed));
+        _client.Subscribe(new EventHandler<ErrorResponse>(OnError));
 
-        _client.Subscribe(new EventHandler<ResultResponse>((sender, e) =>
-        {
-            ProcessTranscriptionResult(e);
-        }));
-
-        _client.Subscribe(new EventHandler<CloseResponse>((sender, e) =>
-        {
-            _logger.LogInformation("Deepgram session closed");
-            PublishEvent("session_stopped", null);
-        }));
-
-        _client.Subscribe(new EventHandler<ErrorResponse>((sender, e) =>
-        {
-            _logger.LogError("Deepgram error: {Error}", e.Message);
-            PublishEvent("error", null, error: new EventError("DEEPGRAM_ERROR", e.Message));
-        }));
-
-        // Connect to Deepgram
-        await _client.Connect(options);
+        // Connect to Deepgram WebSocket endpoint
+        await _client.Connect(options).ConfigureAwait(false);
         _logger.LogInformation("Deepgram WebSocket connected successfully");
     }
 
     /// <summary>
-    /// Process Deepgram transcription result and normalize to TranscriptEvent.
-    /// 
-    /// Deepgram response format with diarization:
-    /// - result.channel.alternatives[0].words[].speaker = 0, 1, 2...
-    /// - We normalize to "speaker_0", "speaker_1", etc.
-    /// 
-    /// Source: https://developers.deepgram.com/docs/diarization#live-streaming
+    /// Handles the WebSocket connection opened event.
     /// </summary>
+    private void OnConnectionOpened(object? sender, OpenResponse e)
+    {
+        _sessionId = e.RequestId ?? Guid.NewGuid().ToString("N");
+        _logger.LogInformation("Deepgram session started: {SessionId}", _sessionId);
+        PublishEventAsync("session_started", text: null);
+    }
+
+    /// <summary>
+    /// Handles transcription result events.
+    /// </summary>
+    private void OnTranscriptionResult(object? sender, ResultResponse e)
+    {
+        ProcessTranscriptionResult(e);
+    }
+
+    /// <summary>
+    /// Handles the WebSocket connection closed event.
+    /// </summary>
+    private void OnConnectionClosed(object? sender, CloseResponse e)
+    {
+        _logger.LogInformation("Deepgram session closed");
+        PublishEventAsync("session_stopped", text: null);
+    }
+
+    /// <summary>
+    /// Handles error events from the Deepgram WebSocket.
+    /// </summary>
+    private void OnError(object? sender, ErrorResponse e)
+    {
+        _logger.LogError("Deepgram error: {Error}", e.Message);
+        PublishEventAsync("error", text: null, error: new EventError("DEEPGRAM_ERROR", e.Message));
+    }
+
+    /// <summary>
+    /// Processes a Deepgram transcription result and normalizes it to a <see cref="TranscriptEvent"/>.
+    /// </summary>
+    /// <remarks>
+    /// Deepgram response format with diarization:
+    /// <list type="bullet">
+    ///   <item>result.channel.alternatives[0].words[].speaker = 0, 1, 2...</item>
+    ///   <item>We normalize speaker IDs to "speaker_0", "speaker_1", etc.</item>
+    /// </list>
+    /// Source: https://developers.deepgram.com/docs/diarization#live-streaming
+    /// </remarks>
     private void ProcessTranscriptionResult(ResultResponse result)
     {
-        if (result.Channel?.Alternatives == null || result.Channel.Alternatives.Count == 0)
+        if (result.Channel?.Alternatives is not { Count: > 0 })
+        {
             return;
+        }
 
-        var alt = result.Channel.Alternatives[0];
-        if (string.IsNullOrWhiteSpace(alt.Transcript))
+        var alternative = result.Channel.Alternatives[0];
+        if (string.IsNullOrWhiteSpace(alternative.Transcript))
+        {
             return;
+        }
 
         var isFinal = result.IsFinal ?? false;
         var eventType = isFinal ? "final" : "partial";
 
         // Extract speaker ID from first word (Deepgram assigns speaker per word)
         string? speakerId = null;
-        if (_diarize && alt.Words != null && alt.Words.Count > 0)
+        if (_diarize && alternative.Words is { Count: > 0 })
         {
-            var firstSpeaker = alt.Words[0].Speaker;
+            var firstSpeaker = alternative.Words[0].Speaker;
             speakerId = firstSpeaker.HasValue ? $"speaker_{firstSpeaker.Value}" : null;
         }
 
-        // Build word-level details
+        // Build word-level details with timing and speaker attribution
         List<WordDetail>? words = null;
-        if (alt.Words != null && alt.Words.Count > 0)
+        if (alternative.Words is { Count: > 0 })
         {
-            words = alt.Words.Select(w => new WordDetail(
-                Word: w.Word ?? "",
+            words = alternative.Words.Select(w => new WordDetail(
+                Word: w.Word ?? string.Empty,
                 StartMs: (w.Start ?? 0) * 1000,
                 EndMs: (w.End ?? 0) * 1000,
                 Confidence: (float?)(w.Confidence ?? 0),
@@ -143,26 +191,33 @@ public sealed class DeepgramRealtimeTranscriber : IRealtimeTranscriber
             )).ToList();
         }
 
-        var audioStart = (result.Start ?? 0) * 1000;
-        var audioEnd = audioStart + ((result.Duration ?? 0) * 1000);
+        var audioStartMs = (result.Start ?? 0) * 1000;
+        var audioEndMs = audioStartMs + ((result.Duration ?? 0) * 1000);
 
+        // Log transcription results with structured logging
         if (isFinal)
         {
-            _logger.LogInformation("[FINAL] Speaker={Speaker}: {Text}", speakerId ?? "unknown", alt.Transcript);
+            _logger.LogInformation(
+                "[FINAL] Speaker={SpeakerId}: {Text}",
+                speakerId ?? "unknown",
+                alternative.Transcript);
         }
         else
         {
-            _logger.LogDebug("[PARTIAL] Speaker={Speaker}: {Text}", speakerId ?? "unknown", alt.Transcript);
+            _logger.LogDebug(
+                "[PARTIAL] Speaker={SpeakerId}: {Text}",
+                speakerId ?? "unknown",
+                alternative.Transcript);
         }
 
-        var evt = new TranscriptEvent(
+        var transcriptEvent = new TranscriptEvent(
             EventType: eventType,
-            Text: alt.Transcript,
+            Text: alternative.Transcript,
             TimestampUtc: DateTime.UtcNow.ToString("O"),
             SpeakerId: speakerId,
-            AudioStartMs: audioStart,
-            AudioEndMs: audioEnd,
-            Confidence: (float?)(alt.Confidence ?? 0),
+            AudioStartMs: audioStartMs,
+            AudioEndMs: audioEndMs,
+            Confidence: (float?)(alternative.Confidence ?? 0),
             Words: words,
             Metadata: new EventMetadata(
                 Provider: "deepgram",
@@ -171,46 +226,55 @@ public sealed class DeepgramRealtimeTranscriber : IRealtimeTranscriber
             )
         );
 
-        _ = Task.Run(() => _publisher.PublishAsync(evt));
+        // Fire-and-forget publish (don't block audio processing thread)
+        PublishEventAsync(transcriptEvent);
     }
 
-    /// <summary>
-    /// Push PCM audio frames to Deepgram WebSocket.
-    /// Teams delivers 20ms frames at 16kHz/16-bit/mono = 640 bytes per frame.
-    /// </summary>
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Teams Media SDK delivers 20ms frames at 16kHz/16-bit/mono = 640 bytes per frame.
+    /// This method is called from the audio receive callback and must not block.
+    /// </remarks>
     public void PushPcm16k16bitMono(ReadOnlySpan<byte> pcmFrame)
     {
-        if (_client == null)
+        if (_isDisposed || _client is null)
         {
-            _logger.LogWarning("Cannot push audio - Deepgram not connected");
+            _logger.LogWarning("Cannot push audio - Deepgram not connected or disposed");
             return;
         }
 
-        // Send raw PCM bytes to Deepgram
+        // Send raw PCM bytes to Deepgram WebSocket
+        // Note: ToArray() is required as the SDK doesn't accept Span<T>
         _client.Send(pcmFrame.ToArray());
 
         _framesReceived++;
         _bytesReceived += pcmFrame.Length;
-        _audioOffsetMs += 20; // 20ms per frame
 
-        // Log stats every ~1 second (50 frames)
+        // Log stats every ~1 second (50 frames at 20ms each)
         if (_framesReceived % 50 == 0)
         {
-            _logger.LogDebug("Audio stats: {Frames} frames, {Bytes} bytes ({Seconds:F1}s)",
-                _framesReceived, _bytesReceived, _framesReceived * 0.02);
+            _logger.LogDebug(
+                "Audio stats: Frames={FrameCount}, Bytes={ByteCount}, Duration={DurationSeconds:F1}s",
+                _framesReceived,
+                _bytesReceived,
+                _framesReceived * 0.02);
         }
     }
 
+    /// <inheritdoc/>
     public async Task StopAsync()
     {
-        if (_client == null) return;
+        if (_client is null)
+        {
+            return;
+        }
 
         _logger.LogInformation("Stopping Deepgram transcription...");
 
         try
         {
-            // Send KeepAlive then Finalize as per Deepgram docs
-            await _client.Finish();
+            // Finish() sends KeepAlive then CloseStream as per Deepgram SDK docs
+            await _client.Finish().ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -218,23 +282,56 @@ public sealed class DeepgramRealtimeTranscriber : IRealtimeTranscriber
         }
 
         _client = null;
-        _logger.LogInformation("Deepgram stopped. Total: {Frames} frames, {Bytes} bytes", _framesReceived, _bytesReceived);
+        _logger.LogInformation(
+            "Deepgram stopped. Total: Frames={FrameCount}, Bytes={ByteCount}",
+            _framesReceived,
+            _bytesReceived);
     }
 
-    private void PublishEvent(string eventType, string? text, EventError? error = null)
+    /// <summary>
+    /// Publishes a transcript event asynchronously without blocking.
+    /// </summary>
+    private void PublishEventAsync(string eventType, string? text, EventError? error = null)
     {
-        var evt = new TranscriptEvent(
+        var transcriptEvent = new TranscriptEvent(
             EventType: eventType,
             Text: text,
             TimestampUtc: DateTime.UtcNow.ToString("O"),
             Metadata: new EventMetadata(Provider: "deepgram", Model: _model, SessionId: _sessionId),
             Error: error
         );
-        _ = Task.Run(() => _publisher.PublishAsync(evt));
+        PublishEventAsync(transcriptEvent);
     }
 
+    /// <summary>
+    /// Publishes a transcript event asynchronously without blocking.
+    /// </summary>
+    private void PublishEventAsync(TranscriptEvent transcriptEvent)
+    {
+        // Fire-and-forget: don't block the caller (typically audio processing thread)
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await _publisher.PublishAsync(transcriptEvent).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to publish transcript event");
+            }
+        });
+    }
+
+    /// <inheritdoc/>
     public async ValueTask DisposeAsync()
     {
-        await StopAsync();
+        if (_isDisposed)
+        {
+            return;
+        }
+
+        _isDisposed = true;
+        await StopAsync().ConfigureAwait(false);
+        GC.SuppressFinalize(this);
     }
 }

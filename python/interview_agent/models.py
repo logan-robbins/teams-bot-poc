@@ -4,7 +4,7 @@ Pydantic models for Interview Analysis Agent.
 Defines data structures for transcript events (v2 with diarization),
 interview sessions, and analysis outputs.
 
-Last Grunted: 01/31/2026
+Last Grunted: 02/05/2026
 """
 
 from datetime import datetime, timezone
@@ -245,7 +245,14 @@ class SessionAnalysis(BaseModel):
     )
     
     def compute_overall_scores(self) -> None:
-        """Compute overall scores from individual analysis items."""
+        """
+        Compute overall scores from individual analysis items.
+        
+        Updates the following instance attributes:
+            - overall_relevance: Average relevance score, or None if no items
+            - overall_clarity: Average clarity score, or None if no items  
+            - total_responses_analyzed: Count of analysis items
+        """
         if not self.analysis_items:
             self.overall_relevance = None
             self.overall_clarity = None

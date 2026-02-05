@@ -4,9 +4,15 @@ Interview Session Manager.
 Manages interview session state including speaker mappings,
 transcript accumulation, and context generation for the analysis agent.
 
-Last Grunted: 01/31/2026
+Thread Safety:
+    This class is NOT thread-safe. Use a single instance per thread/task,
+    or wrap access with appropriate synchronization primitives if sharing
+    across threads.
+
+Last Grunted: 02/05/2026
 """
 
+import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -16,6 +22,25 @@ from .models import (
     InterviewSession,
     SpeakerMapping,
 )
+
+
+__all__ = ["InterviewSessionManager"]
+
+
+logger = logging.getLogger(__name__)
+
+
+def _format_utc_timestamp(dt: datetime) -> str:
+    """
+    Format a datetime as ISO 8601 UTC string with 'Z' suffix.
+    
+    Args:
+        dt: A datetime object (should be timezone-aware UTC).
+        
+    Returns:
+        ISO 8601 formatted string ending with 'Z'.
+    """
+    return dt.isoformat().replace("+00:00", "Z")
 
 
 class InterviewSessionManager:
@@ -41,6 +66,7 @@ class InterviewSessionManager:
         """Initialize the session manager without an active session."""
         self._session: Optional[InterviewSession] = None
         self._speaker_roles: dict[str, str] = {}  # speaker_id -> role
+        logger.debug("InterviewSessionManager initialized")
     
     @property
     def session(self) -> Optional[InterviewSession]:
@@ -73,6 +99,7 @@ class InterviewSessionManager:
         """
         # End any existing session
         if self._session is not None:
+            logger.info("Ending existing session before starting new one")
             self.end_session()
         
         # Generate session ID with timestamp and random suffix
@@ -83,10 +110,15 @@ class InterviewSessionManager:
             session_id=session_id,
             candidate_name=candidate_name,
             meeting_url=meeting_url,
-            started_at=timestamp.isoformat() + "Z",
+            started_at=_format_utc_timestamp(timestamp),
         )
         self._speaker_roles = {}
         
+        logger.info(
+            "Started session %s for candidate '%s'",
+            session_id,
+            candidate_name,
+        )
         return self._session
     
     def end_session(self) -> Optional[InterviewSession]:
@@ -99,11 +131,18 @@ class InterviewSessionManager:
             The ended session, or None if no session was active.
         """
         if self._session is None:
+            logger.debug("end_session called but no active session")
             return None
         
-        self._session.ended_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        self._session.ended_at = _format_utc_timestamp(datetime.now(timezone.utc))
         ended_session = self._session
         # Don't clear _session yet - allow retrieval of ended session data
+        
+        logger.info(
+            "Ended session %s (total events: %d)",
+            ended_session.session_id,
+            len(ended_session.transcript_events),
+        )
         return ended_session
     
     def map_speaker(self, speaker_id: str, role: str, name: Optional[str] = None) -> None:
@@ -141,12 +180,20 @@ class InterviewSessionManager:
             m for m in self._session.speaker_mappings if m.speaker_id != speaker_id
         ]
         
+        display_name = name or (self._session.candidate_name if role == "candidate" else None)
         self._session.speaker_mappings.append(
             SpeakerMapping(
                 speaker_id=speaker_id,
                 role=role,
-                name=name or self._session.candidate_name if role == "candidate" else name,
+                name=display_name,
             )
+        )
+        
+        logger.info(
+            "Mapped speaker %s -> %s%s",
+            speaker_id,
+            role,
+            f" ({display_name})" if display_name else "",
         )
     
     def get_candidate_speaker_id(self) -> Optional[str]:
@@ -161,10 +208,10 @@ class InterviewSessionManager:
             >>> manager.get_candidate_speaker_id()
             'speaker_1'
         """
-        for speaker_id, role in self._speaker_roles.items():
-            if role == "candidate":
-                return speaker_id
-        return None
+        return next(
+            (sid for sid, role in self._speaker_roles.items() if role == "candidate"),
+            None,
+        )
     
     def get_speaker_role(self, speaker_id: str) -> Optional[str]:
         """
@@ -204,6 +251,13 @@ class InterviewSessionManager:
             raise ValueError("No active session. Call start_session() first.")
         
         self._session.transcript_events.append(event)
+        
+        if event.event_type == "final":
+            logger.debug(
+                "Added final transcript: speaker=%s, len=%d",
+                event.speaker_id,
+                len(event.text) if event.text else 0,
+            )
     
     def get_recent_transcripts(
         self,

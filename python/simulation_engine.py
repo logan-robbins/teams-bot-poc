@@ -1,5 +1,5 @@
 """
-Interview Simulation Engine for Streamlit Integration
+Interview Simulation Engine for Streamlit Integration.
 
 Provides a stateful simulation engine that plays back the INTERVIEW_SCRIPT
 with realistic timing, pause/resume support, and transcript sink integration.
@@ -15,41 +15,53 @@ Usage:
     await engine.restart()  # Start fresh
 """
 
+from __future__ import annotations
+
 import asyncio
-import httpx
+import logging
 import random
 import threading
-import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
-from dataclasses import dataclass, field
 from enum import Enum
+from typing import Final
+
+import httpx
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
-logger = logging.getLogger(__name__)
+logger: logging.Logger = logging.getLogger(__name__)
 
 
 # =============================================================================
 # Configuration
 # =============================================================================
 
-SINK_URL = "http://127.0.0.1:8765"
-CANDIDATE_NAME = "Sarah Chen"
-MEETING_URL = "https://teams.microsoft.com/l/meetup-join/simulated-interview-session"
+SINK_URL: Final[str] = "http://127.0.0.1:8765"
+CANDIDATE_NAME: Final[str] = "Sarah Chen"
+MEETING_URL: Final[str] = "https://teams.microsoft.com/l/meetup-join/simulated-interview-session"
 
 # Speaker IDs (matching diarization format)
-INTERVIEWER_ID = "speaker_0"
-CANDIDATE_ID = "speaker_1"
+INTERVIEWER_ID: Final[str] = "speaker_0"
+CANDIDATE_ID: Final[str] = "speaker_1"
 
 # Timing configuration (seconds)
-INTERVIEWER_DELAY_MIN = 2.0
-INTERVIEWER_DELAY_MAX = 3.0
-CANDIDATE_DELAY_MIN = 3.0
-CANDIDATE_DELAY_MAX = 5.0
-CANDIDATE_WORDS_PER_SECOND = 2.5  # For length-based delay calculation
+INTERVIEWER_DELAY_MIN: Final[float] = 2.0
+INTERVIEWER_DELAY_MAX: Final[float] = 3.0
+CANDIDATE_DELAY_MIN: Final[float] = 3.0
+CANDIDATE_DELAY_MAX: Final[float] = 5.0
+CANDIDATE_WORDS_PER_SECOND: Final[float] = 2.5  # For length-based delay calculation
+
+# Event generation constants
+MS_PER_WORD: Final[float] = 60.0
+MIN_DURATION_JITTER_MS: Final[float] = 50.0
+MAX_DURATION_JITTER_MS: Final[float] = 150.0
+MIN_CONFIDENCE: Final[float] = 0.88
+MAX_CONFIDENCE: Final[float] = 0.98
+PAUSE_BETWEEN_MESSAGES_MS: Final[float] = 500.0
+DELAY_JITTER_RANGE: Final[float] = 0.5
 
 
 # =============================================================================
@@ -132,11 +144,24 @@ def generate_transcript_event(
     text: str,
     event_type: str = "final",
     audio_offset_ms: float = 0.0,
-) -> dict:
-    """Generate a v2 transcript event matching C# bot output format."""
+) -> dict[str, object]:
+    """
+    Generate a v2 transcript event matching C# bot output format.
+
+    Args:
+        speaker_id: The speaker identifier (e.g., "speaker_0").
+        text: The transcript text content.
+        event_type: Event type, typically "final" for complete transcripts.
+        audio_offset_ms: Audio offset from session start in milliseconds.
+
+    Returns:
+        Dictionary containing the transcript event in v2 format.
+    """
     word_count = len(text.split())
-    duration_ms = word_count * 60 + random.uniform(50, 150)  # ~60ms per word
-    
+    duration_ms = word_count * MS_PER_WORD + random.uniform(
+        MIN_DURATION_JITTER_MS, MAX_DURATION_JITTER_MS
+    )
+
     return {
         "event_type": event_type,
         "text": text,
@@ -144,7 +169,7 @@ def generate_transcript_event(
         "speaker_id": speaker_id,
         "audio_start_ms": round(audio_offset_ms, 1),
         "audio_end_ms": round(audio_offset_ms + duration_ms, 1),
-        "confidence": round(random.uniform(0.88, 0.98), 3),
+        "confidence": round(random.uniform(MIN_CONFIDENCE, MAX_CONFIDENCE), 3),
         "metadata": {
             "provider": "deepgram",
             "model": "nova-3",
@@ -152,8 +177,16 @@ def generate_transcript_event(
     }
 
 
-def generate_session_event(event_type: str) -> dict:
-    """Generate session start/stop event."""
+def generate_session_event(event_type: str) -> dict[str, object]:
+    """
+    Generate session start/stop event.
+
+    Args:
+        event_type: The session event type (e.g., "session_started", "session_stopped").
+
+    Returns:
+        Dictionary containing the session event.
+    """
     return {
         "event_type": event_type,
         "text": None,
@@ -168,21 +201,28 @@ def generate_session_event(event_type: str) -> dict:
 def calculate_delay(speaker_id: str, text: str) -> float:
     """
     Calculate realistic delay based on speaker and message length.
-    
+
     Interviewer: 2-3 seconds (faster pace for questions)
     Candidate: 3-5 seconds (slower, thoughtful responses), scaled by length
+
+    Args:
+        speaker_id: The speaker identifier.
+        text: The message text (used for length-based delay calculation).
+
+    Returns:
+        Delay in seconds before the next message.
     """
     if speaker_id == INTERVIEWER_ID:
         return random.uniform(INTERVIEWER_DELAY_MIN, INTERVIEWER_DELAY_MAX)
-    
+
     # Candidate delay scales with message length
     word_count = len(text.split())
     base_delay = word_count / CANDIDATE_WORDS_PER_SECOND
-    
+
     # Clamp to reasonable range with some randomness
     delay = max(CANDIDATE_DELAY_MIN, min(CANDIDATE_DELAY_MAX, base_delay))
-    delay += random.uniform(-0.5, 0.5)  # Add jitter
-    
+    delay += random.uniform(-DELAY_JITTER_RANGE, DELAY_JITTER_RANGE)
+
     return max(CANDIDATE_DELAY_MIN, min(CANDIDATE_DELAY_MAX, delay))
 
 
@@ -193,10 +233,16 @@ def calculate_delay(speaker_id: str, text: str) -> float:
 class SimulationEngine:
     """
     Stateful interview simulation engine for Streamlit integration.
-    
+
     Thread-safe state management with async control methods for
-    start/stop/restart functionality.
-    
+    start/stop/restart functionality. Uses structured concurrency
+    patterns for proper task lifecycle management.
+
+    Attributes:
+        sink_url: URL of the transcript sink service.
+        candidate_name: Name of the interview candidate.
+        meeting_url: URL of the Teams meeting.
+
     Usage:
         engine = SimulationEngine()
         await engine.start()  # Start from beginning
@@ -204,31 +250,44 @@ class SimulationEngine:
         await engine.start()  # Resume from paused position
         await engine.restart()  # Reset and start fresh
     """
-    
+
     def __init__(
         self,
         sink_url: str = SINK_URL,
         candidate_name: str = CANDIDATE_NAME,
         meeting_url: str = MEETING_URL,
-    ):
-        self.sink_url = sink_url
-        self.candidate_name = candidate_name
-        self.meeting_url = meeting_url
-        
+    ) -> None:
+        """
+        Initialize the simulation engine.
+
+        Args:
+            sink_url: URL of the transcript sink service.
+            candidate_name: Name of the interview candidate.
+            meeting_url: URL of the Teams meeting.
+        """
+        self.sink_url: str = sink_url
+        self.candidate_name: str = candidate_name
+        self.meeting_url: str = meeting_url
+
         # State
-        self._state = SimulationState.IDLE
-        self._current_index = 0
+        self._state: SimulationState = SimulationState.IDLE
+        self._current_index: int = 0
         self._messages_sent: list[SentMessage] = []
-        self._audio_offset_ms = 0.0
-        self._session_id: Optional[str] = None
-        self._error: Optional[str] = None
-        
+        self._audio_offset_ms: float = 0.0
+        self._session_id: str | None = None
+        self._error: str | None = None
+
         # Threading
-        self._lock = threading.Lock()
-        self._stop_event = asyncio.Event()
-        self._running_task: Optional[asyncio.Task] = None
-        
-        logger.info(f"SimulationEngine initialized: sink={sink_url}, candidate={candidate_name}")
+        self._lock: threading.Lock = threading.Lock()
+        self._stop_event: asyncio.Event = asyncio.Event()
+        self._running_task: asyncio.Task[None] | None = None
+        self._finalize_task: asyncio.Task[None] | None = None  # Track finalization task
+
+        logger.info(
+            "SimulationEngine initialized: sink=%s, candidate=%s",
+            sink_url,
+            candidate_name,
+        )
     
     # -------------------------------------------------------------------------
     # Properties (thread-safe)
@@ -325,37 +384,57 @@ class SimulationEngine:
     async def stop(self) -> None:
         """
         Pause the simulation at current position.
-        
-        The simulation can be resumed with start().
+
+        The simulation can be resumed with start(). This method properly
+        awaits all spawned tasks to ensure clean shutdown.
         """
         with self._lock:
             if self._state != SimulationState.RUNNING:
-                logger.info(f"Cannot stop: state is {self._state}")
+                logger.info("Cannot stop: state is %s", self._state)
                 return
-            
+
             self._state = SimulationState.PAUSED
             self._stop_event.set()
-        
-        logger.info(f"Simulation paused at index {self._current_index}")
-        
+
+        logger.info("Simulation paused at index %d", self._current_index)
+
         # Wait for running task to acknowledge stop
         if self._running_task:
             try:
                 await asyncio.wait_for(self._running_task, timeout=2.0)
             except asyncio.TimeoutError:
                 logger.warning("Simulation task did not stop cleanly")
+                self._running_task.cancel()
+                try:
+                    await self._running_task
+                except asyncio.CancelledError:
+                    pass
             self._running_task = None
+
+        # Also await any pending finalization task
+        if self._finalize_task and not self._finalize_task.done():
+            try:
+                await asyncio.wait_for(self._finalize_task, timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning("Finalization task did not complete in time")
+                self._finalize_task.cancel()
+                try:
+                    await self._finalize_task
+                except asyncio.CancelledError:
+                    pass
+            self._finalize_task = None
     
     async def restart(self) -> None:
         """
         Reset to beginning and start fresh.
-        
+
         Stops current simulation (if running), resets state, and starts over.
+        Ensures proper cleanup of all tasks before restarting.
         """
         # Stop if running
         if self.is_running:
             await self.stop()
-        
+
         with self._lock:
             self._state = SimulationState.IDLE
             self._current_index = 0
@@ -363,16 +442,17 @@ class SimulationEngine:
             self._audio_offset_ms = 0.0
             self._session_id = None
             self._error = None
-        
+            self._finalize_task = None
+
         logger.info("Simulation reset to beginning")
-        
+
         # Start fresh
         await self.start()
-    
-    async def run_step(self) -> Optional[dict]:
+
+    async def run_step(self) -> dict[str, object] | None:
         """
         Execute one step of simulation.
-        
+
         Returns:
             The message event dict that was sent, or None if:
             - Simulation is not running
@@ -382,34 +462,44 @@ class SimulationEngine:
         with self._lock:
             if self._state != SimulationState.RUNNING:
                 return None
-            
+
             if self._current_index >= len(INTERVIEW_SCRIPT):
                 self._state = SimulationState.COMPLETED
                 return None
-            
+
             index = self._current_index
             speaker_id, text = INTERVIEW_SCRIPT[index]
             audio_offset = self._audio_offset_ms
-        
+
         # Generate and send event
         event = generate_transcript_event(
             speaker_id=speaker_id,
             text=text,
             audio_offset_ms=audio_offset,
         )
-        
+
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.post(f"{self.sink_url}/transcript", json=event)
                 if resp.status_code != 200:
-                    logger.warning(f"Failed to send transcript: {resp.status_code} - {resp.text}")
-        except Exception as e:
-            logger.error(f"Error sending transcript: {e}")
+                    logger.warning(
+                        "Failed to send transcript: %d - %s",
+                        resp.status_code,
+                        resp.text,
+                    )
+        except httpx.ConnectError as e:
+            logger.error("Connection error sending transcript: %s", e)
             with self._lock:
                 self._state = SimulationState.ERROR
-                self._error = str(e)
+                self._error = f"Connection error: {e}"
             return None
-        
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP error sending transcript: %s", e)
+            with self._lock:
+                self._state = SimulationState.ERROR
+                self._error = f"HTTP error: {e}"
+            return None
+
         # Record sent message
         word_count = len(text.split())
         sent_msg = SentMessage(
@@ -434,138 +524,169 @@ class SimulationEngine:
     # -------------------------------------------------------------------------
     # Internal Methods
     # -------------------------------------------------------------------------
-    
+
     async def _run_loop(self) -> None:
         """
         Main simulation loop with timing and pause support.
+
+        Implements structured concurrency by properly managing all spawned tasks.
+        Uses interruptible waits to support pause/resume functionality.
         """
         try:
             # Initialize session if starting fresh
             if self._current_index == 0:
                 await self._initialize_session()
-            
+
             while True:
                 # Check for stop signal
                 if self._stop_event.is_set():
                     logger.info("Stop signal received")
                     break
-                
+
                 # Check if complete
                 with self._lock:
                     if self._current_index >= len(INTERVIEW_SCRIPT):
                         self._state = SimulationState.COMPLETED
                         break
-                    
+
                     speaker_id, text = INTERVIEW_SCRIPT[self._current_index]
-                
+
                 # Execute step
                 event = await self.run_step()
                 if event is None:
                     break
-                
+
                 # Calculate and apply delay
                 delay = calculate_delay(speaker_id, text)
-                
+
                 # Wait with interruptible sleep
                 try:
                     await asyncio.wait_for(
                         self._stop_event.wait(),
-                        timeout=delay
+                        timeout=delay,
                     )
                     # Stop event was set
                     break
                 except asyncio.TimeoutError:
-                    # Normal timeout, continue
+                    # Normal timeout, continue to next message
                     pass
-            
-            # Finalize session if completed
+
+            # Finalize session if completed - properly track the task
+            # NOTE: Previously this was a bare create_task() which leaked tasks.
+            # Now we properly track and await the finalization task.
             with self._lock:
                 if self._state == SimulationState.COMPLETED:
-                    asyncio.create_task(self._finalize_session())
-        
-        except Exception as e:
-            logger.error(f"Error in simulation loop: {e}", exc_info=True)
+                    self._finalize_task = asyncio.create_task(
+                        self._finalize_session(),
+                        name="finalize_session",
+                    )
+
+        except httpx.ConnectError as e:
+            logger.error("Connection error in simulation loop: %s", e)
+            with self._lock:
+                self._state = SimulationState.ERROR
+                self._error = f"Connection error: {e}"
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP error in simulation loop: %s", e)
+            with self._lock:
+                self._state = SimulationState.ERROR
+                self._error = f"HTTP error: {e}"
+        except RuntimeError as e:
+            logger.error("Runtime error in simulation loop: %s", e, exc_info=True)
             with self._lock:
                 self._state = SimulationState.ERROR
                 self._error = str(e)
     
     async def _initialize_session(self) -> None:
-        """Initialize session with transcript sink."""
-        logger.info(f"Initializing session for: {self.candidate_name}")
-        
+        """
+        Initialize session with transcript sink.
+
+        Raises:
+            RuntimeError: If sink is unhealthy or session creation fails.
+            httpx.ConnectError: If connection to sink fails.
+        """
+        logger.info("Initializing session for: %s", self.candidate_name)
+
         async with httpx.AsyncClient(timeout=10.0) as client:
             # Check sink health
-            try:
-                resp = await client.get(f"{self.sink_url}/health")
-                if resp.status_code != 200:
-                    raise RuntimeError(f"Sink not healthy: {resp.status_code}")
-                logger.info(f"Sink healthy: {resp.json()}")
-            except httpx.ConnectError:
-                raise RuntimeError(f"Cannot connect to sink at {self.sink_url}")
-            
+            resp = await client.get(f"{self.sink_url}/health")
+            if resp.status_code != 200:
+                raise RuntimeError(f"Sink not healthy: {resp.status_code}")
+            logger.info("Sink healthy: %s", resp.json())
+
             # Start session
             resp = await client.post(
                 f"{self.sink_url}/session/start",
                 json={
                     "candidate_name": self.candidate_name,
                     "meeting_url": self.meeting_url,
-                }
+                },
             )
             if resp.status_code != 200:
                 raise RuntimeError(f"Failed to start session: {resp.text}")
-            
-            session_data = resp.json()
+
+            session_data: dict[str, object] = resp.json()
             with self._lock:
-                self._session_id = session_data.get("session_id")
-            
-            logger.info(f"Session started: {self._session_id}")
-            
+                self._session_id = str(session_data.get("session_id", ""))
+
+            logger.info("Session started: %s", self._session_id)
+
             # Map speakers
             await client.post(
                 f"{self.sink_url}/session/map-speaker",
-                json={"speaker_id": INTERVIEWER_ID, "role": "interviewer"}
+                json={"speaker_id": INTERVIEWER_ID, "role": "interviewer"},
             )
             await client.post(
                 f"{self.sink_url}/session/map-speaker",
-                json={"speaker_id": CANDIDATE_ID, "role": "candidate"}
+                json={"speaker_id": CANDIDATE_ID, "role": "candidate"},
             )
             logger.info("Speakers mapped: speaker_0=interviewer, speaker_1=candidate")
-            
+
             # Send session started event
             await client.post(
                 f"{self.sink_url}/transcript",
-                json=generate_session_event("session_started")
+                json=generate_session_event("session_started"),
             )
             logger.info("Session started event sent")
     
     async def _finalize_session(self) -> None:
-        """Finalize session with transcript sink."""
+        """
+        Finalize session with transcript sink.
+
+        Sends session_stopped event, retrieves final stats, and ends the session.
+        Handles errors gracefully to ensure cleanup completes.
+        """
         logger.info("Finalizing session...")
-        
+
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 # Send session stopped event
                 await client.post(
                     f"{self.sink_url}/transcript",
-                    json=generate_session_event("session_stopped")
+                    json=generate_session_event("session_stopped"),
                 )
-                
+
                 await asyncio.sleep(0.5)
-                
+
                 # Get final stats
                 stats_resp = await client.get(f"{self.sink_url}/stats")
                 if stats_resp.status_code == 200:
-                    stats = stats_resp.json()
-                    logger.info(f"Final stats: {stats['stats']}")
-                
+                    stats: dict[str, object] = stats_resp.json()
+                    logger.info("Final stats: %s", stats.get("stats"))
+
                 # End the session
                 end_resp = await client.post(f"{self.sink_url}/session/end")
                 if end_resp.status_code == 200:
-                    summary = end_resp.json().get("summary", {})
-                    logger.info(f"Session ended: {summary}")
-        
-        except Exception as e:
-            logger.error(f"Error finalizing session: {e}")
+                    summary: dict[str, object] = end_resp.json().get("summary", {})
+                    logger.info("Session ended: %s", summary)
+
+        except httpx.ConnectError as e:
+            logger.error("Connection error finalizing session: %s", e)
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP error finalizing session: %s", e)
+        except asyncio.CancelledError:
+            logger.warning("Session finalization was cancelled")
+            raise  # Re-raise to allow proper cancellation handling
     
     # -------------------------------------------------------------------------
     # Status Methods
@@ -612,15 +733,19 @@ class SimulationEngine:
 # Singleton for Streamlit
 # =============================================================================
 
-_engine_instance: Optional[SimulationEngine] = None
-_engine_lock = threading.Lock()
+_engine_instance: SimulationEngine | None = None
+_engine_lock: threading.Lock = threading.Lock()
 
 
 def get_simulation_engine() -> SimulationEngine:
     """
     Get or create the singleton SimulationEngine instance.
-    
+
     Use this in Streamlit to ensure only one engine exists across reruns.
+    Thread-safe through module-level lock.
+
+    Returns:
+        The singleton SimulationEngine instance.
     """
     global _engine_instance
     with _engine_lock:
@@ -632,8 +757,11 @@ def get_simulation_engine() -> SimulationEngine:
 def reset_simulation_engine() -> SimulationEngine:
     """
     Reset the singleton SimulationEngine instance.
-    
-    Creates a fresh engine instance.
+
+    Creates a fresh engine instance, replacing any existing one.
+
+    Returns:
+        A new SimulationEngine instance.
     """
     global _engine_instance
     with _engine_lock:

@@ -7,14 +7,19 @@ without blocking response analysis.
 
 Supports both OpenAI and Azure OpenAI backends (inherits from agent.py config).
 
-Last Grunted: 02/01/2026
+Thread Safety:
+    The global `_checklist_callback` is set at ChecklistAgent instantiation.
+    Only one ChecklistAgent instance should exist per application, or ensure
+    callbacks are updated atomically.
+
+Last Grunted: 02/05/2026
 """
 
 import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import Any, Callable, Literal, Optional
+from typing import Any, Callable, Literal, Optional, Protocol, runtime_checkable
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -26,10 +31,41 @@ from .models import AnalysisItem
 
 
 # Load environment variables from .env file
+# Note: In production, prefer configuring via environment or external config
 _env_path = Path(__file__).parent.parent / ".env"
-load_dotenv(_env_path)
+if _env_path.exists():
+    load_dotenv(_env_path)
+else:
+    logger = logging.getLogger(__name__)
+    logger.debug("No .env file found at %s, using environment variables", _env_path)
 
 logger = logging.getLogger(__name__)
+
+
+__all__ = [
+    "CHECKLIST_ITEMS",
+    "CHECKLIST_STATUSES",
+    "ChecklistUpdate",
+    "ChecklistAgentOutput",
+    "ChecklistAgent",
+    "parallel_analysis",
+    "create_checklist_agent",
+]
+
+
+@runtime_checkable
+class AnalyzerProtocol(Protocol):
+    """Protocol defining the interface for interview analyzers."""
+    
+    async def analyze_async(
+        self,
+        response_text: str,
+        context: Optional[dict[str, Any]] = None,
+        response_id: Optional[str] = None,
+        speaker_id: Optional[str] = None,
+    ) -> AnalysisItem:
+        """Analyze a response and return an AnalysisItem."""
+        ...
 
 
 # =============================================================================
@@ -178,8 +214,9 @@ def _get_openai_config() -> tuple[str, Optional[AsyncAzureOpenAI]]:
             )
 
         logger.info(
-            f"ChecklistAgent using Azure OpenAI: {azure_endpoint}, "
-            f"deployment: {azure_deployment}"
+            "ChecklistAgent using Azure OpenAI: %s, deployment: %s",
+            azure_endpoint,
+            azure_deployment,
         )
 
         azure_client = AsyncAzureOpenAI(
@@ -192,7 +229,7 @@ def _get_openai_config() -> tuple[str, Optional[AsyncAzureOpenAI]]:
 
     # Fall back to standard OpenAI - use mini model for speed
     model = os.environ.get("OPENAI_CHECKLIST_MODEL", "gpt-4o-mini")
-    logger.info(f"ChecklistAgent using OpenAI: model {model}")
+    logger.info("ChecklistAgent using OpenAI: model %s", model)
     return model, None
 
 
@@ -229,10 +266,10 @@ def update_checklist(item: str, status: str, reason: str) -> str:
     if _checklist_callback is not None:
         try:
             _checklist_callback(item, status, reason)
-            logger.info(f"Checklist updated: {item} -> {status} ({reason})")
+            logger.info("Checklist updated: %s -> %s (%s)", item, status, reason)
             return f"Successfully updated '{item}' to '{status}'"
         except Exception as e:
-            logger.error(f"Callback failed: {e}")
+            logger.error("Callback failed: %s", e, exc_info=True)
             return f"Error calling callback: {e}"
 
     logger.warning("No checklist callback registered")
@@ -403,7 +440,7 @@ class ChecklistAgent:
         speaker_id: str,
         speaker_role: str,
         text: str,
-        conversation_history: list[dict],
+        conversation_history: list[dict[str, Any]],
     ) -> Optional[dict[str, Any]]:
         """
         Analyze the conversation turn to determine if checklist should be updated.
@@ -428,10 +465,10 @@ class ChecklistAgent:
                 # Complete previous topic if exists
                 if self._current_topic and self._current_topic not in self._completed_topics:
                     self._completed_topics.add(self._current_topic)
-                    logger.debug(f"Auto-completing previous topic: {self._current_topic}")
+                    logger.debug("Auto-completing previous topic: %s", self._current_topic)
 
                 self._current_topic = quick_topic
-                logger.info(f"Quick detection: {quick_topic} -> analyzing")
+                logger.info("Quick detection: %s -> analyzing", quick_topic)
                 return {
                     "item": quick_topic,
                     "status": "analyzing",
@@ -452,11 +489,11 @@ class ChecklistAgent:
             # We track state changes via the callback, so just return None here
             # if no explicit update was detected
 
-            logger.debug(f"Agent run complete. Final output: {result.final_output}")
+            logger.debug("Agent run complete. Final output: %s", result.final_output)
             return None
 
         except Exception as e:
-            logger.error(f"Checklist agent analysis failed: {e}", exc_info=True)
+            logger.error("Checklist agent analysis failed: %s", e, exc_info=True)
             return None
 
     def update_state(self, item: str, status: str) -> None:
@@ -484,30 +521,34 @@ class ChecklistAgent:
 
 
 async def parallel_analysis(
-    analyzer: Any,  # InterviewAnalyzer - avoid circular import
+    analyzer: AnalyzerProtocol,
     checklist_agent: ChecklistAgent,
     response_text: str,
     speaker_id: str,
     speaker_role: str,
     context: Optional[dict[str, Any]] = None,
-    conversation_history: Optional[list[dict]] = None,
+    conversation_history: Optional[list[dict[str, Any]]] = None,
     response_id: Optional[str] = None,
 ) -> tuple[AnalysisItem, Optional[dict[str, Any]]]:
     """
     Run both analyses in parallel for maximum efficiency.
 
     Args:
-        analyzer: The main InterviewAnalyzer instance
-        checklist_agent: The ChecklistAgent instance
-        response_text: The text to analyze
-        speaker_id: Speaker identifier
-        speaker_role: "interviewer" or "candidate"
-        context: Context for the main analyzer
-        conversation_history: Conversation history for checklist agent
-        response_id: Optional response ID
+        analyzer: The main InterviewAnalyzer instance (implements AnalyzerProtocol).
+        checklist_agent: The ChecklistAgent instance.
+        response_text: The text to analyze.
+        speaker_id: Speaker identifier.
+        speaker_role: "interviewer" or "candidate".
+        context: Context for the main analyzer.
+        conversation_history: Conversation history for checklist agent.
+        response_id: Optional response ID.
 
     Returns:
-        Tuple of (AnalysisItem, Optional[ChecklistUpdate dict])
+        Tuple of (AnalysisItem, Optional[ChecklistUpdate dict]).
+        
+    Note:
+        Both analyses run concurrently. If either fails, the function still
+        returns results for the successful one (with a fallback for failures).
     """
     # Only run main analysis for candidate responses
     # Checklist analysis runs for all speakers
@@ -535,10 +576,9 @@ async def parallel_analysis(
     )
 
     # Handle exceptions
-    if isinstance(analysis_result, Exception):
-        logger.error(f"Analysis task failed: {analysis_result}")
+    if isinstance(analysis_result, BaseException):
+        logger.error("Analysis task failed: %s", analysis_result, exc_info=analysis_result)
         # Return minimal analysis item on failure
-        from .models import AnalysisItem
         analysis_result = AnalysisItem(
             response_id=response_id or "error",
             response_text=response_text,
@@ -548,8 +588,8 @@ async def parallel_analysis(
             follow_up_suggestions=[],
         )
 
-    if isinstance(checklist_result, Exception):
-        logger.error(f"Checklist task failed: {checklist_result}")
+    if isinstance(checklist_result, BaseException):
+        logger.error("Checklist task failed: %s", checklist_result, exc_info=checklist_result)
         checklist_result = None
 
     return analysis_result, checklist_result

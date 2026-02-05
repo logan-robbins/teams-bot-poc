@@ -1,5 +1,12 @@
+// ==============================================
+// Talestral Teams Media Bot - Program Entry Point
+// ==============================================
+// ASP.NET Core 8.0 application for Teams meeting transcription.
+// Receives real-time audio via Graph Communications SDK and 
+// streams it to STT providers (Deepgram/Azure Speech).
+// ==============================================
+
 using Microsoft.Graph.Communications.Common.Telemetry;
-using Microsoft.Extensions.Logging;
 using Serilog;
 using System.Security.Cryptography.X509Certificates;
 using TeamsMediaBot.Models;
@@ -7,58 +14,158 @@ using TeamsMediaBot.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Load configuration from Config/appsettings.json (required for VM/service)
+// Load configuration from Config/appsettings.json (required for VM/service deployment)
 builder.Configuration.AddJsonFile("Config/appsettings.json", optional: false, reloadOnChange: true);
 
-// Configure Serilog
+// Configure Serilog for structured logging
 Log.Logger = new LoggerConfiguration()
     .ReadFrom.Configuration(builder.Configuration)
     .Enrich.FromLogContext()
-    .WriteTo.Console()
-    .WriteTo.File("logs/teamsbot-.log", rollingInterval: RollingInterval.Day)
+    .Enrich.WithMachineName()
+    .Enrich.WithThreadId()
+    .WriteTo.Console(outputTemplate: "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj}{NewLine}{Exception}")
+    .WriteTo.File("logs/teamsbot-.log", rollingInterval: RollingInterval.Day, retainedFileCountLimit: 14)
     .CreateLogger();
 
 builder.Host.UseSerilog();
 
-// Load configuration sections
-var botConfig = builder.Configuration.GetSection("Bot").Get<BotConfiguration>()
-    ?? throw new InvalidOperationException("Bot configuration is missing");
-
-var mediaConfig = builder.Configuration.GetSection("MediaPlatformSettings").Get<MediaPlatformConfiguration>()
-    ?? throw new InvalidOperationException("MediaPlatformSettings configuration is missing");
-
-// STT configuration:
-// - Prefer new "Stt" section (provider selection)
-// - Fall back to legacy "Speech" section for backward compatibility
-var sttConfig = builder.Configuration.GetSection("Stt").Get<SttConfiguration>();
-if (sttConfig == null)
+try
 {
-    var speechConfig = builder.Configuration.GetSection("Speech").Get<SpeechConfiguration>()
-        ?? throw new InvalidOperationException("STT configuration is missing. Provide either 'Stt' or legacy 'Speech' section.");
+    // Load and validate configuration sections
+    var botConfig = LoadRequiredConfiguration<BotConfiguration>(builder.Configuration, "Bot");
+    var mediaConfig = LoadRequiredConfiguration<MediaPlatformConfiguration>(builder.Configuration, "MediaPlatformSettings");
+    var sttConfig = LoadSttConfiguration(builder.Configuration);
+    var transcriptSinkConfig = LoadRequiredConfiguration<TranscriptSinkConfiguration>(builder.Configuration, "TranscriptSink");
 
-    sttConfig = new SttConfiguration
+    // Configure Kestrel to listen on the specified URL with TLS if configured
+    ConfigureKestrel(builder, botConfig, mediaConfig);
+
+    // Register configuration as singletons
+    builder.Services.AddSingleton(botConfig);
+    builder.Services.AddSingleton(mediaConfig);
+    builder.Services.AddSingleton(sttConfig);
+    builder.Services.AddSingleton(transcriptSinkConfig);
+
+    // Register Graph Communications logger
+    builder.Services.AddSingleton<IGraphLogger>(sp =>
     {
-        Provider = "AzureSpeech",
-        AzureSpeech = new AzureSpeechProviderConfiguration
-        {
-            Key = speechConfig.Key,
-            Region = speechConfig.Region,
-            RecognitionLanguage = speechConfig.RecognitionLanguage,
-            EndpointId = null
-        }
-    };
+        var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+        var graphLogger = new GraphLogger(
+            component: "TeamsMediaBotPOC",
+            properties: Array.Empty<object>(),
+            redirectToTrace: false,
+            obfuscationConfiguration: null);
+        graphLogger.BindToILoggerFactory(loggerFactory);
+        return graphLogger;
+    });
+
+    // Register transcriber factory (creates transcribers outside of DI tracking)
+    builder.Services.AddSingleton<TranscriberFactory>(sp =>
+    {
+        var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+        return new TranscriberFactory(
+            sttConfig,
+            transcriptSinkConfig.PythonEndpoint,
+            loggerFactory);
+    });
+
+    // Register bot service as singleton
+    builder.Services.AddSingleton<TeamsCallingBotService>();
+
+    // Add controllers with Newtonsoft.Json (required by Graph Communications SDK)
+    builder.Services.AddControllers()
+        .AddNewtonsoftJson();
+
+    // Add health checks for monitoring
+    builder.Services.AddHealthChecks();
+
+    var app = builder.Build();
+
+    // Configure HTTP request pipeline
+    app.UseRouting();
+    app.MapControllers();
+    app.MapHealthChecks("/health");
+
+    // Initialize bot service on startup
+    var botService = app.Services.GetRequiredService<TeamsCallingBotService>();
+    await botService.InitializeAsync().ConfigureAwait(false);
+
+    Log.Information(
+        "Teams Media Bot starting - ListenUrl={ListenUrl}, NotificationUrl={NotificationUrl}, MediaEndpoint={ServiceFqdn}:{PublicPort}",
+        botConfig.LocalHttpListenUrl,
+        botConfig.NotificationUrl,
+        mediaConfig.ServiceFqdn,
+        mediaConfig.InstancePublicPort);
+
+    await app.RunAsync().ConfigureAwait(false);
+
+    // Graceful shutdown
+    Log.Information("Shutting down bot service...");
+    await botService.DisposeAsync().ConfigureAwait(false);
 }
-else
+catch (Exception ex)
 {
-    // Allow selecting provider via Stt.Provider without duplicating secrets:
-    // If Stt.Provider selects AzureSpeech but Stt.AzureSpeech is missing, fall back to legacy Speech section.
-    var provider = (sttConfig.Provider ?? string.Empty).Trim();
-    var isAzure = provider.Equals("AzureSpeech", StringComparison.OrdinalIgnoreCase) ||
-                  provider.Equals("Azure", StringComparison.OrdinalIgnoreCase);
-    if (isAzure && sttConfig.AzureSpeech == null)
+    Log.Fatal(ex, "Application terminated unexpectedly");
+    throw;
+}
+finally
+{
+    await Log.CloseAndFlushAsync().ConfigureAwait(false);
+}
+
+return;
+
+// ==============================================
+// Local Helper Methods
+// ==============================================
+
+/// <summary>
+/// Loads a required configuration section, throwing if missing.
+/// </summary>
+static T LoadRequiredConfiguration<T>(IConfiguration configuration, string sectionName) where T : class
+{
+    return configuration.GetSection(sectionName).Get<T>()
+        ?? throw new InvalidOperationException($"Configuration section '{sectionName}' is missing or invalid.");
+}
+
+/// <summary>
+/// Loads STT configuration with backward compatibility for legacy 'Speech' section.
+/// </summary>
+static SttConfiguration LoadSttConfiguration(IConfiguration configuration)
+{
+    var sttConfig = configuration.GetSection("Stt").Get<SttConfiguration>();
+    
+    if (sttConfig is null)
     {
-        var speechConfig = builder.Configuration.GetSection("Speech").Get<SpeechConfiguration>()
-            ?? throw new InvalidOperationException("Stt.Provider='AzureSpeech' but no Stt.AzureSpeech and no legacy Speech section found.");
+        // Fall back to legacy 'Speech' section
+        var speechConfig = configuration.GetSection("Speech").Get<SpeechConfiguration>()
+            ?? throw new InvalidOperationException(
+                "STT configuration is missing. Provide either 'Stt' or legacy 'Speech' section.");
+
+        return new SttConfiguration
+        {
+            Provider = "AzureSpeech",
+            AzureSpeech = new AzureSpeechProviderConfiguration
+            {
+                Key = speechConfig.Key,
+                Region = speechConfig.Region,
+                RecognitionLanguage = speechConfig.RecognitionLanguage,
+                EndpointId = null
+            }
+        };
+    }
+
+    // If Stt.Provider selects AzureSpeech but Stt.AzureSpeech is missing, 
+    // fall back to legacy Speech section for credentials
+    var provider = (sttConfig.Provider ?? string.Empty).Trim();
+    var isAzureProvider = provider.Equals("AzureSpeech", StringComparison.OrdinalIgnoreCase) ||
+                          provider.Equals("Azure", StringComparison.OrdinalIgnoreCase);
+    
+    if (isAzureProvider && sttConfig.AzureSpeech is null)
+    {
+        var speechConfig = configuration.GetSection("Speech").Get<SpeechConfiguration>()
+            ?? throw new InvalidOperationException(
+                "Stt.Provider='AzureSpeech' but no Stt.AzureSpeech and no legacy Speech section found.");
 
         sttConfig.AzureSpeech = new AzureSpeechProviderConfiguration
         {
@@ -68,115 +175,70 @@ else
             EndpointId = null
         };
     }
+
+    return sttConfig;
 }
 
-var transcriptSinkConfig = builder.Configuration.GetSection("TranscriptSink").Get<TranscriptSinkConfiguration>()
-    ?? throw new InvalidOperationException("TranscriptSink configuration is missing");
-
-// Configure Kestrel to listen on the specified URL.
-// If HTTPS is specified, bind the installed certificate by thumbprint.
-var listenUri = new Uri(botConfig.LocalHttpListenUrl);
-if (listenUri.Scheme.Equals("http", StringComparison.OrdinalIgnoreCase) && listenUri.Port == 443)
+/// <summary>
+/// Configures Kestrel to listen on the specified URL with optional TLS.
+/// </summary>
+static void ConfigureKestrel(
+    WebApplicationBuilder builder, 
+    BotConfiguration botConfig, 
+    MediaPlatformConfiguration mediaConfig)
 {
-    throw new InvalidOperationException("LocalHttpListenUrl is HTTP on port 443. Use https:// for TLS or change the port.");
-}
-builder.WebHost.ConfigureKestrel(options =>
-{
-    options.ListenAnyIP(listenUri.Port, listenOptions =>
+    var listenUri = new Uri(botConfig.LocalHttpListenUrl);
+    
+    // Validate HTTP/HTTPS port configuration
+    if (string.Equals(listenUri.Scheme, "http", StringComparison.OrdinalIgnoreCase) && listenUri.Port == 443)
     {
-        if (listenUri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase))
-        {
-            var cert = LoadCertificateFromStore(mediaConfig.CertificateThumbprint);
-            listenOptions.UseHttps(cert);
-        }
-    });
-});
-
-// Register configuration as singletons
-builder.Services.AddSingleton(botConfig);
-builder.Services.AddSingleton(mediaConfig);
-builder.Services.AddSingleton(sttConfig);
-builder.Services.AddSingleton(transcriptSinkConfig);
-
-// Register Graph logger (use SDK GraphLogger to satisfy IGraphLogger interface)
-builder.Services.AddSingleton<IGraphLogger>(sp =>
-{
-    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
-    var graphLogger = new GraphLogger(
-        component: "TeamsMediaBotPOC",
-        properties: Array.Empty<object>(),
-        redirectToTrace: false,
-        obfuscationConfiguration: null);
-    graphLogger.BindToILoggerFactory(loggerFactory);
-    return graphLogger;
-});
-
-// Register a factory for creating transcribers
-// We use a factory instead of registering the transcriber directly because:
-// 1. The transcriber implements IAsyncDisposable
-// 2. DI container tracks IAsyncDisposable objects and tries to dispose them
-// 3. The transcriber's lifetime is managed by CallHandler, not by DI
-builder.Services.AddSingleton<TranscriberFactory>(sp =>
-{
-    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
-    return new TranscriberFactory(
-        sttConfig,
-        transcriptSinkConfig.PythonEndpoint,
-        loggerFactory);
-});
-
-// Register bot service as singleton
-builder.Services.AddSingleton<TeamsCallingBotService>();
-
-// Add controllers
-builder.Services.AddControllers()
-    .AddNewtonsoftJson(); // Graph SDK uses Newtonsoft.Json
-
-// Add health checks
-builder.Services.AddHealthChecks();
-
-var app = builder.Build();
-
-// Configure HTTP request pipeline
-app.UseRouting();
-
-app.MapControllers();
-app.MapHealthChecks("/health");
-
-// Initialize bot service on startup
-var botService = app.Services.GetRequiredService<TeamsCallingBotService>();
-await botService.InitializeAsync();
-
-Log.Information("Teams Media Bot POC starting on {Url}", botConfig.LocalHttpListenUrl);
-Log.Information("Notification URL configured: {NotificationUrl}", botConfig.NotificationUrl);
-Log.Information("Media endpoint: {ServiceFqdn}:{PublicPort}", mediaConfig.ServiceFqdn, mediaConfig.InstancePublicPort);
-
-await app.RunAsync();
-
-// Cleanup
-await botService.DisposeAsync();
-Log.CloseAndFlush();
-
-static X509Certificate2 LoadCertificateFromStore(string thumbprint)
-{
-    if (string.IsNullOrWhiteSpace(thumbprint) || thumbprint == "CHANGE_AFTER_CERT_INSTALL")
-    {
-        throw new InvalidOperationException("CertificateThumbprint is not set. Update Config/appsettings.json.");
+        throw new InvalidOperationException(
+            "LocalHttpListenUrl is HTTP on port 443. Use https:// for TLS or change the port.");
     }
 
-    var normalized = thumbprint.Replace(" ", string.Empty).ToUpperInvariant();
+    builder.WebHost.ConfigureKestrel(options =>
+    {
+        options.ListenAnyIP(listenUri.Port, listenOptions =>
+        {
+            if (string.Equals(listenUri.Scheme, "https", StringComparison.OrdinalIgnoreCase))
+            {
+                var cert = LoadCertificateFromStore(mediaConfig.CertificateThumbprint);
+                listenOptions.UseHttps(cert);
+            }
+        });
+    });
+}
+
+/// <summary>
+/// Loads an X509 certificate from the LocalMachine certificate store by thumbprint.
+/// </summary>
+static X509Certificate2 LoadCertificateFromStore(string thumbprint)
+{
+    ArgumentException.ThrowIfNullOrWhiteSpace(thumbprint);
+    
+    if (string.Equals(thumbprint, "CHANGE_AFTER_CERT_INSTALL", StringComparison.OrdinalIgnoreCase))
+    {
+        throw new InvalidOperationException(
+            "CertificateThumbprint is not set. Update Config/appsettings.json with the actual certificate thumbprint.");
+    }
+
+    var normalizedThumbprint = thumbprint
+        .Replace(" ", string.Empty, StringComparison.Ordinal)
+        .ToUpperInvariant();
+    
     using var store = new X509Store(StoreName.My, StoreLocation.LocalMachine);
     store.Open(OpenFlags.ReadOnly);
 
-    var certs = store.Certificates.Find(
+    var certificates = store.Certificates.Find(
         X509FindType.FindByThumbprint,
-        normalized,
+        normalizedThumbprint,
         validOnly: false);
 
-    if (certs.Count == 0)
+    if (certificates.Count == 0)
     {
-        throw new InvalidOperationException($"Certificate with thumbprint {normalized} not found in LocalMachine/My.");
+        throw new InvalidOperationException(
+            $"Certificate with thumbprint '{normalizedThumbprint}' not found in LocalMachine/My store.");
     }
 
-    return certs[0];
+    return certificates[0];
 }

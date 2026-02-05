@@ -9,9 +9,10 @@ Supports both OpenAI and Azure OpenAI backends:
   - OpenAI: Set OPENAI_API_KEY
   - Azure OpenAI: Set AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_KEY, AZURE_OPENAI_DEPLOYMENT
 
-Last Grunted: 02/01/2026
+Last Grunted: 02/05/2026
 """
 
+import asyncio
 import logging
 import os
 import uuid
@@ -20,10 +21,11 @@ from typing import Any, Optional
 from pathlib import Path
 
 from dotenv import load_dotenv
+from openai import AsyncAzureOpenAI, AsyncOpenAI
+from openai.types.shared import Reasoning
 from pydantic import BaseModel, Field
 
-from agents import Agent, Runner
-from openai import AsyncAzureOpenAI, AsyncOpenAI
+from agents import Agent, ModelSettings, Runner, set_default_openai_client
 
 from .models import AnalysisItem
 from .session import InterviewSessionManager
@@ -38,12 +40,15 @@ load_dotenv(_env_path)
 logger = logging.getLogger(__name__)
 
 
-def _get_openai_config() -> tuple[str, Optional[AsyncAzureOpenAI]]:
+def _configure_openai_client() -> tuple[str, bool]:
     """
-    Determine OpenAI configuration based on environment variables.
+    Configure OpenAI client based on environment variables.
+    
+    Sets the default client for the OpenAI Agents SDK using set_default_openai_client().
+    This is the recommended pattern for Azure OpenAI integration.
     
     Returns:
-        Tuple of (model_name, azure_client_or_none)
+        Tuple of (model_name, is_azure)
         
     Azure OpenAI requires:
         - AZURE_OPENAI_ENDPOINT: The endpoint URL
@@ -52,7 +57,10 @@ def _get_openai_config() -> tuple[str, Optional[AsyncAzureOpenAI]]:
         
     Standard OpenAI requires:
         - OPENAI_API_KEY: The API key
-        - OPENAI_MODEL (optional): Model name, defaults to gpt-4o
+        - OPENAI_MODEL (optional): Model name, defaults to gpt-5-mini
+        
+    Raises:
+        ValueError: If Azure is configured but missing required environment variables.
     """
     azure_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
     azure_key = os.environ.get("AZURE_OPENAI_KEY")
@@ -75,18 +83,21 @@ def _get_openai_config() -> tuple[str, Optional[AsyncAzureOpenAI]]:
             api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2024-08-01-preview"),
         )
         
-        return azure_deployment, azure_client
+        # Set as default client for the Agents SDK
+        set_default_openai_client(azure_client)
+        
+        return azure_deployment, True
     
-    # Fall back to standard OpenAI
+    # Fall back to standard OpenAI (SDK will use OPENAI_API_KEY automatically)
     # Note: gpt-5.2 requires registration at https://aka.ms/oai/gpt5access
     # Using gpt-5-mini as default (no registration required, has reasoning)
     model = os.environ.get("OPENAI_MODEL", "gpt-5-mini")
     logger.info(f"Using OpenAI: model {model}")
-    return model, None
+    return model, False
 
 
-# Get default configuration
-DEFAULT_MODEL, _DEFAULT_AZURE_CLIENT = _get_openai_config()
+# Configure default client on module load
+DEFAULT_MODEL, _IS_AZURE_CONFIGURED = _configure_openai_client()
 
 # Default reasoning effort for GPT-5 (low for faster responses in real-time analysis)
 DEFAULT_REASONING_EFFORT = os.environ.get("OPENAI_REASONING_EFFORT", "low")
@@ -280,11 +291,14 @@ class InterviewAnalyzer:
         session_manager: Optional[InterviewSessionManager] = None,
         output_writer: Optional[AnalysisOutputWriter] = None,
         publish_thoughts: bool = True,
-        azure_client: Optional[AsyncAzureOpenAI] = None,
         reasoning_effort: Optional[str] = None,
     ) -> None:
         """
         Initialize the InterviewAnalyzer.
+        
+        The OpenAI client (standard or Azure) is configured globally via
+        set_default_openai_client() during module initialization based on
+        environment variables.
         
         Args:
             model: Model/deployment to use. If None, uses AZURE_OPENAI_DEPLOYMENT 
@@ -292,8 +306,6 @@ class InterviewAnalyzer:
             session_manager: Optional session manager for context.
             output_writer: Optional output writer for persisting analyses.
             publish_thoughts: Whether to publish thoughts to the pub-sub system.
-            azure_client: Optional Azure OpenAI client. If None and Azure is 
-                          configured via environment, uses the default Azure client.
             reasoning_effort: Reasoning effort for GPT-5 ("low", "medium", "high").
                               Default: "low" for faster real-time responses.
             
@@ -307,18 +319,16 @@ class InterviewAnalyzer:
                 
             Standard OpenAI:
                 OPENAI_API_KEY: OpenAI API key
-                OPENAI_MODEL: Model name (default: gpt-5)
+                OPENAI_MODEL: Model name (default: gpt-5-mini)
                 
             GPT-5 Settings:
                 OPENAI_REASONING_EFFORT: Reasoning effort level (default: low)
         """
-        # Determine model and client
         self.model = model or DEFAULT_MODEL
-        self._azure_client = azure_client or _DEFAULT_AZURE_CLIENT
         self.reasoning_effort = reasoning_effort or DEFAULT_REASONING_EFFORT
         
         # Validate configuration
-        if not self._azure_client and not os.environ.get("OPENAI_API_KEY"):
+        if not _IS_AZURE_CONFIGURED and not os.environ.get("OPENAI_API_KEY"):
             logger.warning(
                 "No OpenAI credentials configured. Set either:\n"
                 "  - OPENAI_API_KEY for standard OpenAI, or\n"
@@ -332,24 +342,27 @@ class InterviewAnalyzer:
         self._publisher = get_publisher() if publish_thoughts else None
         
         # Track running assessment across responses
-        self._response_count = 0
-        self._cumulative_relevance = 0.0
-        self._cumulative_clarity = 0.0
+        self._response_count: int = 0
+        self._cumulative_relevance: float = 0.0
+        self._cumulative_clarity: float = 0.0
         self._all_key_points: list[str] = []
         
         # Track previous coaching for context (avoid repetition)
         self._previous_coaching: Optional[dict[str, Any]] = None
         
+        # Configure model settings for GPT-5/reasoning models
+        # Uses Reasoning type from openai.types.shared per SDK documentation
+        model_settings: ModelSettings | None = None
+        is_reasoning_model = any(
+            prefix in self.model.lower() 
+            for prefix in ("gpt-5", "o1", "o3")
+        )
+        if is_reasoning_model:
+            model_settings = ModelSettings(
+                reasoning=Reasoning(effort=self.reasoning_effort),
+            )
+        
         # Create the analysis agent with structured output
-        # Configure model settings for GPT-5 reasoning effort
-        from agents import ModelSettings
-        
-        model_settings = ModelSettings(
-            reasoning={
-                "effort": self.reasoning_effort,
-            }
-        ) if "gpt-5" in self.model.lower() or "o1" in self.model.lower() or "o3" in self.model.lower() else None
-        
         self._agent = Agent(
             name="Interview Analyzer",
             instructions=INTERVIEW_ANALYZER_INSTRUCTIONS,
@@ -358,7 +371,7 @@ class InterviewAnalyzer:
             model_settings=model_settings,
         )
         
-        provider_info = "Azure OpenAI" if self._azure_client else "OpenAI"
+        provider_info = "Azure OpenAI" if _IS_AZURE_CONFIGURED else "OpenAI"
         reasoning_info = f", reasoning_effort: {self.reasoning_effort}" if model_settings else ""
         logger.info(f"InterviewAnalyzer initialized with {provider_info}, model: {self.model}{reasoning_info}")
         logger.info(f"Thought publishing: {'enabled' if publish_thoughts else 'disabled'}")
@@ -491,11 +504,8 @@ class InterviewAnalyzer:
         logger.debug(f"Running analysis for response: {response_text[:100]}...")
         
         try:
-            # Run the agent (use Azure client if configured)
-            if self._azure_client:
-                result = await Runner.run(self._agent, prompt, client=self._azure_client)
-            else:
-                result = await Runner.run(self._agent, prompt)
+            # Run the agent (client is configured globally via set_default_openai_client)
+            result = await Runner.run(self._agent, prompt)
             
             # Extract the structured output
             analysis_output: InterviewAnalysisOutput = result.final_output_as(InterviewAnalysisOutput)
@@ -615,20 +625,26 @@ class InterviewAnalyzer:
         Returns:
             AnalysisItem with scores, key points, and suggestions.
             
+        Raises:
+            RuntimeError: If called from within an existing async context.
+            
         Note:
             This method creates a new event loop if one is not running.
             Use analyze_async in async contexts to avoid overhead.
         """
-        import asyncio
-        
         try:
-            # Try to get the running loop
-            loop = asyncio.get_running_loop()
-            # If we're in an async context, we can't use run_until_complete
-            # This case is handled by the caller using asyncio.to_thread
-            raise RuntimeError("Cannot call sync analyze from async context")
-        except RuntimeError:
-            # No running loop, create one
+            # Check if there's already a running event loop
+            asyncio.get_running_loop()
+            # If we get here, there IS a running loop - we can't use asyncio.run()
+            raise RuntimeError(
+                "Cannot call sync analyze() from an async context. "
+                "Use 'await analyze_async()' instead."
+            )
+        except RuntimeError as e:
+            # Re-raise if it's our custom error
+            if "Cannot call sync analyze" in str(e):
+                raise
+            # No running loop exists, safe to create one
             return asyncio.run(
                 self.analyze_async(
                     response_text=transcript,
@@ -698,23 +714,27 @@ def create_interview_analyzer(
     session_manager: Optional[InterviewSessionManager] = None,
     output_dir: Optional[str] = None,
     publish_thoughts: bool = True,
-    azure_client: Optional[AsyncAzureOpenAI] = None,
     reasoning_effort: Optional[str] = None,
 ) -> InterviewAnalyzer:
     """
     Factory function to create a configured InterviewAnalyzer.
     
-    Automatically detects Azure OpenAI vs standard OpenAI based on environment:
+    The OpenAI client (standard or Azure) is configured globally during module
+    initialization based on environment variables. This function creates an
+    analyzer instance that uses that global configuration.
+    
+    Environment-based detection:
         - Azure: AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_KEY, AZURE_OPENAI_DEPLOYMENT
         - OpenAI: OPENAI_API_KEY
     
     Args:
-        model: Model/deployment to use. If None, auto-detects from environment (default: gpt-5).
+        model: Model/deployment to use. If None, auto-detects from environment
+               (default: gpt-5-mini for OpenAI, deployment name for Azure).
         session_manager: Optional session manager for context.
         output_dir: Optional directory for analysis output files.
         publish_thoughts: Whether to publish thoughts to real-time stream.
-        azure_client: Optional explicit Azure OpenAI client.
-        reasoning_effort: Reasoning effort for GPT-5 ("low", "medium", "high"). Default: "low".
+        reasoning_effort: Reasoning effort for GPT-5 ("low", "medium", "high"). 
+                          Default: "low" for faster real-time responses.
         
     Returns:
         Configured InterviewAnalyzer instance.
@@ -730,9 +750,8 @@ def create_interview_analyzer(
         >>> # Set AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_KEY, AZURE_OPENAI_DEPLOYMENT
         >>> analyzer = create_interview_analyzer()
     """
-    output_writer = None
+    output_writer: AnalysisOutputWriter | None = None
     if output_dir:
-        from pathlib import Path
         output_writer = AnalysisOutputWriter(Path(output_dir))
     
     return InterviewAnalyzer(
@@ -740,6 +759,5 @@ def create_interview_analyzer(
         session_manager=session_manager,
         output_writer=output_writer,
         publish_thoughts=publish_thoughts,
-        azure_client=azure_client,
         reasoning_effort=reasoning_effort,
     )

@@ -1,5 +1,5 @@
 """
-Python Transcript Receiver with v2 Diarization Support and Interview Agent Integration
+Talestral Transcript Service v2
 
 Receives real-time transcript events from the C# bot with speaker diarization,
 manages interview sessions, and integrates with the interview analysis agent.
@@ -17,30 +17,31 @@ Target deployment: https://agent.qmachina.com (behind TLS proxy)
 Internal binding: http://0.0.0.0:8765
 """
 
-from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
-from fastapi.responses import JSONResponse
-import uvicorn
+from __future__ import annotations
+
 import asyncio
-from datetime import datetime, timezone
-from typing import Optional, Dict, Any
-from contextlib import asynccontextmanager
 import logging
 import os
-import uuid
-from pathlib import Path
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
+from typing import Annotated, Any, AsyncIterator, TypedDict
 
+import aiofiles
+import uvicorn
+from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-# Import interview agent components
 from interview_agent.models import (
-    TranscriptEvent,
     AnalysisItem,
     SessionAnalysis,
+    TranscriptEvent,
 )
-from interview_agent.session import InterviewSessionManager
 from interview_agent.output import AnalysisOutputWriter
-
+from interview_agent.session import InterviewSessionManager
 
 # =============================================================================
 # Logging Configuration
@@ -48,7 +49,7 @@ from interview_agent.output import AnalysisOutputWriter
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
@@ -64,128 +65,350 @@ OUTPUT_DIR = Path(__file__).parent / "output"
 DESKTOP_PATH = Path(os.environ.get("USERPROFILE", os.path.expanduser("~"))) / "Desktop"
 TRANSCRIPT_FILE = DESKTOP_PATH / "meeting_transcript.txt"
 
+# CORS configuration - modify for production
+CORS_ORIGINS: list[str] = [
+    "http://localhost:8501",  # Streamlit default
+    "http://localhost:3000",  # Common React dev port
+    "https://agent.qmachina.com",
+]
+
 
 # =============================================================================
-# Try to import InterviewAnalyzer and Pub/Sub (graceful if unavailable)
+# Optional Agent Import (graceful degradation)
 # =============================================================================
 
 try:
     from interview_agent.agent import InterviewAnalyzer
-    from interview_agent.pubsub import get_publisher, ThoughtType
+    from interview_agent.pubsub import ThoughtType, get_publisher
+
     AGENT_AVAILABLE = True
-    logger.info("InterviewAnalyzer loaded successfully (using GPT-5)")
+    logger.info("InterviewAnalyzer loaded successfully")
 except ImportError as e:
     AGENT_AVAILABLE = False
-    InterviewAnalyzer = None  # type: ignore
-    get_publisher = None  # type: ignore
-    ThoughtType = None  # type: ignore
+    InterviewAnalyzer = None  # type: ignore[misc, assignment]
+    get_publisher = None  # type: ignore[misc, assignment]
+    ThoughtType = None  # type: ignore[misc, assignment]
     logger.warning(
-        f"interview_agent.agent module not available: {e}. "
-        "Agent analysis features disabled. Ensure openai-agents is installed and OPENAI_API_KEY is set."
+        "interview_agent.agent module not available: %s. "
+        "Agent analysis features disabled.",
+        e,
     )
 
 
 # =============================================================================
-# Request/Response Models
+# Enums
 # =============================================================================
 
+
 class SpeakerRole(str, Enum):
-    """Speaker roles in interview"""
+    """Speaker roles in an interview."""
+
     CANDIDATE = "candidate"
     INTERVIEWER = "interviewer"
     UNKNOWN = "unknown"
 
 
+# =============================================================================
+# Request Models
+# =============================================================================
+
+
+class TranscriptEventRequest(BaseModel):
+    """
+    Request model for transcript events.
+
+    Supports both v1 and v2 formats through field aliases.
+    """
+
+    # v2 fields (canonical)
+    event_type: str | None = Field(
+        default=None,
+        description="Event type: partial, final, session_started, session_stopped, error",
+    )
+    text: str | None = Field(default=None, description="Transcript text content")
+    timestamp_utc: str | None = Field(
+        default=None, description="UTC timestamp in ISO format"
+    )
+    speaker_id: str | None = Field(
+        default=None, description="Speaker identifier (e.g., speaker_0)"
+    )
+    audio_start_ms: float | None = Field(
+        default=None, description="Audio start time in milliseconds"
+    )
+    audio_end_ms: float | None = Field(
+        default=None, description="Audio end time in milliseconds"
+    )
+    confidence: float | None = Field(
+        default=None, ge=0.0, le=1.0, description="Recognition confidence"
+    )
+    metadata: dict[str, Any] | None = Field(
+        default=None, description="Additional metadata"
+    )
+
+    # v1 fields (legacy aliases)
+    Kind: str | None = Field(default=None, description="Legacy v1 event kind")
+    Text: str | None = Field(default=None, description="Legacy v1 text")
+    TsUtc: str | None = Field(default=None, description="Legacy v1 timestamp")
+    Details: str | None = Field(default=None, description="Legacy v1 error details")
+
+    model_config = {"extra": "ignore"}
+
+
 class SessionStartRequest(BaseModel):
-    """Request to start a new interview session"""
-    candidate_name: str = Field(..., description="Name of the candidate")
-    meeting_url: str = Field(..., description="Teams meeting join URL")
-    candidate_speaker_id: Optional[str] = Field(
-        None,
-        description="Optional speaker_id to map to candidate (can be mapped later)"
+    """Request to start a new interview session."""
+
+    candidate_name: str = Field(..., min_length=1, description="Name of the candidate")
+    meeting_url: str = Field(..., min_length=1, description="Teams meeting join URL")
+    candidate_speaker_id: str | None = Field(
+        default=None,
+        description="Optional speaker_id to map to candidate (can be mapped later)",
     )
 
 
 class SpeakerMapRequest(BaseModel):
-    """Request to map a speaker ID to a role"""
-    speaker_id: str = Field(..., description="Speaker identifier: speaker_0, speaker_1, etc.")
+    """Request to map a speaker ID to a role."""
+
+    speaker_id: str = Field(
+        ..., min_length=1, description="Speaker identifier: speaker_0, speaker_1, etc."
+    )
     role: SpeakerRole = Field(..., description="Role: candidate or interviewer")
 
 
+# =============================================================================
+# Response Models
+# =============================================================================
+
+
+class BaseResponse(BaseModel):
+    """Base response model with common fields."""
+
+    ok: bool = Field(..., description="Whether the operation succeeded")
+    message: str | None = Field(default=None, description="Optional status message")
+
+
+class ErrorResponse(BaseModel):
+    """Standard error response."""
+
+    ok: bool = Field(default=False)
+    error: str = Field(..., description="Error description")
+    error_code: str | None = Field(default=None, description="Machine-readable error code")
+
+
+class TranscriptResponse(BaseResponse):
+    """Response for transcript submission."""
+
+    received_at: str = Field(..., description="Server receipt timestamp")
+
+
+class SessionStartResponse(BaseResponse):
+    """Response for session start."""
+
+    session_id: str = Field(..., description="Unique session identifier")
+    started_at: str = Field(..., description="Session start timestamp")
+
+
+class SpeakerMapResponse(BaseResponse):
+    """Response for speaker mapping."""
+
+    speaker_mappings: dict[str, str] = Field(
+        default_factory=dict, description="Current speaker-to-role mappings"
+    )
+
+
 class SessionStatusResponse(BaseModel):
-    """Session status response"""
-    active: bool
-    session_id: Optional[str] = None
-    candidate_name: Optional[str] = None
-    meeting_url: Optional[str] = None
-    started_at: Optional[str] = None
-    speaker_mappings: Dict[str, str] = Field(default_factory=dict)
-    total_events: int = 0
-    final_events: int = 0
-    analysis_count: int = 0
+    """Session status information."""
+
+    active: bool = Field(..., description="Whether a session is currently active")
+    session_id: str | None = Field(default=None, description="Current session ID")
+    candidate_name: str | None = Field(default=None, description="Candidate name")
+    meeting_url: str | None = Field(default=None, description="Meeting URL")
+    started_at: str | None = Field(default=None, description="Session start time")
+    speaker_mappings: dict[str, str] = Field(
+        default_factory=dict, description="Speaker-to-role mappings"
+    )
+    total_events: int = Field(default=0, description="Total transcript events received")
+    final_events: int = Field(default=0, description="Final transcript events")
+    analysis_count: int = Field(default=0, description="Number of analyses performed")
+
+
+class SessionStatusWrapper(BaseModel):
+    """Wrapper for session status response."""
+
+    session: SessionStatusResponse
+    agent_available: bool = Field(..., description="Whether agent analysis is available")
+
+
+class SessionEndResponse(BaseResponse):
+    """Response for session end."""
+
+    summary: dict[str, Any] = Field(..., description="Session summary statistics")
+
+
+class HealthResponse(BaseModel):
+    """Health check response."""
+
+    status: str = Field(..., description="Service health status")
+    service: str = Field(..., description="Service name")
+    version: str = Field(..., description="Service version")
+    timestamp: str = Field(..., description="Current server timestamp")
+    agent_available: bool = Field(..., description="Whether agent is available")
+    session_active: bool = Field(..., description="Whether a session is active")
+
+
+class StatsResponse(BaseModel):
+    """Statistics response."""
+
+    stats: dict[str, Any] = Field(..., description="Service statistics")
+    transcript_queue_size: int = Field(..., description="Pending transcript events")
+    agent_queue_size: int = Field(..., description="Pending agent analysis items")
+    session: dict[str, Any] = Field(..., description="Current session info")
+    agent_available: bool = Field(..., description="Whether agent is available")
+    output_directory: str = Field(..., description="Analysis output directory path")
 
 
 # =============================================================================
-# Global State
+# Application State (Type-safe Lifespan State)
 # =============================================================================
 
-# Session manager
-session_manager: InterviewSessionManager = InterviewSessionManager()
 
-# Analysis output writer (initialized on startup)
-output_writer: Optional[AnalysisOutputWriter] = None
+class AppStats(TypedDict):
+    """Application statistics tracking."""
 
-# Async queue for agent consumption
-transcript_queue: asyncio.Queue[TranscriptEvent] = asyncio.Queue()
+    events_received: int
+    partial_transcripts: int
+    final_transcripts: int
+    errors: int
+    session_events: int
+    v1_events: int
+    v2_events: int
+    agent_analyses: int
+    started_at: str
 
-# Agent analysis queue (for candidate transcripts only)
-agent_queue: asyncio.Queue[TranscriptEvent] = asyncio.Queue()
 
-# Stats tracking
-stats = {
-    "events_received": 0,
-    "partial_transcripts": 0,
-    "final_transcripts": 0,
-    "errors": 0,
-    "session_events": 0,
-    "v1_events": 0,
-    "v2_events": 0,
-    "agent_analyses": 0,
-    "started_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-}
+class AppState(TypedDict):
+    """Type-safe application state managed by lifespan."""
 
-# Background task handle
-_agent_task: Optional[asyncio.Task] = None
+    session_manager: InterviewSessionManager
+    output_writer: AnalysisOutputWriter
+    transcript_queue: asyncio.Queue[TranscriptEvent]
+    agent_queue: asyncio.Queue[TranscriptEvent]
+    stats: AppStats
+    agent_task: asyncio.Task[None] | None
+
+
+def get_initial_stats() -> AppStats:
+    """Create initial statistics dictionary."""
+    return AppStats(
+        events_received=0,
+        partial_transcripts=0,
+        final_transcripts=0,
+        errors=0,
+        session_events=0,
+        v1_events=0,
+        v2_events=0,
+        agent_analyses=0,
+        started_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    )
+
+
+# =============================================================================
+# Custom Exceptions
+# =============================================================================
+
+
+class TranscriptServiceError(Exception):
+    """Base exception for transcript service errors."""
+
+    def __init__(
+        self,
+        message: str,
+        status_code: int = status.HTTP_500_INTERNAL_SERVER_ERROR,
+        error_code: str | None = None,
+    ) -> None:
+        self.message = message
+        self.status_code = status_code
+        self.error_code = error_code
+        super().__init__(message)
+
+
+class SessionNotActiveError(TranscriptServiceError):
+    """Raised when operation requires an active session."""
+
+    def __init__(self, message: str = "No active session. Start a session first.") -> None:
+        super().__init__(
+            message=message,
+            status_code=status.HTTP_400_BAD_REQUEST,
+            error_code="SESSION_NOT_ACTIVE",
+        )
+
+
+class SessionAlreadyActiveError(TranscriptServiceError):
+    """Raised when trying to start a session when one is already active."""
+
+    def __init__(
+        self, message: str = "Session already active. End current session first."
+    ) -> None:
+        super().__init__(
+            message=message,
+            status_code=status.HTTP_409_CONFLICT,
+            error_code="SESSION_ALREADY_ACTIVE",
+        )
+
+
+# =============================================================================
+# Dependencies
+# =============================================================================
+
+
+def get_app_state(request: Request) -> AppState:
+    """
+    Dependency to retrieve application state from request.
+
+    Args:
+        request: The incoming request object.
+
+    Returns:
+        AppState dictionary from lifespan context.
+
+    Raises:
+        RuntimeError: If state is not properly initialized.
+    """
+    state = getattr(request, "state", None)
+    if state is None:
+        raise RuntimeError("Application state not initialized")
+    return AppState(
+        session_manager=state.session_manager,
+        output_writer=state.output_writer,
+        transcript_queue=state.transcript_queue,
+        agent_queue=state.agent_queue,
+        stats=state.stats,
+        agent_task=state.agent_task,
+    )
+
+
+# Type alias for dependency injection
+AppStateDep = Annotated[AppState, Depends(get_app_state)]
 
 
 # =============================================================================
 # Event Normalization (v1 -> v2)
 # =============================================================================
 
-def normalize_v1_to_v2(payload: Dict[str, Any]) -> Dict[str, Any]:
+
+def normalize_v1_to_v2(request: TranscriptEventRequest, stats: AppStats) -> dict[str, Any]:
     """
     Convert v1 format to v2 format.
 
-    v1 format (from C# bot):
-        {
-            "Kind": "recognizing" | "recognized" | "session_started" | "session_stopped" | "canceled",
-            "Text": "transcript text" | null,
-            "TsUtc": "2026-01-28T20:33:12.3456789Z",
-            "Details": "optional error details" | null
-        }
+    Args:
+        request: The incoming transcript event request.
+        stats: Application statistics to update.
 
-    v2 format:
-        {
-            "event_type": "partial" | "final" | "session_started" | "session_stopped" | "error",
-            "text": "transcript text" | null,
-            "timestamp_utc": "2026-01-28T20:33:12.3456789Z",
-            "speaker_id": "speaker_0" | null,
-            ...
-        }
+    Returns:
+        Normalized v2 format dictionary.
     """
     # Check if this is v1 format (has "Kind" key)
-    if "Kind" in payload or "kind" in payload:
-        kind = payload.get("Kind") or payload.get("kind", "unknown")
+    if request.Kind is not None:
+        kind = request.Kind
 
         # Map v1 event types to v2
         event_type_map = {
@@ -196,77 +419,109 @@ def normalize_v1_to_v2(payload: Dict[str, Any]) -> Dict[str, Any]:
             "canceled": "error",
         }
 
-        v2_payload = {
+        v2_payload: dict[str, Any] = {
             "event_type": event_type_map.get(kind.lower(), kind.lower()),
-            "text": payload.get("Text") or payload.get("text"),
-            "timestamp_utc": payload.get("TsUtc") or payload.get("tsUtc") or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "text": request.Text,
+            "timestamp_utc": (
+                request.TsUtc
+                or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            ),
         }
 
         # Handle error details
-        details = payload.get("Details") or payload.get("details")
-        if details:
-            v2_payload["metadata"] = {"raw_response": {"error_details": details}}
+        if request.Details:
+            v2_payload["metadata"] = {"raw_response": {"error_details": request.Details}}
 
         stats["v1_events"] += 1
         return v2_payload
 
-    # Already v2 format
+    # Already v2 format - build from request fields
     stats["v2_events"] += 1
-    return payload
+    return {
+        "event_type": request.event_type,
+        "text": request.text,
+        "timestamp_utc": (
+            request.timestamp_utc
+            or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        ),
+        "speaker_id": request.speaker_id,
+        "audio_start_ms": request.audio_start_ms,
+        "audio_end_ms": request.audio_end_ms,
+        "confidence": request.confidence,
+        "metadata": request.metadata,
+    }
 
 
 # =============================================================================
-# File Operations
+# File Operations (Async)
 # =============================================================================
 
-def save_transcript_to_file(event: TranscriptEvent) -> None:
-    """Append transcript to file on desktop"""
+
+async def save_transcript_to_file(event: TranscriptEvent) -> None:
+    """
+    Append transcript to file on desktop asynchronously.
+
+    Args:
+        event: The transcript event to save.
+    """
     try:
         DESKTOP_PATH.mkdir(parents=True, exist_ok=True)
 
-        with open(TRANSCRIPT_FILE, "a", encoding="utf-8") as f:
+        async with aiofiles.open(TRANSCRIPT_FILE, "a", encoding="utf-8") as f:
             if event.event_type == "session_started":
-                f.write(f"\n{'='*60}\n")
-                f.write(f"NEW SESSION STARTED: {event.timestamp_utc}\n")
-                f.write(f"{'='*60}\n\n")
+                await f.write(f"\n{'=' * 60}\n")
+                await f.write(f"NEW SESSION STARTED: {event.timestamp_utc}\n")
+                await f.write(f"{'=' * 60}\n\n")
             elif event.event_type == "final" and event.text:
                 speaker_info = f"[{event.speaker_id}]" if event.speaker_id else ""
-                f.write(f"[{event.timestamp_utc}]{speaker_info} {event.text}\n")
+                await f.write(f"[{event.timestamp_utc}]{speaker_info} {event.text}\n")
             elif event.event_type == "session_stopped":
-                f.write(f"\n--- Session ended: {event.timestamp_utc} ---\n\n")
+                await f.write(f"\n--- Session ended: {event.timestamp_utc} ---\n\n")
 
-        logger.debug(f"Saved to file: {TRANSCRIPT_FILE}")
-    except Exception as e:
-        logger.error(f"Failed to save transcript to file: {e}")
+        logger.debug("Saved to file: %s", TRANSCRIPT_FILE)
+    except OSError as e:
+        logger.error("Failed to save transcript to file: %s", e)
 
 
 # =============================================================================
 # Agent Processing
 # =============================================================================
 
-async def agent_processing_loop() -> None:
+
+async def agent_processing_loop(
+    agent_queue: asyncio.Queue[TranscriptEvent],
+    session_manager: InterviewSessionManager,
+    output_writer: AnalysisOutputWriter,
+    stats: AppStats,
+) -> None:
     """
     Background task that processes candidate transcripts through the interview agent.
 
     Only processes:
     - "final" transcript events
     - From speakers mapped as "candidate"
-    
+
     Publishes real-time thoughts to the pub-sub system for Streamlit UI.
+
+    Args:
+        agent_queue: Queue of transcript events to process.
+        session_manager: Session manager instance.
+        output_writer: Output writer for analysis results.
+        stats: Statistics dictionary to update.
     """
     logger.info("Agent processing loop started")
 
     # Initialize analyzer if available
     analyzer = None
     publisher = None
-    
+
     if AGENT_AVAILABLE and InterviewAnalyzer:
         try:
             analyzer = InterviewAnalyzer(publish_thoughts=True)
             publisher = get_publisher() if get_publisher else None
-            logger.info("InterviewAnalyzer initialized with GPT-5 and real-time publishing")
+            logger.info("InterviewAnalyzer initialized with real-time publishing")
         except Exception as e:
-            logger.error(f"Failed to initialize InterviewAnalyzer: {e}")
+            logger.error("Failed to initialize InterviewAnalyzer: %s", e)
 
     response_counter = 0
 
@@ -278,14 +533,13 @@ async def agent_processing_loop() -> None:
             if not event.text:
                 continue
 
-            logger.info(f"AGENT_INPUT [{event.speaker_id}]: {event.text[:100]}...")
+            logger.info("AGENT_INPUT [%s]: %s...", event.speaker_id, event.text[:100])
 
             # Process with agent if available
             if analyzer and session_manager.is_active:
                 try:
                     # Get conversation context
                     context = session_manager.get_session_context()
-                    last_question = session_manager.get_last_interviewer_question()
 
                     # Build conversation history for context
                     conversation_history = []
@@ -294,14 +548,14 @@ async def agent_processing_loop() -> None:
                             "role": turn.get("role", "unknown"),
                             "text": turn.get("text", ""),
                         })
-                    
+
                     analysis_context = {
                         "candidate_name": context.get("candidate_name", "Unknown"),
                         "conversation_history": conversation_history,
                     }
 
-                    # Run analysis (returns AnalysisItem, publishes to pub-sub automatically)
-                    analysis_item = await analyzer.analyze_async(
+                    # Run analysis (publishes to pub-sub automatically)
+                    analysis_item: AnalysisItem = await analyzer.analyze_async(
                         response_text=event.text,
                         context=analysis_context,
                         speaker_id=event.speaker_id,
@@ -311,22 +565,22 @@ async def agent_processing_loop() -> None:
                     response_counter += 1
 
                     # Write to output file
-                    if output_writer and session_manager.session:
+                    if session_manager.session:
                         output_writer.append_item(
-                            session_manager.session.session_id,
-                            analysis_item
+                            session_manager.session.session_id, analysis_item
                         )
 
                     logger.info(
-                        f"Analysis #{response_counter} complete: "
-                        f"relevance={analysis_item.relevance_score:.2f}, "
-                        f"clarity={analysis_item.clarity_score:.2f}"
+                        "Analysis #%d complete: relevance=%.2f, clarity=%.2f",
+                        response_counter,
+                        analysis_item.relevance_score,
+                        analysis_item.clarity_score,
                     )
 
                 except Exception as e:
-                    logger.error(f"Agent analysis failed: {e}", exc_info=True)
+                    logger.error("Agent analysis failed: %s", e, exc_info=True)
                     if publisher:
-                        await publisher.publish_error(f"Analysis failed: {str(e)}")
+                        await publisher.publish_error(f"Analysis failed: {e!s}")
             else:
                 if not AGENT_AVAILABLE:
                     logger.debug("Skipping analysis - agent not available")
@@ -337,40 +591,120 @@ async def agent_processing_loop() -> None:
             logger.info("Agent processing loop cancelled")
             break
         except Exception as e:
-            logger.error(f"Error in agent processing loop: {e}", exc_info=True)
+            logger.error("Error in agent processing loop: %s", e, exc_info=True)
             await asyncio.sleep(1)
 
 
 # =============================================================================
-# FastAPI App
+# Exception Handlers
 # =============================================================================
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Manage application lifespan"""
-    global _agent_task, output_writer
 
-    # Startup
-    logger.info("Starting Teams Transcript Sink v2")
+async def transcript_service_error_handler(
+    request: Request, exc: TranscriptServiceError
+) -> JSONResponse:
+    """
+    Handle TranscriptServiceError exceptions.
+
+    Args:
+        request: The incoming request.
+        exc: The exception that was raised.
+
+    Returns:
+        JSONResponse with error details.
+    """
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=ErrorResponse(
+            ok=False,
+            error=exc.message,
+            error_code=exc.error_code,
+        ).model_dump(),
+    )
+
+
+async def generic_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """
+    Handle unexpected exceptions.
+
+    Args:
+        request: The incoming request.
+        exc: The exception that was raised.
+
+    Returns:
+        JSONResponse with generic error message.
+    """
+    logger.error("Unhandled exception: %s", exc, exc_info=True)
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content=ErrorResponse(
+            ok=False,
+            error="Internal server error",
+            error_code="INTERNAL_ERROR",
+        ).model_dump(),
+    )
+
+
+# =============================================================================
+# FastAPI App Lifespan
+# =============================================================================
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[dict[str, Any]]:
+    """
+    Manage application lifespan with type-safe state.
+
+    Initializes all shared resources on startup and cleans up on shutdown.
+
+    Args:
+        app: The FastAPI application instance.
+
+    Yields:
+        Dictionary of application state to be attached to requests.
+    """
+    logger.info("Starting Talestral Transcript Service v2")
 
     # Initialize output directory and writer
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     output_writer = AnalysisOutputWriter(OUTPUT_DIR)
-    logger.info(f"Analysis output directory: {OUTPUT_DIR}")
+    logger.info("Analysis output directory: %s", OUTPUT_DIR)
+
+    # Initialize state components
+    session_manager = InterviewSessionManager()
+    transcript_queue: asyncio.Queue[TranscriptEvent] = asyncio.Queue()
+    agent_queue: asyncio.Queue[TranscriptEvent] = asyncio.Queue()
+    stats = get_initial_stats()
 
     # Start agent processing loop
-    _agent_task = asyncio.create_task(agent_processing_loop())
+    agent_task = asyncio.create_task(
+        agent_processing_loop(agent_queue, session_manager, output_writer, stats)
+    )
 
-    yield
+    # Yield state to be attached to app.state
+    state = {
+        "session_manager": session_manager,
+        "output_writer": output_writer,
+        "transcript_queue": transcript_queue,
+        "agent_queue": agent_queue,
+        "stats": stats,
+        "agent_task": agent_task,
+    }
+
+    yield state
 
     # Shutdown
     logger.info("Shutting down...")
-    if _agent_task:
-        _agent_task.cancel()
-        try:
-            await _agent_task
-        except asyncio.CancelledError:
-            pass
+    agent_task.cancel()
+    try:
+        await agent_task
+    except asyncio.CancelledError:
+        pass
+
+
+# =============================================================================
+# FastAPI Application
+# =============================================================================
 
 
 app = FastAPI(
@@ -380,13 +714,31 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+    max_age=3600,
+)
+
+# Register exception handlers
+app.add_exception_handler(TranscriptServiceError, transcript_service_error_handler)
+app.add_exception_handler(Exception, generic_exception_handler)
+
 
 # =============================================================================
 # Endpoints
 # =============================================================================
 
-@app.post("/transcript")
-async def receive_transcript(req: Request):
+
+@app.post("/transcript", response_model=TranscriptResponse)
+async def receive_transcript(
+    request: TranscriptEventRequest,
+    state: AppStateDep,
+) -> TranscriptResponse:
     """
     Receive transcript events from C# bot.
 
@@ -409,95 +761,105 @@ async def receive_transcript(req: Request):
             "audio_end_ms": 5678.9,
             "confidence": 0.95
         }
+
+    Args:
+        request: The transcript event request (validated by Pydantic).
+        state: Application state from dependency injection.
+
+    Returns:
+        TranscriptResponse confirming receipt.
     """
-    try:
-        payload = await req.json()
+    stats = state["stats"]
+    session_manager = state["session_manager"]
+    transcript_queue = state["transcript_queue"]
+    agent_queue = state["agent_queue"]
 
-        # Normalize v1 to v2 format
-        normalized = normalize_v1_to_v2(payload)
+    # Normalize v1 to v2 format
+    normalized = normalize_v1_to_v2(request, stats)
 
-        # Parse into TranscriptEvent model
-        event = TranscriptEvent(**normalized)
+    # Parse into TranscriptEvent model
+    event = TranscriptEvent(**normalized)
 
-        # Update stats
-        stats["events_received"] += 1
+    # Update stats
+    stats["events_received"] += 1
 
-        if event.event_type == "partial":
-            stats["partial_transcripts"] += 1
-            logger.debug(f"[PARTIAL] [{event.speaker_id}] {event.text}")
+    if event.event_type == "partial":
+        stats["partial_transcripts"] += 1
+        logger.debug("[PARTIAL] [%s] %s", event.speaker_id, event.text)
 
-        elif event.event_type == "final":
-            stats["final_transcripts"] += 1
-            logger.info(f"[FINAL] [{event.speaker_id}] {event.text}")
+    elif event.event_type == "final":
+        stats["final_transcripts"] += 1
+        logger.info("[FINAL] [%s] %s", event.speaker_id, event.text)
 
-            # Save to file
-            save_transcript_to_file(event)
+        # Save to file (async)
+        await save_transcript_to_file(event)
 
-            # Add to session if active
-            if session_manager.is_active:
-                session_manager.add_transcript(event)
+        # Add to session if active
+        if session_manager.is_active:
+            session_manager.add_transcript(event)
 
-                # Queue for agent if from candidate
-                candidate_id = session_manager.get_candidate_speaker_id()
-                if candidate_id and event.speaker_id == candidate_id:
-                    await agent_queue.put(event)
-                    logger.debug(f"Queued for agent analysis: {event.text[:50]}...")
+            # Queue for agent if from candidate
+            candidate_id = session_manager.get_candidate_speaker_id()
+            if candidate_id and event.speaker_id == candidate_id:
+                await agent_queue.put(event)
+                logger.debug("Queued for agent analysis: %s...", event.text[:50])
 
-        elif event.event_type == "session_started":
-            stats["session_events"] += 1
-            logger.info("Speech recognition session started")
-            save_transcript_to_file(event)
+    elif event.event_type == "session_started":
+        stats["session_events"] += 1
+        logger.info("Speech recognition session started")
+        await save_transcript_to_file(event)
 
-        elif event.event_type == "session_stopped":
-            stats["session_events"] += 1
-            logger.info("Speech recognition session stopped")
-            save_transcript_to_file(event)
+    elif event.event_type == "session_stopped":
+        stats["session_events"] += 1
+        logger.info("Speech recognition session stopped")
+        await save_transcript_to_file(event)
 
-        elif event.event_type == "error":
-            stats["errors"] += 1
-            if event.error:
-                error_msg = f"{event.error.code}: {event.error.message}"
-            elif event.metadata and event.metadata.raw_response:
-                error_msg = str(event.metadata.raw_response)
-            else:
-                error_msg = "Unknown error"
-            logger.error(f"Speech recognition error: {error_msg}")
-
-        # Push to general transcript queue for other consumers
-        await transcript_queue.put(event)
-
-        return {"ok": True, "received_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}
-
-    except Exception as e:
-        logger.error(f"Error processing transcript: {e}", exc_info=True)
+    elif event.event_type == "error":
         stats["errors"] += 1
-        return JSONResponse(
-            status_code=500,
-            content={"ok": False, "error": str(e)}
-        )
+        if event.error:
+            error_msg = f"{event.error.code}: {event.error.message}"
+        elif event.metadata and event.metadata.raw_response:
+            error_msg = str(event.metadata.raw_response)
+        else:
+            error_msg = "Unknown error"
+        logger.error("Speech recognition error: %s", error_msg)
+
+    # Push to general transcript queue for other consumers
+    await transcript_queue.put(event)
+
+    return TranscriptResponse(
+        ok=True,
+        received_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    )
 
 
-@app.post("/session/start")
-async def start_session(request: SessionStartRequest):
+@app.post("/session/start", response_model=SessionStartResponse)
+async def start_session(
+    request: SessionStartRequest,
+    state: AppStateDep,
+) -> SessionStartResponse:
     """
     Start a new interview session.
 
-    Request body:
-        {
-            "candidate_name": "John Doe",
-            "meeting_url": "https://teams.microsoft.com/...",
-            "candidate_speaker_id": "speaker_0"  // optional
-        }
+    Args:
+        request: Session start parameters.
+        state: Application state from dependency injection.
+
+    Returns:
+        SessionStartResponse with session details.
+
+    Raises:
+        SessionAlreadyActiveError: If a session is already active.
     """
+    session_manager = state["session_manager"]
+    output_writer = state["output_writer"]
+
     if session_manager.is_active:
-        raise HTTPException(
-            status_code=409,
-            detail="Session already active. End current session first."
-        )
+        raise SessionAlreadyActiveError()
 
     session = session_manager.start_session(
         candidate_name=request.candidate_name,
-        meeting_url=request.meeting_url
+        meeting_url=request.meeting_url,
     )
 
     # Map candidate speaker if provided
@@ -505,17 +867,16 @@ async def start_session(request: SessionStartRequest):
         session_manager.map_speaker(
             request.candidate_speaker_id,
             "candidate",
-            request.candidate_name
+            request.candidate_name,
         )
 
     # Initialize analysis file
-    if output_writer:
-        analysis = SessionAnalysis(
-            session_id=session.session_id,
-            candidate_name=request.candidate_name,
-            started_at=session.started_at,
-        )
-        output_writer.write_analysis(session.session_id, analysis)
+    analysis = SessionAnalysis(
+        session_id=session.session_id,
+        candidate_name=request.candidate_name,
+        started_at=session.started_at,
+    )
+    output_writer.write_analysis(session.session_id, analysis)
 
     # Publish session start to real-time stream
     if AGENT_AVAILABLE and get_publisher:
@@ -524,48 +885,69 @@ async def start_session(request: SessionStartRequest):
             f"Interview session started for {request.candidate_name}"
         )
 
-    logger.info(f"Interview session started for: {request.candidate_name} ({session.session_id})")
+    logger.info(
+        "Interview session started for: %s (%s)",
+        request.candidate_name,
+        session.session_id,
+    )
 
-    return {
-        "ok": True,
-        "message": f"Session started for {request.candidate_name}",
-        "session_id": session.session_id,
-        "started_at": session.started_at,
-    }
+    return SessionStartResponse(
+        ok=True,
+        message=f"Session started for {request.candidate_name}",
+        session_id=session.session_id,
+        started_at=session.started_at,
+    )
 
 
-@app.post("/session/map-speaker")
-async def map_speaker(request: SpeakerMapRequest):
+@app.post("/session/map-speaker", response_model=SpeakerMapResponse)
+async def map_speaker(
+    request: SpeakerMapRequest,
+    state: AppStateDep,
+) -> SpeakerMapResponse:
     """
     Map a speaker ID to a role.
 
-    Request body:
-        {
-            "speaker_id": "speaker_0",
-            "role": "candidate"  // or "interviewer"
-        }
+    Args:
+        request: Speaker mapping parameters.
+        state: Application state from dependency injection.
+
+    Returns:
+        SpeakerMapResponse with updated mappings.
+
+    Raises:
+        SessionNotActiveError: If no session is active.
     """
+    session_manager = state["session_manager"]
+
     if not session_manager.is_active:
-        raise HTTPException(
-            status_code=400,
-            detail="No active session. Start a session first."
-        )
+        raise SessionNotActiveError()
 
     session_manager.map_speaker(request.speaker_id, request.role.value)
 
-    return {
-        "ok": True,
-        "message": f"Mapped {request.speaker_id} to {request.role.value}",
-        "speaker_mappings": session_manager.get_session_context()["speaker_mappings"],
-    }
+    return SpeakerMapResponse(
+        ok=True,
+        message=f"Mapped {request.speaker_id} to {request.role.value}",
+        speaker_mappings=session_manager.get_session_context()["speaker_mappings"],
+    )
 
 
-@app.get("/session/status")
-async def get_session_status():
-    """Get current session information"""
+@app.get("/session/status", response_model=SessionStatusWrapper)
+async def get_session_status(state: AppStateDep) -> SessionStatusWrapper:
+    """
+    Get current session information.
+
+    Args:
+        state: Application state from dependency injection.
+
+    Returns:
+        SessionStatusWrapper with session details and agent availability.
+    """
+    session_manager = state["session_manager"]
+    stats = state["stats"]
+
     context = session_manager.get_session_context()
 
-    response = SessionStatusResponse(
+    session_status = SessionStatusResponse(
         active=context["session_active"],
         session_id=context.get("session_id"),
         candidate_name=context.get("candidate_name"),
@@ -577,35 +959,50 @@ async def get_session_status():
         analysis_count=stats["agent_analyses"],
     )
 
-    return {
-        "session": response.model_dump(),
-        "agent_available": AGENT_AVAILABLE,
-    }
+    return SessionStatusWrapper(
+        session=session_status,
+        agent_available=AGENT_AVAILABLE,
+    )
 
 
-# Alias for backwards compatibility
-@app.get("/session")
-async def get_session():
-    """Get current session info (alias for /session/status)"""
-    return await get_session_status()
+@app.get("/session", response_model=SessionStatusWrapper)
+async def get_session(state: AppStateDep) -> SessionStatusWrapper:
+    """
+    Get current session info (alias for /session/status).
+
+    Args:
+        state: Application state from dependency injection.
+
+    Returns:
+        SessionStatusWrapper with session details.
+    """
+    return await get_session_status(state)
 
 
-@app.post("/session/end")
-async def end_session():
+@app.post("/session/end", response_model=SessionEndResponse)
+async def end_session(state: AppStateDep) -> SessionEndResponse:
     """
     End the current session and finalize analysis.
 
-    Returns session summary with statistics.
+    Args:
+        state: Application state from dependency injection.
+
+    Returns:
+        SessionEndResponse with session summary.
+
+    Raises:
+        SessionNotActiveError: If no session is active.
     """
+    session_manager = state["session_manager"]
+    output_writer = state["output_writer"]
+    stats = state["stats"]
+
     if not session_manager.is_active:
-        raise HTTPException(
-            status_code=400,
-            detail="No active session to end."
-        )
+        raise SessionNotActiveError("No active session to end.")
 
     session = session_manager.session
     if not session:
-        raise HTTPException(status_code=400, detail="No session data available.")
+        raise SessionNotActiveError("No session data available.")
 
     session_id = session.session_id
     candidate_name = session.candidate_name
@@ -615,7 +1012,7 @@ async def end_session():
     ended_session = session_manager.end_session()
 
     # Finalize analysis file
-    if output_writer and ended_session:
+    if ended_session:
         try:
             analysis = output_writer.load_analysis(session_id)
             if analysis:
@@ -623,13 +1020,17 @@ async def end_session():
                 analysis.compute_overall_scores()
                 output_writer.write_analysis(session_id, analysis)
         except Exception as e:
-            logger.error(f"Failed to finalize analysis: {e}")
+            logger.error("Failed to finalize analysis: %s", e)
 
     summary = {
         "session_id": session_id,
         "candidate_name": candidate_name,
         "started_at": started_at,
-        "ended_at": ended_session.ended_at if ended_session else datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "ended_at": (
+            ended_session.ended_at
+            if ended_session
+            else datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        ),
         "total_events": len(ended_session.transcript_events) if ended_session else 0,
         "analyses_generated": stats["agent_analyses"],
     }
@@ -642,47 +1043,70 @@ async def end_session():
             f"Analyzed {stats['agent_analyses']} responses."
         )
 
-    logger.info(f"Session ended: {session_id}")
+    logger.info("Session ended: %s", session_id)
 
-    return {
-        "ok": True,
-        "message": "Session ended",
-        "summary": summary,
-    }
-
-
-@app.get("/health")
-async def health():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "service": "Talestral Transcript Service",
-        "version": "2.0.0",
-        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "agent_available": AGENT_AVAILABLE,
-        "session_active": session_manager.is_active,
-    }
+    return SessionEndResponse(
+        ok=True,
+        message="Session ended",
+        summary=summary,
+    )
 
 
-@app.get("/stats")
-async def get_stats():
-    """Get current statistics"""
+@app.get("/health", response_model=HealthResponse)
+async def health(state: AppStateDep) -> HealthResponse:
+    """
+    Health check endpoint.
+
+    Args:
+        state: Application state from dependency injection.
+
+    Returns:
+        HealthResponse with service status.
+    """
+    session_manager = state["session_manager"]
+
+    return HealthResponse(
+        status="healthy",
+        service="Talestral Transcript Service",
+        version="2.0.0",
+        timestamp=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        agent_available=AGENT_AVAILABLE,
+        session_active=session_manager.is_active,
+    )
+
+
+@app.get("/stats", response_model=StatsResponse)
+async def get_stats(state: AppStateDep) -> StatsResponse:
+    """
+    Get current statistics.
+
+    Args:
+        state: Application state from dependency injection.
+
+    Returns:
+        StatsResponse with service statistics.
+    """
+    session_manager = state["session_manager"]
+    stats = state["stats"]
+    transcript_queue = state["transcript_queue"]
+    agent_queue = state["agent_queue"]
+
     context = session_manager.get_session_context()
 
-    return {
-        "stats": stats,
-        "transcript_queue_size": transcript_queue.qsize(),
-        "agent_queue_size": agent_queue.qsize(),
-        "session": {
+    return StatsResponse(
+        stats=dict(stats),
+        transcript_queue_size=transcript_queue.qsize(),
+        agent_queue_size=agent_queue.qsize(),
+        session={
             "active": context["session_active"],
             "session_id": context.get("session_id"),
             "candidate_name": context.get("candidate_name"),
             "total_events": context.get("total_events", 0),
             "final_events": context.get("final_events", 0),
         },
-        "agent_available": AGENT_AVAILABLE,
-        "output_directory": str(OUTPUT_DIR),
-    }
+        agent_available=AGENT_AVAILABLE,
+        output_directory=str(OUTPUT_DIR),
+    )
 
 
 # =============================================================================
@@ -693,8 +1117,8 @@ if __name__ == "__main__":
     logger.info("=" * 60)
     logger.info("Talestral Transcript Service v2")
     logger.info("=" * 60)
-    logger.info(f"Binding to: http://0.0.0.0:8765")
-    logger.info(f"Target FQDN: https://agent.qmachina.com")
+    logger.info("Binding to: http://0.0.0.0:8765")
+    logger.info("Target FQDN: https://agent.qmachina.com")
     logger.info("")
     logger.info("Endpoints:")
     logger.info("  POST /transcript          - Receive transcript events")
@@ -705,9 +1129,9 @@ if __name__ == "__main__":
     logger.info("  GET  /health              - Health check")
     logger.info("  GET  /stats               - Statistics")
     logger.info("")
-    logger.info(f"Transcripts saved to: {TRANSCRIPT_FILE}")
-    logger.info(f"Analysis output: {OUTPUT_DIR}")
-    logger.info(f"Agent available: {AGENT_AVAILABLE}")
+    logger.info("Transcripts saved to: %s", TRANSCRIPT_FILE)
+    logger.info("Analysis output: %s", OUTPUT_DIR)
+    logger.info("Agent available: %s", AGENT_AVAILABLE)
     logger.info("=" * 60)
 
     uvicorn.run(

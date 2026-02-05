@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Synthetic Interview Conversation Simulator
+Synthetic Interview Conversation Simulator.
 
-Streams 20 realistic interview messages to the FastAPI transcript sink,
+Streams realistic interview messages to the FastAPI transcript sink,
 simulating exactly how data would arrive from a live Teams meeting.
 
 Usage:
@@ -11,34 +11,67 @@ Usage:
 
     # In another terminal, run the simulator:
     uv run python simulate_interview.py
+
+    # With custom options:
+    uv run python simulate_interview.py --sink-url http://localhost:8765 --candidate "Jane Doe"
 """
 
+from __future__ import annotations
+
 import asyncio
-import httpx
-import random
-from datetime import datetime, timezone
-from typing import Optional
 import logging
+import os
 import sys
+from datetime import datetime, timezone
+from typing import Final
+
+import httpx
+
+# =============================================================================
+# Logging Configuration
+# =============================================================================
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
-logger = logging.getLogger(__name__)
+logger: logging.Logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Exit Codes
+# =============================================================================
+
+EXIT_SUCCESS: Final[int] = 0
+EXIT_CONNECTION_ERROR: Final[int] = 1
+EXIT_SINK_UNHEALTHY: Final[int] = 2
+EXIT_SESSION_ERROR: Final[int] = 3
+EXIT_INTERRUPTED: Final[int] = 130  # Standard SIGINT exit code
 
 
 # =============================================================================
 # Configuration
 # =============================================================================
 
-SINK_URL = "http://127.0.0.1:8765"
-CANDIDATE_NAME = "Sarah Chen"
-MEETING_URL = "https://teams.microsoft.com/l/meetup-join/simulated-interview-session"
+DEFAULT_SINK_URL: Final[str] = "http://127.0.0.1:8765"
+DEFAULT_CANDIDATE_NAME: Final[str] = "Sarah Chen"
+DEFAULT_MEETING_URL: Final[str] = "https://teams.microsoft.com/l/meetup-join/simulated-interview-session"
 
 # Speaker IDs (matching diarization format)
-INTERVIEWER_ID = "speaker_0"
-CANDIDATE_ID = "speaker_1"
+INTERVIEWER_ID: Final[str] = "speaker_0"
+CANDIDATE_ID: Final[str] = "speaker_1"
+
+# Timing constants
+MS_PER_WORD: Final[float] = 60.0
+PAUSE_BETWEEN_MESSAGES_MS: Final[float] = 500.0
+MIN_DURATION_JITTER_MS: Final[float] = 50.0
+MAX_DURATION_JITTER_MS: Final[float] = 150.0
+MIN_CONFIDENCE: Final[float] = 0.88
+MAX_CONFIDENCE: Final[float] = 0.98
+CANDIDATE_DELAY_SCALE: Final[float] = 0.5
+CANDIDATE_DELAY_MAX: Final[float] = 3.0
+INTERVIEWER_DELAY_SCALE: Final[float] = 0.3
+INTERVIEWER_DELAY_MAX: Final[float] = 1.5
 
 
 # =============================================================================
@@ -92,16 +125,39 @@ INTERVIEW_SCRIPT = [
 # Event Generation
 # =============================================================================
 
+def _generate_duration_jitter() -> float:
+    """Generate random duration jitter for realistic speech timing."""
+    import random
+    return random.uniform(MIN_DURATION_JITTER_MS, MAX_DURATION_JITTER_MS)
+
+
+def _generate_confidence() -> float:
+    """Generate random confidence score within realistic range."""
+    import random
+    return round(random.uniform(MIN_CONFIDENCE, MAX_CONFIDENCE), 3)
+
+
 def generate_transcript_event(
     speaker_id: str,
     text: str,
     event_type: str = "final",
     audio_offset_ms: float = 0.0,
-) -> dict:
-    """Generate a v2 transcript event matching C# bot output format."""
+) -> dict[str, object]:
+    """
+    Generate a v2 transcript event matching C# bot output format.
+
+    Args:
+        speaker_id: The speaker identifier (e.g., "speaker_0").
+        text: The transcript text content.
+        event_type: Event type, typically "final" for complete transcripts.
+        audio_offset_ms: Audio offset from session start in milliseconds.
+
+    Returns:
+        Dictionary containing the transcript event in v2 format.
+    """
     word_count = len(text.split())
-    duration_ms = word_count * 60 + random.uniform(50, 150)  # ~60ms per word
-    
+    duration_ms = word_count * MS_PER_WORD + _generate_duration_jitter()
+
     return {
         "event_type": event_type,
         "text": text,
@@ -109,7 +165,7 @@ def generate_transcript_event(
         "speaker_id": speaker_id,
         "audio_start_ms": round(audio_offset_ms, 1),
         "audio_end_ms": round(audio_offset_ms + duration_ms, 1),
-        "confidence": round(random.uniform(0.88, 0.98), 3),
+        "confidence": _generate_confidence(),
         "metadata": {
             "provider": "deepgram",
             "model": "nova-3",
@@ -117,8 +173,16 @@ def generate_transcript_event(
     }
 
 
-def generate_session_event(event_type: str) -> dict:
-    """Generate session start/stop event."""
+def generate_session_event(event_type: str) -> dict[str, object]:
+    """
+    Generate session start/stop event.
+
+    Args:
+        event_type: The session event type (e.g., "session_started", "session_stopped").
+
+    Returns:
+        Dictionary containing the session event.
+    """
     return {
         "event_type": event_type,
         "text": None,
@@ -134,149 +198,269 @@ def generate_session_event(event_type: str) -> dict:
 # Simulation Runner
 # =============================================================================
 
-async def run_simulation():
-    """Run the interview simulation, streaming events to the transcript sink."""
-    
+async def run_simulation(
+    sink_url: str,
+    candidate_name: str,
+    meeting_url: str,
+) -> int:
+    """
+    Run the interview simulation, streaming events to the transcript sink.
+
+    Args:
+        sink_url: URL of the transcript sink service.
+        candidate_name: Name of the interview candidate.
+        meeting_url: URL of the Teams meeting.
+
+    Returns:
+        Exit code indicating success or failure.
+    """
+    total_messages = len(INTERVIEW_SCRIPT)
+
     async with httpx.AsyncClient(timeout=30.0) as client:
-        
         # Check if sink is running
         logger.info("Checking transcript sink health...")
         try:
-            resp = await client.get(f"{SINK_URL}/health")
+            resp = await client.get(f"{sink_url}/health")
             if resp.status_code != 200:
-                logger.error(f"Sink not healthy: {resp.status_code}")
-                return
-            logger.info(f"Sink healthy: {resp.json()}")
+                logger.error("Sink not healthy: %d", resp.status_code)
+                return EXIT_SINK_UNHEALTHY
+            logger.info("Sink healthy: %s", resp.json())
         except httpx.ConnectError:
-            logger.error(f"Cannot connect to sink at {SINK_URL}. Is it running?")
+            logger.error("Cannot connect to sink at %s. Is it running?", sink_url)
             logger.error("Start it with: uv run python transcript_sink.py")
-            return
-        
+            return EXIT_CONNECTION_ERROR
+
         # Start interview session
-        logger.info(f"\n{'='*60}")
-        logger.info(f"Starting interview session for: {CANDIDATE_NAME}")
-        logger.info(f"{'='*60}\n")
-        
-        resp = await client.post(
-            f"{SINK_URL}/session/start",
-            json={
-                "candidate_name": CANDIDATE_NAME,
-                "meeting_url": MEETING_URL,
-            }
-        )
+        logger.info("\n%s", "=" * 60)
+        logger.info("Starting interview session for: %s", candidate_name)
+        logger.info("%s\n", "=" * 60)
+
+        try:
+            resp = await client.post(
+                f"{sink_url}/session/start",
+                json={
+                    "candidate_name": candidate_name,
+                    "meeting_url": meeting_url,
+                },
+            )
+        except httpx.RequestError as exc:
+            logger.error("Failed to start session: %s", exc)
+            return EXIT_SESSION_ERROR
+
         if resp.status_code != 200:
-            logger.error(f"Failed to start session: {resp.text}")
-            return
-        session_data = resp.json()
+            logger.error("Failed to start session: %s", resp.text)
+            return EXIT_SESSION_ERROR
+
+        session_data: dict[str, object] = resp.json()
         session_id = session_data.get("session_id")
-        logger.info(f"Session started: {session_id}")
-        
+        logger.info("Session started: %s", session_id)
+
         # Map speakers
         await client.post(
-            f"{SINK_URL}/session/map-speaker",
-            json={"speaker_id": INTERVIEWER_ID, "role": "interviewer"}
+            f"{sink_url}/session/map-speaker",
+            json={"speaker_id": INTERVIEWER_ID, "role": "interviewer"},
         )
         await client.post(
-            f"{SINK_URL}/session/map-speaker",
-            json={"speaker_id": CANDIDATE_ID, "role": "candidate"}
+            f"{sink_url}/session/map-speaker",
+            json={"speaker_id": CANDIDATE_ID, "role": "candidate"},
         )
         logger.info("Speakers mapped: speaker_0=interviewer, speaker_1=candidate")
-        
+
         # Send session started event
         await client.post(
-            f"{SINK_URL}/transcript",
-            json=generate_session_event("session_started")
+            f"{sink_url}/transcript",
+            json=generate_session_event("session_started"),
         )
         logger.info("Session started event sent")
-        
+
         await asyncio.sleep(1)
-        
+
         # Stream the interview
-        audio_offset = 0.0
-        
+        audio_offset: float = 0.0
+
         for i, (speaker_id, text) in enumerate(INTERVIEW_SCRIPT, 1):
             role = "Interviewer" if speaker_id == INTERVIEWER_ID else "Candidate"
-            
+
             # Calculate realistic delay based on text length
             word_count = len(text.split())
-            speaking_time = word_count * 0.06  # ~60ms per word for speech
-            
+            speaking_time = word_count * (MS_PER_WORD / 1000)  # Convert to seconds
+
             # Send the transcript event
             event = generate_transcript_event(
                 speaker_id=speaker_id,
                 text=text,
                 audio_offset_ms=audio_offset,
             )
-            
-            logger.info(f"\n[{i}/20] {role}: {text[:80]}{'...' if len(text) > 80 else ''}")
-            
-            resp = await client.post(f"{SINK_URL}/transcript", json=event)
+
+            truncated_text = f"{text[:80]}..." if len(text) > 80 else text
+            logger.info("\n[%d/%d] %s: %s", i, total_messages, role, truncated_text)
+
+            resp = await client.post(f"{sink_url}/transcript", json=event)
             if resp.status_code != 200:
-                logger.warning(f"Failed to send event: {resp.text}")
-            
+                logger.warning("Failed to send event: %s", resp.text)
+
             # Update audio offset
-            audio_offset += word_count * 60 + 500  # Add 500ms pause between messages
-            
+            audio_offset += word_count * MS_PER_WORD + PAUSE_BETWEEN_MESSAGES_MS
+
             # Wait for realistic streaming delay
-            # Shorter for interviewer (questions are quicker), longer for candidate (thoughtful responses)
+            # Shorter for interviewer (questions are quicker), longer for candidate
             if speaker_id == CANDIDATE_ID:
-                delay = min(speaking_time * 0.5, 3.0)  # Cap at 3 seconds for candidate
+                delay = min(speaking_time * CANDIDATE_DELAY_SCALE, CANDIDATE_DELAY_MAX)
             else:
-                delay = min(speaking_time * 0.3, 1.5)  # Cap at 1.5 seconds for interviewer
-            
+                delay = min(speaking_time * INTERVIEWER_DELAY_SCALE, INTERVIEWER_DELAY_MAX)
+
             await asyncio.sleep(delay)
-        
+
         # Send session stopped event
         await client.post(
-            f"{SINK_URL}/transcript",
-            json=generate_session_event("session_stopped")
+            f"{sink_url}/transcript",
+            json=generate_session_event("session_stopped"),
         )
-        
+
         await asyncio.sleep(1)
-        
+
         # Get final stats
-        stats_resp = await client.get(f"{SINK_URL}/stats")
-        stats = stats_resp.json()
-        
-        logger.info(f"\n{'='*60}")
+        stats_resp = await client.get(f"{sink_url}/stats")
+        stats: dict[str, object] = stats_resp.json()
+
+        logger.info("\n%s", "=" * 60)
         logger.info("Interview simulation complete!")
-        logger.info(f"{'='*60}")
-        logger.info(f"Total events received: {stats['stats']['events_received']}")
-        logger.info(f"Final transcripts: {stats['stats']['final_transcripts']}")
-        logger.info(f"Agent analyses: {stats['stats']['agent_analyses']}")
-        logger.info(f"V2 events: {stats['stats']['v2_events']}")
-        
+        logger.info("%s", "=" * 60)
+
+        stats_data = stats.get("stats", {})
+        if isinstance(stats_data, dict):
+            logger.info("Total events received: %s", stats_data.get("events_received"))
+            logger.info("Final transcripts: %s", stats_data.get("final_transcripts"))
+            logger.info("Agent analyses: %s", stats_data.get("agent_analyses"))
+            logger.info("V2 events: %s", stats_data.get("v2_events"))
+
         # End the session
-        end_resp = await client.post(f"{SINK_URL}/session/end")
+        end_resp = await client.post(f"{sink_url}/session/end")
         if end_resp.status_code == 200:
-            summary = end_resp.json().get("summary", {})
-            logger.info(f"\nSession ended: {summary.get('session_id')}")
-            logger.info(f"Analyses generated: {summary.get('analyses_generated', 0)}")
-        
+            summary: dict[str, object] = end_resp.json().get("summary", {})
+            logger.info("\nSession ended: %s", summary.get("session_id"))
+            logger.info("Analyses generated: %s", summary.get("analyses_generated", 0))
+
         # Show where to view analysis
-        logger.info(f"\n{'='*60}")
+        logger.info("\n%s", "=" * 60)
         logger.info("View analysis at:")
-        logger.info(f"  curl {SINK_URL}/session/status")
-        logger.info(f"  Check output/ directory for analysis JSON")
-        logger.info(f"{'='*60}")
+        logger.info("  curl %s/session/status", sink_url)
+        logger.info("  Check output/ directory for analysis JSON")
+        logger.info("%s", "=" * 60)
+
+    return EXIT_SUCCESS
 
 
-def main():
-    """Main entry point."""
+def main(
+    sink_url: str | None = None,
+    candidate_name: str | None = None,
+    meeting_url: str | None = None,
+) -> int:
+    """
+    Main entry point for the interview simulator.
+
+    Args:
+        sink_url: URL of the transcript sink (defaults to env var or localhost:8765).
+        candidate_name: Name of the candidate (defaults to "Sarah Chen").
+        meeting_url: Teams meeting URL (defaults to simulated URL).
+
+    Returns:
+        Exit code indicating success or failure.
+    """
+    # Resolve configuration with environment variable fallbacks
+    resolved_sink_url = sink_url or os.environ.get("SINK_URL", DEFAULT_SINK_URL)
+    resolved_candidate = candidate_name or os.environ.get("CANDIDATE_NAME", DEFAULT_CANDIDATE_NAME)
+    resolved_meeting_url = meeting_url or os.environ.get("MEETING_URL", DEFAULT_MEETING_URL)
+
     logger.info("=" * 60)
     logger.info("Teams Interview Simulator")
     logger.info("=" * 60)
-    logger.info(f"Target: {SINK_URL}")
-    logger.info(f"Candidate: {CANDIDATE_NAME}")
-    logger.info(f"Messages: {len(INTERVIEW_SCRIPT)}")
+    logger.info("Target: %s", resolved_sink_url)
+    logger.info("Candidate: %s", resolved_candidate)
+    logger.info("Messages: %d", len(INTERVIEW_SCRIPT))
     logger.info("")
-    
+
     try:
-        asyncio.run(run_simulation())
+        exit_code = asyncio.run(
+            run_simulation(
+                sink_url=resolved_sink_url,
+                candidate_name=resolved_candidate,
+                meeting_url=resolved_meeting_url,
+            )
+        )
+        return exit_code
     except KeyboardInterrupt:
         logger.info("\nSimulation interrupted")
-        sys.exit(0)
+        return EXIT_INTERRUPTED
+
+
+def cli() -> None:
+    """
+    Command-line interface entry point with argument parsing.
+
+    Provides CLI options for configuring the simulation.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Simulate an interview conversation by streaming transcripts to the sink.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    # Run with defaults
+    uv run python simulate_interview.py
+
+    # Custom sink URL
+    uv run python simulate_interview.py --sink-url http://localhost:9000
+
+    # Custom candidate name
+    uv run python simulate_interview.py --candidate "Jane Doe"
+
+Environment Variables:
+    SINK_URL         Transcript sink URL (default: http://127.0.0.1:8765)
+    CANDIDATE_NAME   Candidate name (default: Sarah Chen)
+    MEETING_URL      Teams meeting URL
+        """,
+    )
+
+    parser.add_argument(
+        "--sink-url",
+        type=str,
+        default=None,
+        help=f"Transcript sink URL (default: {DEFAULT_SINK_URL})",
+    )
+    parser.add_argument(
+        "--candidate",
+        type=str,
+        default=None,
+        dest="candidate_name",
+        help=f"Candidate name (default: {DEFAULT_CANDIDATE_NAME})",
+    )
+    parser.add_argument(
+        "--meeting-url",
+        type=str,
+        default=None,
+        help="Teams meeting URL",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable debug logging",
+    )
+
+    args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    exit_code = main(
+        sink_url=args.sink_url,
+        candidate_name=args.candidate_name,
+        meeting_url=args.meeting_url,
+    )
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
-    main()
+    cli()

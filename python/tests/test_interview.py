@@ -3,29 +3,38 @@ Integration tests for Interview Agent components.
 
 Tests InterviewSessionManager, AnalysisOutputWriter, and mock data generators.
 
-Last Grunted: 01/31/2026
+Last Grunted: 02/05/2026
 """
 
-import pytest
+from __future__ import annotations
+
+import json
 import tempfile
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+import pytest
 
 from interview_agent.models import (
-    TranscriptEvent,
-    InterviewSession,
-    SpeakerMapping,
     AnalysisItem,
+    InterviewSession,
     SessionAnalysis,
+    SpeakerMapping,
+    TranscriptEvent,
+)
+from interview_agent.output import (
+    AnalysisOutputWriter,
+    OutputReadError,
+    OutputWriteError,
 )
 from interview_agent.session import InterviewSessionManager
-from interview_agent.output import AnalysisOutputWriter
 from tests.mock_data import (
+    generate_analysis_item,
+    generate_interview_conversation,
+    generate_session_analysis,
     generate_session_start_event,
     generate_session_stop_event,
     generate_transcript_event,
-    generate_interview_conversation,
-    generate_analysis_item,
-    generate_session_analysis,
     generate_v2_event_dict,
 )
 
@@ -678,3 +687,311 @@ class TestModelValidation:
         assert analysis.overall_relevance is None
         assert analysis.overall_clarity is None
         assert analysis.total_responses_analyzed == 0
+
+
+# =============================================================================
+# Output Exception Tests
+# =============================================================================
+
+class TestOutputExceptions:
+    """Tests for AnalysisOutputWriter custom exceptions."""
+    
+    @pytest.fixture
+    def temp_output_dir(self):
+        """Create temporary directory for test outputs."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+    
+    def test_output_write_error_attributes(self):
+        """OutputWriteError has correct attributes."""
+        cause = OSError("Permission denied")
+        path = Path("/test/path")
+        
+        error = OutputWriteError(path, cause)
+        
+        assert error.path == path
+        assert error.cause == cause
+        assert "Permission denied" in str(error)
+        assert "/test/path" in str(error)
+    
+    def test_output_read_error_attributes(self):
+        """OutputReadError has correct attributes."""
+        cause = json.JSONDecodeError("Invalid JSON", doc="", pos=0)
+        path = Path("/test/path")
+        
+        error = OutputReadError(path, cause)
+        
+        assert error.path == path
+        assert error.cause == cause
+        assert "/test/path" in str(error)
+    
+    def test_load_analysis_invalid_json_raises_read_error(self, temp_output_dir):
+        """Loading invalid JSON raises OutputReadError."""
+        writer = AnalysisOutputWriter(temp_output_dir)
+        
+        # Write invalid JSON directly
+        invalid_file = temp_output_dir / "invalid_session_analysis.json"
+        with open(invalid_file, "w") as f:
+            f.write("{not valid json")
+        
+        with pytest.raises(OutputReadError) as exc_info:
+            writer.load_analysis("invalid_session")
+        
+        assert exc_info.value.path == invalid_file
+        assert isinstance(exc_info.value.cause, json.JSONDecodeError)
+    
+    def test_load_analysis_invalid_schema_raises_read_error(self, temp_output_dir):
+        """Loading valid JSON with invalid schema raises OutputReadError."""
+        writer = AnalysisOutputWriter(temp_output_dir)
+        
+        # Write valid JSON but invalid schema
+        invalid_file = temp_output_dir / "bad_schema_analysis.json"
+        with open(invalid_file, "w") as f:
+            json.dump({"invalid": "schema", "no_required_fields": True}, f)
+        
+        with pytest.raises(OutputReadError) as exc_info:
+            writer.load_analysis("bad_schema")
+        
+        assert exc_info.value.path == invalid_file
+    
+    def test_append_item_with_corrupted_file_raises_error(self, temp_output_dir):
+        """Appending to corrupted file raises OutputReadError."""
+        writer = AnalysisOutputWriter(temp_output_dir)
+        
+        # Create corrupted file
+        corrupted_file = temp_output_dir / "corrupted_analysis.json"
+        with open(corrupted_file, "w") as f:
+            f.write("not json at all {{{")
+        
+        item = generate_analysis_item(response_id="test_item")
+        
+        with pytest.raises(OutputReadError) as exc_info:
+            writer.append_item("corrupted", item)
+        
+        assert exc_info.value.path == corrupted_file
+
+
+# =============================================================================
+# Pubsub Tests
+# =============================================================================
+
+class TestAgentThoughtPublisher:
+    """Tests for AgentThoughtPublisher."""
+    
+    @pytest.fixture
+    def publisher(self):
+        """Create a fresh publisher instance."""
+        from interview_agent.pubsub import AgentThoughtPublisher
+        return AgentThoughtPublisher(max_history=10)
+    
+    @pytest.mark.asyncio
+    async def test_subscribe_returns_queue(self, publisher):
+        """Subscribing returns an asyncio Queue."""
+        import asyncio
+        
+        queue = await publisher.subscribe()
+        
+        assert isinstance(queue, asyncio.Queue)
+        assert publisher.subscriber_count == 1
+    
+    @pytest.mark.asyncio
+    async def test_publish_broadcasts_to_subscribers(self, publisher):
+        """Published thoughts are sent to all subscribers."""
+        from interview_agent.pubsub import AgentThought, ThoughtType
+        
+        queue1 = await publisher.subscribe()
+        queue2 = await publisher.subscribe()
+        
+        thought = AgentThought(
+            thought_type=ThoughtType.ANALYSIS,
+            content="Test analysis",
+        )
+        await publisher.publish(thought)
+        
+        # Both queues should receive the thought
+        received1 = await queue1.get()
+        received2 = await queue2.get()
+        
+        assert received1.content == "Test analysis"
+        assert received2.content == "Test analysis"
+    
+    @pytest.mark.asyncio
+    async def test_unsubscribe_removes_queue(self, publisher):
+        """Unsubscribing removes the queue from subscribers."""
+        queue = await publisher.subscribe()
+        assert publisher.subscriber_count == 1
+        
+        await publisher.unsubscribe(queue)
+        assert publisher.subscriber_count == 0
+    
+    @pytest.mark.asyncio
+    async def test_get_history_returns_copy(self, publisher):
+        """get_history returns a copy of history list."""
+        from interview_agent.pubsub import AgentThought, ThoughtType
+        
+        thought = AgentThought(
+            thought_type=ThoughtType.SYSTEM,
+            content="System message",
+        )
+        await publisher.publish(thought)
+        
+        history = await publisher.get_history()
+        
+        assert len(history) == 1
+        assert history[0].content == "System message"
+        
+        # Modifying returned list shouldn't affect internal history
+        history.clear()
+        internal_history = await publisher.get_history()
+        assert len(internal_history) == 1
+    
+    @pytest.mark.asyncio
+    async def test_clear_history_empties_history(self, publisher):
+        """clear_history removes all thoughts from history."""
+        from interview_agent.pubsub import AgentThought, ThoughtType
+        
+        await publisher.publish(AgentThought(
+            thought_type=ThoughtType.ANALYSIS,
+            content="Test 1",
+        ))
+        await publisher.publish(AgentThought(
+            thought_type=ThoughtType.ANALYSIS,
+            content="Test 2",
+        ))
+        
+        history_before = await publisher.get_history()
+        assert len(history_before) == 2
+        
+        await publisher.clear_history()
+        
+        history_after = await publisher.get_history()
+        assert len(history_after) == 0
+    
+    @pytest.mark.asyncio
+    async def test_history_limit_enforced(self, publisher):
+        """History respects max_history limit."""
+        from interview_agent.pubsub import AgentThought, ThoughtType
+        
+        # Publisher has max_history=10
+        for i in range(15):
+            await publisher.publish(AgentThought(
+                thought_type=ThoughtType.OBSERVATION,
+                content=f"Message {i}",
+            ))
+        
+        history = await publisher.get_history()
+        
+        assert len(history) == 10
+        # Should have the most recent messages (5-14)
+        assert history[0].content == "Message 5"
+        assert history[-1].content == "Message 14"
+    
+    @pytest.mark.asyncio
+    async def test_new_subscriber_gets_history(self, publisher):
+        """New subscribers receive the existing history."""
+        from interview_agent.pubsub import AgentThought, ThoughtType
+        
+        # Publish some thoughts first
+        await publisher.publish(AgentThought(
+            thought_type=ThoughtType.SYSTEM,
+            content="Old message 1",
+        ))
+        await publisher.publish(AgentThought(
+            thought_type=ThoughtType.SYSTEM,
+            content="Old message 2",
+        ))
+        
+        # Subscribe after publishing
+        queue = await publisher.subscribe()
+        
+        # Should immediately have the historical messages
+        msg1 = await queue.get()
+        msg2 = await queue.get()
+        
+        assert msg1.content == "Old message 1"
+        assert msg2.content == "Old message 2"
+    
+    @pytest.mark.asyncio
+    async def test_publish_analysis_convenience_method(self, publisher):
+        """publish_analysis creates proper AgentThought."""
+        from interview_agent.pubsub import ThoughtType
+        
+        queue = await publisher.subscribe()
+        
+        await publisher.publish_analysis(
+            content="Strong technical response",
+            speaker_id="speaker_1",
+            relevance_score=0.9,
+            clarity_score=0.85,
+            key_points=["Point 1", "Point 2"],
+        )
+        
+        thought = await queue.get()
+        
+        assert thought.thought_type == ThoughtType.ANALYSIS
+        assert thought.content == "Strong technical response"
+        assert thought.speaker_id == "speaker_1"
+        assert thought.relevance_score == 0.9
+        assert thought.clarity_score == 0.85
+        assert thought.key_points == ["Point 1", "Point 2"]
+    
+    @pytest.mark.asyncio
+    async def test_publish_error_convenience_method(self, publisher):
+        """publish_error creates ERROR type thought."""
+        from interview_agent.pubsub import ThoughtType
+        
+        queue = await publisher.subscribe()
+        
+        await publisher.publish_error("Analysis failed: timeout")
+        
+        thought = await queue.get()
+        
+        assert thought.thought_type == ThoughtType.ERROR
+        assert thought.content == "Analysis failed: timeout"
+    
+    @pytest.mark.asyncio
+    async def test_get_subscriber_count_async(self, publisher):
+        """get_subscriber_count returns accurate async-safe count."""
+        await publisher.subscribe()
+        await publisher.subscribe()
+        
+        count = await publisher.get_subscriber_count()
+        
+        assert count == 2
+    
+    @pytest.mark.asyncio
+    async def test_agent_thought_to_dict(self):
+        """AgentThought.to_dict produces correct dictionary."""
+        from interview_agent.pubsub import AgentThought, ThoughtType
+        
+        thought = AgentThought(
+            thought_type=ThoughtType.ANALYSIS,
+            content="Test content",
+            speaker_id="speaker_0",
+            relevance_score=0.8,
+        )
+        
+        data = thought.to_dict()
+        
+        assert data["thought_type"] == "analysis"
+        assert data["content"] == "Test content"
+        assert data["speaker_id"] == "speaker_0"
+        assert data["relevance_score"] == 0.8
+        assert "timestamp" in data
+    
+    @pytest.mark.asyncio
+    async def test_agent_thought_to_json(self):
+        """AgentThought.to_json produces valid JSON string."""
+        from interview_agent.pubsub import AgentThought, ThoughtType
+        import json
+        
+        thought = AgentThought(
+            thought_type=ThoughtType.OBSERVATION,
+            content="Observation content",
+        )
+        
+        json_str = thought.to_json()
+        parsed = json.loads(json_str)
+        
+        assert parsed["thought_type"] == "observation"
+        assert parsed["content"] == "Observation content"

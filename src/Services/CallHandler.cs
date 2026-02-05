@@ -1,10 +1,7 @@
-using Microsoft.Graph;
 using Microsoft.Graph.Communications.Calls;
 using Microsoft.Graph.Communications.Calls.Media;
-using Microsoft.Graph.Communications.Common.Telemetry;
 using Microsoft.Graph.Communications.Resources;
 using Microsoft.Graph.Models;
-using Microsoft.Graph.Contracts;
 using Microsoft.Skype.Bots.Media;
 using System.Runtime.InteropServices;
 using System.Timers;
@@ -12,62 +9,88 @@ using System.Timers;
 namespace TeamsMediaBot.Services;
 
 /// <summary>
-/// Handles the lifecycle of a single call, including heartbeat, media, and transcription
-/// Based on Microsoft's EchoBot CallHandler pattern
-/// 
-/// Responsibilities:
-/// - Sends heartbeat keepalive every 10 minutes to prevent 45-minute timeout
-/// - Manages audio socket events
-/// - Coordinates transcription lifecycle
-/// - Handles call state transitions
+/// Handles the lifecycle of a single call, including heartbeat, media, and transcription.
 /// </summary>
+/// <remarks>
+/// <para>
+/// Based on Microsoft's EchoBot CallHandler pattern.
+/// </para>
+/// <para>
+/// Responsibilities:
+/// <list type="bullet">
+///   <item>Sends heartbeat keepalive every 10 minutes to prevent 45-minute timeout</item>
+///   <item>Manages audio socket events and forwards frames to transcriber</item>
+///   <item>Coordinates transcription lifecycle (start/stop)</item>
+///   <item>Handles call state transitions</item>
+/// </list>
+/// </para>
+/// </remarks>
 public class CallHandler : HeartbeatHandler
 {
+    /// <summary>
+    /// Heartbeat interval in minutes. Microsoft recommends between 15-45 minutes.
+    /// Using 10 minutes for safety margin.
+    /// </summary>
+    private const int HeartbeatIntervalMinutes = 10;
+    
+    /// <summary>
+    /// Number of frames between statistics logging (50 frames = ~1 second at 20ms/frame).
+    /// </summary>
+    private const int StatsLogInterval = 50;
+    
     private readonly ILogger _logger;
     private readonly IRealtimeTranscriber _transcriber;
     private bool _isTranscriberStarted;
     private long _audioFramesReceived;
+    private bool _isShuttingDown;
 
     /// <summary>
-    /// Gets the call being handled
+    /// Gets the call being handled.
     /// </summary>
     public ICall Call { get; }
 
     /// <summary>
-    /// Gets the media session for this call
+    /// Gets the media session for this call.
     /// </summary>
     public ILocalMediaSession MediaSession { get; }
 
     /// <summary>
-    /// Gets the timestamp when this call was joined
+    /// Gets the UTC timestamp when this call was joined.
     /// </summary>
-    public DateTime JoinedAt { get; }
+    public DateTime JoinedAtUtc { get; }
 
     /// <summary>
     /// Initializes a new instance of the <see cref="CallHandler"/> class.
     /// </summary>
-    /// <param name="call">The stateful call object</param>
-    /// <param name="mediaSession">The media session</param>
-    /// <param name="transcriber">The transcriber for this call</param>
-    /// <param name="logger">The application logger</param>
+    /// <param name="call">The stateful call object from Graph Communications SDK.</param>
+    /// <param name="mediaSession">The local media session with audio socket.</param>
+    /// <param name="transcriber">The real-time transcriber for this call.</param>
+    /// <param name="logger">The application logger.</param>
+    /// <exception cref="ArgumentNullException">Thrown when required parameters are null.</exception>
     public CallHandler(
         ICall call,
         ILocalMediaSession mediaSession,
         IRealtimeTranscriber transcriber,
         ILogger logger)
-        : base(TimeSpan.FromMinutes(10), call.GraphLogger) // Heartbeat every 10 minutes (Microsoft uses 10 min)
+        : base(TimeSpan.FromMinutes(HeartbeatIntervalMinutes), call?.GraphLogger 
+            ?? throw new ArgumentNullException(nameof(call)))
     {
-        Call = call ?? throw new ArgumentNullException(nameof(call));
-        MediaSession = mediaSession ?? throw new ArgumentNullException(nameof(mediaSession));
-        _transcriber = transcriber ?? throw new ArgumentNullException(nameof(transcriber));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-        JoinedAt = DateTime.UtcNow;
+        ArgumentNullException.ThrowIfNull(call);
+        ArgumentNullException.ThrowIfNull(mediaSession);
+        ArgumentNullException.ThrowIfNull(transcriber);
+        ArgumentNullException.ThrowIfNull(logger);
+        
+        Call = call;
+        MediaSession = mediaSession;
+        _transcriber = transcriber;
+        _logger = logger;
+        JoinedAtUtc = DateTime.UtcNow;
 
         // Subscribe to call state changes
         Call.OnUpdated += OnCallUpdated;
 
         // Subscribe to audio events
-        if (MediaSession.AudioSocket != null)
+        if (MediaSession.AudioSocket is not null)
         {
             MediaSession.AudioSocket.AudioMediaReceived += OnAudioMediaReceived;
             _logger.LogInformation("CallHandler created for call {CallId} - audio socket wired", call.Id);
@@ -79,18 +102,26 @@ public class CallHandler : HeartbeatHandler
     }
 
     /// <summary>
-    /// Sends keepalive to Microsoft Graph to prevent call from timing out
-    /// Per Microsoft: Calls without keepalive for 45 minutes are terminated
+    /// Sends keepalive to Microsoft Graph to prevent call from timing out.
     /// </summary>
+    /// <remarks>
+    /// Per Microsoft Graph API documentation: Calls without keepalive for 45 minutes are terminated.
+    /// Source: https://learn.microsoft.com/en-us/graph/api/call-keepalive
+    /// </remarks>
     protected override async Task HeartbeatAsync(ElapsedEventArgs args)
     {
+        if (_isShuttingDown)
+        {
+            return;
+        }
+        
         try
         {
             _logger.LogDebug("Sending keepalive for call {CallId}", Call.Id);
             await Call.KeepAliveAsync().ConfigureAwait(false);
             _logger.LogDebug("Keepalive sent successfully for call {CallId}", Call.Id);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger.LogError(ex, "Failed to send keepalive for call {CallId}", Call.Id);
             // Don't throw - we want to keep trying on next heartbeat
@@ -98,7 +129,7 @@ public class CallHandler : HeartbeatHandler
     }
 
     /// <summary>
-    /// Handles call state changes
+    /// Handles call state changes from the Graph Communications SDK.
     /// </summary>
     private async void OnCallUpdated(ICall sender, ResourceEventArgs<Call> args)
     {
@@ -107,7 +138,10 @@ public class CallHandler : HeartbeatHandler
 
         _logger.LogInformation(
             "Call {CallId} state changed: {OldState} -> {NewState} (ResultInfo: {ResultInfo})",
-            Call.Id, oldState, newState, args.NewResource.ResultInfo?.Message);
+            Call.Id,
+            oldState,
+            newState,
+            args.NewResource.ResultInfo?.Message);
 
         // Start transcription when call is established
         if (oldState != newState && newState == CallState.Established)
@@ -125,32 +159,43 @@ public class CallHandler : HeartbeatHandler
     }
 
     /// <summary>
-    /// Handles incoming audio frames from Teams
-    /// Per S5: Audio frames are 20ms each, delivered at ~50 fps (16kHz, 16-bit, mono PCM)
+    /// Handles incoming audio frames from Teams Media SDK.
     /// </summary>
+    /// <remarks>
+    /// Audio frames are 20ms each, delivered at ~50 fps (16kHz, 16-bit, mono PCM = 640 bytes per frame).
+    /// This callback runs on a media worker thread and must not block.
+    /// </remarks>
     private void OnAudioMediaReceived(object? sender, AudioMediaReceivedEventArgs e)
     {
+        AudioBuffer? buffer = null;
+        
         try
         {
-            var buffer = e.Buffer;
-            if (buffer != null && buffer.Data != IntPtr.Zero && buffer.Length > 0)
+            buffer = e.Buffer;
+            if (buffer is null || buffer.Data == IntPtr.Zero || buffer.Length <= 0)
             {
-                // Extract PCM bytes from unmanaged buffer
-                var pcmData = new byte[buffer.Length];
-                Marshal.Copy(buffer.Data, pcmData, 0, (int)buffer.Length);
+                return;
+            }
 
-                // Push to transcriber
-                _transcriber.PushPcm16k16bitMono(pcmData);
+            // Extract PCM bytes from unmanaged buffer
+            // Note: Using stackalloc would be better for small buffers, but buffer.Length 
+            // can vary and we need to pass to transcriber which expects heap allocation
+            var pcmData = new byte[buffer.Length];
+            Marshal.Copy(buffer.Data, pcmData, 0, (int)buffer.Length);
 
-                _audioFramesReceived++;
+            // Push to transcriber (non-blocking call)
+            _transcriber.PushPcm16k16bitMono(pcmData);
 
-                // Log stats every second (~50 frames)
-                if (_audioFramesReceived % 50 == 0)
-                {
-                    _logger.LogDebug(
-                        "Call {CallId}: Received {Frames} audio frames ({Seconds:F1}s of audio)",
-                        Call.Id, _audioFramesReceived, _audioFramesReceived * 0.02);
-                }
+            _audioFramesReceived++;
+
+            // Log stats periodically (~1 second intervals)
+            if (_audioFramesReceived % StatsLogInterval == 0)
+            {
+                _logger.LogDebug(
+                    "Call {CallId}: Received {FrameCount} audio frames ({DurationSeconds:F1}s of audio)",
+                    Call.Id,
+                    _audioFramesReceived,
+                    _audioFramesReceived * 0.02);
             }
         }
         catch (Exception ex)
@@ -159,17 +204,20 @@ public class CallHandler : HeartbeatHandler
         }
         finally
         {
-            // CRITICAL: Must dispose buffer per SDK requirements
-            e.Buffer?.Dispose();
+            // CRITICAL: Must dispose buffer per SDK requirements to release unmanaged memory
+            buffer?.Dispose();
         }
     }
 
     /// <summary>
-    /// Starts the transcriber
+    /// Starts the transcriber for this call.
     /// </summary>
     private async Task StartTranscriptionAsync()
     {
-        if (_isTranscriberStarted) return;
+        if (_isTranscriberStarted || _isShuttingDown)
+        {
+            return;
+        }
 
         try
         {
@@ -184,19 +232,23 @@ public class CallHandler : HeartbeatHandler
     }
 
     /// <summary>
-    /// Stops the transcriber
+    /// Stops the transcriber for this call.
     /// </summary>
     private async Task StopTranscriptionAsync()
     {
-        if (!_isTranscriberStarted) return;
+        if (!_isTranscriberStarted)
+        {
+            return;
+        }
 
         try
         {
             await _transcriber.StopAsync().ConfigureAwait(false);
             _isTranscriberStarted = false;
             _logger.LogInformation(
-                "Transcription stopped for call {CallId}. Total audio frames: {Frames}",
-                Call.Id, _audioFramesReceived);
+                "Transcription stopped for call {CallId}. Total audio frames: {FrameCount}",
+                Call.Id,
+                _audioFramesReceived);
         }
         catch (Exception ex)
         {
@@ -205,30 +257,56 @@ public class CallHandler : HeartbeatHandler
     }
 
     /// <summary>
-    /// Gracefully shuts down this call handler
+    /// Gracefully shuts down this call handler, stopping transcription and unsubscribing from events.
     /// </summary>
+    /// <returns>A task representing the asynchronous shutdown operation.</returns>
     public async Task ShutdownAsync()
     {
+        if (_isShuttingDown)
+        {
+            return;
+        }
+
+        _isShuttingDown = true;
         _logger.LogInformation("Shutting down CallHandler for call {CallId}", Call.Id);
 
-        // Stop transcription
+        // Stop transcription first
         await StopTranscriptionAsync().ConfigureAwait(false);
 
-        // Unsubscribe from events
+        // Dispose transcriber if it implements IAsyncDisposable
+        if (_transcriber is IAsyncDisposable asyncDisposable)
+        {
+            try
+            {
+                await asyncDisposable.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Error disposing transcriber for call {CallId}", Call.Id);
+            }
+        }
+
+        // Unsubscribe from events to prevent memory leaks
         Call.OnUpdated -= OnCallUpdated;
         
-        if (MediaSession.AudioSocket != null)
+        if (MediaSession.AudioSocket is not null)
         {
             MediaSession.AudioSocket.AudioMediaReceived -= OnAudioMediaReceived;
         }
+
+        _logger.LogInformation(
+            "CallHandler shutdown complete for call {CallId}. Duration: {Duration}",
+            Call.Id,
+            DateTime.UtcNow - JoinedAtUtc);
     }
 
     /// <inheritdoc/>
     protected override void Dispose(bool disposing)
     {
-        if (disposing)
+        if (disposing && !_isShuttingDown)
         {
-            // Fire and forget shutdown - we're being disposed
+            // Fire and forget shutdown - we're being disposed synchronously
+            // but need to perform async cleanup
             _ = Task.Run(async () =>
             {
                 try

@@ -6,67 +6,112 @@ using TeamsMediaBot.Models;
 namespace TeamsMediaBot.Services;
 
 /// <summary>
-/// Factory for creating IRealtimeTranscriber instances (Deepgram or Azure ConversationTranscriber).
-/// This avoids DI disposal issues since the transcriber implements IAsyncDisposable
-/// and its lifetime is managed by CallHandler, not the DI container
+/// Factory for creating <see cref="IRealtimeTranscriber"/> instances.
 /// </summary>
-public class TranscriberFactory
+/// <remarks>
+/// <para>
+/// Supports Deepgram (primary) and Azure ConversationTranscriber (fallback).
+/// </para>
+/// <para>
+/// This factory pattern avoids DI disposal issues since transcribers implement 
+/// <see cref="IAsyncDisposable"/> and their lifetime is managed by CallHandler, 
+/// not the DI container.
+/// </para>
+/// </remarks>
+public sealed class TranscriberFactory
 {
-    private readonly SttConfiguration _stt;
+    private readonly SttConfiguration _sttConfig;
     private readonly string _pythonEndpoint;
     private readonly ILoggerFactory _loggerFactory;
 
+    /// <summary>
+    /// Initializes a new instance of the <see cref="TranscriberFactory"/> class.
+    /// </summary>
+    /// <param name="sttConfig">The STT configuration.</param>
+    /// <param name="pythonEndpoint">The Python endpoint for transcript events.</param>
+    /// <param name="loggerFactory">The logger factory.</param>
+    /// <exception cref="ArgumentNullException">Thrown when required parameters are null.</exception>
     public TranscriberFactory(
-        SttConfiguration stt,
+        SttConfiguration sttConfig,
         string pythonEndpoint,
         ILoggerFactory loggerFactory)
     {
-        _stt = stt;
+        ArgumentNullException.ThrowIfNull(sttConfig);
+        ArgumentException.ThrowIfNullOrWhiteSpace(pythonEndpoint);
+        ArgumentNullException.ThrowIfNull(loggerFactory);
+        
+        _sttConfig = sttConfig;
         _pythonEndpoint = pythonEndpoint;
         _loggerFactory = loggerFactory;
     }
 
+    /// <summary>
+    /// Creates a new transcriber instance based on the configured provider.
+    /// </summary>
+    /// <returns>A new <see cref="IRealtimeTranscriber"/> instance.</returns>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when the configured provider's configuration is missing.
+    /// </exception>
+    /// <exception cref="NotSupportedException">
+    /// Thrown when the configured provider is not supported.
+    /// </exception>
     public IRealtimeTranscriber Create()
     {
         var publisherLogger = _loggerFactory.CreateLogger<PythonTranscriptPublisher>();
         var publisher = new PythonTranscriptPublisher(_pythonEndpoint, publisherLogger);
         
-        var provider = (_stt.Provider ?? "Deepgram").Trim();
+        var provider = (_sttConfig.Provider ?? "Deepgram").Trim();
 
-        // PRIMARY: Deepgram (best diarization)
-        if (provider.Equals("Deepgram", StringComparison.OrdinalIgnoreCase))
+        // PRIMARY: Deepgram (best diarization quality)
+        if (string.Equals(provider, "Deepgram", StringComparison.OrdinalIgnoreCase))
         {
-            var cfg = _stt.Deepgram ?? throw new InvalidOperationException(
-                "STT provider 'Deepgram' selected but Stt.Deepgram config is missing.");
-
-            var logger = _loggerFactory.CreateLogger<DeepgramRealtimeTranscriber>();
-            return new DeepgramRealtimeTranscriber(
-                cfg.ApiKey,
-                cfg.Model,
-                cfg.Diarize,
-                publisher,
-                logger);
+            return CreateDeepgramTranscriber(publisher);
         }
 
         // FALLBACK: Azure Speech ConversationTranscriber
-        if (provider.Equals("AzureSpeech", StringComparison.OrdinalIgnoreCase) ||
-            provider.Equals("Azure", StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(provider, "AzureSpeech", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(provider, "Azure", StringComparison.OrdinalIgnoreCase))
         {
-            var cfg = _stt.AzureSpeech ?? throw new InvalidOperationException(
-                "STT provider 'AzureSpeech' selected but Stt.AzureSpeech config is missing.");
-
-            var logger = _loggerFactory.CreateLogger<AzureConversationTranscriber>();
-            return new AzureConversationTranscriber(
-                cfg.Key,
-                cfg.Region,
-                cfg.RecognitionLanguage,
-                cfg.EndpointId,
-                publisher,
-                logger);
+            return CreateAzureTranscriber(publisher);
         }
 
         throw new NotSupportedException(
             $"STT provider '{provider}' is not supported. Use 'Deepgram' or 'AzureSpeech'.");
+    }
+
+    /// <summary>
+    /// Creates a Deepgram transcriber instance.
+    /// </summary>
+    private DeepgramRealtimeTranscriber CreateDeepgramTranscriber(PythonTranscriptPublisher publisher)
+    {
+        var config = _sttConfig.Deepgram ?? throw new InvalidOperationException(
+            "STT provider 'Deepgram' selected but Stt.Deepgram config is missing.");
+
+        var logger = _loggerFactory.CreateLogger<DeepgramRealtimeTranscriber>();
+        return new DeepgramRealtimeTranscriber(
+            config.ApiKey,
+            config.Model,
+            config.Diarize,
+            publisher,
+            logger);
+    }
+
+    /// <summary>
+    /// Creates an Azure ConversationTranscriber instance.
+    /// </summary>
+    private AzureConversationTranscriber CreateAzureTranscriber(PythonTranscriptPublisher publisher)
+    {
+        var config = _sttConfig.AzureSpeech ?? throw new InvalidOperationException(
+            "STT provider 'AzureSpeech' selected but Stt.AzureSpeech config is missing.");
+
+        var logger = _loggerFactory.CreateLogger<AzureConversationTranscriber>();
+        return new AzureConversationTranscriber(
+            config.Key,
+            config.Region,
+            config.RecognitionLanguage,
+            config.EndpointId,
+            publisher,
+            logger);
     }
 }
 

@@ -3,7 +3,11 @@ Analysis Output Writer.
 
 Handles persistence of interview analysis results to JSON files.
 
-Last Grunted: 01/31/2026
+Thread Safety:
+    File operations are atomic at the write level but not at the read-modify-write
+    level. For concurrent access to the same session file, external locking is required.
+
+Last Grunted: 02/05/2026
 """
 
 import json
@@ -12,10 +16,38 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from pydantic import ValidationError
+
 from .models import AnalysisItem, SessionAnalysis
 
 
+__all__ = ["AnalysisOutputWriter", "OutputWriteError", "OutputReadError"]
+
+
 logger = logging.getLogger(__name__)
+
+
+class OutputWriteError(Exception):
+    """Raised when writing analysis output fails."""
+    
+    def __init__(self, path: Path, cause: Exception) -> None:
+        self.path = path
+        self.cause = cause
+        super().__init__(f"Failed to write to {path}: {cause}")
+
+
+class OutputReadError(Exception):
+    """Raised when reading analysis output fails."""
+    
+    def __init__(self, path: Path, cause: Exception) -> None:
+        self.path = path
+        self.cause = cause
+        super().__init__(f"Failed to read from {path}: {cause}")
+
+
+def _format_utc_timestamp() -> str:
+    """Return current UTC timestamp as ISO 8601 string with 'Z' suffix."""
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 class AnalysisOutputWriter:
@@ -45,9 +77,17 @@ class AnalysisOutputWriter:
         self._ensure_output_dir()
     
     def _ensure_output_dir(self) -> None:
-        """Create output directory if it doesn't exist."""
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        logger.debug(f"Output directory ready: {self.output_dir}")
+        """
+        Create output directory if it doesn't exist.
+        
+        Raises:
+            OutputWriteError: If directory creation fails.
+        """
+        try:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            logger.debug("Output directory ready: %s", self.output_dir)
+        except OSError as e:
+            raise OutputWriteError(self.output_dir, e) from e
     
     def _get_output_path(self, session_id: str) -> Path:
         """Get the output file path for a session."""
@@ -65,6 +105,9 @@ class AnalysisOutputWriter:
             
         Returns:
             Path to the written file.
+            
+        Raises:
+            OutputWriteError: If file write fails.
             
         Example:
             >>> analysis = SessionAnalysis(
@@ -84,14 +127,17 @@ class AnalysisOutputWriter:
         # Convert to dict and add metadata
         data = analysis.model_dump()
         data["_meta"] = {
-            "written_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "written_at": _format_utc_timestamp(),
             "version": "1.0",
         }
         
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        try:
+            with open(output_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except OSError as e:
+            raise OutputWriteError(output_path, e) from e
         
-        logger.info(f"Wrote analysis to {output_path}")
+        logger.info("Wrote analysis to %s", output_path)
         return output_path
     
     def append_item(self, session_id: str, item: AnalysisItem) -> Path:
@@ -108,6 +154,10 @@ class AnalysisOutputWriter:
         Returns:
             Path to the updated file.
             
+        Raises:
+            OutputWriteError: If file read or write fails.
+            OutputReadError: If existing file contains invalid JSON.
+            
         Example:
             >>> item = AnalysisItem(
             ...     response_id="resp_001",
@@ -118,24 +168,30 @@ class AnalysisOutputWriter:
             >>> path = writer.append_item("int_20260131_103000", item)
         """
         output_path = self._get_output_path(session_id)
+        current_timestamp = _format_utc_timestamp()
         
         # Load existing data or create minimal structure
         if output_path.exists():
-            with open(output_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            try:
+                with open(output_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except json.JSONDecodeError as e:
+                raise OutputReadError(output_path, e) from e
+            except OSError as e:
+                raise OutputReadError(output_path, e) from e
         else:
             # Create minimal structure
             data = {
                 "session_id": session_id,
                 "candidate_name": "Unknown",
-                "started_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "started_at": current_timestamp,
                 "ended_at": None,
                 "analysis_items": [],
                 "overall_relevance": None,
                 "overall_clarity": None,
                 "total_responses_analyzed": 0,
                 "_meta": {
-                    "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "created_at": current_timestamp,
                     "version": "1.0",
                 },
             }
@@ -151,12 +207,15 @@ class AnalysisOutputWriter:
             data["overall_clarity"] = sum(i["clarity_score"] for i in items) / len(items)
         
         # Update metadata
-        data["_meta"]["last_updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        data["_meta"]["last_updated_at"] = current_timestamp
         
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        try:
+            with open(output_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except OSError as e:
+            raise OutputWriteError(output_path, e) from e
         
-        logger.info(f"Appended item {item.response_id} to {output_path}")
+        logger.info("Appended item %s to %s", item.response_id, output_path)
         return output_path
     
     def load_analysis(self, session_id: str) -> Optional[SessionAnalysis]:
@@ -168,20 +227,31 @@ class AnalysisOutputWriter:
             
         Returns:
             SessionAnalysis if file exists, None otherwise.
+            
+        Raises:
+            OutputReadError: If file read fails or contains invalid JSON/data.
         """
         output_path = self._get_output_path(session_id)
         
         if not output_path.exists():
-            logger.debug(f"No analysis file found for session {session_id}")
+            logger.debug("No analysis file found for session %s", session_id)
             return None
         
-        with open(output_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        try:
+            with open(output_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except json.JSONDecodeError as e:
+            raise OutputReadError(output_path, e) from e
+        except OSError as e:
+            raise OutputReadError(output_path, e) from e
         
         # Remove metadata before parsing
         data.pop("_meta", None)
         
-        return SessionAnalysis.model_validate(data)
+        try:
+            return SessionAnalysis.model_validate(data)
+        except ValidationError as e:
+            raise OutputReadError(output_path, e) from e
     
     def list_sessions(self) -> list[str]:
         """
@@ -209,12 +279,19 @@ class AnalysisOutputWriter:
             
         Returns:
             True if file was deleted, False if it didn't exist.
+            
+        Raises:
+            OutputWriteError: If file deletion fails due to permissions or other OS error.
         """
         output_path = self._get_output_path(session_id)
         
-        if output_path.exists():
-            output_path.unlink()
-            logger.info(f"Deleted analysis file for session {session_id}")
-            return True
+        if not output_path.exists():
+            logger.debug("No analysis file to delete for session %s", session_id)
+            return False
         
-        return False
+        try:
+            output_path.unlink()
+            logger.info("Deleted analysis file for session %s", session_id)
+            return True
+        except OSError as e:
+            raise OutputWriteError(output_path, e) from e
