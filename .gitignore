@@ -31,22 +31,39 @@ venv/
 .env
 ENV/
 env/
-python/output/*
+python/output/
 
 # Logs
 logs/
 *.log
+log.txt
 
 # Secrets - NEVER COMMIT
+src/Config/appsettings.json
 appsettings.Development.json
 appsettings.Production.json
+*_api_key.txt
+deepgram_api_key.txt
+Deepgram.txt
 *.pfx
 *.key
 *.pem
 *.crt
 
 # ngrok
-ngrok.yml  # Contains authtoken
+scripts/ngrok.yml
+
+# Test / validation projects (not part of main app)
+DeepgramTest/
+LoaderTest/
+InspectLiveSchema/
+
+# Temp investigation scripts
+inspect_*.ps1
+list_*.ps1
+
+# Build artifacts
+manifest/teams-bot-poc.zip
 
 # OS
 .DS_Store
@@ -55,6 +72,7 @@ Thumbs.db
 # IDE
 .idea/
 .vscode/
+.cursor/
 *.swp
 *.swo
 

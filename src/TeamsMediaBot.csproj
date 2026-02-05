@@ -27,6 +27,8 @@
     
     <!-- Microsoft Identity for authentication -->
     <PackageReference Include="Microsoft.Identity.Client" Version="4.73.1" />
+    <PackageReference Include="Serilog.Enrichers.Environment" Version="3.0.1" />
+    <PackageReference Include="Serilog.Enrichers.Thread" Version="4.0.0" />
     
     <!-- JWT Token Validation - match transitive deps from Microsoft.Graph.Core -->
     <PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="8.6.1" />

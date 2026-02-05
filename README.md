@@ -6,7 +6,9 @@ AI-powered meeting transcription bot that joins Teams meetings, provides real-ti
 **Domain:** `teamsbot.qmachina.com` / `media.qmachina.com`  
 **VM:** `52.188.117.153` (Windows Server 2022, D4s_v3)
 
-**Implementation Status:** ✅ COMPLETE (Python: ✅ | C#: ✅)
+**Implementation Status:** ✅ COMPLETE (Python: ✅ | C#: ✅)  
+**Active STT Provider:** Deepgram (nova-3, diarize=true, endpointing=10)  
+**Last Build:** Feb 5, 2026 -- 0 errors, 0 warnings
 
 ## Key Features (v2)
 
@@ -124,7 +126,7 @@ Implementation-wise this can be IIS, nginx, Caddy, or any other layer that perfo
 
 - **Source of truth**: the C# code creates **one transcriber per call** and pushes Teams PCM frames into it.
 - **Choosing provider**: STT selection is config-driven via `Stt.Provider` (supports `Deepgram` or `AzureSpeech`).
-- **Deepgram (recommended)**: Best-in-class diarization with speaker IDs on every word. Model selection via `Stt.Deepgram.Model` (default: "nova-3").
+- **Deepgram (recommended, active)**: Best-in-class diarization with speaker IDs on every word. Model selection via `Stt.Deepgram.Model` (default: "nova-3"). WebSocket parameters sent: `diarize=true, endpointing=10, interim_results=true, smart_format=true, punctuate=true, utterance_end_ms=1000, encoding=linear16, sample_rate=16000`.
 - **Azure ConversationTranscriber (fallback)**: Enterprise-grade with real-time diarization. Supports Custom Speech models via `Stt.AzureSpeech.EndpointId` (optional).
 - **No fan-out**: the bot does **not** stream the same audio to multiple STT providers/models.
 
@@ -312,10 +314,9 @@ Update `C:\teams-bot-poc\src\Config\appsettings.json`:
 # Create logs directory
 New-Item -ItemType Directory -Path C:\teams-bot-poc\logs -Force
 
-# Install service with NSSM
-nssm install TeamsMediaBot "C:\Program Files\dotnet\dotnet.exe"
-nssm set TeamsMediaBot AppParameters "exec C:\teams-bot-poc\src\bin\Release\net8.0\TeamsMediaBot.dll"
-nssm set TeamsMediaBot AppDirectory "C:\teams-bot-poc\src"
+# Install service with NSSM (current config runs exe directly)
+nssm install TeamsMediaBot "C:\teams-bot-poc\src\bin\Release\net8.0\TeamsMediaBot.exe"
+nssm set TeamsMediaBot AppDirectory "C:\teams-bot-poc\src\bin\Release\net8.0"
 nssm set TeamsMediaBot ObjectName ".\azureuser" "YOUR_VM_PASSWORD"
 nssm set TeamsMediaBot Start SERVICE_AUTO_START
 nssm set TeamsMediaBot AppStdout "C:\teams-bot-poc\logs\service-output.log"
@@ -325,6 +326,9 @@ nssm set TeamsMediaBot AppStderr "C:\teams-bot-poc\logs\service-error.log"
 Start-Service TeamsMediaBot
 Get-Service TeamsMediaBot
 ```
+
+> **Note:** If the service fails to start with "logon failure", update the password:
+> `nssm set TeamsMediaBot ObjectName ".\azureuser" "NEW_PASSWORD"`
 
 ### Update Azure Bot Webhook
 
@@ -373,20 +377,39 @@ zip -r teams-bot-poc.zip manifest.json color.png outline.png
 ### Health Check
 
 ```bash
-curl https://teamsbot.yourdomain.com/api/calling/health
+curl https://teamsbot.qmachina.com/api/calling/health
 ```
 
-Expected: `{"Status":"Healthy","Timestamp":"...","Service":"Talestral"}`
+Expected: `{"status":"Healthy","timestampUtc":"...","service":"Talestral","activeCalls":0}`
 
-### Join Meeting
+### Join a Teams Meeting
+
+To add the bot to a live Teams meeting, copy the meeting join URL from Teams and run:
 
 ```bash
-curl -X POST https://teamsbot.yourdomain.com/api/calling/join \
+curl -X POST https://teamsbot.qmachina.com/api/calling/join \
   -H "Content-Type: application/json" \
-  -d '{"joinUrl":"TEAMS_MEETING_JOIN_URL","displayName":"Talestral"}'
+  -d '{"joinUrl":"PASTE_TEAMS_MEETING_JOIN_URL_HERE","displayName":"Talestral"}'
 ```
 
-Bot should join within 5-10 seconds.
+On Windows (PowerShell):
+
+```powershell
+Invoke-WebRequest -Uri "https://teamsbot.qmachina.com/api/calling/join" `
+  -Method POST `
+  -ContentType "application/json" `
+  -Body '{"joinUrl":"PASTE_TEAMS_MEETING_JOIN_URL_HERE","displayName":"Talestral"}'
+```
+
+The bot should join within 5-10 seconds. You'll see "Talestral" appear as a participant.
+
+**Join URL formats supported:**
+- New: `https://teams.microsoft.com/meet/{meetingId}?p={passcode}`
+- Legacy: `https://teams.microsoft.com/l/meetup-join/{thread}/{message}?context={...}`
+
+**Optional parameters:**
+- `displayName` (string, default: "Talestral") - Bot's display name in the meeting
+- `joinAsGuest` (bool, default: false) - Join as guest identity with the display name
 
 ### Check Logs
 
@@ -587,24 +610,26 @@ Teams Meeting
     ↓
 [Media Stream: port 8445]
     ↓
-[Azure Speech Service]
+[Deepgram / Azure Speech]  ← Config-driven via Stt.Provider
     ↓
 [Python Service: port 8765] ← Your agent framework
 ```
 
 **Key Components:**
 - `TeamsCallingBotService.cs` - Handles Teams Graph calls
-- `TranscriberFactory.cs` - Creates provider-specific transcribers
-- `DeepgramRealtimeTranscriber.cs` - Primary STT provider (best diarization)
+- `TranscriberFactory.cs` - Creates provider-specific transcribers (in `AzureSpeechRealtimeTranscriber.cs`)
+- `DeepgramRealtimeTranscriber.cs` - Primary STT provider (best diarization, Deepgram SDK v6)
 - `AzureConversationTranscriber.cs` - Fallback STT provider (enterprise-grade diarization)
+- `AzureSpeechRealtimeTranscriber.cs` - Deprecated (no diarization, contains TranscriberFactory)
 - `PythonTranscriptPublisher.cs` - HTTP POST to Python service (snake_case JSON)
-- `CallingController.cs` - Webhook endpoints
+- `CallingController.cs` - Webhook endpoints + join/health APIs
 
 **Dependencies:**
 - `Microsoft.Skype.Bots.Media` 1.31.0.225-preview (Windows Server 2022 compatible)
 - `Microsoft.Graph.Communications.*` 1.2.0.15690
-- Azure Speech SDK 1.40.* (for ConversationTranscriber)
-- Deepgram SDK 3.0.0 (for primary transcription)
+- Azure Speech SDK 1.40.0 (for ConversationTranscriber)
+- Deepgram SDK 6.6.1 (for primary transcription)
+- `Serilog.Enrichers.Environment` 3.0.1 / `Serilog.Enrichers.Thread` 4.0.0
 
 ---
 
@@ -617,45 +642,53 @@ teams-bot-poc/
 ├── src/
 │   ├── TeamsMediaBot.csproj
 │   ├── Program.cs
-│   ├── Config/appsettings.json
+│   ├── Config/appsettings.json       # Credentials + STT provider config (DO NOT commit)
 │   ├── Controllers/CallingController.cs
 │   ├── Models/
-│   │   ├── TranscriptEvent.cs (v2 with diarization support)
-│   │   └── BotConfiguration.cs
+│   │   ├── TranscriptEvent.cs        # v2 event format with diarization support
+│   │   └── BotConfiguration.cs       # Config models (Bot, STT, Media, TranscriptSink)
 │   └── Services/
-│       ├── TeamsCallingBotService.cs
-│       ├── TranscriberFactory.cs
-│       ├── DeepgramRealtimeTranscriber.cs (PRIMARY)
-│       ├── AzureConversationTranscriber.cs (FALLBACK)
-│       ├── AzureSpeechRealtimeTranscriber.cs (DEPRECATED - no diarization)
-│       ├── PythonTranscriptPublisher.cs
-│       ├── CallHandler.cs
-│       └── HeartbeatHandler.cs
+│       ├── TeamsCallingBotService.cs  # Graph Communications SDK, join/leave calls
+│       ├── IRealtimeTranscriber.cs    # Transcriber interface (provider-agnostic)
+│       ├── DeepgramRealtimeTranscriber.cs   # PRIMARY - Deepgram SDK v6 WebSocket streaming
+│       ├── AzureConversationTranscriber.cs  # FALLBACK - Azure ConversationTranscriber
+│       ├── AzureSpeechRealtimeTranscriber.cs # DEPRECATED (no diarization) + TranscriberFactory
+│       ├── PythonTranscriptPublisher.cs     # HTTP POST to Python endpoint (snake_case JSON)
+│       ├── CallHandler.cs            # Per-call lifecycle, audio forwarding, heartbeat
+│       └── HeartbeatHandler.cs       # Base class for Graph API keepalive timer
+├── DeepgramTest/                     # Standalone validation tool for Deepgram API key + connection
+│   ├── DeepgramTest.csproj
+│   └── Program.cs
+├── LoaderTest/                       # SDK reflection inspector (development utility)
+│   ├── LoaderTest.csproj
+│   └── Program.cs
 ├── python/
-│   ├── pyproject.toml              # uv project config
-│   ├── transcript_sink.py          # FastAPI transcript receiver
-│   ├── simulate_interview.py       # CLI interview simulator
-│   ├── streamlit_ui.py             # Modern three-column UI with built-in simulation
-│   ├── interview_agent/            # Interview analysis agent package
-│   │   ├── __init__.py             # Package exports (InterviewAnalyzer, etc.)
-│   │   ├── agent.py                # OpenAI Agents SDK interview analyzer
-│   │   ├── models.py               # Pydantic models (TranscriptEvent, AnalysisItem, etc.)
-│   │   ├── session.py              # InterviewSessionManager
-│   │   └── output.py               # AnalysisOutputWriter (JSON persistence)
-│   └── tests/                      # Test suite
+│   ├── pyproject.toml                # uv project config
+│   ├── transcript_sink.py            # FastAPI transcript receiver
+│   ├── simulate_interview.py         # CLI interview simulator
+│   ├── streamlit_ui.py               # Modern three-column UI with built-in simulation
+│   ├── interview_agent/              # Interview analysis agent package
+│   │   ├── __init__.py
+│   │   ├── agent.py                  # OpenAI Agents SDK interview analyzer
+│   │   ├── models.py                 # Pydantic models (TranscriptEvent, AnalysisItem, etc.)
+│   │   ├── session.py                # InterviewSessionManager
+│   │   └── output.py                 # AnalysisOutputWriter (JSON persistence)
+│   └── tests/
 │       ├── __init__.py
-│       ├── mock_data.py            # Mock data generators for testing
-│       ├── test_interview.py       # InterviewSessionManager, AnalysisOutputWriter tests
-│       └── test_sink.py            # FastAPI endpoint tests
+│       ├── mock_data.py
+│       ├── test_interview.py
+│       └── test_sink.py
 ├── scripts/
 │   ├── deploy-azure-vm.sh
+│   ├── deploy-azure-agent.sh
 │   ├── deploy-production.ps1
 │   ├── update-bot.ps1
 │   └── diagnose-bot.ps1
 ├── manifest/
-│   ├── manifest.json
+│   ├── manifest.json                 # Teams app manifest (bot ID, permissions)
 │   ├── color.png
-│   └── outline.png
+│   ├── outline.png
+│   └── teams-bot-poc.zip             # Ready-to-upload Teams app package
 └── README.md
 ```
 
@@ -856,8 +889,16 @@ open https://interview.qmachina.com
 
 **No transcripts:**
 - Verify audio frames received: `Get-Content logs\service-output.log | Select-String "Audio stats"`
-- Check Speech Service key and region in appsettings.json
-- Test Speech connectivity: `Test-NetConnection eastus.api.cognitive.microsoft.com -Port 443`
+- Check which STT provider is active in `Config/appsettings.json` (`Stt.Provider`)
+- For Deepgram: verify API key is valid by running `dotnet run --project DeepgramTest`
+- For Deepgram: test connectivity: `Test-NetConnection api.deepgram.com -Port 443`
+- For Azure Speech: check key and region in appsettings.json
+- For Azure Speech: test connectivity: `Test-NetConnection eastus.api.cognitive.microsoft.com -Port 443`
+
+**Service won't start (logon failure):**
+- Password for `.\azureuser` is stale in NSSM
+- Fix: `nssm set TeamsMediaBot ObjectName ".\azureuser" "CURRENT_PASSWORD"`
+- Then: `Start-Service TeamsMediaBot`
 
 **Deployment updates not applying:**
 - Ensure service restarted after code changes

@@ -1,4 +1,5 @@
 using Deepgram;
+using Deepgram.Clients.Interfaces.v2;
 using Deepgram.Models.Listen.v2.WebSocket;
 using Microsoft.Extensions.Logging;
 using TeamsMediaBot.Models;
@@ -27,7 +28,7 @@ public sealed class DeepgramRealtimeTranscriber : IRealtimeTranscriber
     private readonly PythonTranscriptPublisher _publisher;
     private readonly ILogger<DeepgramRealtimeTranscriber> _logger;
     
-    private ListenWebSocketClient? _client;
+    private IListenWebSocketClient? _client;
     private string? _sessionId;
     private long _framesReceived;
     private long _bytesReceived;
@@ -86,21 +87,23 @@ public sealed class DeepgramRealtimeTranscriber : IRealtimeTranscriber
         var options = new LiveSchema
         {
             Model = _model,           // "nova-3" recommended for 2025/2026
-            Language = "en-US",
+            Language = "en",
             Punctuate = true,
             SmartFormat = true,
             Diarize = _diarize,       // CRITICAL: Enables speaker detection per word
             InterimResults = true,    // Get partial results for real-time UX
-            UtteranceEnd = "1000",    // End utterance after 1s silence
+            EndPointing = "10",       // Fast utterance endpointing (10ms silence) for quick speaker turns
+            UtteranceEnd = "1000",    // Fire utterance_end event after 1s silence
             Encoding = "linear16",    // PCM 16-bit signed little-endian
             SampleRate = 16000        // Teams Media SDK sends 16kHz
         };
 
         // Subscribe to events using Deepgram's event-driven pattern
-        _client.Subscribe(new EventHandler<OpenResponse>(OnConnectionOpened));
-        _client.Subscribe(new EventHandler<ResultResponse>(OnTranscriptionResult));
-        _client.Subscribe(new EventHandler<CloseResponse>(OnConnectionClosed));
-        _client.Subscribe(new EventHandler<ErrorResponse>(OnError));
+        // Discard return values: Subscribe registers handlers and does not need to be awaited
+        _ = _client.Subscribe(new EventHandler<OpenResponse>(OnConnectionOpened));
+        _ = _client.Subscribe(new EventHandler<ResultResponse>(OnTranscriptionResult));
+        _ = _client.Subscribe(new EventHandler<CloseResponse>(OnConnectionClosed));
+        _ = _client.Subscribe(new EventHandler<ErrorResponse>(OnError));
 
         // Connect to Deepgram WebSocket endpoint
         await _client.Connect(options).ConfigureAwait(false);
@@ -112,7 +115,7 @@ public sealed class DeepgramRealtimeTranscriber : IRealtimeTranscriber
     /// </summary>
     private void OnConnectionOpened(object? sender, OpenResponse e)
     {
-        _sessionId = e.RequestId ?? Guid.NewGuid().ToString("N");
+        _sessionId = Guid.NewGuid().ToString("N");
         _logger.LogInformation("Deepgram session started: {SessionId}", _sessionId);
         PublishEventAsync("session_started", text: null);
     }
@@ -140,7 +143,7 @@ public sealed class DeepgramRealtimeTranscriber : IRealtimeTranscriber
     private void OnError(object? sender, ErrorResponse e)
     {
         _logger.LogError("Deepgram error: {Error}", e.Message);
-        PublishEventAsync("error", text: null, error: new EventError("DEEPGRAM_ERROR", e.Message));
+        PublishEventAsync("error", text: null, error: new EventError("DEEPGRAM_ERROR", e.Message ?? "Unknown error"));
     }
 
     /// <summary>
@@ -183,16 +186,16 @@ public sealed class DeepgramRealtimeTranscriber : IRealtimeTranscriber
         if (alternative.Words is { Count: > 0 })
         {
             words = alternative.Words.Select(w => new WordDetail(
-                Word: w.Word ?? string.Empty,
-                StartMs: (w.Start ?? 0) * 1000,
-                EndMs: (w.End ?? 0) * 1000,
+                Word: w.PunctuatedWord ?? w.HeardWord ?? string.Empty,
+                StartMs: (double)(w.Start ?? 0m) * 1000,
+                EndMs: (double)(w.End ?? 0m) * 1000,
                 Confidence: (float?)(w.Confidence ?? 0),
                 SpeakerId: w.Speaker.HasValue ? $"speaker_{w.Speaker.Value}" : null
             )).ToList();
         }
 
-        var audioStartMs = (result.Start ?? 0) * 1000;
-        var audioEndMs = audioStartMs + ((result.Duration ?? 0) * 1000);
+        var audioStartMs = (double)(result.Start ?? 0m) * 1000;
+        var audioEndMs = audioStartMs + ((double)(result.Duration ?? 0m) * 1000);
 
         // Log transcription results with structured logging
         if (isFinal)
@@ -273,8 +276,9 @@ public sealed class DeepgramRealtimeTranscriber : IRealtimeTranscriber
 
         try
         {
-            // Finish() sends KeepAlive then CloseStream as per Deepgram SDK docs
-            await _client.Finish().ConfigureAwait(false);
+            // Send finalize to flush remaining audio, then stop the connection
+            await _client.SendFinalize().ConfigureAwait(false);
+            await _client.Stop(new CancellationTokenSource(TimeSpan.FromSeconds(5))).ConfigureAwait(false);
         }
         catch (Exception ex)
         {

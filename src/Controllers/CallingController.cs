@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Graph.Communications.Client;
 using Newtonsoft.Json;
 using TeamsMediaBot.Services;
 

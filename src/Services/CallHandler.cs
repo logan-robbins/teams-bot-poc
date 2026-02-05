@@ -167,7 +167,7 @@ public class CallHandler : HeartbeatHandler
     /// </remarks>
     private void OnAudioMediaReceived(object? sender, AudioMediaReceivedEventArgs e)
     {
-        AudioBuffer? buffer = null;
+        AudioMediaBuffer? buffer = null;
         
         try
         {
