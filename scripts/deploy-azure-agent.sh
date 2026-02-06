@@ -218,11 +218,13 @@ else
     echo "Creating Streamlit container app..."
     
     # Create the container app with source code deployment
+    # Uses Dockerfile.streamlit (separate from the default Dockerfile which targets FastAPI)
     az containerapp create \
         --name "$STREAMLIT_APP_NAME" \
         --resource-group "$RG_NAME" \
         --environment "$CONTAINER_ENV_NAME" \
         --source "$PYTHON_DIR" \
+        --dockerfile Dockerfile.streamlit \
         --ingress external \
         --target-port 8501 \
         --cpu "$STREAMLIT_CPU" \
