@@ -428,22 +428,29 @@ Get-Content C:\teams-bot-poc\logs\service-error.log -Tail 20
 
 ---
 
-## Python Transcript Service
+## Python Components
 
-### Setup
-
-On VM or separate server:
+All Python components live in the `python/` directory. Shared prerequisite:
 
 ```bash
 cd python
-uv venv
-uv pip install -r requirements.txt
-uv run transcript_sink.py
+uv sync  # Install dependencies from pyproject.toml
 ```
 
-Runs FastAPI server on `http://0.0.0.0:8765`. Target deployment: `https://agent.qmachina.com` (behind TLS proxy).
+Environment: `python/.env` contains `OPENAI_API_KEY=sk-...` (loaded automatically by the agent). For Azure OpenAI deployment, set the Azure env vars instead (see Azure Agent Deployment section).
 
-### Endpoints
+### FastAPI Transcript Sink (`transcript_sink.py`)
+
+Receives transcript events from the C# bot (or from the Streamlit simulation) and triggers real-time LLM analysis via the Interview Analysis Agent.
+
+**Launch:**
+```bash
+cd python
+uv run python transcript_sink.py
+# Listens on http://0.0.0.0:8765
+```
+
+**Endpoints:**
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
@@ -455,7 +462,7 @@ Runs FastAPI server on `http://0.0.0.0:8765`. Target deployment: `https://agent.
 | `/health` | GET | Health check |
 | `/stats` | GET | Statistics |
 
-### Session Workflow
+**Session Workflow:**
 
 ```bash
 # 1. Start session before meeting
@@ -479,46 +486,66 @@ curl http://localhost:8765/session/status
 curl -X POST http://localhost:8765/session/end
 ```
 
-### Agent Integration (OpenAI Agents SDK)
+**Output:**
+- Transcripts: `~/Desktop/meeting_transcript.txt` (Windows VM)
+- Analysis JSON: `python/output/{session_id}_analysis.json`
 
-The sink integrates with `interview_agent` package:
-- `interview_agent.models.TranscriptEvent` - v2 transcript format with diarization
-- `interview_agent.session.InterviewSessionManager` - session state management
-- `interview_agent.output.AnalysisOutputWriter` - analysis JSON output to `python/output/`
-- `interview_agent.agent.InterviewAnalyzer` - OpenAI Agents SDK interview analyzer
+### Interview Analysis Agent (`interview_agent/`)
 
-**Real-time analysis is enabled via `interview_agent/agent.py`:**
+OpenAI Agents SDK package that scores candidate responses in real-time. Called by the FastAPI sink when candidate transcript events arrive.
 
+**Package modules:**
+- `interview_agent.agent` - `InterviewAnalyzer` / `create_interview_analyzer` (OpenAI Agents SDK)
+- `interview_agent.models` - Pydantic models (`TranscriptEvent`, `AnalysisItem`, etc.)
+- `interview_agent.session` - `InterviewSessionManager` (session state management)
+- `interview_agent.output` - `AnalysisOutputWriter` (JSON persistence to `python/output/`)
+
+**Programmatic usage:**
 ```python
 from interview_agent import InterviewAnalyzer, create_interview_analyzer
 
-# Initialize analyzer (requires OPENAI_API_KEY env var)
 analyzer = create_interview_analyzer(model="gpt-4o", output_dir="./output")
-
-# Analyze a candidate response
 result = await analyzer.analyze_async(
     response_text="I have 5 years of Python experience...",
     context={"candidate_name": "John Doe", "conversation_history": [...]}
 )
 
-print(result.relevance_score)  # 0.85
-print(result.clarity_score)    # 0.90
-print(result.key_points)       # ["5 years experience", "Backend development"]
+print(result.relevance_score)  # 0-1: relevance to the question
+print(result.clarity_score)    # 0-1: articulation clarity
+print(result.key_points)       # extracted key observations
+print(result.follow_up_suggestions)  # suggested follow-up questions
 ```
 
-**Environment Setup:**
+### Streamlit UI (`streamlit_ui.py`)
+
+Three-column real-time interview display. Does NOT call the LLM directly — it sends transcript events to the FastAPI sink via HTTP and polls `python/output/` for analysis results.
+
+**Launch:**
 ```bash
-export OPENAI_API_KEY="sk-..."
+cd python
+uv run streamlit run streamlit_ui.py --server.port 8502
+# Opens browser at http://localhost:8502
 ```
 
-### Output
+**Requires the FastAPI sink to be running** (see above). The UI header shows a green/red connection indicator for sink status.
 
-- Transcripts: `~/Desktop/meeting_transcript.txt` (Windows VM)
-- Analysis JSON: `python/output/{session_id}_analysis.json`
+**UI Layout:**
+| Column | Width | Contents |
+|--------|-------|----------|
+| Left | 20% | Meeting ID, participants, session stats |
+| Center | 50% | Chat-style transcript + agent analysis coaching bubbles |
+| Right | 30% | Interview checklist with stoplight progress indicators |
+
+**Built-in simulation controls (in the header):**
+| Button | Action |
+|--------|--------|
+| Simulate | Start 20-message mock interview |
+| Stop | Pause simulation at current position |
+| Restart | Reset and start fresh |
+
+**Checklist items:** Intro, Role Overview, Background, Python Question, Salary Expectations, Next Steps. Auto-detected via keyword matching in transcripts. Stoplight indicators: pending, analyzing, complete.
 
 ### Testing
-
-Run the test suite:
 
 ```bash
 cd python
@@ -530,11 +557,59 @@ uv run pytest tests/ -v
 - `tests/test_interview.py` - Tests for InterviewSessionManager, AnalysisOutputWriter, models
 - `tests/test_sink.py` - FastAPI endpoint tests for transcript_sink.py
 
-**Mock Data Functions:**
-- `generate_session_start_event()` / `generate_session_stop_event()` - Session lifecycle events
-- `generate_transcript_event(speaker_id, text, event_type)` - Single transcript event
-- `generate_interview_conversation(candidate_name, num_exchanges)` - Full interview simulation
-- `generate_v2_event_dict()` / `generate_v1_event_dict()` - Raw JSON format matching C# bot output
+---
+
+## Run Modes
+
+### Demo Mode (local, no Teams meeting required)
+
+Runs a 20-message simulated interview through the full pipeline with **real LLM calls**. Requires **two processes simultaneously**:
+
+```bash
+# Terminal 1: FastAPI transcript sink (receives events, calls OpenAI for analysis)
+cd python
+uv run python transcript_sink.py
+
+# Terminal 2: Streamlit UI (drives simulation, displays results)
+cd python
+uv run streamlit run streamlit_ui.py --server.port 8502
+```
+
+Then click "Simulate" in the Streamlit header. The data flow:
+
+```
+Streamlit UI (streamlit_ui.py)
+    │
+    │  HTTP POST simulated transcript events
+    ↓
+FastAPI Sink (transcript_sink.py :8765)
+    │
+    │  Calls InterviewAnalyzer (OpenAI Agents SDK)
+    ↓
+OpenAI API (real LLM calls, requires OPENAI_API_KEY in python/.env)
+    │
+    │  Analysis results written to python/output/{session_id}_analysis.json
+    ↓
+Streamlit UI (polls output/ directory, renders coaching bubbles)
+```
+
+### Live Mode (real Teams meeting)
+
+The C# bot joins a Teams meeting, transcribes audio via Deepgram, and POSTs transcript events to the FastAPI sink. The Streamlit UI displays the live transcript and coaching analysis.
+
+**Processes required:**
+1. C# TeamsMediaBot Windows Service (on Azure VM, already deployed)
+2. FastAPI transcript sink (on VM or `agent.qmachina.com`)
+3. Streamlit UI (optional, for real-time monitoring)
+
+**Trigger:**
+```bash
+curl -X POST https://teamsbot.qmachina.com/api/calling/join \
+  -H "Content-Type: application/json" \
+  -d '{"joinUrl":"PASTE_TEAMS_MEETING_JOIN_URL_HERE","displayName":"Talestral"}'
+```
+
+The data flow follows the full architecture diagram at the top of this file.
 
 ---
 
@@ -691,75 +766,6 @@ teams-bot-poc/
 │   └── teams-bot-poc.zip             # Ready-to-upload Teams app package
 └── README.md
 ```
-
-### Interview Analysis Agent
-
-The `interview_agent` package uses the OpenAI Agents SDK to analyze candidate responses in real-time.
-
-**Setup:**
-```bash
-cd python
-uv sync  # Install dependencies
-export OPENAI_API_KEY=sk-...
-```
-
-**Usage in transcript_sink:**
-```python
-from interview_agent import InterviewAnalyzer
-
-analyzer = InterviewAnalyzer(model="gpt-4o")
-result = await analyzer.analyze_async(
-    response_text="I have 5 years of Python experience...",
-    context={
-        "candidate_name": "John Smith",
-        "conversation_history": [
-            {"role": "interviewer", "text": "Tell me about your Python experience."}
-        ]
-    }
-)
-print(f"Relevance: {result.relevance_score}, Clarity: {result.clarity_score}")
-```
-
-**Analysis Output:**
-- `relevance_score` (0-1): How relevant the response is to the question
-- `clarity_score` (0-1): How clearly the response is articulated
-- `key_points`: Extracted key points from the response
-- `follow_up_suggestions`: Suggested follow-up questions
-
-### Streamlit UI
-
-Modern three-column Streamlit interface with built-in interview simulation.
-
-**Launch:**
-```bash
-cd python
-uv run streamlit run streamlit_ui.py
-```
-
-**Layout:**
-| Column | Width | Contents |
-|--------|-------|----------|
-| Left | 20% | Meeting ID, participants, session stats |
-| Center | 50% | Chat-style transcript + agent analysis bubbles |
-| Right | 30% | Interview checklist with stoplight indicators |
-
-**Simulation Controls:**
-| Button | Action |
-|--------|--------|
-| ▶️ Simulate | Start 20-message interview simulation |
-| ⏹️ Stop | Pause simulation at current position |
-| 🔄 Restart | Reset and start fresh |
-
-**Checklist Items:**
-- Intro, Role Overview, Background, Python Question, Salary Expectations, Next Steps
-- Stoplight indicators: ⚪ pending, 🟡 analyzing, 🟢 complete
-- Auto-detection via keyword matching in transcripts
-
-**State Management (st.session_state):**
-- `simulation_running`: bool
-- `simulation_index`: int (0-19)
-- `messages`: list of ChatMessage objects
-- `checklist_status`: dict mapping item_id to status
 
 ### Critical Configuration Notes
 
