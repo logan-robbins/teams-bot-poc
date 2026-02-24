@@ -29,6 +29,7 @@ from typing import Final
 
 import httpx
 import streamlit as st
+from variants import load_variant
 
 # =============================================================================
 # Logging Configuration
@@ -40,8 +41,18 @@ logger: logging.Logger = logging.getLogger(__name__)
 # Configuration
 # =============================================================================
 
+VARIANT = load_variant(os.environ.get("VARIANT_ID", "default"))
+INSTANCE_ID: Final[str] = os.environ.get("INSTANCE_ID", VARIANT.variant_id)
 SINK_URL: Final[str] = os.environ.get("SINK_URL", "http://127.0.0.1:8765")
-OUTPUT_DIR: Final[Path] = Path(__file__).parent / "output"
+OUTPUT_DIR: Final[Path] = (
+    Path(os.environ["OUTPUT_DIR"]).expanduser()
+    if "OUTPUT_DIR" in os.environ
+    else (
+        Path(__file__).parent / "output" / INSTANCE_ID
+        if "INSTANCE_ID" in os.environ
+        else Path(__file__).parent / "output"
+    )
+)
 
 # Simulation timing: MINIMUM 5 seconds between messages
 MIN_DELAY_SECONDS: Final[float] = 5.0
@@ -63,38 +74,14 @@ PAUSE_BETWEEN_MESSAGES_MS: Final[float] = 500.0
 IDLE_POLL_DELAY_SECONDS: Final[float] = 2.0
 POST_RESTART_DELAY_SECONDS: Final[float] = 0.3
 
-# Interview script (20 messages)
-INTERVIEW_SCRIPT = [
-    ("speaker_0", "Good morning Sarah, thanks for joining us today. I'm David, the Engineering Manager. Before we dive in, how are you doing today?"),
-    ("speaker_1", "Good morning David! I'm doing great, thank you for asking. I'm really excited about this opportunity and looking forward to our conversation."),
-    ("speaker_0", "Wonderful. Let's start with your background. Can you walk me through your experience with Python and tell me about a project you're particularly proud of?"),
-    ("speaker_1", "Absolutely. I've been working with Python for about six years now, primarily in backend development. The project I'm most proud of is a real-time data pipeline I built at my current company. We were processing clickstream data from our e-commerce platform, handling about 50,000 events per second. I designed the architecture using Apache Kafka for ingestion and built custom consumers in Python with asyncio. The system reduced our data latency from hours to under 30 seconds."),
-    ("speaker_0", "That's impressive throughput. How did you handle failures and ensure data consistency in that pipeline?"),
-    ("speaker_1", "Great question. We implemented several layers of reliability. First, Kafka's built-in replication handled broker failures. For our consumers, I used idempotent processing with deduplication based on event IDs stored in Redis. We also implemented dead letter queues for messages that failed processing after three retries. For monitoring, I set up Prometheus metrics and PagerDuty alerts for consumer lag and error rates. We achieved 99.97% data delivery reliability."),
-    ("speaker_0", "Nice. Let's shift to system design. If you were tasked with building a real-time collaborative document editor like Google Docs, how would you approach it?"),
-    ("speaker_1", "I'd start by identifying the core challenges: real-time synchronization, conflict resolution, and scalability. For the sync layer, I'd use WebSockets with a message broker like Redis Pub/Sub for horizontal scaling. The key technical challenge is handling concurrent edits. I'd implement Operational Transformation or CRDTs, probably CRDTs since they're more mathematically sound for eventual consistency. For storage, I'd use a combination of PostgreSQL for document metadata and a specialized data structure for the document content itself."),
-    ("speaker_0", "Good approach. Now, imagine you're on call and get paged at 3 AM because the document editor is showing 10 second delays. Walk me through your debugging process."),
-    ("speaker_1", "First, I'd check our monitoring dashboards to understand the scope. Is it all users or specific regions? Then I'd look at key metrics: WebSocket connection counts, message queue depth, database query latency, and CPU/memory on our servers. If the queue depth is high, we have a consumer bottleneck. If database latency spiked, I'd check for slow queries or locks. Communication is key too. I'd update the status page and keep stakeholders informed."),
-    ("speaker_0", "Good systematic approach. How do you ensure code quality in your projects? What's your testing philosophy?"),
-    ("speaker_1", "I follow the testing pyramid: lots of unit tests, fewer integration tests, and minimal end-to-end tests. For Python, I use pytest religiously. I aim for high coverage on business logic but don't obsess over 100% coverage. I also write property-based tests with Hypothesis for edge case discovery. Beyond testing, I enforce type hints with mypy in strict mode and use ruff for linting."),
-    ("speaker_0", "Speaking of code reviews, tell me about a time you disagreed with a colleague on a technical decision. How did you handle it?"),
-    ("speaker_1", "Last year, we had a heated debate about microservices versus keeping our monolith. My colleague wanted to break everything into services immediately. I was concerned about the operational complexity. Instead of just arguing, I proposed we create a decision matrix. We listed criteria like deployment complexity, team expertise, and timeline. We scored each approach objectively. The data showed a hybrid approach was best."),
-    ("speaker_0", "That's a mature approach to conflict. How do you stay current with new technologies?"),
-    ("speaker_1", "I have a few strategies. I dedicate Friday afternoons to learning. Sometimes it's reading papers, sometimes building small prototypes. I also contribute to open source. I maintain a small library for async HTTP caching that has about 500 stars on GitHub. Teaching is learning, so when I learn something new, I try to write about it or present it to the team."),
-    ("speaker_0", "You mentioned async programming. Can you explain a tricky bug you encountered with async code and how you solved it?"),
-    ("speaker_1", "Oh, I have a good one. We had a memory leak that only appeared under sustained load. After hours of profiling, I discovered we were creating thousands of tasks but never awaiting them. The fix was to use asyncio.TaskGroup, which was new in Python 3.11. It ensures all tasks are properly awaited and handles cancellation correctly. The deeper lesson was that async code requires careful lifecycle management."),
-    ("speaker_0", "Excellent debugging story. We're coming up on time. Do you have any questions for me about the team or the role?"),
-    ("speaker_1", "Yes, I have a few. First, what does success look like in this role after six months? Second, how does the team handle technical debt? Is there dedicated time for refactoring, or is it more opportunistic? And finally, I'm curious about the team culture."),
-]
-
-# Checklist items
-CHECKLIST_ITEMS = [
-    {"id": "intro", "label": "Intro", "keywords": ["good morning", "welcome", "how are you"]},
-    {"id": "role_overview", "label": "Role Overview", "keywords": ["role", "position", "responsibilities"]},
-    {"id": "background", "label": "Background", "keywords": ["experience", "background", "walk me through", "python"]},
-    {"id": "python_question", "label": "Python Question", "keywords": ["async", "debugging", "testing", "pytest", "asyncio"]},
-    {"id": "salary", "label": "Salary Expectations", "keywords": ["salary", "compensation"]},
-    {"id": "next_steps", "label": "Next Steps", "keywords": ["questions for me", "next steps", "any questions"]},
+INTERVIEW_SCRIPT: Final[list[tuple[str, str]]] = list(VARIANT.ui.interview_script)
+CHECKLIST_ITEMS: Final[list[dict[str, object]]] = [
+    {
+        "id": item.id,
+        "label": item.label,
+        "keywords": list(item.keywords),
+    }
+    for item in VARIANT.ui.checklist_items
 ]
 
 
@@ -103,8 +90,8 @@ CHECKLIST_ITEMS = [
 # =============================================================================
 
 st.set_page_config(
-    page_title="Talestral Interview Agent",
-    page_icon="🎯",
+    page_title=VARIANT.ui.page_title,
+    page_icon=VARIANT.ui.page_icon,
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -416,8 +403,8 @@ def start_sim() -> bool:
             response = client.post(
                 f"{SINK_URL}/session/start",
                 json={
-                    "candidate_name": "Sarah Chen",
-                    "meeting_url": "https://teams.microsoft.com/l/meetup-join/simulated",
+                    "candidate_name": VARIANT.ui.candidate_name,
+                    "meeting_url": VARIANT.ui.meeting_url,
                 },
             )
             if response.status_code != 200:
@@ -662,7 +649,7 @@ def main() -> None:
     # Header with controls
     col_h1, col_h2, col_h3, col_h4, col_h5 = st.columns([3, 1, 1, 1, 2])
     with col_h1:
-        st.markdown("### 🎯 Talestral Interview Agent")
+        st.markdown(f"### {VARIANT.ui.header_title}")
     with col_h2:
         if st.button("▶️ Simulate", disabled=st.session_state.running, type="primary"):
             if check_sink():
@@ -684,6 +671,7 @@ def main() -> None:
     with col_h5:
         sink_ok = check_sink()
         status = "🟢 Connected" if sink_ok else "🔴 Disconnected"
+        status += f" | {VARIANT.variant_id}:{INSTANCE_ID}"
         if st.session_state.running:
             status += f" | Running ({st.session_state.index}/{len(INTERVIEW_SCRIPT)})"
         st.markdown(

@@ -12,10 +12,15 @@ using System.Security.Cryptography.X509Certificates;
 using TeamsMediaBot.Models;
 using TeamsMediaBot.Services;
 
+var configResolution = ResolveConfiguration(args);
+
 var builder = WebApplication.CreateBuilder(args);
 
-// Load configuration from Config/appsettings.json (required for VM/service deployment)
-builder.Configuration.AddJsonFile("Config/appsettings.json", optional: false, reloadOnChange: true);
+// Load configuration from explicit path (CLI/env/default fallback)
+builder.Configuration.Sources.Clear();
+builder.Configuration.AddJsonFile(configResolution.ConfigPath, optional: false, reloadOnChange: true);
+builder.Configuration.AddEnvironmentVariables();
+builder.Configuration.AddCommandLine(args);
 
 // Configure Serilog for structured logging
 Log.Logger = new LoggerConfiguration()
@@ -31,6 +36,12 @@ builder.Host.UseSerilog();
 
 try
 {
+    Log.Information(
+        "Loaded configuration: Path={ConfigPath}, Source={ConfigSource}, InstanceId={InstanceId}",
+        configResolution.ConfigPath,
+        configResolution.Source,
+        configResolution.InstanceId);
+
     // Load and validate configuration sections
     var botConfig = LoadRequiredConfiguration<BotConfiguration>(builder.Configuration, "Bot");
     var mediaConfig = LoadRequiredConfiguration<MediaPlatformConfiguration>(builder.Configuration, "MediaPlatformSettings");
@@ -91,11 +102,13 @@ try
     await botService.InitializeAsync().ConfigureAwait(false);
 
     Log.Information(
-        "Teams Media Bot starting - ListenUrl={ListenUrl}, NotificationUrl={NotificationUrl}, MediaEndpoint={ServiceFqdn}:{PublicPort}",
+        "Teams Media Bot starting - InstanceId={InstanceId}, ListenUrl={ListenUrl}, NotificationUrl={NotificationUrl}, MediaEndpoint={ServiceFqdn}:{PublicPort}, SinkEndpoint={SinkEndpoint}",
+        configResolution.InstanceId,
         botConfig.LocalHttpListenUrl,
         botConfig.NotificationUrl,
         mediaConfig.ServiceFqdn,
-        mediaConfig.InstancePublicPort);
+        mediaConfig.InstancePublicPort,
+        transcriptSinkConfig.PythonEndpoint);
 
     await app.RunAsync().ConfigureAwait(false);
 
@@ -126,6 +139,120 @@ static T LoadRequiredConfiguration<T>(IConfiguration configuration, string secti
 {
     return configuration.GetSection(sectionName).Get<T>()
         ?? throw new InvalidOperationException($"Configuration section '{sectionName}' is missing or invalid.");
+}
+
+/// <summary>
+/// Resolves configuration file path and instance identity with strict precedence.
+/// </summary>
+static ConfigResolution ResolveConfiguration(string[] args)
+{
+    ArgumentNullException.ThrowIfNull(args);
+
+    var fromArgs = TryGetConfigPathFromArgs(args);
+    if (!string.IsNullOrWhiteSpace(fromArgs))
+    {
+        return BuildConfigResolution(fromArgs, "command-line");
+    }
+
+    var fromEnv = Environment.GetEnvironmentVariable("TALESTRAL_CONFIG_PATH");
+    if (!string.IsNullOrWhiteSpace(fromEnv))
+    {
+        return BuildConfigResolution(fromEnv, "environment");
+    }
+
+    return BuildConfigResolution("Config/appsettings.json", "default");
+}
+
+/// <summary>
+/// Parses supported command-line forms:
+/// --config /path/to/file.json
+/// --config=/path/to/file.json
+/// </summary>
+static string? TryGetConfigPathFromArgs(string[] args)
+{
+    for (var i = 0; i < args.Length; i++)
+    {
+        var arg = args[i];
+        if (string.Equals(arg, "--config", StringComparison.Ordinal))
+        {
+            if (i + 1 >= args.Length || string.IsNullOrWhiteSpace(args[i + 1]))
+            {
+                throw new InvalidOperationException(
+                    "Command-line option '--config' requires a non-empty file path argument.");
+            }
+
+            return args[i + 1];
+        }
+
+        const string prefix = "--config=";
+        if (arg.StartsWith(prefix, StringComparison.Ordinal))
+        {
+            var value = arg[prefix.Length..];
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                throw new InvalidOperationException(
+                    "Command-line option '--config=' requires a non-empty file path value.");
+            }
+
+            return value;
+        }
+    }
+
+    return null;
+}
+
+/// <summary>
+/// Validates the configuration path and derives instance metadata.
+/// </summary>
+static ConfigResolution BuildConfigResolution(string rawPath, string source)
+{
+    if (string.IsNullOrWhiteSpace(rawPath))
+    {
+        throw new InvalidOperationException(
+            $"Configuration path from {source} is empty. Provide a valid appsettings JSON path.");
+    }
+
+    var fullPath = Path.GetFullPath(rawPath);
+    if (!File.Exists(fullPath))
+    {
+        throw new InvalidOperationException(
+            $"Configuration file not found at '{fullPath}'. " +
+            "Set a valid path via '--config <path>' or TALESTRAL_CONFIG_PATH.");
+    }
+
+    var fileName = Path.GetFileNameWithoutExtension(fullPath);
+    var instanceId = DeriveInstanceId(fileName);
+    return new ConfigResolution(fullPath, source, instanceId);
+}
+
+/// <summary>
+/// Maps configuration file naming to instance identity.
+/// Example: appsettings.meeting-a.json -> meeting-a
+/// </summary>
+static string DeriveInstanceId(string fileNameWithoutExtension)
+{
+    if (string.IsNullOrWhiteSpace(fileNameWithoutExtension))
+    {
+        return "default";
+    }
+
+    var candidate = fileNameWithoutExtension;
+    const string appSettingsPrefix = "appsettings.";
+    if (candidate.StartsWith(appSettingsPrefix, StringComparison.OrdinalIgnoreCase))
+    {
+        candidate = candidate[appSettingsPrefix.Length..];
+    }
+    else if (string.Equals(candidate, "appsettings", StringComparison.OrdinalIgnoreCase))
+    {
+        candidate = "default";
+    }
+
+    var filtered = new string(candidate
+        .Trim()
+        .Where(ch => char.IsLetterOrDigit(ch) || ch == '-' || ch == '_')
+        .ToArray());
+
+    return string.IsNullOrWhiteSpace(filtered) ? "default" : filtered;
 }
 
 /// <summary>
@@ -242,3 +369,8 @@ static X509Certificate2 LoadCertificateFromStore(string thumbprint)
 
     return certificates[0];
 }
+
+/// <summary>
+/// Runtime configuration file selection metadata.
+/// </summary>
+file sealed record ConfigResolution(string ConfigPath, string Source, string InstanceId);

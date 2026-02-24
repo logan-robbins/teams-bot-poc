@@ -17,6 +17,7 @@ AI-powered meeting transcription bot that joins Teams meetings, provides real-ti
 - **Real-Time Streaming**: ~100-300ms latency to Python endpoint
 - **Interview Analysis Agent**: OpenAI Agents SDK-based analyzer scores candidate responses
 - **External Deployment**: Python agent at `agent.qmachina.com` (separate from C# bot)
+- **Multi-Instance Stacks**: Run multiple isolated `bot -> sink -> UI` pipelines concurrently with per-instance config and variant launchers
 
 ---
 
@@ -91,15 +92,15 @@ AI-powered meeting transcription bot that joins Teams meetings, provides real-ti
 │  │                     ↓                                          │     │
 │  │  ┌─────────────────────────────────────────────────────────┐  │     │
 │  │  │ PythonTranscriptPublisher.cs                             │  │     │
-│  │  │  • POST → http://127.0.0.1:8765/transcript               │  │     │
+│  │  │  • POST → TranscriptSink.PythonEndpoint (per instance)   │  │     │
 │  │  │  • Also saves: Desktop\\meeting_transcript.txt           │  │     │
 │  │  └─────────────────────────────────────────────────────────┘  │     │
 │  └───────────────────────────────────────────────────────────────┘     │
 │                                                                          │
 │  ┌───────────────────────────────────────────────────────────────┐     │
 │  │ Python Transcript Sink (optional, same VM or elsewhere)        │     │
-│  │  • `python/transcript_sink.py` (FastAPI)                       │     │
-│  │  • POST /transcript :8765                                      │     │
+│  │  • `python/run_variant_sink.py` + `python/transcript_sink.py`  │     │
+│  │  • Variant+instance-aware, POST /transcript on configured port │     │
 │  └───────────────────────────────────────────────────────────────┘     │
 └────────────────────────────────────────────────────────────────────────┘
                                                      wss:// (STT APIs)
@@ -266,9 +267,17 @@ dotnet build --configuration Release
 Test-Path "bin\Release\net8.0\NativeMedia.dll"
 ```
 
-### Configure appsettings.json
+### Configure appsettings (single or multi-instance)
 
-Update `C:\teams-bot-poc\src\Config\appsettings.json`:
+For single-instance, update `C:\teams-bot-poc\src\Config\appsettings.json`.
+
+For multi-instance, create one file per bot service (examples in repo):
+- `src/Config/appsettings.instance-a.example.json`
+- `src/Config/appsettings.instance-b.example.json`
+
+Each instance file must have its own listen/media ports and its own `TranscriptSink.PythonEndpoint`.
+
+Example instance config:
 
 ```json
 {
@@ -308,15 +317,23 @@ Update `C:\teams-bot-poc\src\Config\appsettings.json`:
 }
 ```
 
+Manual launch examples (from `src/bin/Release/net8.0`):
+
+```powershell
+.\TeamsMediaBot.exe --config C:\teams-bot-poc\src\Config\appsettings.instance-a.json
+.\TeamsMediaBot.exe --config C:\teams-bot-poc\src\Config\appsettings.instance-b.json
+```
+
 ### Create Windows Service
 
 ```powershell
 # Create logs directory
 New-Item -ItemType Directory -Path C:\teams-bot-poc\logs -Force
 
-# Install service with NSSM (current config runs exe directly)
+# Install service with NSSM (single instance example)
 nssm install TeamsMediaBot "C:\teams-bot-poc\src\bin\Release\net8.0\TeamsMediaBot.exe"
 nssm set TeamsMediaBot AppDirectory "C:\teams-bot-poc\src\bin\Release\net8.0"
+nssm set TeamsMediaBot AppParameters "--config C:\teams-bot-poc\src\Config\appsettings.json"
 nssm set TeamsMediaBot ObjectName ".\azureuser" "YOUR_VM_PASSWORD"
 nssm set TeamsMediaBot Start SERVICE_AUTO_START
 nssm set TeamsMediaBot AppStdout "C:\teams-bot-poc\logs\service-output.log"
@@ -329,6 +346,18 @@ Get-Service TeamsMediaBot
 
 > **Note:** If the service fails to start with "logon failure", update the password:
 > `nssm set TeamsMediaBot ObjectName ".\azureuser" "NEW_PASSWORD"`
+
+For multi-instance on one host, create unique service names with unique config paths:
+
+```powershell
+nssm install TeamsMediaBot-A "C:\teams-bot-poc\src\bin\Release\net8.0\TeamsMediaBot.exe"
+nssm set TeamsMediaBot-A AppDirectory "C:\teams-bot-poc\src\bin\Release\net8.0"
+nssm set TeamsMediaBot-A AppParameters "--config C:\teams-bot-poc\src\Config\appsettings.instance-a.json"
+
+nssm install TeamsMediaBot-B "C:\teams-bot-poc\src\bin\Release\net8.0\TeamsMediaBot.exe"
+nssm set TeamsMediaBot-B AppDirectory "C:\teams-bot-poc\src\bin\Release\net8.0"
+nssm set TeamsMediaBot-B AppParameters "--config C:\teams-bot-poc\src\Config\appsettings.instance-b.json"
+```
 
 ### Update Azure Bot Webhook
 
@@ -439,16 +468,29 @@ uv sync  # Install dependencies from pyproject.toml
 
 Environment: `python/.env` contains `OPENAI_API_KEY=sk-...` (loaded automatically by the agent). For Azure OpenAI deployment, set the Azure env vars instead (see Azure Agent Deployment section).
 
-### FastAPI Transcript Sink (`transcript_sink.py`)
+### FastAPI Transcript Sink (`transcript_sink.py`, `run_variant_sink.py`)
 
 Receives transcript events from the C# bot (or from the Streamlit simulation) and triggers real-time LLM analysis via the Interview Analysis Agent.
 
-**Launch:**
+**Launch (single-instance compatibility):**
 ```bash
 cd python
 uv run python transcript_sink.py
 # Listens on http://0.0.0.0:8765
 ```
+
+**Launch (multi-instance, recommended):**
+```bash
+cd python
+uv run python run_variant_sink.py --variant default --instance meeting-a --port 8765
+uv run python run_variant_sink.py --variant behavioral --instance meeting-b --port 8865
+```
+
+`run_variant_sink.py` sets:
+- `VARIANT_ID` (`default`, `behavioral`)
+- `INSTANCE_ID`
+- `SINK_HOST` / `SINK_PORT`
+- `OUTPUT_DIR` (defaults to `python/output/<instance>`)
 
 **Endpoints:**
 
@@ -487,8 +529,8 @@ curl -X POST http://localhost:8765/session/end
 ```
 
 **Output:**
-- Transcripts: `~/Desktop/meeting_transcript.txt` (Windows VM)
-- Analysis JSON: `python/output/{session_id}_analysis.json`
+- Transcripts: `~/Desktop/meeting_transcript.txt` (default instance) or `~/Desktop/meeting_transcript_<instance>.txt`
+- Analysis JSON: `python/output/{session_id}_analysis.json` (default) or `python/output/<instance>/{session_id}_analysis.json`
 
 ### Interview Analysis Agent (`interview_agent/`)
 
@@ -516,16 +558,25 @@ print(result.key_points)       # extracted key observations
 print(result.follow_up_suggestions)  # suggested follow-up questions
 ```
 
-### Streamlit UI (`streamlit_ui.py`)
+### Streamlit UI (`streamlit_ui.py`, `run_variant_ui.py`)
 
 Three-column real-time interview display. Does NOT call the LLM directly — it sends transcript events to the FastAPI sink via HTTP and polls `python/output/` for analysis results.
 
-**Launch:**
+**Launch (single-instance compatibility):**
 ```bash
 cd python
 uv run streamlit run streamlit_ui.py --server.port 8502
 # Opens browser at http://localhost:8502
 ```
+
+**Launch (multi-instance, recommended):**
+```bash
+cd python
+uv run python run_variant_ui.py --variant default --instance meeting-a --port 8502 --sink-url http://127.0.0.1:8765
+uv run python run_variant_ui.py --variant behavioral --instance meeting-b --port 8602 --sink-url http://127.0.0.1:8865
+```
+
+`streamlit_ui.py` now loads checklist/script/title from the active variant plugin.
 
 **Requires the FastAPI sink to be running** (see above). The UI header shows a green/red connection indicator for sink status.
 
@@ -539,11 +590,11 @@ uv run streamlit run streamlit_ui.py --server.port 8502
 **Built-in simulation controls (in the header):**
 | Button | Action |
 |--------|--------|
-| Simulate | Start 20-message mock interview |
+| Simulate | Start variant-defined mock interview script |
 | Stop | Pause simulation at current position |
 | Restart | Reset and start fresh |
 
-**Checklist items:** Intro, Role Overview, Background, Python Question, Salary Expectations, Next Steps. Auto-detected via keyword matching in transcripts. Stoplight indicators: pending, analyzing, complete.
+**Checklist items:** Variant-specific and keyword-driven (e.g., default vs behavioral). Stoplight indicators: pending, analyzing, complete.
 
 ### Testing
 
@@ -556,6 +607,7 @@ uv run pytest tests/ -v
 - `tests/mock_data.py` - Mock data generators for TranscriptEvent, AnalysisItem, interview conversations
 - `tests/test_interview.py` - Tests for InterviewSessionManager, AnalysisOutputWriter, models
 - `tests/test_sink.py` - FastAPI endpoint tests for transcript_sink.py
+- `tests/test_variants.py` - Variant registry and plugin behavior tests
 
 ---
 
@@ -563,7 +615,7 @@ uv run pytest tests/ -v
 
 ### Demo Mode (local, no Teams meeting required)
 
-Runs a 20-message simulated interview through the full pipeline with **real LLM calls**. Requires **two processes simultaneously**:
+Runs a scripted simulated interview through the full pipeline with **real LLM calls**. Requires **two processes simultaneously**:
 
 ```bash
 # Terminal 1: FastAPI transcript sink (receives events, calls OpenAI for analysis)
@@ -592,6 +644,32 @@ OpenAI API (real LLM calls, requires OPENAI_API_KEY in python/.env)
     ↓
 Streamlit UI (polls output/ directory, renders coaching bubbles)
 ```
+
+### Multi-Instance Demo Mode (multiple meetings/agents/UI)
+
+Run two isolated pipelines on one machine:
+
+```bash
+# Stack A
+cd python
+uv run python run_variant_sink.py --variant default --instance meeting-a --port 8765
+# In another terminal
+cd python
+uv run python run_variant_ui.py --variant default --instance meeting-a --port 8502 --sink-url http://127.0.0.1:8765
+
+# Stack B
+cd python
+uv run python run_variant_sink.py --variant behavioral --instance meeting-b --port 8865
+# In another terminal
+cd python
+uv run python run_variant_ui.py --variant behavioral --instance meeting-b --port 8602 --sink-url http://127.0.0.1:8865
+```
+
+Each stack has:
+- isolated FastAPI process state/session memory
+- isolated output directory (`python/output/<instance>`)
+- isolated transcript file (`meeting_transcript_<instance>.txt`)
+- variant-specific UI/checklist and coaching context
 
 ### Live Mode (real Teams meeting)
 
@@ -681,13 +759,15 @@ Teams Meeting
     ↓
 [Bot Signaling: port 443]  ← Azure Bot webhook
     ↓
-[Ingress / TLS termination: :443 → Bot listener :9443]
+[Ingress / TLS termination: :443 → Bot listener :9443 (instance-specific)]
     ↓
-[Media Stream: port 8445]
+[Media Stream: port 8445 (instance-specific)]
     ↓
 [Deepgram / Azure Speech]  ← Config-driven via Stt.Provider
     ↓
-[Python Service: port 8765] ← Your agent framework
+[Python Service: configurable sink port] ← variant-aware agent framework
+    ↓
+[Streamlit UI: configurable port] ← variant-aware interview UI
 ```
 
 **Key Components:**
@@ -698,6 +778,7 @@ Teams Meeting
 - `AzureSpeechRealtimeTranscriber.cs` - Deprecated (no diarization, contains TranscriberFactory)
 - `PythonTranscriptPublisher.cs` - HTTP POST to Python service (snake_case JSON)
 - `CallingController.cs` - Webhook endpoints + join/health APIs
+- `run_variant_sink.py` / `run_variant_ui.py` - Multi-instance launchers for variant stacks
 
 **Dependencies:**
 - `Microsoft.Skype.Bots.Media` 1.31.0.225-preview (Windows Server 2022 compatible)
@@ -740,8 +821,17 @@ teams-bot-poc/
 ├── python/
 │   ├── pyproject.toml                # uv project config
 │   ├── transcript_sink.py            # FastAPI transcript receiver
+│   ├── run_variant_sink.py           # Variant/instance sink launcher
+│   ├── run_variant_ui.py             # Variant/instance Streamlit launcher
 │   ├── simulate_interview.py         # CLI interview simulator
 │   ├── streamlit_ui.py               # Modern three-column UI with built-in simulation
+│   ├── variants/                     # Variant plugins (UI + agent behavior)
+│   │   ├── __init__.py
+│   │   ├── base.py
+│   │   ├── registry.py
+│   │   ├── default.py
+│   │   ├── behavioral.py
+│   │   └── shared_content.py
 │   ├── interview_agent/              # Interview analysis agent package
 │   │   ├── __init__.py
 │   │   ├── agent.py                  # OpenAI Agents SDK interview analyzer
@@ -752,7 +842,8 @@ teams-bot-poc/
 │       ├── __init__.py
 │       ├── mock_data.py
 │       ├── test_interview.py
-│       └── test_sink.py
+│       ├── test_sink.py
+│       └── test_variants.py
 ├── scripts/
 │   ├── deploy-azure-vm.sh
 │   ├── deploy-azure-agent.sh
@@ -770,6 +861,11 @@ teams-bot-poc/
 ### Critical Configuration Notes
 
 **Service Account:** Must run as `.\azureuser` for certificate access
+
+**Config Path Selection:** C# startup loads config in this precedence:
+1. `--config <path>` command-line argument
+2. `TALESTRAL_CONFIG_PATH` environment variable
+3. default `Config/appsettings.json`
 
 **Package Versions:** Do not upgrade `Microsoft.Skype.Bots.Media` beyond 1.31.0.225-preview - version 1.32.x causes "Procedure Not Found" errors on Windows Server 2022
 

@@ -1,3 +1,17 @@
+# TASK: Multi-Instance UI + Agent + Bot Routing (2026-02-24)
+
+Status legend: `[ ]` pending, `[-]` in progress, `[x]` complete.
+
+1. [x] Discovery and baseline capture
+2. [x] C# per-instance config selection (`--config`, env override, default fallback)
+3. [x] Python variant plugin system (two runnable variants)
+4. [x] Python multi-instance launchers for sink/UI
+5. [x] Tests and verification (`uv run pytest` passed; `dotnet build` unavailable in this environment)
+6. [x] README update with multi-instance runbook
+7. [x] Final task status update
+
+---
+
 # TASK: Interview Analysis System Implementation
 
 **Created:** 2026-01-31  

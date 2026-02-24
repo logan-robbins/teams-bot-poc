@@ -14,7 +14,7 @@ Endpoints:
     GET  /stats            - Statistics
 
 Target deployment: https://agent.qmachina.com (behind TLS proxy)
-Internal binding: http://0.0.0.0:8765
+Internal binding: configured by SINK_HOST/SINK_PORT (default 0.0.0.0:8765)
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -42,6 +43,7 @@ from interview_agent.models import (
 )
 from interview_agent.output import AnalysisOutputWriter
 from interview_agent.session import InterviewSessionManager
+from variants import VariantPlugin, load_variant
 
 # =============================================================================
 # Logging Configuration
@@ -58,12 +60,82 @@ logger = logging.getLogger(__name__)
 # Configuration
 # =============================================================================
 
+@dataclass(frozen=True)
+class RuntimeConfig:
+    """Runtime config for multi-instance sink execution."""
+
+    variant_id: str
+    instance_id: str
+    sink_host: str
+    sink_port: int
+    output_dir: Path
+    transcript_file: Path
+
+
+def load_runtime_config() -> RuntimeConfig:
+    """Load runtime config from environment with strict validation."""
+    variant_id = (os.environ.get("VARIANT_ID", "default") or "").strip().lower()
+    if not variant_id:
+        raise RuntimeError("VARIANT_ID resolved to empty value.")
+
+    instance_id = (os.environ.get("INSTANCE_ID", variant_id) or "").strip()
+    if not instance_id:
+        raise RuntimeError(
+            "INSTANCE_ID resolved to empty value. Set INSTANCE_ID or VARIANT_ID."
+        )
+
+    sink_host = (os.environ.get("SINK_HOST", "0.0.0.0") or "").strip()
+    if not sink_host:
+        raise RuntimeError("SINK_HOST resolved to empty value.")
+
+    sink_port_raw = (os.environ.get("SINK_PORT", "8765") or "").strip()
+    if not sink_port_raw:
+        raise RuntimeError("SINK_PORT resolved to empty value.")
+
+    try:
+        sink_port = int(sink_port_raw)
+    except ValueError as exc:
+        raise RuntimeError(f"SINK_PORT must be an integer. Got: {sink_port_raw}") from exc
+
+    if sink_port < 1 or sink_port > 65535:
+        raise RuntimeError(f"SINK_PORT must be in range 1-65535. Got: {sink_port}.")
+
+    output_override = os.environ.get("OUTPUT_DIR")
+    if output_override:
+        output_dir = Path(output_override).expanduser()
+    elif "INSTANCE_ID" in os.environ:
+        output_dir = Path(__file__).parent / "output" / instance_id
+    else:
+        output_dir = Path(__file__).parent / "output"
+
+    transcript_override = os.environ.get("TRANSCRIPT_FILE")
+    if transcript_override:
+        transcript_file = Path(transcript_override).expanduser()
+    else:
+        desktop_path = Path(os.environ.get("USERPROFILE", os.path.expanduser("~"))) / "Desktop"
+        if instance_id == "default":
+            transcript_file = desktop_path / "meeting_transcript.txt"
+        else:
+            transcript_file = desktop_path / f"meeting_transcript_{instance_id}.txt"
+
+    return RuntimeConfig(
+        variant_id=variant_id,
+        instance_id=instance_id,
+        sink_host=sink_host,
+        sink_port=sink_port,
+        output_dir=output_dir,
+        transcript_file=transcript_file,
+    )
+
+
+RUNTIME_CONFIG = load_runtime_config()
+VARIANT = load_variant(RUNTIME_CONFIG.variant_id)
+
 # Output directory for analysis results
-OUTPUT_DIR = Path(__file__).parent / "output"
+OUTPUT_DIR = RUNTIME_CONFIG.output_dir
 
 # Transcript file path - save to Desktop for easy access (Windows VM default)
-DESKTOP_PATH = Path(os.environ.get("USERPROFILE", os.path.expanduser("~"))) / "Desktop"
-TRANSCRIPT_FILE = DESKTOP_PATH / "meeting_transcript.txt"
+TRANSCRIPT_FILE = RUNTIME_CONFIG.transcript_file
 
 # CORS configuration - modify for production
 CORS_ORIGINS: list[str] = [
@@ -253,6 +325,8 @@ class HealthResponse(BaseModel):
     timestamp: str = Field(..., description="Current server timestamp")
     agent_available: bool = Field(..., description="Whether agent is available")
     session_active: bool = Field(..., description="Whether a session is active")
+    variant_id: str = Field(..., description="Active variant ID")
+    instance_id: str = Field(..., description="Active instance ID")
 
 
 class StatsResponse(BaseModel):
@@ -264,6 +338,8 @@ class StatsResponse(BaseModel):
     session: dict[str, Any] = Field(..., description="Current session info")
     agent_available: bool = Field(..., description="Whether agent is available")
     output_directory: str = Field(..., description="Analysis output directory path")
+    variant_id: str = Field(..., description="Active variant ID")
+    instance_id: str = Field(..., description="Active instance ID")
 
 
 # =============================================================================
@@ -294,6 +370,7 @@ class AppState(TypedDict):
     agent_queue: asyncio.Queue[TranscriptEvent]
     stats: AppStats
     agent_task: asyncio.Task[None] | None
+    variant_plugin: VariantPlugin
 
 
 def get_initial_stats() -> AppStats:
@@ -383,6 +460,7 @@ def get_app_state(request: Request) -> AppState:
         agent_queue=state.agent_queue,
         stats=state.stats,
         agent_task=state.agent_task,
+        variant_plugin=state.variant_plugin,
     )
 
 
@@ -465,7 +543,7 @@ async def save_transcript_to_file(event: TranscriptEvent) -> None:
         event: The transcript event to save.
     """
     try:
-        DESKTOP_PATH.mkdir(parents=True, exist_ok=True)
+        TRANSCRIPT_FILE.parent.mkdir(parents=True, exist_ok=True)
 
         async with aiofiles.open(TRANSCRIPT_FILE, "a", encoding="utf-8") as f:
             if event.event_type == "session_started":
@@ -493,6 +571,7 @@ async def agent_processing_loop(
     session_manager: InterviewSessionManager,
     output_writer: AnalysisOutputWriter,
     stats: AppStats,
+    variant_plugin: VariantPlugin,
 ) -> None:
     """
     Background task that processes candidate transcripts through the interview agent.
@@ -508,6 +587,7 @@ async def agent_processing_loop(
         session_manager: Session manager instance.
         output_writer: Output writer for analysis results.
         stats: Statistics dictionary to update.
+        variant_plugin: Active variant plugin.
     """
     logger.info("Agent processing loop started")
 
@@ -553,6 +633,10 @@ async def agent_processing_loop(
                         "candidate_name": context.get("candidate_name", "Unknown"),
                         "conversation_history": conversation_history,
                     }
+                    analysis_context = variant_plugin.build_analysis_context(
+                        analysis_context,
+                        event,
+                    )
 
                     # Run analysis (publishes to pub-sub automatically)
                     analysis_item: AnalysisItem = await analyzer.analyze_async(
@@ -560,6 +644,7 @@ async def agent_processing_loop(
                         context=analysis_context,
                         speaker_id=event.speaker_id,
                     )
+                    analysis_item = variant_plugin.transform_analysis_item(analysis_item)
 
                     stats["agent_analyses"] += 1
                     response_counter += 1
@@ -664,6 +749,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[dict[str, Any]]:
         Dictionary of application state to be attached to requests.
     """
     logger.info("Starting Talestral Transcript Service v2")
+    logger.info(
+        "Runtime: variant=%s instance=%s host=%s port=%d",
+        VARIANT.variant_id,
+        RUNTIME_CONFIG.instance_id,
+        RUNTIME_CONFIG.sink_host,
+        RUNTIME_CONFIG.sink_port,
+    )
 
     # Initialize output directory and writer
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -678,7 +770,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[dict[str, Any]]:
 
     # Start agent processing loop
     agent_task = asyncio.create_task(
-        agent_processing_loop(agent_queue, session_manager, output_writer, stats)
+        agent_processing_loop(
+            agent_queue,
+            session_manager,
+            output_writer,
+            stats,
+            VARIANT,
+        )
     )
 
     # Yield state to be attached to app.state
@@ -689,6 +787,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[dict[str, Any]]:
         "agent_queue": agent_queue,
         "stats": stats,
         "agent_task": agent_task,
+        "variant_plugin": VARIANT,
     }
 
     yield state
@@ -708,7 +807,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[dict[str, Any]]:
 
 
 app = FastAPI(
-    title="Talestral Transcript Service",
+    title=f"Talestral Transcript Service ({VARIANT.variant_id})",
     version="2.0.0",
     description="Receives diarized transcripts from Talestral and integrates with interview analysis agent",
     lifespan=lifespan,
@@ -773,6 +872,7 @@ async def receive_transcript(
     session_manager = state["session_manager"]
     transcript_queue = state["transcript_queue"]
     agent_queue = state["agent_queue"]
+    variant_plugin = state["variant_plugin"]
 
     # Normalize v1 to v2 format
     normalized = normalize_v1_to_v2(request, stats)
@@ -824,6 +924,8 @@ async def receive_transcript(
             error_msg = "Unknown error"
         logger.error("Speech recognition error: %s", error_msg)
 
+    await variant_plugin.on_transcript(event, session_manager.get_session_context())
+
     # Push to general transcript queue for other consumers
     await transcript_queue.put(event)
 
@@ -853,6 +955,7 @@ async def start_session(
     """
     session_manager = state["session_manager"]
     output_writer = state["output_writer"]
+    variant_plugin = state["variant_plugin"]
 
     if session_manager.is_active:
         raise SessionAlreadyActiveError()
@@ -890,6 +993,7 @@ async def start_session(
         request.candidate_name,
         session.session_id,
     )
+    await variant_plugin.on_session_start(session_manager.get_session_context())
 
     return SessionStartResponse(
         ok=True,
@@ -996,6 +1100,7 @@ async def end_session(state: AppStateDep) -> SessionEndResponse:
     session_manager = state["session_manager"]
     output_writer = state["output_writer"]
     stats = state["stats"]
+    variant_plugin = state["variant_plugin"]
 
     if not session_manager.is_active:
         raise SessionNotActiveError("No active session to end.")
@@ -1044,6 +1149,7 @@ async def end_session(state: AppStateDep) -> SessionEndResponse:
         )
 
     logger.info("Session ended: %s", session_id)
+    await variant_plugin.on_session_end(summary)
 
     return SessionEndResponse(
         ok=True,
@@ -1072,6 +1178,8 @@ async def health(state: AppStateDep) -> HealthResponse:
         timestamp=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         agent_available=AGENT_AVAILABLE,
         session_active=session_manager.is_active,
+        variant_id=VARIANT.variant_id,
+        instance_id=RUNTIME_CONFIG.instance_id,
     )
 
 
@@ -1106,6 +1214,8 @@ async def get_stats(state: AppStateDep) -> StatsResponse:
         },
         agent_available=AGENT_AVAILABLE,
         output_directory=str(OUTPUT_DIR),
+        variant_id=VARIANT.variant_id,
+        instance_id=RUNTIME_CONFIG.instance_id,
     )
 
 
@@ -1117,8 +1227,17 @@ if __name__ == "__main__":
     logger.info("=" * 60)
     logger.info("Talestral Transcript Service v2")
     logger.info("=" * 60)
-    logger.info("Binding to: http://0.0.0.0:8765")
-    logger.info("Target FQDN: https://agent.qmachina.com")
+    logger.info(
+        "Binding to: http://%s:%d",
+        RUNTIME_CONFIG.sink_host,
+        RUNTIME_CONFIG.sink_port,
+    )
+    logger.info(
+        "Variant: %s (%s), Instance: %s",
+        VARIANT.variant_id,
+        VARIANT.display_name,
+        RUNTIME_CONFIG.instance_id,
+    )
     logger.info("")
     logger.info("Endpoints:")
     logger.info("  POST /transcript          - Receive transcript events")
@@ -1136,7 +1255,7 @@ if __name__ == "__main__":
 
     uvicorn.run(
         app,
-        host="0.0.0.0",
-        port=8765,
+        host=RUNTIME_CONFIG.sink_host,
+        port=RUNTIME_CONFIG.sink_port,
         log_level="info",
     )
