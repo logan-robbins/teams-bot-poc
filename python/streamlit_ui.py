@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Streamlit UI for Real-Time Interview Agent - Talestral.
+Streamlit UI for Real-Time Interview Agent (LegionMeet modality runtime).
 
 Provides a real-time interview simulation UI with:
 - Live transcript display with speaker identification
@@ -29,7 +29,7 @@ from typing import Final
 
 import httpx
 import streamlit as st
-from variants import load_variant
+from legionmeet_platform import load_product_spec
 
 # =============================================================================
 # Logging Configuration
@@ -41,8 +41,8 @@ logger: logging.Logger = logging.getLogger(__name__)
 # Configuration
 # =============================================================================
 
-VARIANT = load_variant(os.environ.get("VARIANT_ID", "default"))
-INSTANCE_ID: Final[str] = os.environ.get("INSTANCE_ID", VARIANT.variant_id)
+PRODUCT_SPEC, PRODUCT_SPEC_PATH = load_product_spec()
+INSTANCE_ID: Final[str] = os.environ.get("INSTANCE_ID", PRODUCT_SPEC.product_id)
 SINK_URL: Final[str] = os.environ.get("SINK_URL", "http://127.0.0.1:8765")
 OUTPUT_DIR: Final[Path] = (
     Path(os.environ["OUTPUT_DIR"]).expanduser()
@@ -74,14 +74,16 @@ PAUSE_BETWEEN_MESSAGES_MS: Final[float] = 500.0
 IDLE_POLL_DELAY_SECONDS: Final[float] = 2.0
 POST_RESTART_DELAY_SECONDS: Final[float] = 0.3
 
-INTERVIEW_SCRIPT: Final[list[tuple[str, str]]] = list(VARIANT.ui.interview_script)
+INTERVIEW_SCRIPT: Final[list[tuple[str, str]]] = [
+    (speaker, text) for speaker, text in PRODUCT_SPEC.ui.interview_script
+]
 CHECKLIST_ITEMS: Final[list[dict[str, object]]] = [
     {
         "id": item.id,
         "label": item.label,
         "keywords": list(item.keywords),
     }
-    for item in VARIANT.ui.checklist_items
+    for item in PRODUCT_SPEC.checklist.items
 ]
 
 
@@ -90,8 +92,8 @@ CHECKLIST_ITEMS: Final[list[dict[str, object]]] = [
 # =============================================================================
 
 st.set_page_config(
-    page_title=VARIANT.ui.page_title,
-    page_icon=VARIANT.ui.page_icon,
+    page_title=PRODUCT_SPEC.ui.page_title,
+    page_icon=PRODUCT_SPEC.ui.page_icon,
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -324,22 +326,28 @@ def fmt_time(timestamp: str) -> str:
         return timestamp[:8] if len(timestamp) >= 8 else timestamp
 
 
-def detect_topic(text: str) -> str | None:
-    """
-    Detect which interview checklist topic the text relates to.
+def sync_checklist_state(session_payload: dict[str, object]) -> None:
+    """Update UI checklist state from sink-owned session status payload."""
+    session = session_payload.get("session", {})
+    if not isinstance(session, dict):
+        return
 
-    Args:
-        text: Message text to analyze.
+    checklist = session.get("checklist", [])
+    if not isinstance(checklist, list):
+        return
 
-    Returns:
-        Checklist item ID if a topic is detected, None otherwise.
-    """
-    text_lower = text.lower()
-    for item in CHECKLIST_ITEMS:
-        keywords: list[str] = item.get("keywords", [])
-        if any(kw in text_lower for kw in keywords):
-            return item["id"]
-    return None
+    for entry in checklist:
+        if not isinstance(entry, dict):
+            continue
+        item_id = entry.get("id")
+        raw_status = entry.get("status")
+        if not isinstance(item_id, str):
+            continue
+        try:
+            parsed_status = ChecklistStatus(str(raw_status))
+        except ValueError:
+            parsed_status = ChecklistStatus.PENDING
+        st.session_state.checklist[item_id] = parsed_status
 
 
 def generate_event(speaker_id: str, text: str, audio_offset: float) -> dict[str, object]:
@@ -403,8 +411,9 @@ def start_sim() -> bool:
             response = client.post(
                 f"{SINK_URL}/session/start",
                 json={
-                    "candidate_name": VARIANT.ui.candidate_name,
-                    "meeting_url": VARIANT.ui.meeting_url,
+                    "candidate_name": PRODUCT_SPEC.ui.candidate_name,
+                    "meeting_url": PRODUCT_SPEC.ui.meeting_url,
+                    "product_id": PRODUCT_SPEC.product_id,
                 },
             )
             if response.status_code != 200:
@@ -521,14 +530,6 @@ def send_msg() -> bool:
                     )
                 )
 
-                topic = detect_topic(text)
-                if topic:
-                    curr = st.session_state.checklist.get(topic)
-                    if curr == ChecklistStatus.PENDING:
-                        st.session_state.checklist[topic] = ChecklistStatus.ANALYZING
-                    elif curr == ChecklistStatus.ANALYZING and speaker_id == "speaker_1":
-                        st.session_state.checklist[topic] = ChecklistStatus.COMPLETE
-
                 st.session_state.audio_offset += (
                     len(text.split()) * MS_PER_WORD + PAUSE_BETWEEN_MESSAGES_MS
                 )
@@ -556,6 +557,7 @@ def poll_analysis() -> None:
         session = fetch_session()
         if not session:
             return
+        sync_checklist_state(session)
 
         session_data = session.get("session", {})
         if not isinstance(session_data, dict) or not session_data.get("active"):
@@ -649,7 +651,7 @@ def main() -> None:
     # Header with controls
     col_h1, col_h2, col_h3, col_h4, col_h5 = st.columns([3, 1, 1, 1, 2])
     with col_h1:
-        st.markdown(f"### {VARIANT.ui.header_title}")
+        st.markdown(f"### {PRODUCT_SPEC.ui.header_title}")
     with col_h2:
         if st.button("▶️ Simulate", disabled=st.session_state.running, type="primary"):
             if check_sink():
@@ -671,7 +673,7 @@ def main() -> None:
     with col_h5:
         sink_ok = check_sink()
         status = "🟢 Connected" if sink_ok else "🔴 Disconnected"
-        status += f" | {VARIANT.variant_id}:{INSTANCE_ID}"
+        status += f" | {PRODUCT_SPEC.product_id}:{INSTANCE_ID}"
         if st.session_state.running:
             status += f" | Running ({st.session_state.index}/{len(INTERVIEW_SCRIPT)})"
         st.markdown(
@@ -690,6 +692,8 @@ def main() -> None:
             st.markdown("**📋 Session Info**")
             
             session = fetch_session()
+            if session:
+                sync_checklist_state(session)
             if session and session.get("session", {}).get("active"):
                 s = session["session"]
                 st.caption("Meeting ID")

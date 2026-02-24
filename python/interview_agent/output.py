@@ -140,7 +140,12 @@ class AnalysisOutputWriter:
         logger.info("Wrote analysis to %s", output_path)
         return output_path
     
-    def append_item(self, session_id: str, item: AnalysisItem) -> Path:
+    def append_item(
+        self,
+        session_id: str,
+        item: AnalysisItem,
+        checklist_state: Optional[list[dict[str, str | None]]] = None,
+    ) -> Path:
         """
         Append a new analysis item to an existing session file.
         
@@ -190,6 +195,7 @@ class AnalysisOutputWriter:
                 "overall_relevance": None,
                 "overall_clarity": None,
                 "total_responses_analyzed": 0,
+                "checklist_state": checklist_state or [],
                 "_meta": {
                     "created_at": current_timestamp,
                     "version": "1.0",
@@ -205,6 +211,9 @@ class AnalysisOutputWriter:
         if items:
             data["overall_relevance"] = sum(i["relevance_score"] for i in items) / len(items)
             data["overall_clarity"] = sum(i["clarity_score"] for i in items) / len(items)
+
+        if checklist_state is not None:
+            data["checklist_state"] = checklist_state
         
         # Update metadata
         data["_meta"]["last_updated_at"] = current_timestamp

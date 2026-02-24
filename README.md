@@ -1,12 +1,18 @@
-# Talestral
+# LegionMeet
 
-AI-powered meeting transcription bot that joins Teams meetings, provides real-time diarized audio transcription with speaker identification, and streams speaker-attributed transcripts to a Python agent endpoint for interview analysis.
+LegionMeet is a platform for configurable Teams meeting agents.  
+Each agent+UI package is defined by a required product spec (prompt, tools, required checklist, output routes).
+
+Current bundled specs:
+- `talestral.json` (interview coaching)
+- `prd-pro.json` (product requirement elicitation between product and engineering teams)
 
 **Status:** Deployed and operational on Azure Windows VM  
 **Domain:** `teamsbot.qmachina.com` / `media.qmachina.com`  
 **VM:** `52.188.117.153` (Windows Server 2022, D4s_v3)
 
 **Implementation Status:** ✅ COMPLETE (Python: ✅ | C#: ✅)  
+**Default Agent Package:** none (spec path required at runtime)  
 **Active STT Provider:** Deepgram (nova-3, diarize=true, endpointing=10)  
 **Last Build:** Feb 5, 2026 -- 0 errors, 0 warnings
 
@@ -17,7 +23,45 @@ AI-powered meeting transcription bot that joins Teams meetings, provides real-ti
 - **Real-Time Streaming**: ~100-300ms latency to Python endpoint
 - **Interview Analysis Agent**: OpenAI Agents SDK-based analyzer scores candidate responses
 - **External Deployment**: Python agent at `agent.qmachina.com` (separate from C# bot)
-- **Multi-Instance Stacks**: Run multiple isolated `bot -> sink -> UI` pipelines concurrently with per-instance config and variant launchers
+- **Product-Spec Platform**: One JSON spec controls prompt, tools, required checklist, and output routes
+- **Checklist-First Runtime**: Checklist is required and sink-owned (not UI-local), always included in session/analysis payloads
+- **Multi-Instance Stacks**: Run multiple isolated `bot -> sink -> UI` pipelines concurrently with per-instance config and launchers
+
+### Product Spec Switches (single source of truth)
+
+Spec path is required at runtime (`PRODUCT_SPEC_PATH` or `--product-spec`).  
+No default spec fallback is used.
+
+Creator-controlled switches:
+- `agent.prompt_template`
+- `agent.tools`
+- `checklist.items` (required)
+- `outputs.routes`
+
+Bundled spec files:
+- `python/legionmeet_platform/specs/talestral.json`
+- `python/legionmeet_platform/specs/prd-pro.json`
+
+Supported route types in this phase:
+- `ui_stream` (implemented)
+- `webhook` (implemented)
+- `teams_chat` / `teams_dm` (declared contract; startup fails fast if enabled)
+
+### Spec Quick Start
+
+Talestral (interview coach):
+```bash
+cd python
+uv run python run_variant_sink.py --instance meeting-a --port 8765 --product-spec ./legionmeet_platform/specs/talestral.json
+uv run python run_variant_ui.py --instance meeting-a --port 8502 --sink-url http://127.0.0.1:8765 --product-spec ./legionmeet_platform/specs/talestral.json
+```
+
+PRD Pro (product requirement elicitation):
+```bash
+cd python
+uv run python run_variant_sink.py --instance prd-session --port 8865 --product-spec ./legionmeet_platform/specs/prd-pro.json
+uv run python run_variant_ui.py --instance prd-session --port 8602 --sink-url http://127.0.0.1:8865 --product-spec ./legionmeet_platform/specs/prd-pro.json
+```
 
 ---
 
@@ -475,19 +519,20 @@ Receives transcript events from the C# bot (or from the Streamlit simulation) an
 **Launch (single-instance compatibility):**
 ```bash
 cd python
-uv run python transcript_sink.py
+PRODUCT_SPEC_PATH=./legionmeet_platform/specs/talestral.json uv run python transcript_sink.py
 # Listens on http://0.0.0.0:8765
 ```
 
 **Launch (multi-instance, recommended):**
 ```bash
 cd python
-uv run python run_variant_sink.py --variant default --instance meeting-a --port 8765
-uv run python run_variant_sink.py --variant behavioral --instance meeting-b --port 8865
+uv run python run_variant_sink.py --instance meeting-a --port 8765 --product-spec ./legionmeet_platform/specs/talestral.json
+uv run python run_variant_sink.py --instance meeting-b --port 8865 --product-spec ./legionmeet_platform/specs/prd-pro.json
 ```
 
 `run_variant_sink.py` sets:
-- `VARIANT_ID` (`default`, `behavioral`)
+- `VARIANT_ID` (compatibility plugin id, default `default`)
+- `PRODUCT_SPEC_PATH` (required)
 - `INSTANCE_ID`
 - `SINK_HOST` / `SINK_PORT`
 - `OUTPUT_DIR` (defaults to `python/output/<instance>`)
@@ -503,6 +548,12 @@ uv run python run_variant_sink.py --variant behavioral --instance meeting-b --po
 | `/session/end` | POST | End session, finalize analysis |
 | `/health` | GET | Health check |
 | `/stats` | GET | Statistics |
+| `/product/spec` | GET | Active product spec summary for UI/integrations |
+
+Checklist behavior:
+- Checklist is required by the product spec and initialized at `/session/start`.
+- Checklist updates happen in the sink (heuristic-first, optional checklist tool overlay).
+- `/session/status` and analysis JSON always include checklist state snapshots.
 
 **Session Workflow:**
 
@@ -510,7 +561,7 @@ uv run python run_variant_sink.py --variant behavioral --instance meeting-b --po
 # 1. Start session before meeting
 curl -X POST http://localhost:8765/session/start \
   -H "Content-Type: application/json" \
-  -d '{"candidate_name":"John Doe","meeting_url":"https://teams.microsoft.com/..."}'
+  -d '{"candidate_name":"John Doe","meeting_url":"https://teams.microsoft.com/...","product_id":"talestral"}'
 
 # 2. Map speakers as they are identified by diarization
 curl -X POST http://localhost:8765/session/map-speaker \
@@ -531,6 +582,7 @@ curl -X POST http://localhost:8765/session/end
 **Output:**
 - Transcripts: `~/Desktop/meeting_transcript.txt` (default instance) or `~/Desktop/meeting_transcript_<instance>.txt`
 - Analysis JSON: `python/output/{session_id}_analysis.json` (default) or `python/output/<instance>/{session_id}_analysis.json`
+- Route dispatch: per-event fanout to configured `outputs.routes` (currently `ui_stream` and optional `webhook`)
 
 ### Interview Analysis Agent (`interview_agent/`)
 
@@ -565,18 +617,19 @@ Three-column real-time interview display. Does NOT call the LLM directly — it 
 **Launch (single-instance compatibility):**
 ```bash
 cd python
-uv run streamlit run streamlit_ui.py --server.port 8502
+PRODUCT_SPEC_PATH=./legionmeet_platform/specs/talestral.json uv run streamlit run streamlit_ui.py --server.port 8502
 # Opens browser at http://localhost:8502
 ```
 
 **Launch (multi-instance, recommended):**
 ```bash
 cd python
-uv run python run_variant_ui.py --variant default --instance meeting-a --port 8502 --sink-url http://127.0.0.1:8765
-uv run python run_variant_ui.py --variant behavioral --instance meeting-b --port 8602 --sink-url http://127.0.0.1:8865
+uv run python run_variant_ui.py --instance meeting-a --port 8502 --sink-url http://127.0.0.1:8765 --product-spec ./legionmeet_platform/specs/talestral.json
+uv run python run_variant_ui.py --instance meeting-b --port 8602 --sink-url http://127.0.0.1:8865 --product-spec ./legionmeet_platform/specs/prd-pro.json
 ```
 
-`streamlit_ui.py` now loads checklist/script/title from the active variant plugin.
+`streamlit_ui.py` now loads title/script/checklist defaults from the active product spec.
+Checklist status is sink-owned and rendered from `/session/status` (not maintained as a local UI authority).
 
 **Requires the FastAPI sink to be running** (see above). The UI header shows a green/red connection indicator for sink status.
 
@@ -590,11 +643,11 @@ uv run python run_variant_ui.py --variant behavioral --instance meeting-b --port
 **Built-in simulation controls (in the header):**
 | Button | Action |
 |--------|--------|
-| Simulate | Start variant-defined mock interview script |
+| Simulate | Start product-spec-defined mock interview script |
 | Stop | Pause simulation at current position |
 | Restart | Reset and start fresh |
 
-**Checklist items:** Variant-specific and keyword-driven (e.g., default vs behavioral). Stoplight indicators: pending, analyzing, complete.
+**Checklist items:** Product-spec-defined. Stoplight indicators: pending, analyzing, complete.
 
 ### Testing
 
@@ -606,6 +659,7 @@ uv run pytest tests/ -v
 **Test Modules:**
 - `tests/mock_data.py` - Mock data generators for TranscriptEvent, AnalysisItem, interview conversations
 - `tests/test_interview.py` - Tests for InterviewSessionManager, AnalysisOutputWriter, models
+- `tests/test_product_spec.py` - Product spec validation and route orchestration tests
 - `tests/test_sink.py` - FastAPI endpoint tests for transcript_sink.py
 - `tests/test_variants.py` - Variant registry and plugin behavior tests
 
@@ -642,7 +696,7 @@ OpenAI API (real LLM calls, requires OPENAI_API_KEY in python/.env)
     │
     │  Analysis results written to python/output/{session_id}_analysis.json
     ↓
-Streamlit UI (polls output/ directory, renders coaching bubbles)
+Streamlit UI (polls output/ for analyses + /session/status for checklist state)
 ```
 
 ### Multi-Instance Demo Mode (multiple meetings/agents/UI)
@@ -652,24 +706,24 @@ Run two isolated pipelines on one machine:
 ```bash
 # Stack A
 cd python
-uv run python run_variant_sink.py --variant default --instance meeting-a --port 8765
+uv run python run_variant_sink.py --instance meeting-a --port 8765 --product-spec ./legionmeet_platform/specs/talestral.json
 # In another terminal
 cd python
-uv run python run_variant_ui.py --variant default --instance meeting-a --port 8502 --sink-url http://127.0.0.1:8765
+uv run python run_variant_ui.py --instance meeting-a --port 8502 --sink-url http://127.0.0.1:8765 --product-spec ./legionmeet_platform/specs/talestral.json
 
 # Stack B
 cd python
-uv run python run_variant_sink.py --variant behavioral --instance meeting-b --port 8865
+uv run python run_variant_sink.py --instance meeting-b --port 8865 --product-spec ./legionmeet_platform/specs/prd-pro.json
 # In another terminal
 cd python
-uv run python run_variant_ui.py --variant behavioral --instance meeting-b --port 8602 --sink-url http://127.0.0.1:8865
+uv run python run_variant_ui.py --instance meeting-b --port 8602 --sink-url http://127.0.0.1:8865 --product-spec ./legionmeet_platform/specs/prd-pro.json
 ```
 
 Each stack has:
 - isolated FastAPI process state/session memory
 - isolated output directory (`python/output/<instance>`)
 - isolated transcript file (`meeting_transcript_<instance>.txt`)
-- variant-specific UI/checklist and coaching context
+- product-spec-driven UI/checklist and coaching context
 
 ### Live Mode (real Teams meeting)
 
@@ -765,9 +819,9 @@ Teams Meeting
     ↓
 [Deepgram / Azure Speech]  ← Config-driven via Stt.Provider
     ↓
-[Python Service: configurable sink port] ← variant-aware agent framework
+[Python Service: configurable sink port] ← product-spec-aware agent/checklist/routes
     ↓
-[Streamlit UI: configurable port] ← variant-aware interview UI
+[Streamlit UI: configurable port] ← product-spec defaults + sink-owned checklist rendering
 ```
 
 **Key Components:**
@@ -778,7 +832,10 @@ Teams Meeting
 - `AzureSpeechRealtimeTranscriber.cs` - Deprecated (no diarization, contains TranscriberFactory)
 - `PythonTranscriptPublisher.cs` - HTTP POST to Python service (snake_case JSON)
 - `CallingController.cs` - Webhook endpoints + join/health APIs
-- `run_variant_sink.py` / `run_variant_ui.py` - Multi-instance launchers for variant stacks
+- `legionmeet_platform/spec_loader.py` - Canonical product-spec loader (`PRODUCT_SPEC_PATH` aware)
+- `legionmeet_platform/routes/router.py` - Output route orchestration (`ui_stream`, `webhook`)
+- `interview_agent/checklist_state.py` - Required sink-owned checklist state and transitions
+- `run_variant_sink.py` / `run_variant_ui.py` - Multi-instance launchers (now accept `--product-spec`)
 
 **Dependencies:**
 - `Microsoft.Skype.Bots.Media` 1.31.0.225-preview (Windows Server 2022 compatible)
@@ -825,6 +882,18 @@ teams-bot-poc/
 │   ├── run_variant_ui.py             # Variant/instance Streamlit launcher
 │   ├── simulate_interview.py         # CLI interview simulator
 │   ├── streamlit_ui.py               # Modern three-column UI with built-in simulation
+│   ├── legionmeet_platform/          # Product spec + route orchestration
+│   │   ├── __init__.py
+│   │   ├── spec_models.py
+│   │   ├── spec_loader.py
+│   │   ├── specs/
+│   │   │   ├── talestral.json
+│   │   │   └── prd-pro.json
+│   │   └── routes/
+│   │       ├── base.py
+│   │       ├── router.py
+│   │       ├── ui_stream.py
+│   │       └── webhook.py
 │   ├── variants/                     # Variant plugins (UI + agent behavior)
 │   │   ├── __init__.py
 │   │   ├── base.py
@@ -835,6 +904,7 @@ teams-bot-poc/
 │   ├── interview_agent/              # Interview analysis agent package
 │   │   ├── __init__.py
 │   │   ├── agent.py                  # OpenAI Agents SDK interview analyzer
+│   │   ├── checklist_state.py        # Sink-owned checklist lifecycle manager
 │   │   ├── models.py                 # Pydantic models (TranscriptEvent, AnalysisItem, etc.)
 │   │   ├── session.py                # InterviewSessionManager
 │   │   └── output.py                 # AnalysisOutputWriter (JSON persistence)
@@ -842,6 +912,7 @@ teams-bot-poc/
 │       ├── __init__.py
 │       ├── mock_data.py
 │       ├── test_interview.py
+│       ├── test_product_spec.py
 │       ├── test_sink.py
 │       └── test_variants.py
 ├── scripts/
@@ -866,6 +937,14 @@ teams-bot-poc/
 1. `--config <path>` command-line argument
 2. `TALESTRAL_CONFIG_PATH` environment variable
 3. default `Config/appsettings.json`
+
+**Product Spec Path Selection (Python sink/UI):**
+1. `PRODUCT_SPEC_PATH` environment variable or `--product-spec` launcher arg
+2. no fallback/default path is used; startup fails fast if path is missing or invalid
+
+**Checklist Requirement:** Sink startup fails fast if the resolved product spec has no checklist items.
+
+**Route Requirement:** Enabled `teams_chat` and `teams_dm` routes are contract-only in this phase; startup fails fast if either is enabled.
 
 **Package Versions:** Do not upgrade `Microsoft.Skype.Bots.Media` beyond 1.31.0.225-preview - version 1.32.x causes "Procedure Not Found" errors on Windows Server 2022
 

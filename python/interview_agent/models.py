@@ -243,6 +243,10 @@ class SessionAnalysis(BaseModel):
         default=0,
         description="Total number of candidate responses analyzed"
     )
+    checklist_state: list[dict[str, str | None]] = Field(
+        default_factory=list,
+        description="Checklist snapshot at latest analysis write"
+    )
     
     def compute_overall_scores(self) -> None:
         """

@@ -1,4 +1,4 @@
-# Dockerfile for Talestral Streamlit Interview UI
+# Dockerfile for LegionMeet Streamlit Interview UI
 # Separate from the FastAPI Dockerfile for independent deployment.
 #
 # Build:  docker build -f Dockerfile.streamlit -t talestral-ui .

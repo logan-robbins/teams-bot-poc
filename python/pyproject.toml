@@ -1,7 +1,7 @@
 [project]
 name = "teams-bot-python"
 version = "0.1.0"
-description = "Python services for Talestral - transcript sink and interview analysis agent"
+description = "Python services for LegionMeet - transcript sink and modality analysis agent"
 requires-python = ">=3.11"
 dependencies = [
     "aiofiles>=24.1.0",

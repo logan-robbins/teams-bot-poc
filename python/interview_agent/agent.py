@@ -292,6 +292,7 @@ class InterviewAnalyzer:
         output_writer: Optional[AnalysisOutputWriter] = None,
         publish_thoughts: bool = True,
         reasoning_effort: Optional[str] = None,
+        instructions: Optional[str] = None,
     ) -> None:
         """
         Initialize the InterviewAnalyzer.
@@ -326,6 +327,7 @@ class InterviewAnalyzer:
         """
         self.model = model or DEFAULT_MODEL
         self.reasoning_effort = reasoning_effort or DEFAULT_REASONING_EFFORT
+        self.instructions = instructions or INTERVIEW_ANALYZER_INSTRUCTIONS
         
         # Validate configuration
         if not _IS_AZURE_CONFIGURED and not os.environ.get("OPENAI_API_KEY"):
@@ -365,7 +367,7 @@ class InterviewAnalyzer:
         # Create the analysis agent with structured output
         self._agent = Agent(
             name="Interview Analyzer",
-            instructions=INTERVIEW_ANALYZER_INSTRUCTIONS,
+            instructions=self.instructions,
             model=self.model,
             output_type=InterviewAnalysisOutput,
             model_settings=model_settings,
@@ -715,6 +717,7 @@ def create_interview_analyzer(
     output_dir: Optional[str] = None,
     publish_thoughts: bool = True,
     reasoning_effort: Optional[str] = None,
+    instructions: Optional[str] = None,
 ) -> InterviewAnalyzer:
     """
     Factory function to create a configured InterviewAnalyzer.
@@ -760,4 +763,5 @@ def create_interview_analyzer(
         output_writer=output_writer,
         publish_thoughts=publish_thoughts,
         reasoning_effort=reasoning_effort,
+        instructions=instructions,
     )

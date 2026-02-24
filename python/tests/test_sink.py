@@ -9,6 +9,8 @@ Last Grunted: 02/05/2026
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import TYPE_CHECKING, AsyncIterator
 
 import pytest
@@ -20,6 +22,15 @@ from tests.mock_data import (
     generate_v1_event_dict,
     generate_v2_event_dict,
 )
+
+
+TEST_PRODUCT_SPEC_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "legionmeet_platform"
+    / "specs"
+    / "talestral.json"
+)
+os.environ.setdefault("PRODUCT_SPEC_PATH", str(TEST_PRODUCT_SPEC_PATH))
 
 
 # =============================================================================
@@ -98,8 +109,9 @@ class TestHealthEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "healthy"
-        assert data["service"] == "Talestral Transcript Service"
+        assert data["service"] == "LegionMeet Transcript Service"
         assert data["version"] == "2.0.0"
+        assert "product_id" in data
         assert "timestamp" in data
 
     @pytest.mark.asyncio
@@ -148,6 +160,7 @@ class TestStatsEndpoint:
         data = response.json()
         assert "session" in data
         assert "active" in data["session"]
+        assert "product_id" in data
 
 
 # =============================================================================
@@ -217,6 +230,22 @@ class TestSessionStartEndpoint:
         data = response.json()
         assert "already active" in data["error"].lower()
 
+    @pytest.mark.asyncio
+    async def test_start_session_product_id_mismatch(self, client: AsyncClient) -> None:
+        """Product id mismatch fails fast."""
+        response = await client.post(
+            "/session/start",
+            json={
+                "candidate_name": "First",
+                "meeting_url": "https://test.com",
+                "product_id": "not-active-product",
+            },
+        )
+
+        assert response.status_code == 400
+        data = response.json()
+        assert data["error_code"] == "PRODUCT_MISMATCH"
+
 
 class TestSessionEndEndpoint:
     """Tests for POST /session/end endpoint."""
@@ -262,6 +291,8 @@ class TestSessionGetEndpoint:
         data = response.json()
         assert data["session"]["active"] is False
         assert data["session"]["candidate_name"] is None
+        assert isinstance(data["session"]["checklist"], list)
+        assert data["product_id"] == data["session"]["product_id"]
 
     @pytest.mark.asyncio
     async def test_get_session_active(self, client: AsyncClient) -> None:
@@ -278,6 +309,7 @@ class TestSessionGetEndpoint:
         data = response.json()
         assert data["session"]["active"] is True
         assert data["session"]["candidate_name"] == "Active User"
+        assert isinstance(data["session"]["checklist"], list)
 
 
 class TestSpeakerMapEndpoint:
@@ -459,6 +491,7 @@ class TestTranscriptEndpoint:
 
         assert data["stats"]["events_received"] >= 3
         assert data["stats"]["final_transcripts"] >= 3
+        assert "route_dispatch_total" in data["stats"]
 
     @pytest.mark.asyncio
     async def test_transcript_adds_to_active_session(self, client: AsyncClient) -> None:
@@ -647,6 +680,17 @@ class TestIntegrationFlow:
         # 9. Verify session is now inactive
         final_session = await client.get("/session")
         assert final_session.json()["session"]["active"] is False
+
+    @pytest.mark.asyncio
+    async def test_product_spec_endpoint(self, client: AsyncClient) -> None:
+        """Product spec endpoint exposes active contract summary."""
+        response = await client.get("/product/spec")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert "product_id" in data
+        assert "checklist_items" in data
+        assert isinstance(data["checklist_items"], list)
 
     @pytest.mark.asyncio
     async def test_multiple_sessions_sequential(self, client: AsyncClient) -> None:

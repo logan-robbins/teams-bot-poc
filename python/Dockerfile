@@ -1,4 +1,4 @@
-# Dockerfile for Talestral FastAPI Transcript Sink
+# Dockerfile for LegionMeet FastAPI Transcript Sink
 # Default target: FastAPI service (transcript_sink.py)
 #
 # Build:  docker build -t talestral-api .

@@ -1,5 +1,5 @@
 """
-Talestral Transcript Service v2
+LegionMeet Transcript Service v2
 
 Receives real-time transcript events from the C# bot with speaker diarization,
 manages interview sessions, and integrates with the interview analysis agent.
@@ -43,6 +43,13 @@ from interview_agent.models import (
 )
 from interview_agent.output import AnalysisOutputWriter
 from interview_agent.session import InterviewSessionManager
+from interview_agent.checklist_state import ChecklistDefinition, ChecklistStateManager
+from legionmeet_platform import (
+    AgentTool,
+    PLATFORM_NAME,
+    load_product_spec,
+)
+from legionmeet_platform.routes import RouteOrchestrator, build_route_orchestrator
 from variants import VariantPlugin, load_variant
 
 # =============================================================================
@@ -65,6 +72,7 @@ class RuntimeConfig:
     """Runtime config for multi-instance sink execution."""
 
     variant_id: str
+    product_spec_path: str
     instance_id: str
     sink_host: str
     sink_port: int
@@ -77,6 +85,12 @@ def load_runtime_config() -> RuntimeConfig:
     variant_id = (os.environ.get("VARIANT_ID", "default") or "").strip().lower()
     if not variant_id:
         raise RuntimeError("VARIANT_ID resolved to empty value.")
+
+    product_spec_path = (os.environ.get("PRODUCT_SPEC_PATH") or "").strip()
+    if not product_spec_path:
+        raise RuntimeError(
+            "PRODUCT_SPEC_PATH is required. Provide a product spec path at runtime."
+        )
 
     instance_id = (os.environ.get("INSTANCE_ID", variant_id) or "").strip()
     if not instance_id:
@@ -120,6 +134,7 @@ def load_runtime_config() -> RuntimeConfig:
 
     return RuntimeConfig(
         variant_id=variant_id,
+        product_spec_path=product_spec_path,
         instance_id=instance_id,
         sink_host=sink_host,
         sink_port=sink_port,
@@ -129,7 +144,9 @@ def load_runtime_config() -> RuntimeConfig:
 
 
 RUNTIME_CONFIG = load_runtime_config()
+PRODUCT_SPEC, PRODUCT_SPEC_PATH = load_product_spec(RUNTIME_CONFIG.product_spec_path)
 VARIANT = load_variant(RUNTIME_CONFIG.variant_id)
+ROUTES = build_route_orchestrator(PRODUCT_SPEC)
 
 # Output directory for analysis results
 OUTPUT_DIR = RUNTIME_CONFIG.output_dir
@@ -151,6 +168,7 @@ CORS_ORIGINS: list[str] = [
 
 try:
     from interview_agent.agent import InterviewAnalyzer
+    from interview_agent.checklist import ChecklistAgent
     from interview_agent.pubsub import ThoughtType, get_publisher
 
     AGENT_AVAILABLE = True
@@ -158,6 +176,7 @@ try:
 except ImportError as e:
     AGENT_AVAILABLE = False
     InterviewAnalyzer = None  # type: ignore[misc, assignment]
+    ChecklistAgent = None  # type: ignore[misc, assignment]
     get_publisher = None  # type: ignore[misc, assignment]
     ThoughtType = None  # type: ignore[misc, assignment]
     logger.warning(
@@ -231,6 +250,10 @@ class SessionStartRequest(BaseModel):
 
     candidate_name: str = Field(..., min_length=1, description="Name of the candidate")
     meeting_url: str = Field(..., min_length=1, description="Teams meeting join URL")
+    product_id: str | None = Field(
+        default=None,
+        description="Optional product id. Must match active product spec when provided.",
+    )
     candidate_speaker_id: str | None = Field(
         default=None,
         description="Optional speaker_id to map to candidate (can be mapped later)",
@@ -301,6 +324,10 @@ class SessionStatusResponse(BaseModel):
     total_events: int = Field(default=0, description="Total transcript events received")
     final_events: int = Field(default=0, description="Final transcript events")
     analysis_count: int = Field(default=0, description="Number of analyses performed")
+    checklist: list[dict[str, str | None]] = Field(
+        default_factory=list, description="Current checklist state"
+    )
+    product_id: str = Field(..., description="Active product id")
 
 
 class SessionStatusWrapper(BaseModel):
@@ -308,6 +335,7 @@ class SessionStatusWrapper(BaseModel):
 
     session: SessionStatusResponse
     agent_available: bool = Field(..., description="Whether agent analysis is available")
+    product_id: str = Field(..., description="Active product id")
 
 
 class SessionEndResponse(BaseResponse):
@@ -326,6 +354,7 @@ class HealthResponse(BaseModel):
     agent_available: bool = Field(..., description="Whether agent is available")
     session_active: bool = Field(..., description="Whether a session is active")
     variant_id: str = Field(..., description="Active variant ID")
+    product_id: str = Field(..., description="Active product id")
     instance_id: str = Field(..., description="Active instance ID")
 
 
@@ -339,7 +368,20 @@ class StatsResponse(BaseModel):
     agent_available: bool = Field(..., description="Whether agent is available")
     output_directory: str = Field(..., description="Analysis output directory path")
     variant_id: str = Field(..., description="Active variant ID")
+    product_id: str = Field(..., description="Active product id")
     instance_id: str = Field(..., description="Active instance ID")
+
+
+class ProductSpecResponse(BaseModel):
+    """Public summary of active product spec."""
+
+    platform: str
+    product_id: str
+    display_name: str
+    spec_path: str
+    checklist_items: list[dict[str, Any]]
+    agent: dict[str, Any]
+    outputs: list[dict[str, Any]]
 
 
 # =============================================================================
@@ -358,6 +400,9 @@ class AppStats(TypedDict):
     v1_events: int
     v2_events: int
     agent_analyses: int
+    checklist_updates: int
+    route_dispatch_total: int
+    route_dispatch_failures: int
     started_at: str
 
 
@@ -371,6 +416,9 @@ class AppState(TypedDict):
     stats: AppStats
     agent_task: asyncio.Task[None] | None
     variant_plugin: VariantPlugin
+    checklist_manager: ChecklistStateManager
+    route_orchestrator: RouteOrchestrator
+    checklist_agent: ChecklistAgent | None
 
 
 def get_initial_stats() -> AppStats:
@@ -384,6 +432,9 @@ def get_initial_stats() -> AppStats:
         v1_events=0,
         v2_events=0,
         agent_analyses=0,
+        checklist_updates=0,
+        route_dispatch_total=0,
+        route_dispatch_failures=0,
         started_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     )
 
@@ -461,6 +512,9 @@ def get_app_state(request: Request) -> AppState:
         stats=state.stats,
         agent_task=state.agent_task,
         variant_plugin=state.variant_plugin,
+        checklist_manager=state.checklist_manager,
+        route_orchestrator=state.route_orchestrator,
+        checklist_agent=state.checklist_agent,
     )
 
 
@@ -561,6 +615,38 @@ async def save_transcript_to_file(event: TranscriptEvent) -> None:
         logger.error("Failed to save transcript to file: %s", e)
 
 
+def build_checklist_manager() -> ChecklistStateManager:
+    """Create checklist state manager from active product spec."""
+    definitions = tuple(
+        ChecklistDefinition(
+            id=item.id,
+            label=item.label,
+            keywords=item.keywords,
+        )
+        for item in PRODUCT_SPEC.checklist.items
+    )
+    return ChecklistStateManager(definitions)
+
+
+async def dispatch_route_payload(
+    route_orchestrator: RouteOrchestrator,
+    stats: AppStats,
+    payload: dict[str, Any],
+) -> None:
+    """Dispatch payload to all configured routes and update stats."""
+    results = await route_orchestrator.dispatch_all(payload)
+    stats["route_dispatch_total"] += len(results)
+    failures = [result for result in results if not result.ok]
+    stats["route_dispatch_failures"] += len(failures)
+    for failed in failures:
+        logger.warning(
+            "Route dispatch failed: route_id=%s route_type=%s detail=%s",
+            failed.route_id,
+            failed.route_type,
+            failed.detail,
+        )
+
+
 # =============================================================================
 # Agent Processing
 # =============================================================================
@@ -572,6 +658,8 @@ async def agent_processing_loop(
     output_writer: AnalysisOutputWriter,
     stats: AppStats,
     variant_plugin: VariantPlugin,
+    checklist_manager: ChecklistStateManager,
+    route_orchestrator: RouteOrchestrator,
 ) -> None:
     """
     Background task that processes candidate transcripts through the interview agent.
@@ -597,7 +685,12 @@ async def agent_processing_loop(
 
     if AGENT_AVAILABLE and InterviewAnalyzer:
         try:
-            analyzer = InterviewAnalyzer(publish_thoughts=True)
+            analyzer = InterviewAnalyzer(
+                model=PRODUCT_SPEC.agent.model,
+                publish_thoughts=True,
+                reasoning_effort=PRODUCT_SPEC.agent.reasoning_effort,
+                instructions=PRODUCT_SPEC.agent.prompt_template,
+            )
             publisher = get_publisher() if get_publisher else None
             logger.info("InterviewAnalyzer initialized with real-time publishing")
         except Exception as e:
@@ -652,7 +745,23 @@ async def agent_processing_loop(
                     # Write to output file
                     if session_manager.session:
                         output_writer.append_item(
-                            session_manager.session.session_id, analysis_item
+                            session_manager.session.session_id,
+                            analysis_item,
+                            checklist_state=checklist_manager.snapshot(),
+                        )
+                        payload = {
+                            "event_type": "analysis",
+                            "product_id": PRODUCT_SPEC.product_id,
+                            "instance_id": RUNTIME_CONFIG.instance_id,
+                            "session_id": session_manager.session.session_id,
+                            "analysis_item": analysis_item.model_dump(),
+                            "checklist": checklist_manager.snapshot(),
+                            "session_context": session_manager.get_session_context(),
+                        }
+                        await dispatch_route_payload(
+                            route_orchestrator=route_orchestrator,
+                            stats=stats,
+                            payload=payload,
                         )
 
                     logger.info(
@@ -748,14 +857,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[dict[str, Any]]:
     Yields:
         Dictionary of application state to be attached to requests.
     """
-    logger.info("Starting Talestral Transcript Service v2")
+    logger.info("Starting LegionMeet Transcript Service v2")
     logger.info(
-        "Runtime: variant=%s instance=%s host=%s port=%d",
+        "Runtime: platform=%s product=%s variant=%s instance=%s host=%s port=%d",
+        PLATFORM_NAME,
+        PRODUCT_SPEC.product_id,
         VARIANT.variant_id,
         RUNTIME_CONFIG.instance_id,
         RUNTIME_CONFIG.sink_host,
         RUNTIME_CONFIG.sink_port,
     )
+    logger.info("Product spec path: %s", PRODUCT_SPEC_PATH)
 
     # Initialize output directory and writer
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -764,9 +876,31 @@ async def lifespan(app: FastAPI) -> AsyncIterator[dict[str, Any]]:
 
     # Initialize state components
     session_manager = InterviewSessionManager()
+    checklist_manager = build_checklist_manager()
     transcript_queue: asyncio.Queue[TranscriptEvent] = asyncio.Queue()
     agent_queue: asyncio.Queue[TranscriptEvent] = asyncio.Queue()
     stats = get_initial_stats()
+    route_orchestrator = ROUTES
+    logger.info("Enabled output routes: %d", route_orchestrator.route_count)
+
+    checklist_agent: ChecklistAgent | None = None
+    if AgentTool.CHECKLIST_AGENT in PRODUCT_SPEC.agent.tools:
+        if not AGENT_AVAILABLE or ChecklistAgent is None:
+            raise RuntimeError(
+                "agent.tools includes 'checklist_agent' but checklist agent is unavailable."
+            )
+
+        def _checklist_callback(item: str, status: str, reason: str) -> None:
+            updated = checklist_manager.update(
+                item=item,
+                status=status,
+                reason=reason,
+                source="tool",
+            )
+            if updated:
+                stats["checklist_updates"] += 1
+
+        checklist_agent = ChecklistAgent(checklist_callback=_checklist_callback)
 
     # Start agent processing loop
     agent_task = asyncio.create_task(
@@ -776,6 +910,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[dict[str, Any]]:
             output_writer,
             stats,
             VARIANT,
+            checklist_manager,
+            route_orchestrator,
         )
     )
 
@@ -788,6 +924,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[dict[str, Any]]:
         "stats": stats,
         "agent_task": agent_task,
         "variant_plugin": VARIANT,
+        "checklist_manager": checklist_manager,
+        "route_orchestrator": route_orchestrator,
+        "checklist_agent": checklist_agent,
     }
 
     yield state
@@ -807,9 +946,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[dict[str, Any]]:
 
 
 app = FastAPI(
-    title=f"Talestral Transcript Service ({VARIANT.variant_id})",
+    title=f"LegionMeet Transcript Service ({PRODUCT_SPEC.product_id})",
     version="2.0.0",
-    description="Receives diarized transcripts from Talestral and integrates with interview analysis agent",
+    description="Receives diarized transcripts and integrates with LegionMeet modality analysis pipelines",
     lifespan=lifespan,
 )
 
@@ -870,9 +1009,13 @@ async def receive_transcript(
     """
     stats = state["stats"]
     session_manager = state["session_manager"]
+    output_writer = state["output_writer"]
     transcript_queue = state["transcript_queue"]
     agent_queue = state["agent_queue"]
     variant_plugin = state["variant_plugin"]
+    checklist_manager = state["checklist_manager"]
+    route_orchestrator = state["route_orchestrator"]
+    checklist_agent = state["checklist_agent"]
 
     # Normalize v1 to v2 format
     normalized = normalize_v1_to_v2(request, stats)
@@ -897,6 +1040,59 @@ async def receive_transcript(
         # Add to session if active
         if session_manager.is_active:
             session_manager.add_transcript(event)
+
+            speaker_role = (
+                session_manager.get_speaker_role(event.speaker_id) if event.speaker_id else None
+            ) or "unknown"
+
+            if event.text and checklist_manager.apply_talestral_heuristic(
+                text=event.text,
+                speaker_role=speaker_role,
+            ):
+                stats["checklist_updates"] += 1
+
+            if checklist_agent and event.text:
+                checklist_result = await checklist_agent.analyze_for_checklist(
+                    speaker_id=event.speaker_id or "unknown",
+                    speaker_role=speaker_role,
+                    text=event.text,
+                    conversation_history=session_manager.get_session_context().get(
+                        "recent_conversation", []
+                    ),
+                )
+                if checklist_result:
+                    updated = checklist_manager.update(
+                        item=str(checklist_result.get("item", "")),
+                        status=str(checklist_result.get("status", "")),
+                        reason=str(checklist_result.get("reason", "")),
+                        source="tool",
+                    )
+                    if updated:
+                        stats["checklist_updates"] += 1
+
+            if session_manager.session:
+                current_analysis = output_writer.load_analysis(
+                    session_manager.session.session_id
+                )
+                if current_analysis is not None:
+                    current_analysis.checklist_state = checklist_manager.snapshot()
+                    output_writer.write_analysis(
+                        session_manager.session.session_id, current_analysis
+                    )
+
+                await dispatch_route_payload(
+                    route_orchestrator=route_orchestrator,
+                    stats=stats,
+                    payload={
+                        "event_type": "transcript",
+                        "product_id": PRODUCT_SPEC.product_id,
+                        "instance_id": RUNTIME_CONFIG.instance_id,
+                        "session_id": session_manager.session.session_id,
+                        "transcript_event": event.model_dump(),
+                        "checklist": checklist_manager.snapshot(),
+                        "session_context": session_manager.get_session_context(),
+                    },
+                )
 
             # Queue for agent if from candidate
             candidate_id = session_manager.get_candidate_speaker_id()
@@ -955,10 +1151,25 @@ async def start_session(
     """
     session_manager = state["session_manager"]
     output_writer = state["output_writer"]
+    checklist_manager = state["checklist_manager"]
+    route_orchestrator = state["route_orchestrator"]
+    stats = state["stats"]
     variant_plugin = state["variant_plugin"]
 
     if session_manager.is_active:
         raise SessionAlreadyActiveError()
+
+    if request.product_id and request.product_id != PRODUCT_SPEC.product_id:
+        raise TranscriptServiceError(
+            message=(
+                f"Requested product_id '{request.product_id}' does not match "
+                f"active product '{PRODUCT_SPEC.product_id}'."
+            ),
+            status_code=status.HTTP_400_BAD_REQUEST,
+            error_code="PRODUCT_MISMATCH",
+        )
+
+    checklist_manager.reset()
 
     session = session_manager.start_session(
         candidate_name=request.candidate_name,
@@ -978,6 +1189,7 @@ async def start_session(
         session_id=session.session_id,
         candidate_name=request.candidate_name,
         started_at=session.started_at,
+        checklist_state=checklist_manager.snapshot(),
     )
     output_writer.write_analysis(session.session_id, analysis)
 
@@ -994,6 +1206,19 @@ async def start_session(
         session.session_id,
     )
     await variant_plugin.on_session_start(session_manager.get_session_context())
+
+    await dispatch_route_payload(
+        route_orchestrator=route_orchestrator,
+        stats=stats,
+        payload={
+            "event_type": "session_started",
+            "product_id": PRODUCT_SPEC.product_id,
+            "instance_id": RUNTIME_CONFIG.instance_id,
+            "session_id": session.session_id,
+            "session_context": session_manager.get_session_context(),
+            "checklist": checklist_manager.snapshot(),
+        },
+    )
 
     return SessionStartResponse(
         ok=True,
@@ -1047,6 +1272,7 @@ async def get_session_status(state: AppStateDep) -> SessionStatusWrapper:
         SessionStatusWrapper with session details and agent availability.
     """
     session_manager = state["session_manager"]
+    checklist_manager = state["checklist_manager"]
     stats = state["stats"]
 
     context = session_manager.get_session_context()
@@ -1061,11 +1287,14 @@ async def get_session_status(state: AppStateDep) -> SessionStatusWrapper:
         total_events=context.get("total_events", 0),
         final_events=context.get("final_events", 0),
         analysis_count=stats["agent_analyses"],
+        checklist=checklist_manager.snapshot(),
+        product_id=PRODUCT_SPEC.product_id,
     )
 
     return SessionStatusWrapper(
         session=session_status,
         agent_available=AGENT_AVAILABLE,
+        product_id=PRODUCT_SPEC.product_id,
     )
 
 
@@ -1099,6 +1328,8 @@ async def end_session(state: AppStateDep) -> SessionEndResponse:
     """
     session_manager = state["session_manager"]
     output_writer = state["output_writer"]
+    checklist_manager = state["checklist_manager"]
+    route_orchestrator = state["route_orchestrator"]
     stats = state["stats"]
     variant_plugin = state["variant_plugin"]
 
@@ -1122,6 +1353,7 @@ async def end_session(state: AppStateDep) -> SessionEndResponse:
             analysis = output_writer.load_analysis(session_id)
             if analysis:
                 analysis.ended_at = ended_session.ended_at
+                analysis.checklist_state = checklist_manager.snapshot()
                 analysis.compute_overall_scores()
                 output_writer.write_analysis(session_id, analysis)
         except Exception as e:
@@ -1151,6 +1383,19 @@ async def end_session(state: AppStateDep) -> SessionEndResponse:
     logger.info("Session ended: %s", session_id)
     await variant_plugin.on_session_end(summary)
 
+    await dispatch_route_payload(
+        route_orchestrator=route_orchestrator,
+        stats=stats,
+        payload={
+            "event_type": "session_ended",
+            "product_id": PRODUCT_SPEC.product_id,
+            "instance_id": RUNTIME_CONFIG.instance_id,
+            "session_id": session_id,
+            "summary": summary,
+            "checklist": checklist_manager.snapshot(),
+        },
+    )
+
     return SessionEndResponse(
         ok=True,
         message="Session ended",
@@ -1173,12 +1418,13 @@ async def health(state: AppStateDep) -> HealthResponse:
 
     return HealthResponse(
         status="healthy",
-        service="Talestral Transcript Service",
+        service="LegionMeet Transcript Service",
         version="2.0.0",
         timestamp=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         agent_available=AGENT_AVAILABLE,
         session_active=session_manager.is_active,
         variant_id=VARIANT.variant_id,
+        product_id=PRODUCT_SPEC.product_id,
         instance_id=RUNTIME_CONFIG.instance_id,
     )
 
@@ -1215,7 +1461,40 @@ async def get_stats(state: AppStateDep) -> StatsResponse:
         agent_available=AGENT_AVAILABLE,
         output_directory=str(OUTPUT_DIR),
         variant_id=VARIANT.variant_id,
+        product_id=PRODUCT_SPEC.product_id,
         instance_id=RUNTIME_CONFIG.instance_id,
+    )
+
+
+@app.get("/product/spec", response_model=ProductSpecResponse)
+async def get_product_spec() -> ProductSpecResponse:
+    """Return active product spec summary for UI/client contract discovery."""
+    return ProductSpecResponse(
+        platform=PLATFORM_NAME,
+        product_id=PRODUCT_SPEC.product_id,
+        display_name=PRODUCT_SPEC.display_name,
+        spec_path=str(PRODUCT_SPEC_PATH),
+        checklist_items=[
+            {
+                "id": item.id,
+                "label": item.label,
+            }
+            for item in PRODUCT_SPEC.checklist.items
+        ],
+        agent={
+            "model": PRODUCT_SPEC.agent.model,
+            "reasoning_effort": PRODUCT_SPEC.agent.reasoning_effort,
+            "has_custom_prompt": bool(PRODUCT_SPEC.agent.prompt_template),
+            "tools": [tool.value for tool in PRODUCT_SPEC.agent.tools],
+        },
+        outputs=[
+            {
+                "id": route.id,
+                "type": route.type.value,
+                "enabled": route.enabled,
+            }
+            for route in PRODUCT_SPEC.outputs.routes
+        ],
     )
 
 
@@ -1225,7 +1504,7 @@ async def get_stats(state: AppStateDep) -> StatsResponse:
 
 if __name__ == "__main__":
     logger.info("=" * 60)
-    logger.info("Talestral Transcript Service v2")
+    logger.info("LegionMeet Transcript Service v2")
     logger.info("=" * 60)
     logger.info(
         "Binding to: http://%s:%d",
@@ -1233,11 +1512,15 @@ if __name__ == "__main__":
         RUNTIME_CONFIG.sink_port,
     )
     logger.info(
-        "Variant: %s (%s), Instance: %s",
+        "Platform: %s, Product: %s (%s), Variant: %s (%s), Instance: %s",
+        PLATFORM_NAME,
+        PRODUCT_SPEC.product_id,
+        PRODUCT_SPEC.display_name,
         VARIANT.variant_id,
         VARIANT.display_name,
         RUNTIME_CONFIG.instance_id,
     )
+    logger.info("Product spec path: %s", PRODUCT_SPEC_PATH)
     logger.info("")
     logger.info("Endpoints:")
     logger.info("  POST /transcript          - Receive transcript events")
@@ -1247,9 +1530,11 @@ if __name__ == "__main__":
     logger.info("  POST /session/end         - End session")
     logger.info("  GET  /health              - Health check")
     logger.info("  GET  /stats               - Statistics")
+    logger.info("  GET  /product/spec        - Active product spec summary")
     logger.info("")
     logger.info("Transcripts saved to: %s", TRANSCRIPT_FILE)
     logger.info("Analysis output: %s", OUTPUT_DIR)
+    logger.info("Enabled routes: %d", ROUTES.route_count)
     logger.info("Agent available: %s", AGENT_AVAILABLE)
     logger.info("=" * 60)
 

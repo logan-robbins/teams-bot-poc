@@ -1,0 +1,147 @@
+{
+  "product_id": "talestral",
+  "display_name": "Talestral",
+  "agent": {
+    "prompt_template": null,
+    "tools": [
+      "none"
+    ],
+    "model": null,
+    "reasoning_effort": null
+  },
+  "checklist": {
+    "items": [
+      {
+        "id": "intro",
+        "label": "Intro",
+        "keywords": [
+          "good morning",
+          "introduce",
+          "background"
+        ]
+      },
+      {
+        "id": "experience",
+        "label": "Experience",
+        "keywords": [
+          "experience",
+          "project",
+          "scale"
+        ]
+      },
+      {
+        "id": "tradeoffs",
+        "label": "Tradeoffs",
+        "keywords": [
+          "tradeoff",
+          "consistency",
+          "throughput"
+        ]
+      },
+      {
+        "id": "debugging",
+        "label": "Debugging",
+        "keywords": [
+          "incident",
+          "debug",
+          "telemetry"
+        ]
+      },
+      {
+        "id": "quality",
+        "label": "Code Quality",
+        "keywords": [
+          "tests",
+          "typing",
+          "review"
+        ]
+      },
+      {
+        "id": "close",
+        "label": "Closing",
+        "keywords": [
+          "questions for me",
+          "success",
+          "technical debt"
+        ]
+      }
+    ]
+  },
+  "outputs": {
+    "routes": [
+      {
+        "id": "ui-stream",
+        "type": "ui_stream",
+        "enabled": true,
+        "timeout_seconds": 5.0,
+        "headers": {}
+      },
+      {
+        "id": "webhook-default",
+        "type": "webhook",
+        "enabled": false,
+        "url": null,
+        "timeout_seconds": 5.0,
+        "headers": {}
+      }
+    ]
+  },
+  "ui": {
+    "template": "talestral",
+    "page_title": "Talestral Interview Agent",
+    "page_icon": "🎯",
+    "header_title": "🎯 Talestral Interview Agent",
+    "candidate_name": "Sarah Chen",
+    "meeting_url": "https://teams.microsoft.com/l/meetup-join/simulated-default",
+    "interview_script": [
+      [
+        "speaker_0",
+        "Good morning and thanks for joining. Can you introduce yourself and your Python background?"
+      ],
+      [
+        "speaker_1",
+        "Good morning. I have six years of Python experience building backend systems and data services."
+      ],
+      [
+        "speaker_0",
+        "Tell me about a project where you improved performance at scale."
+      ],
+      [
+        "speaker_1",
+        "I redesigned our event pipeline and cut end-to-end latency from minutes to under 40 seconds."
+      ],
+      [
+        "speaker_0",
+        "What was the hardest engineering tradeoff in that redesign?"
+      ],
+      [
+        "speaker_1",
+        "Balancing consistency and throughput. We chose idempotent consumers with strict retry boundaries."
+      ],
+      [
+        "speaker_0",
+        "How do you approach debugging production incidents at 3 AM?"
+      ],
+      [
+        "speaker_1",
+        "I start with blast radius and telemetry, identify bottlenecks quickly, and communicate status continuously."
+      ],
+      [
+        "speaker_0",
+        "How do you ensure code quality and team alignment?"
+      ],
+      [
+        "speaker_1",
+        "I rely on tests, strict typing, focused reviews, and design docs for high-risk changes."
+      ],
+      [
+        "speaker_0",
+        "Any questions for me about the role or the team?"
+      ],
+      [
+        "speaker_1",
+        "Yes. What does success look like in six months, and how does the team handle technical debt?"
+      ]
+    ]
+  }
+}

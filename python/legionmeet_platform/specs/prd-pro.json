@@ -1,0 +1,181 @@
+{
+  "product_id": "prd-pro",
+  "display_name": "PRD Pro",
+  "agent": {
+    "prompt_template": "You are PRD Pro, a real-time requirements elicitation coach for engineering teams talking with product stakeholders. Your objective is to help the technical team gather complete, implementation-ready product requirements. For each product-team response, identify requirement gaps, ambiguities, and risks. Prioritize functional clarity over non-functional depth. Provide concrete next questions the engineer should ask immediately, and keep guidance concise and actionable.",
+    "tools": [
+      "none"
+    ],
+    "model": null,
+    "reasoning_effort": null
+  },
+  "checklist": {
+    "items": [
+      {
+        "id": "business_goal",
+        "label": "Business Goal",
+        "keywords": [
+          "goal",
+          "objective",
+          "outcome",
+          "success",
+          "kpi"
+        ]
+      },
+      {
+        "id": "user_persona",
+        "label": "User Persona",
+        "keywords": [
+          "user",
+          "customer",
+          "persona",
+          "who",
+          "segment"
+        ]
+      },
+      {
+        "id": "problem_scope",
+        "label": "Problem Scope",
+        "keywords": [
+          "problem",
+          "scope",
+          "in scope",
+          "out of scope",
+          "priority"
+        ]
+      },
+      {
+        "id": "workflow_requirements",
+        "label": "Workflow Requirements",
+        "keywords": [
+          "workflow",
+          "flow",
+          "step",
+          "happy path",
+          "journey"
+        ]
+      },
+      {
+        "id": "edge_cases",
+        "label": "Edge Cases",
+        "keywords": [
+          "edge case",
+          "exception",
+          "failure",
+          "fallback",
+          "error"
+        ]
+      },
+      {
+        "id": "data_integrations",
+        "label": "Data & Integrations",
+        "keywords": [
+          "data",
+          "integration",
+          "api",
+          "source",
+          "system"
+        ]
+      },
+      {
+        "id": "acceptance_criteria",
+        "label": "Acceptance Criteria",
+        "keywords": [
+          "acceptance",
+          "done",
+          "criteria",
+          "test",
+          "definition"
+        ]
+      },
+      {
+        "id": "delivery_plan",
+        "label": "Delivery Plan",
+        "keywords": [
+          "timeline",
+          "milestone",
+          "release",
+          "phases",
+          "dependencies"
+        ]
+      }
+    ]
+  },
+  "outputs": {
+    "routes": [
+      {
+        "id": "ui-stream",
+        "type": "ui_stream",
+        "enabled": true,
+        "timeout_seconds": 5.0,
+        "headers": {}
+      },
+      {
+        "id": "webhook-default",
+        "type": "webhook",
+        "enabled": false,
+        "url": null,
+        "timeout_seconds": 5.0,
+        "headers": {}
+      }
+    ]
+  },
+  "ui": {
+    "template": "prd-pro",
+    "page_title": "PRD Pro | LegionMeet",
+    "page_icon": "📘",
+    "header_title": "📘 PRD Pro - Product Requirements Elicitation",
+    "candidate_name": "Product Lead",
+    "meeting_url": "https://teams.microsoft.com/l/meetup-join/simulated-prd-pro",
+    "interview_script": [
+      [
+        "speaker_0",
+        "Thanks for joining. To start, what business outcome should this feature deliver this quarter?"
+      ],
+      [
+        "speaker_1",
+        "We need to reduce onboarding drop-off by 20 percent for new SMB admins."
+      ],
+      [
+        "speaker_0",
+        "Which users are in scope, and who is explicitly out of scope for this first release?"
+      ],
+      [
+        "speaker_1",
+        "Primary users are first-time SMB admins. Enterprise IT admins are out of scope for v1."
+      ],
+      [
+        "speaker_0",
+        "Walk us through the happy path user flow from invite to first successful configuration."
+      ],
+      [
+        "speaker_1",
+        "Users accept an invite, connect billing, choose a template, then complete setup in three guided steps."
+      ],
+      [
+        "speaker_0",
+        "What edge cases matter most, like partial setup, missing data, or permission failures?"
+      ],
+      [
+        "speaker_1",
+        "If billing fails, they should save progress and retry later. If permissions are missing, we need a guided remediation step."
+      ],
+      [
+        "speaker_0",
+        "What systems and APIs are required, and what data contracts are non-negotiable for launch?"
+      ],
+      [
+        "speaker_1",
+        "We depend on billing, identity, and notifications APIs. User profile and workspace metadata must be available at step one."
+      ],
+      [
+        "speaker_0",
+        "What are the acceptance criteria for launch, and what timeline constraints should we plan around?"
+      ],
+      [
+        "speaker_1",
+        "Success means 80 percent completion in under 10 minutes with no manual support ticket. We need beta in six weeks and GA in ten."
+      ]
+    ]
+  }
+}
