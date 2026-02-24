@@ -23,6 +23,18 @@
 .PARAMETER DisplayName
     Bot display name in meeting (default: Talestral)
 
+.PARAMETER MeetingId
+    Optional external meeting identifier used for correlation.
+
+.PARAMETER OrganizerTenantId
+    Optional organizer tenant id used for tenant-aware mode resolution.
+
+.PARAMETER JoinMode
+    Optional join mode override (policy_auto_invite or invite_and_graph_join).
+
+.PARAMETER BotAttendeeMissing
+    Indicates the bot/service account is not present on the invite.
+
 .PARAMETER DryRun
     Print what would be done without making actual requests
 
@@ -60,6 +72,19 @@ param(
 
     [Parameter(Mandatory=$false)]
     [string]$DisplayName = "Talestral",
+
+    [Parameter(Mandatory=$false)]
+    [string]$MeetingId = "",
+
+    [Parameter(Mandatory=$false)]
+    [string]$OrganizerTenantId = "",
+
+    [Parameter(Mandatory=$false)]
+    [ValidateSet("", "policy_auto_invite", "invite_and_graph_join")]
+    [string]$JoinMode = "",
+
+    [Parameter(Mandatory=$false)]
+    [switch]$BotAttendeeMissing,
 
     [Parameter(Mandatory=$false)]
     [switch]$DryRun,
@@ -139,6 +164,10 @@ function Invoke-AutoJoin {
     Write-Log "Bot Endpoint: $BotEndpoint"
     Write-Log "Sink Endpoint: $SinkEndpoint"
     Write-Log "Display Name: $DisplayName"
+    Write-Log "Bot Attendee Present: $(-not $BotAttendeeMissing)"
+    if ($MeetingId) { Write-Log "Meeting ID: $MeetingId" }
+    if ($OrganizerTenantId) { Write-Log "Organizer Tenant ID: $OrganizerTenantId" }
+    if ($JoinMode) { Write-Log "Requested Join Mode: $JoinMode" }
     if ($DryRun) {
         Write-Log "MODE: DRY RUN"
     }
@@ -153,8 +182,23 @@ function Invoke-AutoJoin {
         "--candidate-name", "`"$CandidateName`"",
         "--bot-endpoint", $BotEndpoint,
         "--sink-endpoint", $SinkEndpoint,
-        "--display-name", "`"$DisplayName`""
+        "--display-name", "`"$DisplayName`"",
+        "--bot-attendee-present"
     )
+
+    if ($BotAttendeeMissing) {
+        $Arguments = $Arguments | Where-Object { $_ -ne "--bot-attendee-present" }
+        $Arguments += "--bot-attendee-missing"
+    }
+    if ($MeetingId) {
+        $Arguments += @("--meeting-id", "`"$MeetingId`"")
+    }
+    if ($OrganizerTenantId) {
+        $Arguments += @("--organizer-tenant-id", $OrganizerTenantId)
+    }
+    if ($JoinMode) {
+        $Arguments += @("--join-mode", $JoinMode)
+    }
     
     if ($DryRun) {
         $Arguments += "--dry-run"

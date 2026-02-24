@@ -1,3 +1,19 @@
+# TASK: Teams Auto-Add Join Modes + Fail-Fast Validation (2026-02-24)
+
+Status legend: `[ ]` pending, `[-]` in progress, `[x]` complete.
+
+1. [x] Discovery of current join/webhook/config patterns in C# bot and scripts
+2. [x] Add canonical join-mode contract and tenant-aware resolution (`policy_auto_invite` / `invite_and_graph_join`)
+3. [x] Implement fail-fast validation and error taxonomy in API + service (`BOT_NOT_INVITED`, `TENANT_NOT_ENABLED_FOR_MODE`, `GRAPH_PERMISSION_MISSING`, `CALL_JOIN_FAILED_7504_OR_7505`)
+4. [x] Extend join request/response interface with meeting metadata and effective mode reporting
+5. [x] Update runtime config examples and startup wiring for join-mode settings
+6. [x] Update automation script payloads for new join contract
+7. [ ] Verify (`dotnet build` and `uv run pytest`) - blocked: `dotnet` not installed; `uv` panics in this sandbox runtime
+8. [x] Update README with current API/config behavior
+9. [x] Final task status update
+
+---
+
 # TASK: Multi-Instance UI + Agent + Bot Routing (2026-02-24)
 
 Status legend: `[ ]` pending, `[-]` in progress, `[x]` complete.

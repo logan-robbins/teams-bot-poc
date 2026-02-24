@@ -47,6 +47,8 @@ try
     var mediaConfig = LoadRequiredConfiguration<MediaPlatformConfiguration>(builder.Configuration, "MediaPlatformSettings");
     var sttConfig = LoadSttConfiguration(builder.Configuration);
     var transcriptSinkConfig = LoadRequiredConfiguration<TranscriptSinkConfiguration>(builder.Configuration, "TranscriptSink");
+    var joinModeSettings = builder.Configuration.GetSection("JoinMode").Get<JoinModeSettings>()
+        ?? new JoinModeSettings();
 
     // Configure Kestrel to listen on the specified URL with TLS if configured
     ConfigureKestrel(builder, botConfig, mediaConfig);
@@ -56,6 +58,7 @@ try
     builder.Services.AddSingleton(mediaConfig);
     builder.Services.AddSingleton(sttConfig);
     builder.Services.AddSingleton(transcriptSinkConfig);
+    builder.Services.AddSingleton(joinModeSettings);
 
     // Register Graph Communications logger
     builder.Services.AddSingleton<IGraphLogger>(sp =>

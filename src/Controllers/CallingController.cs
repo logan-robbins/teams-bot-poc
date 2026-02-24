@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Graph.Communications.Client;
 using Newtonsoft.Json;
+using TeamsMediaBot.Models;
 using TeamsMediaBot.Services;
 
 namespace TeamsMediaBot.Controllers;
@@ -139,7 +140,10 @@ public class CallingController : ControllerBase
     /// <returns>Information about the initiated call.</returns>
     [HttpPost("join")]
     [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status202Accepted)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status403Forbidden)]
+    [ProducesResponseType(StatusCodes.Status502BadGateway)]
     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> JoinMeetingAsync(
         [FromBody] JoinMeetingRequest request,
@@ -159,19 +163,62 @@ public class CallingController : ControllerBase
             // so the DI container won't try to dispose it
             var transcriber = _transcriberFactory.Create();
 
-            var callId = await _botService.JoinMeetingAsync(
-                request.JoinUrl,
-                request.DisplayName ?? "Talestral",
-                request.JoinAsGuest,
-                transcriber)
+            var workflowResult = await _botService.JoinMeetingWithModeAsync(
+                    new JoinMeetingCommand
+                    {
+                        JoinUrl = request.JoinUrl,
+                        DisplayName = request.DisplayName ?? "Talestral",
+                        JoinAsGuest = request.JoinAsGuest,
+                        RequestedJoinMode = request.JoinMode,
+                        MeetingId = request.MeetingId,
+                        OrganizerTenantId = request.OrganizerTenantId,
+                        ScheduledStartUtc = request.ScheduledStartUtc,
+                        BotAttendeePresent = request.BotAttendeePresent
+                    },
+                    transcriber)
                 .ConfigureAwait(false);
 
-            return Ok(new JoinMeetingResponse
+            var response = new JoinMeetingResponse
             {
-                CallId = callId,
-                Message = "Bot is joining the meeting",
-                JoinUrl = request.JoinUrl
-            });
+                CallId = workflowResult.CallId,
+                Message = workflowResult.Message,
+                JoinUrl = request.JoinUrl,
+                JoinMode = workflowResult.SelectedJoinMode,
+                EffectiveTenantId = workflowResult.EffectiveTenantId,
+                MeetingId = workflowResult.MeetingId,
+                Deferred = workflowResult.Deferred
+            };
+
+            if (workflowResult.Deferred)
+            {
+                return Accepted(response);
+            }
+
+            return Ok(response);
+        }
+        catch (JoinWorkflowException ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Join workflow rejected request: ErrorCode={ErrorCode}, JoinUrl={JoinUrl}, MeetingId={MeetingId}",
+                ex.ErrorCode,
+                request.JoinUrl,
+                request.MeetingId);
+
+            var payload = new JoinMeetingErrorResponse
+            {
+                Error = ex.Message,
+                ErrorCode = ex.ErrorCode
+            };
+
+            return ex.ErrorCode switch
+            {
+                JoinWorkflowErrorCodes.BotNotInvited => BadRequest(payload),
+                JoinWorkflowErrorCodes.TenantNotEnabledForMode => StatusCode(StatusCodes.Status403Forbidden, payload),
+                JoinWorkflowErrorCodes.GraphPermissionMissing => StatusCode(StatusCodes.Status403Forbidden, payload),
+                JoinWorkflowErrorCodes.CallJoinFailed7504Or7505 => StatusCode(StatusCodes.Status502BadGateway, payload),
+                _ => BadRequest(payload)
+            };
         }
         catch (InvalidOperationException ex)
         {
@@ -347,6 +394,37 @@ public sealed class JoinMeetingRequest
     /// </summary>
     [JsonProperty("joinAsGuest")]
     public bool JoinAsGuest { get; set; }
+
+    /// <summary>
+    /// Gets or sets requested join mode. Supported values:
+    /// policy_auto_invite, invite_and_graph_join.
+    /// </summary>
+    [JsonProperty("joinMode")]
+    public string? JoinMode { get; set; }
+
+    /// <summary>
+    /// Gets or sets an external meeting identifier for correlation.
+    /// </summary>
+    [JsonProperty("meetingId")]
+    public string? MeetingId { get; set; }
+
+    /// <summary>
+    /// Gets or sets the organizer tenant id when known.
+    /// </summary>
+    [JsonProperty("organizerTenantId")]
+    public string? OrganizerTenantId { get; set; }
+
+    /// <summary>
+    /// Gets or sets the scheduled start time in UTC.
+    /// </summary>
+    [JsonProperty("scheduledStartUtc")]
+    public DateTime? ScheduledStartUtc { get; set; }
+
+    /// <summary>
+    /// Gets or sets whether the bot attendee/service account is present on the invite.
+    /// </summary>
+    [JsonProperty("botAttendeePresent")]
+    public bool BotAttendeePresent { get; set; } = true;
 }
 
 /// <summary>
@@ -357,7 +435,7 @@ public sealed class JoinMeetingResponse
     /// <summary>
     /// Gets or sets the call ID assigned by Graph Communications SDK.
     /// </summary>
-    public required string CallId { get; init; }
+    public string? CallId { get; init; }
 
     /// <summary>
     /// Gets or sets a human-readable status message.
@@ -368,6 +446,35 @@ public sealed class JoinMeetingResponse
     /// Gets or sets the join URL that was used.
     /// </summary>
     public required string JoinUrl { get; init; }
+
+    /// <summary>
+    /// Gets or sets the selected join mode used by the workflow.
+    /// </summary>
+    public required string JoinMode { get; init; }
+
+    /// <summary>
+    /// Gets or sets the effective tenant id used for join operations.
+    /// </summary>
+    public required string EffectiveTenantId { get; init; }
+
+    /// <summary>
+    /// Gets or sets optional external meeting correlation id.
+    /// </summary>
+    public string? MeetingId { get; init; }
+
+    /// <summary>
+    /// Gets or sets whether join execution is deferred awaiting policy auto-invite.
+    /// </summary>
+    public bool Deferred { get; init; }
+}
+
+/// <summary>
+/// Error model for join workflow failures.
+/// </summary>
+public sealed class JoinMeetingErrorResponse
+{
+    public required string Error { get; init; }
+    public required string ErrorCode { get; init; }
 }
 
 /// <summary>

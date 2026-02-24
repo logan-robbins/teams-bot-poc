@@ -46,10 +46,12 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
 {
     private readonly BotConfiguration _botConfig;
     private readonly MediaPlatformConfiguration _mediaConfig;
+    private readonly JoinModeSettings _joinModeSettings;
     private readonly ILogger<TeamsCallingBotService> _logger;
     private readonly IGraphLogger _graphLogger;
     private readonly TranscriberFactory _transcriberFactory;
     private readonly ConcurrentDictionary<string, IRealtimeTranscriber> _pendingTranscribers = new();
+    private readonly ConcurrentDictionary<string, string> _callIdToMeetingId = new();
 
     private ICommunicationsClient? _client;
     private bool _isDisposed;
@@ -99,6 +101,7 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
     public TeamsCallingBotService(
         BotConfiguration botConfig,
         MediaPlatformConfiguration mediaConfig,
+        JoinModeSettings joinModeSettings,
         ILogger<TeamsCallingBotService> logger,
         IGraphLogger graphLogger,
         IServiceProvider serviceProvider,
@@ -106,12 +109,14 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(botConfig);
         ArgumentNullException.ThrowIfNull(mediaConfig);
+        ArgumentNullException.ThrowIfNull(joinModeSettings);
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(graphLogger);
         ArgumentNullException.ThrowIfNull(transcriberFactory);
         
         _botConfig = botConfig;
         _mediaConfig = mediaConfig;
+        _joinModeSettings = joinModeSettings;
         _logger = logger;
         _graphLogger = graphLogger;
         _transcriberFactory = transcriberFactory;
@@ -265,6 +270,14 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
             "Call added to collection: CallId={CallId}, ThreadId={ThreadId}",
             call.Id,
             threadId);
+
+        if (_callIdToMeetingId.TryGetValue(call.Id, out var meetingId))
+        {
+            _logger.LogInformation(
+                "Call {CallId} correlated to meeting metadata MeetingId={MeetingId}",
+                call.Id,
+                meetingId);
+        }
         
         // Get or create transcriber (may have been pre-registered by JoinMeetingAsync)
         var transcriber = GetOrCreateTranscriber(threadId);
@@ -303,6 +316,7 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
         
         // Clean up any pending transcribers that weren't used
         _pendingTranscribers.TryRemove(threadId, out _);
+        _callIdToMeetingId.TryRemove(call.Id, out _);
     }
 
     /// <summary>
@@ -352,6 +366,88 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
     }
 
     /// <summary>
+    /// Canonical join workflow that resolves tenant mode and executes a single join path.
+    /// </summary>
+    /// <param name="command">Join command with meeting metadata and mode hints.</param>
+    /// <param name="transcriber">Transcriber instance to bind to the created call.</param>
+    /// <returns>A structured result including effective mode and call id when applicable.</returns>
+    /// <exception cref="JoinWorkflowException">Thrown when prerequisites or policy checks fail.</exception>
+    public async Task<JoinMeetingWorkflowResult> JoinMeetingWithModeAsync(
+        JoinMeetingCommand command,
+        IRealtimeTranscriber transcriber)
+    {
+        ObjectDisposedException.ThrowIf(_isDisposed, this);
+        ArgumentNullException.ThrowIfNull(command);
+        ArgumentNullException.ThrowIfNull(transcriber);
+        ArgumentException.ThrowIfNullOrWhiteSpace(command.JoinUrl);
+
+        var effectiveTenantId = ResolveEffectiveTenantId(command.OrganizerTenantId);
+        var mode = ResolveJoinMode(command.RequestedJoinMode, effectiveTenantId);
+
+        _logger.LogInformation(
+            "Join workflow resolved: RequestedMode={RequestedMode}, SelectedMode={SelectedMode}, Tenant={TenantId}, MeetingId={MeetingId}, ScheduledStartUtc={ScheduledStartUtc}, BotAttendeePresent={BotAttendeePresent}",
+            mode.RequestedMode,
+            mode.SelectedMode,
+            mode.EffectiveTenantId,
+            command.MeetingId,
+            command.ScheduledStartUtc,
+            command.BotAttendeePresent);
+
+        if (string.Equals(mode.SelectedMode, JoinModeNames.PolicyAutoInvite, StringComparison.Ordinal))
+        {
+            return new JoinMeetingWorkflowResult
+            {
+                SelectedJoinMode = mode.SelectedMode,
+                EffectiveTenantId = mode.EffectiveTenantId,
+                MeetingId = command.MeetingId,
+                Deferred = true,
+                Message = "Policy auto-invite mode selected. Waiting for Teams to invite bot via calling webhook."
+            };
+        }
+
+        if (mode.RequireBotAttendeeForInviteJoin && !command.BotAttendeePresent)
+        {
+            throw new JoinWorkflowException(
+                JoinWorkflowErrorCodes.BotNotInvited,
+                "Bot attendee is required for invite_and_graph_join mode but BotAttendeePresent was false.");
+        }
+
+        try
+        {
+            var callId = await JoinMeetingAsync(
+                    command.JoinUrl,
+                    command.DisplayName,
+                    command.JoinAsGuest,
+                    transcriber,
+                    effectiveTenantId)
+                .ConfigureAwait(false);
+
+            if (!string.IsNullOrWhiteSpace(command.MeetingId))
+            {
+                _callIdToMeetingId[callId] = command.MeetingId;
+            }
+
+            return new JoinMeetingWorkflowResult
+            {
+                SelectedJoinMode = mode.SelectedMode,
+                EffectiveTenantId = mode.EffectiveTenantId,
+                CallId = callId,
+                MeetingId = command.MeetingId,
+                Deferred = false,
+                Message = "Bot is joining the meeting."
+            };
+        }
+        catch (JoinWorkflowException)
+        {
+            throw;
+        }
+        catch (Exception ex) when (TryMapJoinFailure(ex, out var mapped))
+        {
+            throw mapped;
+        }
+    }
+
+    /// <summary>
     /// Joins a Teams meeting using the provided join URL.
     /// </summary>
     /// <remarks>
@@ -380,7 +476,8 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
         string joinUrl,
         string displayName,
         bool joinAsGuest,
-        IRealtimeTranscriber transcriber)
+        IRealtimeTranscriber transcriber,
+        string? preferredTenantId = null)
     {
         ObjectDisposedException.ThrowIf(_isDisposed, this);
         ArgumentException.ThrowIfNullOrWhiteSpace(joinUrl);
@@ -410,13 +507,13 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
         if (shortUrlMatch.Success)
         {
             (call, threadId) = await JoinMeetingWithShortUrlAsync(
-                shortUrlMatch, mediaSession, scenarioId, displayName, joinAsGuest, transcriber)
+                shortUrlMatch, mediaSession, scenarioId, displayName, joinAsGuest, transcriber, preferredTenantId)
                 .ConfigureAwait(false);
         }
         else
         {
             (call, threadId) = await JoinMeetingWithLegacyUrlAsync(
-                joinUrl, mediaSession, scenarioId, displayName, joinAsGuest, transcriber)
+                joinUrl, mediaSession, scenarioId, displayName, joinAsGuest, transcriber, preferredTenantId)
                 .ConfigureAwait(false);
         }
 
@@ -434,7 +531,8 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
         Guid scenarioId,
         string displayName,
         bool joinAsGuest,
-        IRealtimeTranscriber transcriber)
+        IRealtimeTranscriber transcriber,
+        string? preferredTenantId)
     {
         var meetingId = shortUrlMatch.Groups["meetingId"].Value;
         var passcode = shortUrlMatch.Groups["passcode"].Success ? shortUrlMatch.Groups["passcode"].Value : null;
@@ -465,7 +563,7 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
 
         var joinParams = new JoinMeetingParameters(null, meetingInfo, mediaSession)
         {
-            TenantId = _botConfig.TenantId
+            TenantId = string.IsNullOrWhiteSpace(preferredTenantId) ? _botConfig.TenantId : preferredTenantId
         };
 
         ConfigureGuestIdentity(joinParams, displayName, joinAsGuest);
@@ -483,14 +581,17 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
         Guid scenarioId,
         string displayName,
         bool joinAsGuest,
-        IRealtimeTranscriber transcriber)
+        IRealtimeTranscriber transcriber,
+        string? preferredTenantId)
     {
         var (chatInfo, meetingInfo) = ParseJoinUrl(joinUrl);
 
         var tenantId = meetingInfo.Organizer?.GetPrimaryIdentity()?.GetTenantId();
         var joinParams = new JoinMeetingParameters(chatInfo, meetingInfo, mediaSession)
         {
-            TenantId = string.IsNullOrWhiteSpace(tenantId) ? _botConfig.TenantId : tenantId
+            TenantId = !string.IsNullOrWhiteSpace(preferredTenantId)
+                ? preferredTenantId
+                : (string.IsNullOrWhiteSpace(tenantId) ? _botConfig.TenantId : tenantId)
         };
 
         ConfigureGuestIdentity(joinParams, displayName, joinAsGuest);
@@ -549,6 +650,140 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
 
         // If no pending transcriber, create a new one using the factory
         return _transcriberFactory.Create();
+    }
+
+    private string ResolveEffectiveTenantId(string? organizerTenantId)
+    {
+        if (!string.IsNullOrWhiteSpace(organizerTenantId))
+        {
+            return organizerTenantId.Trim();
+        }
+
+        if (!string.IsNullOrWhiteSpace(_botConfig.TenantId))
+        {
+            return _botConfig.TenantId.Trim();
+        }
+
+        throw new JoinWorkflowException(
+            JoinWorkflowErrorCodes.TenantNotEnabledForMode,
+            "No organizer tenant id was provided and Bot.TenantId is empty.");
+    }
+
+    private ResolvedJoinMode ResolveJoinMode(string? requestedJoinMode, string effectiveTenantId)
+    {
+        var preferredMode = JoinModeParser.NormalizeOrThrow(
+            _joinModeSettings.PreferredMode,
+            "JoinMode.PreferredMode");
+
+        var policyEnabled = _joinModeSettings.PolicyAutoInviteEnabled;
+        var autoFallback = _joinModeSettings.AutoFallbackToInviteAndGraphJoin;
+        var requireBotAttendee = _joinModeSettings.RequireBotAttendeeForInviteJoin;
+
+        if (_joinModeSettings.TenantOverrides.TryGetValue(effectiveTenantId, out var tenantOverride))
+        {
+            if (!string.IsNullOrWhiteSpace(tenantOverride.PreferredMode))
+            {
+                preferredMode = JoinModeParser.NormalizeOrThrow(
+                    tenantOverride.PreferredMode,
+                    $"JoinMode.TenantOverrides['{effectiveTenantId}'].PreferredMode");
+            }
+
+            if (tenantOverride.PolicyAutoInviteEnabled.HasValue)
+            {
+                policyEnabled = tenantOverride.PolicyAutoInviteEnabled.Value;
+            }
+
+            if (tenantOverride.AutoFallbackToInviteAndGraphJoin.HasValue)
+            {
+                autoFallback = tenantOverride.AutoFallbackToInviteAndGraphJoin.Value;
+            }
+
+            if (tenantOverride.RequireBotAttendeeForInviteJoin.HasValue)
+            {
+                requireBotAttendee = tenantOverride.RequireBotAttendeeForInviteJoin.Value;
+            }
+        }
+
+        var requestedMode = string.IsNullOrWhiteSpace(requestedJoinMode)
+            ? preferredMode
+            : JoinModeParser.NormalizeOrThrow(requestedJoinMode, "joinMode");
+
+        var selectedMode = requestedMode;
+        if (string.Equals(requestedMode, JoinModeNames.PolicyAutoInvite, StringComparison.Ordinal) && !policyEnabled)
+        {
+            if (autoFallback)
+            {
+                _logger.LogWarning(
+                    "Policy mode requested but tenant {TenantId} is not enabled. Falling back to {FallbackMode}.",
+                    effectiveTenantId,
+                    JoinModeNames.InviteAndGraphJoin);
+                selectedMode = JoinModeNames.InviteAndGraphJoin;
+            }
+            else
+            {
+                throw new JoinWorkflowException(
+                    JoinWorkflowErrorCodes.TenantNotEnabledForMode,
+                    $"Tenant '{effectiveTenantId}' is not enabled for '{JoinModeNames.PolicyAutoInvite}'.");
+            }
+        }
+
+        return new ResolvedJoinMode
+        {
+            RequestedMode = requestedMode,
+            SelectedMode = selectedMode,
+            EffectiveTenantId = effectiveTenantId,
+            PolicyAutoInviteEnabled = policyEnabled,
+            AutoFallbackToInviteAndGraphJoin = autoFallback,
+            RequireBotAttendeeForInviteJoin = requireBotAttendee
+        };
+    }
+
+    private static bool TryMapJoinFailure(Exception ex, out JoinWorkflowException mappedException)
+    {
+        var text = ex.ToString();
+        if (ContainsAny(
+                text,
+                "7504",
+                "7505",
+                "Insufficient enterprise tenant permissions",
+                "Request authorization tenant mismatch"))
+        {
+            mappedException = new JoinWorkflowException(
+                JoinWorkflowErrorCodes.CallJoinFailed7504Or7505,
+                "Call join failed with tenant-level authorization constraints (7504/7505).",
+                ex);
+            return true;
+        }
+
+        if (ContainsAny(
+                text,
+                "Insufficient privileges",
+                "Authorization_RequestDenied",
+                "access denied",
+                "forbidden"))
+        {
+            mappedException = new JoinWorkflowException(
+                JoinWorkflowErrorCodes.GraphPermissionMissing,
+                "Graph permissions are missing or admin consent is incomplete for join operation.",
+                ex);
+            return true;
+        }
+
+        mappedException = null!;
+        return false;
+    }
+
+    private static bool ContainsAny(string source, params string[] values)
+    {
+        foreach (var value in values)
+        {
+            if (source.Contains(value, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -642,6 +877,7 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
         
         CallHandlers.Clear();
         _pendingTranscribers.Clear();
+        _callIdToMeetingId.Clear();
 
         _logger.LogInformation("Bot service shutdown complete");
     }

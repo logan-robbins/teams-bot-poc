@@ -123,8 +123,50 @@ Join meeting:
 ```bash
 curl -X POST <bot-base-url>/api/calling/join \
   -H "Content-Type: application/json" \
-  -d '{"joinUrl":"<teams-meeting-join-url>","displayName":"<bot-display-name>"}'
+  -d '{
+    "joinUrl":"<teams-meeting-join-url>",
+    "displayName":"<bot-display-name>",
+    "meetingId":"<external-meeting-id>",
+    "organizerTenantId":"<tenant-id>",
+    "botAttendeePresent":true,
+    "joinMode":"invite_and_graph_join"
+  }'
 ```
+
+Policy-mode request (deferred until Teams auto-invites bot):
+
+```bash
+curl -X POST <bot-base-url>/api/calling/join \
+  -H "Content-Type: application/json" \
+  -d '{
+    "joinUrl":"<teams-meeting-join-url>",
+    "meetingId":"<external-meeting-id>",
+    "botAttendeePresent":true,
+    "joinMode":"policy_auto_invite"
+  }'
+```
+
+Join response behavior:
+- `200 OK`: explicit Graph join started, response includes `callId`
+- `202 Accepted`: policy mode selected; join is deferred awaiting incoming call webhook
+- `400 Bad Request`: failed fast (for example `BOT_NOT_INVITED`)
+- `403 Forbidden`: tenant/mode/permission issue (`TENANT_NOT_ENABLED_FOR_MODE`, `GRAPH_PERMISSION_MISSING`)
+- `502 Bad Gateway`: Graph join failed with known tenant authorization class (`CALL_JOIN_FAILED_7504_OR_7505`)
+
+## Join Mode Configuration
+
+The C# runtime reads optional `JoinMode` settings from bot config JSON.
+
+Supported modes:
+- `policy_auto_invite`
+- `invite_and_graph_join`
+
+Config keys:
+- `JoinMode.PreferredMode`
+- `JoinMode.PolicyAutoInviteEnabled`
+- `JoinMode.AutoFallbackToInviteAndGraphJoin`
+- `JoinMode.RequireBotAttendeeForInviteJoin`
+- `JoinMode.TenantOverrides.<tenant-id>.*`
 
 ### Teams app package
 

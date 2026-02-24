@@ -31,7 +31,7 @@ import argparse
 import asyncio
 import logging
 import sys
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Optional
 
 import httpx
@@ -57,6 +57,10 @@ async def join_meeting(
     bot_endpoint: str,
     meeting_url: str,
     display_name: str,
+    bot_attendee_present: bool,
+    meeting_id: Optional[str] = None,
+    organizer_tenant_id: Optional[str] = None,
+    join_mode: Optional[str] = None,
     dry_run: bool = False,
 ) -> bool:
     """
@@ -75,7 +79,14 @@ async def join_meeting(
     payload = {
         "joinUrl": meeting_url,
         "displayName": display_name,
+        "botAttendeePresent": bot_attendee_present,
     }
+    if meeting_id:
+        payload["meetingId"] = meeting_id
+    if organizer_tenant_id:
+        payload["organizerTenantId"] = organizer_tenant_id
+    if join_mode:
+        payload["joinMode"] = join_mode
 
     if dry_run:
         logger.info(f"[DRY RUN] Would POST to: {join_url}")
@@ -84,6 +95,7 @@ async def join_meeting(
 
     logger.info(f"Joining meeting via: {join_url}")
     logger.info(f"Display name: {display_name}")
+    logger.info(f"Bot attendee present: {bot_attendee_present}")
 
     try:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
@@ -175,6 +187,10 @@ async def auto_join(
     bot_endpoint: str = DEFAULT_BOT_ENDPOINT,
     sink_endpoint: str = DEFAULT_SINK_ENDPOINT,
     display_name: str = DEFAULT_DISPLAY_NAME,
+    bot_attendee_present: bool = True,
+    meeting_id: Optional[str] = None,
+    organizer_tenant_id: Optional[str] = None,
+    join_mode: Optional[str] = None,
     dry_run: bool = False,
 ) -> bool:
     """
@@ -197,19 +213,35 @@ async def auto_join(
     logger.info("=" * 60)
     logger.info("Talestral - Auto Join")
     logger.info("=" * 60)
-    logger.info(f"Timestamp: {datetime.utcnow().isoformat()}Z")
+    logger.info(f"Timestamp: {datetime.now(UTC).isoformat().replace('+00:00', 'Z')}")
     logger.info(f"Meeting URL: {meeting_url[:80]}..." if len(meeting_url) > 80 else f"Meeting URL: {meeting_url}")
     logger.info(f"Candidate: {candidate_name}")
     logger.info(f"Bot Endpoint: {bot_endpoint}")
     logger.info(f"Sink Endpoint: {sink_endpoint}")
     logger.info(f"Display Name: {display_name}")
+    logger.info(f"Bot Attendee Present: {bot_attendee_present}")
+    if meeting_id:
+        logger.info(f"Meeting ID: {meeting_id}")
+    if organizer_tenant_id:
+        logger.info(f"Organizer Tenant ID: {organizer_tenant_id}")
+    if join_mode:
+        logger.info(f"Requested Join Mode: {join_mode}")
     if dry_run:
         logger.info("MODE: DRY RUN (no actual requests will be made)")
     logger.info("-" * 60)
 
     # Step 1: Join meeting
     logger.info("Step 1: Joining Teams meeting...")
-    join_success = await join_meeting(bot_endpoint, meeting_url, display_name, dry_run)
+    join_success = await join_meeting(
+        bot_endpoint=bot_endpoint,
+        meeting_url=meeting_url,
+        display_name=display_name,
+        bot_attendee_present=bot_attendee_present,
+        meeting_id=meeting_id,
+        organizer_tenant_id=organizer_tenant_id,
+        join_mode=join_mode,
+        dry_run=dry_run,
+    )
     if not join_success:
         logger.error("Failed to join meeting. Aborting.")
         return False
@@ -291,6 +323,40 @@ Examples:
     )
 
     parser.add_argument(
+        "--meeting-id",
+        default=None,
+        help="External meeting identifier for correlation",
+    )
+
+    parser.add_argument(
+        "--organizer-tenant-id",
+        default=None,
+        help="Organizer tenant id used for tenant-aware join-mode resolution",
+    )
+
+    parser.add_argument(
+        "--join-mode",
+        choices=["policy_auto_invite", "invite_and_graph_join"],
+        default=None,
+        help="Optional join mode override (default: server-side tenant configuration)",
+    )
+
+    attendee_group = parser.add_mutually_exclusive_group()
+    attendee_group.add_argument(
+        "--bot-attendee-present",
+        dest="bot_attendee_present",
+        action="store_true",
+        help="Assert the bot/service account is present on the meeting invite (default)",
+    )
+    attendee_group.add_argument(
+        "--bot-attendee-missing",
+        dest="bot_attendee_present",
+        action="store_false",
+        help="Indicate the bot attendee is not on the invite (will fail fast in invite mode)",
+    )
+    parser.set_defaults(bot_attendee_present=True)
+
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print what would be done without making actual requests",
@@ -322,6 +388,10 @@ def main() -> int:
             bot_endpoint=args.bot_endpoint,
             sink_endpoint=args.sink_endpoint,
             display_name=args.display_name,
+            bot_attendee_present=args.bot_attendee_present,
+            meeting_id=args.meeting_id,
+            organizer_tenant_id=args.organizer_tenant_id,
+            join_mode=args.join_mode,
             dry_run=args.dry_run,
         )
     )
