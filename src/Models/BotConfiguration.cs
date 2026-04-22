@@ -219,4 +219,50 @@ public sealed class TranscriptSinkConfiguration
     /// </summary>
     /// <example>https://agent.example.com/transcript</example>
     public required string PythonEndpoint { get; init; }
+
+    /// <summary>
+    /// Gets or sets the Python endpoint URL for receiving meeting-chat events.
+    /// Typically the sink's /chat endpoint (e.g. https://agent.example.com/chat).
+    /// When null, the bot does not forward chat messages to the sink.
+    /// </summary>
+    public string? ChatEndpoint { get; init; }
+}
+
+/// <summary>
+/// Meeting-chat integration config (Alfred).
+///
+/// Covers both directions:
+///   - Inbound (Graph change-notification subscription on the meeting chat thread).
+///   - Outbound (Bot Framework proactive messages via ContinueConversationAsync).
+/// </summary>
+public sealed class MeetingChatConfiguration
+{
+    /// <summary>Enables the entire meeting-chat path. Defaults to true on this branch.</summary>
+    public bool Enabled { get; init; } = true;
+
+    /// <summary>
+    /// Public HTTPS base URL the bot exposes for Graph change-notification callbacks.
+    /// Must reach /api/graph-notifications on this process from the public internet.
+    /// </summary>
+    public string? GraphNotificationBaseUrl { get; init; }
+
+    /// <summary>
+    /// Path to a PFX or CER file holding the RSA 2048+ cert used to decrypt Graph
+    /// change-notification resource data. If null, subscriptions are created with
+    /// includeResourceData=false and each notification triggers a GET fetch.
+    /// </summary>
+    public string? GraphSubscriptionEncryptionCertPath { get; init; }
+
+    /// <summary>Opaque clientState secret echoed in Graph notifications for auth.</summary>
+    public string? ChatSubscriptionClientStateSecret { get; init; }
+
+    /// <summary>Max outbound rps into the meeting chat. Soft-caps well under the Teams 8 rps limit.</summary>
+    public double ChatSendMaxRps { get; init; } = 4.0;
+
+    /// <summary>
+    /// Fully-qualified Teams app catalog id for Alfred, used by the optional
+    /// programmatic install path. If null, the bot skips auto-install and assumes
+    /// the app is installed via admin policy / scripts/install-bot-in-chat.ps1.
+    /// </summary>
+    public string? TeamsAppCatalogId { get; init; }
 }

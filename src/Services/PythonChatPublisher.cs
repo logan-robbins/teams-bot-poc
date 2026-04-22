@@ -1,0 +1,92 @@
+using System.Net.Http.Json;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using TeamsMediaBot.Models;
+
+namespace TeamsMediaBot.Services;
+
+/// <summary>
+/// Forwards meeting-chat events to the Python sink's /chat endpoint.
+///
+/// Mirrors the shape of <see cref="PythonTranscriptPublisher"/> for /transcript.
+/// The sink expects snake_case keys and a schema matching ChatMessageRequest
+/// in python/transcript_sink.py.
+/// </summary>
+public sealed class PythonChatPublisher
+{
+    private static readonly JsonSerializerOptions SerializerOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+    };
+
+    private readonly HttpClient _httpClient;
+    private readonly ILogger<PythonChatPublisher> _logger;
+    private readonly TranscriptSinkConfiguration _config;
+
+    public PythonChatPublisher(
+        HttpClient httpClient,
+        TranscriptSinkConfiguration config,
+        ILogger<PythonChatPublisher> logger)
+    {
+        _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
+        _config = config ?? throw new ArgumentNullException(nameof(config));
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+    }
+
+    public bool IsConfigured => !string.IsNullOrWhiteSpace(_config.ChatEndpoint);
+
+    public async Task PublishAsync(ChatEventPayload payload, CancellationToken cancellationToken = default)
+    {
+        if (!IsConfigured)
+        {
+            _logger.LogDebug("PythonChatPublisher disabled (ChatEndpoint not configured); dropping event {MessageId}", payload.MessageId);
+            return;
+        }
+
+        try
+        {
+            using var response = await _httpClient.PostAsJsonAsync(
+                _config.ChatEndpoint,
+                payload,
+                SerializerOptions,
+                cancellationToken);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var body = await response.Content.ReadAsStringAsync(cancellationToken);
+                _logger.LogWarning(
+                    "Chat sink returned {Status}: {Body}",
+                    (int)response.StatusCode,
+                    body.Length > 200 ? body[..200] : body);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to POST chat event {MessageId} to {Endpoint}",
+                payload.MessageId, _config.ChatEndpoint);
+        }
+    }
+}
+
+/// <summary>
+/// Wire shape sent to the Python sink's /chat endpoint.
+/// Must stay in sync with ChatMessageRequest in python/transcript_sink.py.
+/// </summary>
+public sealed record ChatEventPayload
+{
+    [JsonPropertyName("event_type")] public string EventType { get; init; } = "chat_created";
+    [JsonPropertyName("chat_thread_id")] public required string ChatThreadId { get; init; }
+    [JsonPropertyName("message_id")] public required string MessageId { get; init; }
+    public string? Text { get; init; }
+    public string? Html { get; init; }
+    [JsonPropertyName("sender_id")] public string? SenderId { get; init; }
+    [JsonPropertyName("sender_display_name")] public string? SenderDisplayName { get; init; }
+    [JsonPropertyName("timestamp_utc")] public required string TimestampUtc { get; init; }
+    [JsonPropertyName("conversation_reference_id")] public string? ConversationReferenceId { get; init; }
+    public List<Dictionary<string, object?>> Attachments { get; init; } = new();
+    public List<Dictionary<string, object?>> Mentions { get; init; } = new();
+    [JsonPropertyName("reply_to_message_id")] public string? ReplyToMessageId { get; init; }
+    [JsonPropertyName("from_bot")] public bool FromBot { get; init; }
+    public Dictionary<string, object?>? Raw { get; init; }
+}

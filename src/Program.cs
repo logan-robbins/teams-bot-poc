@@ -6,6 +6,9 @@
 // streams it to STT providers (Deepgram/Azure Speech).
 // ==============================================
 
+using Microsoft.Bot.Builder;
+using Microsoft.Bot.Builder.Integration.AspNet.Core;
+using Microsoft.Bot.Connector.Authentication;
 using Microsoft.Graph.Communications.Common.Telemetry;
 using Serilog;
 using System.Security.Cryptography.X509Certificates;
@@ -49,6 +52,8 @@ try
     var transcriptSinkConfig = LoadRequiredConfiguration<TranscriptSinkConfiguration>(builder.Configuration, "TranscriptSink");
     var joinModeSettings = builder.Configuration.GetSection("JoinMode").Get<JoinModeSettings>()
         ?? new JoinModeSettings();
+    var meetingChatConfig = builder.Configuration.GetSection("MeetingChat").Get<MeetingChatConfiguration>()
+        ?? new MeetingChatConfiguration();
 
     // Configure Kestrel to listen on the specified URL with TLS if configured
     ConfigureKestrel(builder, botConfig, mediaConfig);
@@ -59,6 +64,20 @@ try
     builder.Services.AddSingleton(sttConfig);
     builder.Services.AddSingleton(transcriptSinkConfig);
     builder.Services.AddSingleton(joinModeSettings);
+    builder.Services.AddSingleton(meetingChatConfig);
+
+    // Bot Framework adapter for Alfred's proactive-messaging chat send path.
+    // Graph has no application-permission alternative for posting chat in 2026,
+    // so this is the only compliant route.
+    builder.Services.AddSingleton<BotFrameworkAuthentication>(sp =>
+        new ConfigurationBotFrameworkAuthentication(sp.GetRequiredService<IConfiguration>()));
+    builder.Services.AddSingleton<IBotFrameworkHttpAdapter, CloudAdapter>();
+    builder.Services.AddSingleton<IConversationReferenceStore, InMemoryConversationReferenceStore>();
+    builder.Services.AddSingleton<IBot, AlfredBot>();
+
+    // Meeting-chat services (inbound chat → Python sink; Graph subscription lifecycle).
+    builder.Services.AddSingleton<IMeetingChatService, MeetingChatService>();
+    builder.Services.AddHttpClient<PythonChatPublisher>();
 
     // Register Graph Communications logger
     builder.Services.AddSingleton<IGraphLogger>(sp =>

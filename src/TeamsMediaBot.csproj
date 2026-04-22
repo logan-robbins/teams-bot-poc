@@ -43,12 +43,19 @@
     
     <!-- ASP.NET Core for webhook endpoints -->
     <PackageReference Include="Microsoft.AspNetCore.Mvc.NewtonsoftJson" Version="8.0.*" />
-    
+
+    <!-- Bot Framework — Alfred's outbound chat path uses proactive messaging
+         via CloudAdapter.ContinueConversationAsync. There is no 2026 Graph
+         app-permission alternative that's compliant for live bot messaging. -->
+    <PackageReference Include="Microsoft.Bot.Builder" Version="4.22.*" />
+    <PackageReference Include="Microsoft.Bot.Builder.Integration.AspNet.Core" Version="4.22.*" />
+    <PackageReference Include="Microsoft.Bot.Builder.Dialogs" Version="4.22.*" />
+
     <!-- Logging and Configuration -->
     <PackageReference Include="Serilog.AspNetCore" Version="8.0.*" />
     <PackageReference Include="Serilog.Sinks.Console" Version="6.0.*" />
     <PackageReference Include="Serilog.Sinks.File" Version="6.0.*" />
-    
+
     <!-- HTTP Client -->
     <PackageReference Include="System.Net.Http.Json" Version="8.0.*" />
   </ItemGroup>

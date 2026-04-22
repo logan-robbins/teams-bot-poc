@@ -1,9 +1,9 @@
 {
-  "$schema": "https://developer.microsoft.com/json-schemas/teams/v1.11/MicrosoftTeams.schema.json",
-  "manifestVersion": "1.11",
-  "version": "1.0.3",
+  "$schema": "https://developer.microsoft.com/json-schemas/teams/v1.21/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.21",
+  "version": "1.0.4",
   "id": "ff4b0902-5ae8-450b-bf45-7e2338292554",
-  "packageName": "com.qmachina.teamsmediabotpoc",
+  "packageName": "com.qmachina.alfred",
   "developer": {
     "name": "QMachina",
     "websiteUrl": "https://qmachina.com",
@@ -11,12 +11,12 @@
     "termsOfUseUrl": "https://qmachina.com/terms"
   },
   "name": {
-    "short": "Talestral",
-    "full": "Talestral"
+    "short": "Alfred",
+    "full": "Alfred — Meeting Assistant"
   },
   "description": {
-    "short": "Internal POC: Real-time meeting transcription",
-    "full": "Internal proof-of-concept bot that joins Teams meetings, receives real-time audio, transcribes using Azure Speech, and streams transcripts to Python agent framework."
+    "short": "Passive meeting assistant: live transcription + chat I/O",
+    "full": "Alfred joins Teams meetings, captures real-time diarized audio, reads and writes the meeting chat, and surfaces live notes and summaries in an external workspace."
   },
   "icons": {
     "outline": "outline.png",
@@ -26,21 +26,14 @@
   "bots": [
     {
       "botId": "ff4b0902-5ae8-450b-bf45-7e2338292554",
-      "scopes": [
-        "personal",
-        "team",
-        "groupchat"
-      ],
+      "scopes": ["personal", "team", "groupchat"],
       "supportsFiles": false,
       "isNotificationOnly": false,
       "supportsCalling": true,
       "supportsVideo": false
     }
   ],
-  "permissions": [
-    "identity",
-    "messageTeamMembers"
-  ],
+  "permissions": ["identity", "messageTeamMembers"],
   "validDomains": [
     "teamsbot.qmachina.com",
     "media.qmachina.com",
@@ -53,5 +46,18 @@
       "scopes": ["groupchat"],
       "context": ["meetingChatTab", "meetingDetailsTab", "meetingSidePanel"]
     }
-  ]
+  ],
+  "authorization": {
+    "permissions": {
+      "resourceSpecific": [
+        { "name": "ChatMessage.Read.Chat", "type": "Application" },
+        { "name": "ChatMessageReadReceipt.Read.Chat", "type": "Application" },
+        { "name": "OnlineMeetingParticipant.Read.Chat", "type": "Application" },
+        { "name": "OnlineMeeting.ReadBasic.Chat", "type": "Application" },
+        { "name": "Calls.AccessMedia.Chat", "type": "Application" },
+        { "name": "Calls.JoinGroupCalls.Chat", "type": "Application" },
+        { "name": "TeamsActivity.Send.Chat", "type": "Application" }
+      ]
+    }
+  }
 }
