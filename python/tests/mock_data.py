@@ -11,7 +11,7 @@ import random
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from interview_agent.models import (
+from meeting_agent.models import (
     TranscriptEvent,
     EventMetadata,
     EventError,

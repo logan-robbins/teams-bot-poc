@@ -12,7 +12,7 @@ Components:
     - Models: Pydantic models for transcripts, sessions, and analysis items
 
 Example:
-    >>> from interview_agent import InterviewAnalyzer
+    >>> from meeting_agent import InterviewAnalyzer
     >>> 
     >>> analyzer = InterviewAnalyzer()  # Uses gpt-5 by default
     >>> result = await analyzer.analyze_async(

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import pytest
 
-from interview_agent.models import AnalysisItem
+from meeting_agent.models import AnalysisItem
 from variants import available_variants, load_variant
 
 

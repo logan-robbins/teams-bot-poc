@@ -36,14 +36,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from interview_agent.models import (
+from meeting_agent.models import (
     AnalysisItem,
     SessionAnalysis,
     TranscriptEvent,
 )
-from interview_agent.output import AnalysisOutputWriter
-from interview_agent.session import InterviewSessionManager
-from interview_agent.checklist_state import ChecklistDefinition, ChecklistStateManager
+from meeting_agent.output import AnalysisOutputWriter
+from meeting_agent.session import InterviewSessionManager
+from meeting_agent.checklist_state import ChecklistDefinition, ChecklistStateManager
 from legionmeet_platform import (
     AgentTool,
     PLATFORM_NAME,
@@ -169,9 +169,9 @@ AGENT_DEBOUNCE_SECONDS = float(os.environ.get("AGENT_DEBOUNCE_SECONDS", "1.8"))
 # =============================================================================
 
 try:
-    from interview_agent.agent import InterviewAnalyzer
-    from interview_agent.checklist import ChecklistAgent
-    from interview_agent.pubsub import ThoughtType, get_publisher
+    from meeting_agent.agent import InterviewAnalyzer
+    from meeting_agent.checklist import ChecklistAgent
+    from meeting_agent.pubsub import ThoughtType, get_publisher
 
     AGENT_AVAILABLE = True
     logger.info("InterviewAnalyzer loaded successfully")
@@ -182,7 +182,7 @@ except ImportError as e:
     get_publisher = None  # type: ignore[misc, assignment]
     ThoughtType = None  # type: ignore[misc, assignment]
     logger.warning(
-        "interview_agent.agent module not available: %s. "
+        "meeting_agent.agent module not available: %s. "
         "Agent analysis features disabled.",
         e,
     )

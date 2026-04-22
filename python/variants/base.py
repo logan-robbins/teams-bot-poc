@@ -7,7 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from interview_agent.models import AnalysisItem, TranscriptEvent
+from meeting_agent.models import AnalysisItem, TranscriptEvent
 
 
 @dataclass(frozen=True)

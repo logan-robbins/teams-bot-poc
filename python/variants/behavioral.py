@@ -4,7 +4,7 @@ Behavioral variant plugin.
 
 from __future__ import annotations
 
-from interview_agent.models import AnalysisItem
+from meeting_agent.models import AnalysisItem
 from variants.base import BaseVariantPlugin, ChecklistItem, VariantUiConfig
 from variants.shared_content import DEFAULT_INTERVIEW_SCRIPT
 
