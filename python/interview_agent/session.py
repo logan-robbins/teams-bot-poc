@@ -30,6 +30,13 @@ __all__ = ["InterviewSessionManager"]
 logger = logging.getLogger(__name__)
 
 
+CONSOLIDATION_WINDOW_SECONDS = 2.25
+SHORT_FRAGMENT_WORDS = 5
+DOMINANT_SPEAKER_MIN_CHARS = 24
+DOMINANT_SPEAKER_MIN_TURNS = 2
+DOMINANT_SPEAKER_SHARE = 0.68
+
+
 def _format_utc_timestamp(dt: datetime) -> str:
     """
     Format a datetime as ISO 8601 UTC string with 'Z' suffix.
@@ -41,6 +48,104 @@ def _format_utc_timestamp(dt: datetime) -> str:
         ISO 8601 formatted string ending with 'Z'.
     """
     return dt.isoformat().replace("+00:00", "Z")
+
+
+def _parse_utc_timestamp(timestamp: str | None) -> Optional[datetime]:
+    """Parse ISO UTC timestamps that may use a trailing 'Z'."""
+    if not timestamp:
+        return None
+    try:
+        normalized = timestamp.replace("Z", "+00:00")
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+
+def _normalize_token(token: str) -> str:
+    """Normalize a token for lightweight transcript deduplication."""
+    return token.strip().lower().strip(".,!?;:\"'()[]{}")
+
+
+def _normalize_text(text: str) -> str:
+    """Normalize transcript text for comparisons."""
+    return " ".join(_normalize_token(token) for token in text.split() if _normalize_token(token))
+
+
+def _merge_transcript_text(existing_text: str, new_text: str) -> str:
+    """Merge adjacent transcript fragments while avoiding duplicate words."""
+    existing = existing_text.strip()
+    incoming = new_text.strip()
+
+    if not existing:
+        return incoming
+    if not incoming:
+        return existing
+
+    existing_norm = _normalize_text(existing)
+    incoming_norm = _normalize_text(incoming)
+
+    if existing_norm == incoming_norm:
+        return incoming if len(incoming) > len(existing) else existing
+    if existing_norm and existing_norm in incoming_norm:
+        return incoming
+    if incoming_norm and incoming_norm in existing_norm:
+        return existing
+
+    existing_words = existing.split()
+    incoming_words = incoming.split()
+    max_overlap = min(len(existing_words), len(incoming_words), 6)
+
+    for overlap_size in range(max_overlap, 0, -1):
+        existing_tail = [_normalize_token(word) for word in existing_words[-overlap_size:]]
+        incoming_head = [_normalize_token(word) for word in incoming_words[:overlap_size]]
+        if existing_tail == incoming_head:
+            return " ".join(existing_words + incoming_words[overlap_size:])
+
+    return f"{existing} {incoming}".strip()
+
+
+def _should_merge_turn(
+    previous_turn: dict[str, str | None],
+    current_turn: dict[str, str | None],
+) -> bool:
+    """Determine whether two adjacent turns should be collapsed."""
+    previous_text = str(previous_turn.get("text") or "").strip()
+    current_text = str(current_turn.get("text") or "").strip()
+    if not previous_text or not current_text:
+        return False
+
+    previous_ts = _parse_utc_timestamp(previous_turn.get("timestamp"))
+    current_ts = _parse_utc_timestamp(current_turn.get("timestamp"))
+    if previous_ts and current_ts:
+        gap_seconds = (current_ts - previous_ts).total_seconds()
+        if gap_seconds < 0 or gap_seconds > CONSOLIDATION_WINDOW_SECONDS:
+            return False
+
+    previous_role = str(previous_turn.get("role") or "unknown")
+    current_role = str(current_turn.get("role") or "unknown")
+    if (
+        previous_role != current_role
+        and previous_role != "unknown"
+        and current_role != "unknown"
+    ):
+        return False
+
+    if previous_turn.get("speaker_id") == current_turn.get("speaker_id"):
+        return True
+
+    previous_norm = _normalize_text(previous_text)
+    current_norm = _normalize_text(current_text)
+    if not previous_norm or not current_norm:
+        return False
+
+    if previous_norm == current_norm:
+        return True
+    if previous_norm in current_norm or current_norm in previous_norm:
+        return True
+
+    previous_words = len(previous_text.split())
+    current_words = len(current_text.split())
+    return previous_words <= SHORT_FRAGMENT_WORDS or current_words <= SHORT_FRAGMENT_WORDS
 
 
 class InterviewSessionManager:
@@ -314,6 +419,100 @@ class InterviewSessionManager:
             events = events[-count:] if len(events) > count else events
         
         return events
+
+    def get_recent_conversation(self, count: int = 10) -> list[dict[str, str | None]]:
+        """
+        Return recent final transcript turns with light consolidation applied.
+
+        Adjacent short fragments are merged so diarization churn and STT chunking
+        do not create a bubble for every partial sentence fragment.
+        """
+        if self._session is None:
+            return []
+
+        recent_events = self.get_recent_transcripts(
+            count=max(count * 3, count),
+            final_only=True,
+        )
+        conversation: list[dict[str, str | None]] = []
+
+        for event in recent_events:
+            if not event.text or not event.text.strip():
+                continue
+
+            role = self.get_speaker_role(event.speaker_id) if event.speaker_id else None
+            turn: dict[str, str | None] = {
+                "speaker_id": event.speaker_id,
+                "role": role or "unknown",
+                "text": event.text.strip(),
+                "timestamp": event.timestamp_utc,
+            }
+
+            if conversation and _should_merge_turn(conversation[-1], turn):
+                previous = conversation[-1]
+                previous["text"] = _merge_transcript_text(
+                    str(previous.get("text") or ""),
+                    turn["text"] or "",
+                )
+                previous["timestamp"] = turn["timestamp"]
+
+                previous_role = str(previous.get("role") or "unknown")
+                current_role = str(turn.get("role") or "unknown")
+                if previous_role == "unknown" and current_role != "unknown":
+                    previous["role"] = current_role
+                    previous["speaker_id"] = turn["speaker_id"]
+
+                continue
+
+            conversation.append(turn)
+
+        return conversation[-count:] if len(conversation) > count else conversation
+
+    def infer_candidate_speaker_id(self, count: int = 12) -> Optional[str]:
+        """
+        Infer the candidate speaker from recent turns when no mapping exists.
+
+        This is intentionally conservative. It only returns a speaker when one
+        participant clearly dominates the recent conversation.
+        """
+        mapped_candidate = self.get_candidate_speaker_id()
+        if mapped_candidate is not None:
+            return mapped_candidate
+
+        speaker_stats: dict[str, dict[str, float]] = {}
+        for turn in self.get_recent_conversation(count=count):
+            speaker_id = turn.get("speaker_id")
+            text = str(turn.get("text") or "").strip()
+            if not speaker_id or not text:
+                continue
+
+            stats = speaker_stats.setdefault(
+                speaker_id,
+                {"chars": 0.0, "turns": 0.0},
+            )
+            stats["chars"] += len(text)
+            stats["turns"] += 1
+
+        if not speaker_stats:
+            return None
+        if len(speaker_stats) == 1:
+            return next(iter(speaker_stats))
+
+        dominant_speaker, dominant_stats = max(
+            speaker_stats.items(),
+            key=lambda item: (item[1]["chars"], item[1]["turns"]),
+        )
+        total_chars = sum(stats["chars"] for stats in speaker_stats.values())
+        dominant_share = dominant_stats["chars"] / total_chars if total_chars else 0.0
+
+        if (
+            dominant_stats["chars"] >= DOMINANT_SPEAKER_MIN_CHARS
+            and dominant_stats["turns"] >= DOMINANT_SPEAKER_MIN_TURNS
+            and dominant_share >= DOMINANT_SPEAKER_SHARE
+        ):
+            return dominant_speaker
+
+        return None
     
     def get_session_context(self) -> dict:
         """
@@ -343,19 +542,9 @@ class InterviewSessionManager:
                 "candidate_speaker_id": None,
             }
         
-        # Get recent conversation with speaker roles annotated
-        recent_events = self.get_recent_transcripts(count=20, final_only=True)
-        conversation = []
-        
-        for event in recent_events:
-            role = self.get_speaker_role(event.speaker_id) if event.speaker_id else "unknown"
-            conversation.append({
-                "speaker_id": event.speaker_id,
-                "role": role,
-                "text": event.text,
-                "timestamp": event.timestamp_utc,
-            })
-        
+        conversation = self.get_recent_conversation(count=20)
+        candidate_speaker_id = self.infer_candidate_speaker_id()
+
         return {
             "session_active": self.is_active,
             "session_id": self._session.session_id,
@@ -363,7 +552,7 @@ class InterviewSessionManager:
             "meeting_url": self._session.meeting_url,
             "started_at": self._session.started_at,
             "speaker_mappings": dict(self._speaker_roles),
-            "candidate_speaker_id": self.get_candidate_speaker_id(),
+            "candidate_speaker_id": candidate_speaker_id,
             "recent_conversation": conversation,
             "total_events": len(self._session.transcript_events),
             "final_events": len([

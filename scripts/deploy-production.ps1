@@ -1,15 +1,42 @@
 # Deploy Teams Media Bot to Production (Standardized)
 # Implements reliable clean/build/deploy cycle for Windows Server 2022
 
+param(
+    [string]$ProjectRoot = "C:\teams-bot-poc",
+    [string]$RepoUrl = "https://github.com/logan-robbins/teams-bot-poc.git",
+    [string]$RepoBranch = "main"
+)
+
 $ErrorActionPreference = "Stop"
-$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$RepoRoot = Split-Path -Parent $ScriptDir
-$SrcDir = Join-Path $RepoRoot "src"
+$RepoRoot = $ProjectRoot
+$SrcDir = Join-Path $ProjectRoot "src"
 $BinDir = Join-Path $SrcDir "bin"
 $ObjDir = Join-Path $SrcDir "obj"
 $ReleaseDir = Join-Path $BinDir "Release\net8.0"
 
 Write-Host "🚀 Starting Standardized Deployment..." -ForegroundColor Cyan
+
+# 0. Ensure repository is present and current
+Write-Host "📦 Ensuring repository is available..." -ForegroundColor Yellow
+$GitDir = Join-Path $RepoRoot ".git"
+if (-not (Test-Path $GitDir)) {
+    $RepoParent = Split-Path -Parent $RepoRoot
+    if (-not (Test-Path $RepoParent)) {
+        New-Item -ItemType Directory -Path $RepoParent -Force | Out-Null
+    }
+
+    git clone --branch $RepoBranch --single-branch $RepoUrl $RepoRoot
+}
+else {
+    Push-Location $RepoRoot
+    try {
+        git fetch origin $RepoBranch
+        git checkout $RepoBranch
+        git pull --ff-only origin $RepoBranch
+    } finally {
+        Pop-Location
+    }
+}
 
 # 1. Stop Service and Ensure Process Termination
 Write-Host "🛑 Stopping service and ensuring process termination..." -ForegroundColor Yellow

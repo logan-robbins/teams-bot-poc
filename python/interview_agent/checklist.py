@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 from agents import Agent, Runner, function_tool
-from openai import AsyncAzureOpenAI
+from openai import AsyncOpenAI
 
 from .models import AnalysisItem
 
@@ -191,7 +191,15 @@ class ChecklistAgentOutput(BaseModel):
 # =============================================================================
 
 
-def _get_openai_config() -> tuple[str, Optional[AsyncAzureOpenAI]]:
+def _build_azure_base_url(endpoint: str) -> str:
+    """Convert an Azure resource endpoint into the OpenAI-compatible v1 base URL."""
+    trimmed = endpoint.rstrip("/")
+    if trimmed.endswith("/openai/v1"):
+        return f"{trimmed}/"
+    return f"{trimmed}/openai/v1/"
+
+
+def _get_openai_config() -> tuple[str, Optional[AsyncOpenAI]]:
     """
     Determine OpenAI configuration based on environment variables.
     Uses a faster/smaller model for checklist updates (gpt-4o-mini preferred).
@@ -219,10 +227,9 @@ def _get_openai_config() -> tuple[str, Optional[AsyncAzureOpenAI]]:
             azure_deployment,
         )
 
-        azure_client = AsyncAzureOpenAI(
-            azure_endpoint=azure_endpoint,
+        azure_client = AsyncOpenAI(
+            base_url=_build_azure_base_url(azure_endpoint),
             api_key=azure_key,
-            api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2024-08-01-preview"),
         )
 
         return azure_deployment, azure_client
@@ -342,7 +349,7 @@ class ChecklistAgent:
         self,
         checklist_callback: Callable[[str, str, str], None],
         model: Optional[str] = None,
-        azure_client: Optional[AsyncAzureOpenAI] = None,
+        azure_client: Optional[AsyncOpenAI] = None,
     ) -> None:
         """
         Initialize the ChecklistAgent.
@@ -603,7 +610,7 @@ async def parallel_analysis(
 def create_checklist_agent(
     checklist_callback: Callable[[str, str, str], None],
     model: Optional[str] = None,
-    azure_client: Optional[AsyncAzureOpenAI] = None,
+    azure_client: Optional[AsyncOpenAI] = None,
 ) -> ChecklistAgent:
     """
     Factory function to create a configured ChecklistAgent.

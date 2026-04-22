@@ -21,7 +21,7 @@ from typing import Any, Optional
 from pathlib import Path
 
 from dotenv import load_dotenv
-from openai import AsyncAzureOpenAI, AsyncOpenAI
+from openai import AsyncOpenAI
 from openai.types.shared import Reasoning
 from pydantic import BaseModel, Field
 
@@ -38,6 +38,14 @@ _env_path = Path(__file__).parent.parent / ".env"
 load_dotenv(_env_path)
 
 logger = logging.getLogger(__name__)
+
+
+def _build_azure_base_url(endpoint: str) -> str:
+    """Convert an Azure resource endpoint into the OpenAI-compatible v1 base URL."""
+    trimmed = endpoint.rstrip("/")
+    if trimmed.endswith("/openai/v1"):
+        return f"{trimmed}/"
+    return f"{trimmed}/openai/v1/"
 
 
 def _configure_openai_client() -> tuple[str, bool]:
@@ -75,12 +83,16 @@ def _configure_openai_client() -> tuple[str, bool]:
                 "and AZURE_OPENAI_DEPLOYMENT environment variables"
             )
         
-        logger.info(f"Using Azure OpenAI: {azure_endpoint}, deployment: {azure_deployment}")
-        
-        azure_client = AsyncAzureOpenAI(
-            azure_endpoint=azure_endpoint,
+        base_url = _build_azure_base_url(azure_endpoint)
+        logger.info(
+            "Using Azure OpenAI v1: %s, deployment: %s",
+            base_url,
+            azure_deployment,
+        )
+
+        azure_client = AsyncOpenAI(
+            base_url=base_url,
             api_key=azure_key,
-            api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2024-08-01-preview"),
         )
         
         # Set as default client for the Agents SDK

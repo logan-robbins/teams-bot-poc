@@ -218,7 +218,15 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
     {
         try
         {
-            await call.AnswerAsync(mediaSession).ConfigureAwait(false);
+            var mediaConfig = new AppHostedMediaConfig
+            {
+                Blob = mediaSession.GetMediaConfiguration().ToString()
+            };
+
+            await call.AnswerAsync(
+                    mediaConfig,
+                    new[] { Modality.Audio })
+                .ConfigureAwait(false);
             _logger.LogInformation("Answered incoming call: {CallId}", call.Id);
         }
         catch (Exception ex)

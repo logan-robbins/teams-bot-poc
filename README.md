@@ -133,6 +133,18 @@ curl -X POST <bot-base-url>/api/calling/join \
   }'
 ```
 
+One-command operator path from the repo root:
+
+```bash
+./scripts/join_meeting.sh "<teams-meeting-join-url>" "<candidate-name>"
+```
+
+Dry run:
+
+```bash
+JOIN_DRY_RUN=1 ./scripts/join_meeting.sh "<teams-meeting-join-url>" "<candidate-name>"
+```
+
 Policy-mode request (deferred until Teams auto-invites bot):
 
 ```bash
@@ -145,6 +157,8 @@ curl -X POST <bot-base-url>/api/calling/join \
     "joinMode":"policy_auto_invite"
   }'
 ```
+
+`policy_auto_invite` is not just a runtime flag. It assumes tenant-side Teams compliance recording setup for the bot application instance and policy assignment. See `docs/TEAMS-AUTO-INVITE-SETUP.md`.
 
 Join response behavior:
 - `200 OK`: explicit Graph join started, response includes `callId`
@@ -161,12 +175,19 @@ Supported modes:
 - `policy_auto_invite`
 - `invite_and_graph_join`
 
+Recommended default:
+- Use `invite_and_graph_join` unless your tenant admin has completed the Teams compliance recording setup required for policy-driven auto-invite.
+
 Config keys:
 - `JoinMode.PreferredMode`
 - `JoinMode.PolicyAutoInviteEnabled`
 - `JoinMode.AutoFallbackToInviteAndGraphJoin`
 - `JoinMode.RequireBotAttendeeForInviteJoin`
 - `JoinMode.TenantOverrides.<tenant-id>.*`
+
+Auto-invite setup runbook:
+- `docs/TEAMS-AUTO-INVITE-SETUP.md`
+- `scripts/setup-policy-auto-invite.ps1`
 
 ### Teams app package
 
@@ -187,6 +208,7 @@ Run from `scripts/`:
 PowerShell entrypoints:
 
 ```bash
+pwsh ./bootstrap-production-vm.ps1
 pwsh ./deploy-production.ps1
 pwsh ./update-bot.ps1
 pwsh ./diagnose-bot.ps1

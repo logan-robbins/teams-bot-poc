@@ -15,7 +15,6 @@ Usage:
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import random
@@ -245,6 +244,7 @@ class ChatMessage:
     clarity: float | None = None
     key_points: list[str] = field(default_factory=list)
     follow_ups: list[str] = field(default_factory=list)
+    related_text: str = ""
 
 
 def init_state() -> None:
@@ -259,6 +259,7 @@ def init_state() -> None:
         st.session_state.running = False
         st.session_state.index = 0
         st.session_state.messages: list[ChatMessage] = []
+        st.session_state.seen_transcript_keys: set[str] = set()
         st.session_state.checklist = {
             item["id"]: ChecklistStatus.PENDING for item in CHECKLIST_ITEMS
         }
@@ -309,6 +310,28 @@ def fetch_session() -> dict[str, object] | None:
     return None
 
 
+def fetch_analysis(session_id: str) -> dict[str, object] | None:
+    """
+    Fetch persisted analysis for a session from the sink API.
+
+    The UI and API run in separate containers in production, so analysis must be
+    loaded over HTTP rather than from the UI container filesystem.
+    """
+    try:
+        with httpx.Client(timeout=HEALTH_CHECK_TIMEOUT_SECONDS) as client:
+            response = client.get(
+                f"{SINK_URL}/session/analysis",
+                params={"session_id": session_id},
+            )
+            if response.status_code == 200:
+                return response.json()
+    except httpx.ConnectError:
+        logger.debug("Failed to fetch analysis: connection error")
+    except httpx.TimeoutException:
+        logger.debug("Failed to fetch analysis: timeout")
+    return None
+
+
 def fmt_time(timestamp: str) -> str:
     """
     Format an ISO timestamp to HH:MM:SS display format.
@@ -324,6 +347,26 @@ def fmt_time(timestamp: str) -> str:
         return dt.strftime("%H:%M:%S")
     except (ValueError, AttributeError):
         return timestamp[:8] if len(timestamp) >= 8 else timestamp
+
+
+def track_session(session_data: dict[str, object]) -> str:
+    """
+    Keep UI state aligned to the active sink session.
+
+    Returns:
+        Current session id or empty string if unavailable.
+    """
+    session_id = session_data.get("session_id", "")
+    if not isinstance(session_id, str) or not session_id:
+        return ""
+
+    if st.session_state.current_session_id != session_id:
+        st.session_state.current_session_id = session_id
+        st.session_state.messages = []
+        st.session_state.analysis_count = 0
+        st.session_state.seen_transcript_keys = set()
+
+    return session_id
 
 
 def sync_checklist_state(session_payload: dict[str, object]) -> None:
@@ -348,6 +391,106 @@ def sync_checklist_state(session_payload: dict[str, object]) -> None:
         except ValueError:
             parsed_status = ChecklistStatus.PENDING
         st.session_state.checklist[item_id] = parsed_status
+
+
+def sync_live_transcript(session_payload: dict[str, object]) -> None:
+    """Populate transcript bubbles from the sink's live recent conversation."""
+    session = session_payload.get("session", {})
+    if not isinstance(session, dict) or not session.get("active"):
+        return
+
+    session_id = track_session(session)
+    if not session_id:
+        return
+
+    candidate_name = session.get("candidate_name")
+    if not isinstance(candidate_name, str) or not candidate_name:
+        candidate_name = "Candidate"
+
+    recent_conversation = session.get("recent_conversation", [])
+    if not isinstance(recent_conversation, list):
+        return
+
+    for turn in recent_conversation:
+        if not isinstance(turn, dict):
+            continue
+
+        text = turn.get("text")
+        timestamp = turn.get("timestamp")
+        role = turn.get("role")
+        speaker_id = turn.get("speaker_id")
+
+        if not isinstance(text, str) or not text.strip():
+            continue
+        if not isinstance(timestamp, str) or not timestamp:
+            continue
+
+        transcript_key = f"{session_id}|{timestamp}|{speaker_id}|{text}"
+        if transcript_key in st.session_state.seen_transcript_keys:
+            continue
+
+        if role == "candidate":
+            speaker = candidate_name
+        elif role == "interviewer":
+            speaker = "Interviewer"
+        else:
+            speaker = str(speaker_id or "Unknown")
+
+        st.session_state.messages.append(
+            ChatMessage(
+                id=str(uuid.uuid4()),
+                msg_type="transcript",
+                content=text,
+                speaker=speaker,
+                timestamp=fmt_time(timestamp),
+                session_id=session_id,
+            )
+        )
+        st.session_state.seen_transcript_keys.add(transcript_key)
+
+
+def get_detected_participants(session_data: dict[str, object]) -> list[tuple[str, str]]:
+    """Build a participant list from explicit mappings or live diarization turns."""
+    participants: list[tuple[str, str]] = []
+    seen_speakers: set[str] = set()
+
+    candidate_name = session_data.get("candidate_name")
+    if not isinstance(candidate_name, str) or not candidate_name:
+        candidate_name = "Candidate"
+
+    mappings = session_data.get("speaker_mappings", {})
+    if isinstance(mappings, dict):
+        for speaker_id, role in mappings.items():
+            if not isinstance(speaker_id, str):
+                continue
+            seen_speakers.add(speaker_id)
+            if role == "candidate":
+                participants.append((candidate_name, speaker_id))
+            elif role == "interviewer":
+                participants.append(("Interviewer", speaker_id))
+            else:
+                participants.append((str(role or speaker_id), speaker_id))
+
+    recent_conversation = session_data.get("recent_conversation", [])
+    if isinstance(recent_conversation, list):
+        for turn in recent_conversation:
+            if not isinstance(turn, dict):
+                continue
+
+            speaker_id = turn.get("speaker_id")
+            role = turn.get("role")
+            if not isinstance(speaker_id, str) or not speaker_id or speaker_id in seen_speakers:
+                continue
+
+            seen_speakers.add(speaker_id)
+            if role == "candidate":
+                participants.append((candidate_name, speaker_id))
+            elif role == "interviewer":
+                participants.append(("Interviewer", speaker_id))
+            else:
+                participants.append((speaker_id, speaker_id))
+
+    return participants
 
 
 def generate_event(speaker_id: str, text: str, audio_offset: float) -> dict[str, object]:
@@ -447,6 +590,7 @@ def start_sim() -> bool:
             st.session_state.running = True
             st.session_state.index = 0
             st.session_state.messages = []
+            st.session_state.seen_transcript_keys = set()
             st.session_state.checklist = {
                 item["id"]: ChecklistStatus.PENDING for item in CHECKLIST_ITEMS
             }
@@ -549,8 +693,8 @@ def poll_analysis() -> None:
     """
     Poll for new analysis results and update the chat display.
 
-    Reads analysis JSON files from the output directory and inserts
-    coaching messages after their corresponding transcript messages.
+    Reads analysis from the sink API and inserts coaching messages
+    after their corresponding transcript messages.
     """
     try:
         # Get current session ID to find the right analysis file
@@ -558,28 +702,23 @@ def poll_analysis() -> None:
         if not session:
             return
         sync_checklist_state(session)
+        sync_live_transcript(session)
 
         session_data = session.get("session", {})
         if not isinstance(session_data, dict) or not session_data.get("active"):
             return
 
-        session_id = session_data.get("session_id", "")
+        session_id = track_session(session_data)
         if not session_id:
             return
 
-        # If session changed, just update tracking
-        # NOTE: Don't clear messages here - start_sim() already cleared them
-        if st.session_state.current_session_id != session_id:
-            st.session_state.current_session_id = session_id
-            st.session_state.analysis_count = 0
-
-        # Look for this session's analysis file specifically
-        analysis_file = OUTPUT_DIR / f"{session_id}_analysis.json"
-        if not analysis_file.exists():
+        analysis_payload = fetch_analysis(session_id)
+        if not analysis_payload:
             return
 
-        with open(analysis_file, "r", encoding="utf-8") as f:
-            data: dict[str, object] = json.load(f)
+        data = analysis_payload.get("analysis")
+        if not isinstance(data, dict):
+            return
 
         items = data.get("analysis_items", [])
         if not isinstance(items, list):
@@ -591,12 +730,20 @@ def poll_analysis() -> None:
                     continue
 
                 response_text = item.get("response_text", "")
+                raw_model_output = item.get("raw_model_output", {})
+                reasoning_text = ""
+                if isinstance(raw_model_output, dict):
+                    raw_reasoning = raw_model_output.get("reasoning")
+                    if isinstance(raw_reasoning, str):
+                        reasoning_text = raw_reasoning.strip()
+
+                bubble_text = reasoning_text or "Analysis received."
 
                 # Create the coaching message
                 coaching_msg = ChatMessage(
                     id=item.get("response_id", str(uuid.uuid4())),
                     msg_type="analysis",
-                    content=response_text,
+                    content=bubble_text,
                     speaker="Coach",
                     timestamp=fmt_time(item.get("timestamp_utc", "")),
                     session_id=session_id,
@@ -604,6 +751,7 @@ def poll_analysis() -> None:
                     clarity=item.get("clarity_score"),
                     key_points=item.get("key_points", []),
                     follow_ups=item.get("follow_up_suggestions", []),
+                    related_text=response_text if isinstance(response_text, str) else "",
                 )
 
                 # Find the transcript message this analysis belongs to
@@ -626,10 +774,8 @@ def poll_analysis() -> None:
 
             st.session_state.analysis_count = len(items)
 
-    except json.JSONDecodeError as e:
-        logger.debug("Invalid JSON in analysis file: %s", e)
-    except OSError as e:
-        logger.debug("Error reading analysis file: %s", e)
+    except ValueError as e:
+        logger.debug("Invalid analysis payload: %s", e)
 
 
 # =============================================================================
@@ -647,24 +793,33 @@ def main() -> None:
     - Right panel: Interview checklist with progress tracking
     """
     init_state()
+    active_session = fetch_session()
+    active_session_data = (
+        active_session.get("session", {})
+        if isinstance(active_session, dict)
+        else {}
+    )
+    live_active = isinstance(active_session_data, dict) and bool(active_session_data.get("active"))
+    live_candidate = active_session_data.get("candidate_name") if live_active else None
+    live_started_at = active_session_data.get("started_at") if live_active else None
 
     # Header with controls
     col_h1, col_h2, col_h3, col_h4, col_h5 = st.columns([3, 1, 1, 1, 2])
     with col_h1:
         st.markdown(f"### {PRODUCT_SPEC.ui.header_title}")
     with col_h2:
-        if st.button("▶️ Simulate", disabled=st.session_state.running, type="primary"):
+        if st.button("▶️ Demo", disabled=st.session_state.running, type="primary"):
             if check_sink():
                 start_sim()
                 st.rerun()
             else:
                 st.error("Sink unavailable")
     with col_h3:
-        if st.button("⏹️ Stop", disabled=not st.session_state.running):
+        if st.button("⏹️ End Demo", disabled=not st.session_state.running):
             stop_sim()
             st.rerun()
     with col_h4:
-        if st.button("🔄 Restart"):
+        if st.button("🔄 Restart Demo"):
             if st.session_state.running:
                 stop_sim()
             time.sleep(POST_RESTART_DELAY_SECONDS)
@@ -675,13 +830,23 @@ def main() -> None:
         status = "🟢 Connected" if sink_ok else "🔴 Disconnected"
         status += f" | {PRODUCT_SPEC.product_id}:{INSTANCE_ID}"
         if st.session_state.running:
-            status += f" | Running ({st.session_state.index}/{len(INTERVIEW_SCRIPT)})"
+            status += f" | Demo ({st.session_state.index}/{len(INTERVIEW_SCRIPT)})"
+        elif live_active:
+            live_name = live_candidate if isinstance(live_candidate, str) and live_candidate else "Active"
+            status += f" | Live: {live_name}"
         st.markdown(
             f"<div style='text-align:right;padding-top:0.5rem;'>{status}</div>",
             unsafe_allow_html=True,
         )
-    
+
     st.divider()
+
+    if live_active:
+        candidate_label = live_candidate if isinstance(live_candidate, str) and live_candidate else "Unknown"
+        started_label = fmt_time(live_started_at) if isinstance(live_started_at, str) else "Unknown"
+        st.info(f"Live meeting active for {candidate_label}. Started at {started_label}.")
+    elif st.session_state.running:
+        st.caption("Demo mode is running against the sink.")
     
     # Three columns
     col_left, col_center, col_right = st.columns([1, 2.5, 1.5])
@@ -691,11 +856,11 @@ def main() -> None:
         with st.container(border=True, height=500):
             st.markdown("**📋 Session Info**")
             
-            session = fetch_session()
-            if session:
-                sync_checklist_state(session)
-            if session and session.get("session", {}).get("active"):
-                s = session["session"]
+            if active_session:
+                sync_checklist_state(active_session)
+                sync_live_transcript(active_session)
+            if live_active:
+                s = active_session_data
                 st.caption("Meeting ID")
                 st.text(s.get("session_id", "N/A")[:20] + "...")
                 
@@ -703,18 +868,23 @@ def main() -> None:
                 st.text(f"Active since {fmt_time(s.get('started_at', ''))}")
                 
                 st.caption("Participants")
-                mappings = s.get("speaker_mappings", {})
-                for spk, role in mappings.items():
-                    icon = "👤" if role == "candidate" else "🎤"
-                    name = s.get("candidate_name", "Unknown") if role == "candidate" else "Interviewer"
-                    st.markdown(f"{icon} **{name}** ({spk})")
-                
+                participants = get_detected_participants(s)
+                if participants:
+                    for name, speaker_id in participants:
+                        icon = "👤" if name == s.get("candidate_name", "Unknown") else "🎤"
+                        st.markdown(f"{icon} **{name}** ({speaker_id})")
+                else:
+                    st.caption("No diarized speakers detected yet.")
+
+                st.caption("Identity source")
+                st.text("Diarization speaker IDs; not Teams roster names")
+
                 st.caption("Statistics")
                 c1, c2 = st.columns(2)
                 c1.metric("Events", s.get("total_events", 0))
                 c2.metric("Analyses", s.get("analysis_count", 0))
             else:
-                st.info("No active session. Click 'Simulate' to start.")
+                st.info("No live meeting detected. Use Demo to test the UI.")
     
     # CENTER: Chat
     with col_center:
@@ -726,7 +896,10 @@ def main() -> None:
             session_messages = [m for m in st.session_state.messages if getattr(m, 'session_id', '') == current_sid]
             
             if not session_messages:
-                st.info("Start the simulation to see the interview.")
+                if live_active:
+                    st.info("Live session active. Waiting for transcript turns...")
+                else:
+                    st.info("No transcript yet. Start Demo or wait for live meeting audio.")
             else:
                 for msg in session_messages:
                         if msg.msg_type == "transcript":
@@ -745,9 +918,22 @@ def main() -> None:
                             
                             # Show context - the snippet being analyzed
                             context_html = ""
-                            if msg.content:
-                                snippet = msg.content[:120] + "..." if len(msg.content) > 120 else msg.content
+                            if msg.related_text:
+                                snippet = (
+                                    msg.related_text[:120] + "..."
+                                    if len(msg.related_text) > 120
+                                    else msg.related_text
+                                )
                                 context_html = f'<div style="font-size:0.7rem;color:#065F46;font-style:italic;margin-bottom:0.5rem;padding:0.4rem;background:rgba(255,255,255,0.5);border-radius:4px;border-left:2px solid #10B981;">Re: "{snippet}"</div>'
+
+                            reasoning_html = ""
+                            if msg.content:
+                                reasoning_html = (
+                                    '<div style="margin-top:0.35rem;font-size:0.86rem;'
+                                    'line-height:1.45;color:#064E3B;">'
+                                    f"{msg.content}"
+                                    "</div>"
+                                )
                             
                             # NEW observations (key points)
                             observations = ""
@@ -770,6 +956,7 @@ def main() -> None:
                                 <div style="font-size:0.7rem;color:#047857;margin-bottom:0.25rem;">{scores}</div>
                                 <div style="font-size:0.9rem;font-weight:600;">🎯 Interview Coach</div>
                                 {context_html}
+                                {reasoning_html}
                                 {observations}
                                 {coaching}
                             </div>
