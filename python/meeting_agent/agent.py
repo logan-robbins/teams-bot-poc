@@ -176,6 +176,31 @@ class AlfredAnalyzer:
         )
         logger.info("AlfredAnalyzer initialized model=%s reasoning=%s", self.model, self.reasoning_effort)
 
+    @staticmethod
+    def _format_dossier_block(label: str, items: list[dict[str, Any]]) -> str:
+        if not items:
+            return f"- {label}: (none)"
+        lines = [f"- {label}:"]
+        for item in items:
+            item_id = item.get("id", "?")
+            text = str(item.get("text") or "").strip()
+            status = item.get("status")
+            owner = item.get("owner")
+            severity = item.get("severity")
+            answer = item.get("answer")
+            meta_bits: list[str] = []
+            if status:
+                meta_bits.append(f"status={status}")
+            if owner:
+                meta_bits.append(f"owner={owner}")
+            if severity:
+                meta_bits.append(f"severity={severity}")
+            if answer:
+                meta_bits.append(f"answer={answer!r}")
+            meta = f" ({', '.join(meta_bits)})" if meta_bits else ""
+            lines.append(f"    • [{item_id}] {text}{meta}")
+        return "\n".join(lines)
+
     def _format_history_line(self, index: int, event: dict[str, Any]) -> str:
         kind = str(event.get("kind") or "system").upper()
         role = str(event.get("role") or "unknown")
@@ -209,6 +234,25 @@ class AlfredAnalyzer:
             "",
             f"topics: {', '.join(stable_prefix.get('topics') or ctx.get('topics') or []) or '(none)'}",
             f"notes: {' | '.join(stable_prefix.get('notes') or ctx.get('notes') or []) or '(none)'}",
+            "",
+            "### Current Dossier (what Alfred already believes)",
+            "Revise these by emitting the same `id` with updated fields.",
+            "Only emit NEW items or CHANGED items in the extraction below.",
+            "",
+            self._format_dossier_block(
+                "decisions", stable_prefix.get("decisions") or ctx.get("decisions") or []
+            ),
+            self._format_dossier_block(
+                "open_questions",
+                stable_prefix.get("open_questions") or ctx.get("open_questions") or [],
+            ),
+            self._format_dossier_block(
+                "action_items",
+                stable_prefix.get("action_items") or ctx.get("action_items") or [],
+            ),
+            self._format_dossier_block(
+                "risks", stable_prefix.get("risks") or ctx.get("risks") or []
+            ),
             "",
             "## Full Meeting History",
         ]

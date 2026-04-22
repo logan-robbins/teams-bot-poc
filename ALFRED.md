@@ -119,9 +119,12 @@ Key files:
 
 Location: `web/`
 
-Vite + React 19 + TypeScript + Tailwind v4 single-page app. Polls the
-sink today (500 ms / 2 s cadence); the two hooks are the seam to swap
-to SSE once the sink exposes `/session/events`.
+Vite + React 19 + TypeScript + Tailwind v4 + Zustand. **Server-Sent
+Events drive all live state.** On mount, a one-shot `GET /session/status`
+seeds the store; from then on, the UI consumes `GET /session/events` and
+the store handles each event type (ledger_append, extraction,
+dossier_upsert, tool_call, session_state, session_started/ended).
+Components never poll.
 
 Three columns:
 
@@ -137,7 +140,8 @@ Key files:
 - `web/src/App.tsx`
 - `web/src/components/{Header,Ledger,LedgerEntry,Dossier,DossierCards,CompanionRail,StatusBadge}.tsx`
 - `web/src/lib/{sink,types,format}.ts`
-- `web/src/hooks/{useSessionStatus,useSessionAnalysis}.ts`
+- `web/src/stores/sessionStore.ts`
+- `web/src/hooks/useSessionStream.ts`
 
 ### 3.4 Streamlit debug observer (legacy)
 
@@ -285,16 +289,42 @@ The repo is structured around one meeting-scoped shared context.
 
 - stable system/product prefix
 - stable meeting metadata and running state (summary, topics, notes,
-  intent-alignment buckets)
+  **and the current dossier — decisions / open_questions / action_items /
+  risks — so the agent can REVISE its prior conclusions instead of
+  duplicating them**)
 - append-only meeting ledger tail
 - only new events added on each turn
+
+The agent prompt formats the current dossier under
+`### Current Dossier (what Alfred already believes)` with the explicit
+instruction "Revise these by emitting the same `id` with updated
+fields." This is what makes incremental upsert-by-id work: the LLM sees
+its own prior `[d1] ship v2 (status=tentative)` and can emit
+`[d1] ship v2 (status=committed)` to revise rather than create `[d2]`.
 
 Implementation hooks:
 
 - `prompt_cache_key`
 - `latest_response_id`
 - `latest_agent_cursor`
-- `session.get_agent_context_snapshot(...)`
+- `session.get_agent_context_snapshot(...)` — surfaces the dossier in
+  `stable_prefix`
+- `AlfredAnalyzer._format_dossier_block(...)` — prompt formatting
+
+### 7.1 Trigger debouncing
+
+Real meetings produce bursts ("ok... so... I think... ship by Friday").
+The agent loop coalesces those into one tick instead of one-LLM-call-
+per-turn:
+
+- `meeting_agent/debounce.py` — `drain_with_debounce(queue, ...)` waits
+  for the next event then keeps draining as long as more arrive within
+  `DEFAULT_QUIET_WINDOW_SECONDS` (1.5 s), capped at `DEFAULT_MAX_BATCH`
+  (8 events).
+- The latest event in the batch is the trigger; the session ledger
+  already has all buffered events appended, so the LLM sees them all on
+  the next run regardless.
+- This typically cuts LLM call count 3–5× on real meetings.
 
 When editing this area, preserve:
 
@@ -304,6 +334,8 @@ When editing this area, preserve:
 - do not make outbound Alfred messages recursively trigger new analysis
 - do not reintroduce a `SILENT/SEND/ASK` action enum; the tool is the
   action surface now
+- do not remove the dossier from the prompt's stable block — that is
+  what enables revision
 
 ## 8. Persistence (SQLite)
 
@@ -328,19 +360,26 @@ Writes happen at every ingress event and at every extraction; reads
 happen through the history endpoints. WAL journaling; reads are
 `asyncio.to_thread`-guarded on the FastAPI side.
 
-## 9. History endpoints (UI contract)
+## 9. History + live endpoints (UI contract)
 
-All JSON, all live on the Python sink.
+All JSON / SSE, all on the Python sink.
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /session/status` | Active session snapshot (the UI's primary poll). Includes `decisions/open_questions/action_items/risks` for the Dossier. |
+| `GET /session/status` | Active session snapshot. Used once on UI mount to seed the store. Includes `decisions/open_questions/action_items/risks`. |
+| `GET /session/events` | **SSE stream.** Push channel the UI subscribes to for live updates. Event types: `ledger_append`, `extraction`, `dossier_upsert`, `tool_call`, `session_state`, `session_started`, `session_ended`. Periodic `: keep-alive` comments defeat proxy idle timeouts. Optional `?session_id=` filter. |
 | `GET /session/analysis` | Persisted per-session analysis JSON (classic `AnalysisOutputWriter` view). |
 | `GET /sessions` | List recent persisted sessions. |
 | `GET /sessions/{id}/ledger` | Full meeting-event ledger for a session. |
 | `GET /sessions/{id}/dossier` | Latest decisions / questions / actions / risks. |
 | `GET /sessions/{id}/extractions?since=&limit=` | Per-tick extraction history (time-series). |
 | `GET /sessions/{id}/tool-calls` | Audit log of agent tool calls. |
+
+The UI's polling layer is gone. The `useSessionStream` hook in
+`web/src/hooks/useSessionStream.ts` opens one `EventSource`, dispatches
+to the Zustand store at `web/src/stores/sessionStore.ts`, and lets the
+browser's native auto-reconnect handle transient disconnects. The footer
+shows a live SSE status dot (amber=connecting, green=open, red=closed).
 
 ## 10. Teams and Graph specifics
 
@@ -460,7 +499,7 @@ cd python
 uv run pytest tests -v
 ```
 
-Baseline on this branch: **87 passed, 2 skipped**.
+Baseline on this branch: **97 passed, 2 skipped**.
 
 UI:
 
@@ -494,17 +533,23 @@ flowchart LR
     subgraph PY["Python sink (python/)"]
         INGEST[/POST /transcript\nPOST /chat/]
         SESSION[InterviewSessionManager\n+ meeting_events ledger]
+        DEBOUNCE[debounce.py\n1.5s quiet window\nmax 8 / batch]
         AGENT[AlfredAnalyzer\noutput_type=AlfredExtraction\ntools=send_to_meeting_chat]
         TOOL["send_to_meeting_chat tool\n(mute-aware, echo-suppressing)"]
+        BUS{{AlfredEventBus\nin-process pub/sub}}
         STORE[(SQLite store\nsessions/ meeting_events/\nextractions/ tool_calls/\ndossier_items)]
-        HIST[/GET /sessions\n/sessions/:id/ledger\n/sessions/:id/dossier\n/sessions/:id/extractions/]
+        SSE[/GET /session/events\nSSE stream/]
         STATUS[/GET /session/status\nGET /session/analysis/]
+        HIST[/GET /sessions\n/sessions/:id/ledger\n/sessions/:id/dossier\n/sessions/:id/extractions\n/sessions/:id/tool-calls/]
     end
 
     subgraph WEB["React Dossier UI (web/)"]
+        SEED[useSessionStream\nseed: /session/status]
+        STREAM[useSessionStream\nlive: EventSource]
+        STORESTORE[(Zustand sessionStore\nupsert-by-id dossier)]
         LEDGER[The Ledger]
-        DOSSIER[The Dossier\ndecisions / questions\nactions / risks]
-        RAIL[Companion Rail\nsummary / topics / controls]
+        DOSSIER[The Dossier]
+        RAIL[Companion Rail]
     end
 
     MT --> CALL
@@ -512,7 +557,9 @@ flowchart LR
     CALL -- "transcript events" --> INGEST
     GRAPH -- "chat events" --> INGEST
     INGEST --> SESSION
-    SESSION --> AGENT
+    INGEST -- "ledger_append" --> BUS
+    SESSION --> DEBOUNCE
+    DEBOUNCE --> AGENT
     AGENT -- "AlfredExtraction (always)" --> SESSION
     AGENT -. "may call" .-> TOOL
     TOOL -- "POST /api/send-chat" --> SEND
@@ -520,15 +567,19 @@ flowchart LR
     REF --> MC
     TOOL -- "append Alfred utterance" --> SESSION
     SESSION --> STORE
+    AGENT -- "extraction / dossier_upsert / tool_call / session_state" --> BUS
     AGENT --> STORE
     TOOL --> STORE
-    WEB -->|poll 500ms/2s| STATUS
-    WEB -->|history reads| HIST
+    BUS --> SSE
     STATUS --> SESSION
     HIST --> STORE
-    LEDGER --- WEB
-    DOSSIER --- WEB
-    RAIL --- WEB
+    SEED -- "GET" --> STATUS
+    STREAM -- "EventSource" --> SSE
+    SEED --> STORESTORE
+    STREAM --> STORESTORE
+    STORESTORE --> LEDGER
+    STORESTORE --> DOSSIER
+    STORESTORE --> RAIL
 ```
 
 ## 16. Editing rules for future LLMs

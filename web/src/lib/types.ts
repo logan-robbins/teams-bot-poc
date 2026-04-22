@@ -44,6 +44,15 @@ export interface SessionSummary {
   meeting_history?: MeetingEvent[];
   checklist?: ChecklistItem[];
   alfred_muted?: boolean;
+  // The sink surfaces Alfred's rolling state on /session/status as well,
+  // so the snapshot fetch can seed the store before SSE delivers any deltas.
+  running_summary?: string;
+  topics?: string[];
+  notes?: string[];
+  decisions?: Decision[];
+  open_questions?: OpenQuestion[];
+  action_items?: ActionItem[];
+  risks?: Risk[];
 }
 
 export interface SessionStatusResponse {

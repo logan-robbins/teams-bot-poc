@@ -33,9 +33,15 @@ import aiofiles
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from meeting_agent.debounce import (
+    DEFAULT_MAX_BATCH,
+    DEFAULT_QUIET_WINDOW_SECONDS,
+    drain_with_debounce,
+)
+from meeting_agent.events import AlfredEventBus, format_sse
 from meeting_agent.models import (
     AnalysisItem,
     ChatMessage,
@@ -481,6 +487,7 @@ class AppState(TypedDict):
     session_manager: InterviewSessionManager
     output_writer: AnalysisOutputWriter
     store: SessionStore
+    event_bus: AlfredEventBus
     transcript_queue: asyncio.Queue[TranscriptEvent]
     agent_queue: asyncio.Queue[MeetingEvent]
     stats: AppStats
@@ -579,6 +586,7 @@ def get_app_state(request: Request) -> AppState:
         session_manager=state.session_manager,
         output_writer=state.output_writer,
         store=state.store,
+        event_bus=state.event_bus,
         transcript_queue=state.transcript_queue,
         agent_queue=state.agent_queue,
         stats=state.stats,
@@ -777,6 +785,7 @@ async def agent_processing_loop(
     session_manager: InterviewSessionManager,
     output_writer: AnalysisOutputWriter,
     store: SessionStore,
+    event_bus: AlfredEventBus,
     stats: AppStats,
     variant_plugin: VariantPlugin,
     checklist_manager: ChecklistStateManager,
@@ -807,7 +816,12 @@ async def agent_processing_loop(
 
     while True:
         try:
-            event = await agent_queue.get()
+            event, batch_size = await drain_with_debounce(
+                agent_queue,
+                quiet_window_seconds=DEFAULT_QUIET_WINDOW_SECONDS,
+                max_batch=DEFAULT_MAX_BATCH,
+            )
+            del batch_size  # logged inside the helper
 
             if not event.text:
                 continue
@@ -841,17 +855,49 @@ async def agent_processing_loop(
                     # the agent thread so we don't block the event loop
                     # tail with FastAPI handlers.
                     if session_manager.session is not None:
+                        sid = session_manager.session.session_id
                         try:
                             store.upsert_session(session_manager.session)
-                            store.append_extraction(
-                                session_manager.session.session_id,
-                                analysis_item,
-                            )
+                            store.append_extraction(sid, analysis_item)
                         except Exception as persist_exc:  # noqa: BLE001
                             logger.warning(
                                 "Persistence write failed for extraction: %s",
                                 persist_exc,
                             )
+
+                        # Fan out to SSE subscribers.
+                        if analysis_item.extraction is not None:
+                            await event_bus.publish(
+                                "extraction",
+                                analysis_item.extraction,
+                                session_id=sid,
+                            )
+                            for bucket, key in (
+                                (analysis_item.extraction.decisions, "decision"),
+                                (analysis_item.extraction.open_questions, "open_question"),
+                                (analysis_item.extraction.action_items, "action_item"),
+                                (analysis_item.extraction.risks, "risk"),
+                            ):
+                                for item_obj in bucket:
+                                    await event_bus.publish(
+                                        "dossier_upsert",
+                                        {"kind": key, "item": item_obj.model_dump()},
+                                        session_id=sid,
+                                    )
+                        for tc in analysis_item.tool_calls or []:
+                            await event_bus.publish(
+                                "tool_call", tc, session_id=sid
+                            )
+                        await event_bus.publish(
+                            "session_state",
+                            {
+                                "session_id": sid,
+                                "running_summary": session_manager.session.running_summary,
+                                "topics": list(session_manager.session.topics),
+                                "alfred_muted": session_manager.session.alfred_muted,
+                            },
+                            session_id=sid,
+                        )
 
                     stats["agent_analyses"] += 1
                     response_counter += 1
@@ -989,6 +1035,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[dict[str, Any]]:
     logger.info("Analysis output directory: %s", OUTPUT_DIR)
     store = build_store(RUNTIME_CONFIG.store_db_path)
     logger.info("Session store: %s", RUNTIME_CONFIG.store_db_path)
+    event_bus = AlfredEventBus()
+    logger.info("Event bus initialized")
 
     # Initialize state components
     session_manager = InterviewSessionManager()
@@ -1026,6 +1074,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[dict[str, Any]]:
             session_manager,
             output_writer,
             store,
+            event_bus,
             stats,
             VARIANT,
             checklist_manager,
@@ -1038,6 +1087,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[dict[str, Any]]:
         "session_manager": session_manager,
         "output_writer": output_writer,
         "store": store,
+        "event_bus": event_bus,
         "transcript_queue": transcript_queue,
         "agent_queue": agent_queue,
         "stats": stats,
@@ -1053,6 +1103,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[dict[str, Any]]:
 
     # Shutdown
     logger.info("Shutting down...")
+    await event_bus.close()
     agent_task.cancel()
     try:
         await agent_task
@@ -1131,6 +1182,7 @@ async def receive_transcript(
     session_manager = state["session_manager"]
     output_writer = state["output_writer"]
     store = state["store"]
+    event_bus = state["event_bus"]
     transcript_queue = state["transcript_queue"]
     agent_queue = state["agent_queue"]
     variant_plugin = state["variant_plugin"]
@@ -1225,11 +1277,13 @@ async def receive_transcript(
             maybe_auto_map_candidate(session_manager)
             latest_event = session_manager.get_latest_meeting_event()
             if session_manager.session is not None and latest_event is not None:
+                sid = session_manager.session.session_id
                 try:
                     store.upsert_session(session_manager.session)
-                    store.append_meeting_event(session_manager.session.session_id, latest_event)
+                    store.append_meeting_event(sid, latest_event)
                 except Exception as persist_exc:  # noqa: BLE001
                     logger.warning("Persistence write failed for transcript event: %s", persist_exc)
+                await event_bus.publish("ledger_append", latest_event, session_id=sid)
             await enqueue_analysis_event(state, latest_event)
 
     elif event.event_type == "session_started":
@@ -1279,6 +1333,7 @@ async def receive_chat_message(
     variant_plugin = state["variant_plugin"]
     route_orchestrator = state["route_orchestrator"]
     store = state["store"]
+    event_bus = state["event_bus"]
 
     stats["events_received"] += 1
 
@@ -1327,11 +1382,13 @@ async def receive_chat_message(
 
         latest_event = session_manager.get_latest_meeting_event()
         if session_manager.session is not None and latest_event is not None:
+            sid = session_manager.session.session_id
             try:
                 store.upsert_session(session_manager.session)
-                store.append_meeting_event(session_manager.session.session_id, latest_event)
+                store.append_meeting_event(sid, latest_event)
             except Exception as persist_exc:  # noqa: BLE001
                 logger.warning("Persistence write failed for chat event: %s", persist_exc)
+            await event_bus.publish("ledger_append", latest_event, session_id=sid)
 
         if should_analyze:
             await enqueue_analysis_event(state, latest_event)
@@ -1369,6 +1426,7 @@ async def start_session(
     stats = state["stats"]
     variant_plugin = state["variant_plugin"]
     store = state["store"]
+    event_bus = state["event_bus"]
 
     if session_manager.is_active:
         raise SessionAlreadyActiveError()
@@ -1411,6 +1469,16 @@ async def start_session(
         store.upsert_session(session)
     except Exception as persist_exc:  # noqa: BLE001
         logger.warning("Persistence write failed on session start: %s", persist_exc)
+    await event_bus.publish(
+        "session_started",
+        {
+            "session_id": session.session_id,
+            "candidate_name": session.candidate_name,
+            "meeting_url": session.meeting_url,
+            "started_at": session.started_at,
+        },
+        session_id=session.session_id,
+    )
 
     # Publish session start to real-time stream
     if AGENT_AVAILABLE and get_publisher:
@@ -1569,6 +1637,62 @@ async def get_session_analysis(
     )
 
 
+@app.get("/session/events")
+async def stream_session_events(
+    state: AppStateDep,
+    request: Request,
+    session_id: str | None = None,
+) -> StreamingResponse:
+    """Server-Sent Events stream for live UI updates.
+
+    Emits: ``ledger_append`` (MeetingEvent), ``extraction`` (AlfredExtraction),
+    ``dossier_upsert`` ({kind, item}), ``tool_call`` (ToolCallRecord),
+    ``session_state`` (summary/topics/muted), ``session_started``,
+    ``session_ended``, and periodic ``heartbeat`` comments to defeat proxy
+    idle timeouts.
+    """
+    event_bus = state["event_bus"]
+
+    async def generator() -> AsyncIterator[bytes]:
+        heartbeat_seconds = 15.0
+        # Initial comment so the connection is established and proxies flush.
+        yield b": alfred-sse-stream\n\n"
+
+        subscription = event_bus.subscribe(session_filter=session_id)
+        iterator = subscription.__aiter__()
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    event = await asyncio.wait_for(
+                        iterator.__anext__(), timeout=heartbeat_seconds
+                    )
+                except asyncio.TimeoutError:
+                    yield b": keep-alive\n\n"
+                    continue
+                except StopAsyncIteration:
+                    break
+                yield format_sse(event)
+        finally:
+            aclose = getattr(subscription, "aclose", None)
+            if aclose is not None:
+                try:
+                    await aclose()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    return StreamingResponse(
+        generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.get("/session", response_model=SessionStatusWrapper)
 async def get_session(state: AppStateDep) -> SessionStatusWrapper:
     """
@@ -1604,6 +1728,7 @@ async def end_session(state: AppStateDep) -> SessionEndResponse:
     stats = state["stats"]
     variant_plugin = state["variant_plugin"]
     store = state["store"]
+    event_bus = state["event_bus"]
 
     if not session_manager.is_active:
         raise SessionNotActiveError("No active session to end.")
@@ -1666,6 +1791,8 @@ async def end_session(state: AppStateDep) -> SessionEndResponse:
     logger.info("Session ended: %s", session_id)
     await variant_plugin.on_session_end(summary)
     state["last_enqueued_event_ids"].pop(session_id, None)
+
+    await event_bus.publish("session_ended", summary, session_id=session_id)
 
     await dispatch_route_payload(
         route_orchestrator=route_orchestrator,
