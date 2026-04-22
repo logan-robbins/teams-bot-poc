@@ -18,10 +18,15 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from .models import (
+    ActionItem,
+    AlfredExtraction,
     ChatMessage,
+    Decision,
     InterviewSession,
     MeetingEvent,
+    OpenQuestion,
     OutboundChatIntent,
+    Risk,
     SpeakerMapping,
     TranscriptEvent,
 )
@@ -410,23 +415,63 @@ class InterviewSessionManager:
         if latest_response_id:
             self._session.latest_response_id = latest_response_id
 
-    def apply_alfred_action(self, action: Any) -> None:
-        """Persist Alfred's latest running state on the session."""
-        if self._session is None or action is None:
+    def apply_extraction(self, extraction: AlfredExtraction | None) -> None:
+        """Merge an AlfredExtraction's deltas into the session's rolling state."""
+        if self._session is None or extraction is None:
             return
 
-        running_summary = str(getattr(action, "running_summary", "") or "").strip()
+        running_summary = (extraction.running_summary or "").strip()
         if running_summary:
             self._session.running_summary = running_summary
 
-        topics = [str(topic).strip() for topic in list(getattr(action, "topics", []) or []) if str(topic).strip()]
+        topics = [t.strip() for t in (extraction.topics or []) if t.strip()]
         if topics:
             self._session.topics = topics
 
-        notes = [str(note).strip() for note in list(getattr(action, "notes", []) or []) if str(note).strip()]
+        notes = [n.strip() for n in (extraction.notes or []) if n.strip()]
         if notes:
             self._session.notes.extend(notes)
             self._session.notes = self._session.notes[-200:]
+
+        self._merge_decisions(extraction.decisions or [])
+        self._merge_open_questions(extraction.open_questions or [])
+        self._merge_action_items(extraction.action_items or [])
+        self._merge_risks(extraction.risks or [])
+
+    # Backwards-compat shim for any remaining callers of the old name.
+    apply_alfred_action = apply_extraction
+
+    def _merge_decisions(self, incoming: list[Decision]) -> None:
+        if self._session is None or not incoming:
+            return
+        by_id = {d.id: d for d in self._session.decisions}
+        for d in incoming:
+            by_id[d.id] = d
+        self._session.decisions = list(by_id.values())[-200:]
+
+    def _merge_open_questions(self, incoming: list[OpenQuestion]) -> None:
+        if self._session is None or not incoming:
+            return
+        by_id = {q.id: q for q in self._session.open_questions}
+        for q in incoming:
+            by_id[q.id] = q
+        self._session.open_questions = list(by_id.values())[-200:]
+
+    def _merge_action_items(self, incoming: list[ActionItem]) -> None:
+        if self._session is None or not incoming:
+            return
+        by_id = {a.id: a for a in self._session.action_items}
+        for a in incoming:
+            by_id[a.id] = a
+        self._session.action_items = list(by_id.values())[-200:]
+
+    def _merge_risks(self, incoming: list[Risk]) -> None:
+        if self._session is None or not incoming:
+            return
+        by_id = {r.id: r for r in self._session.risks}
+        for r in incoming:
+            by_id[r.id] = r
+        self._session.risks = list(by_id.values())[-200:]
 
     def record_outbound_chat_intent(self, text: str, reply_to_message_id: str | None = None) -> None:
         """Remember recent outbound chat so the bot echo does not re-trigger Alfred."""
@@ -697,6 +742,10 @@ class InterviewSessionManager:
             "running_summary": self._session.running_summary,
             "topics": list(self._session.topics),
             "notes": list(self._session.notes),
+            "decisions": [d.model_dump() for d in self._session.decisions],
+            "open_questions": [q.model_dump() for q in self._session.open_questions],
+            "action_items": [a.model_dump() for a in self._session.action_items],
+            "risks": [r.model_dump() for r in self._session.risks],
             "alfred_muted": self._session.alfred_muted,
             "total_events": len(self._session.transcript_events),
             "final_events": len([

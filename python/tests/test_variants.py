@@ -4,7 +4,15 @@ from __future__ import annotations
 
 import pytest
 
-from meeting_agent.models import AnalysisItem, AlfredAction, ChatMessage, MeetingEvent, TranscriptEvent
+from meeting_agent.models import (
+    AlfredExtraction,
+    AnalysisItem,
+    ChatMessage,
+    Decision,
+    MeetingEvent,
+    OpenQuestion,
+    TranscriptEvent,
+)
 from variants import available_variants, load_variant
 
 
@@ -24,7 +32,7 @@ def test_alfred_context_marks_trigger_kind_for_speech() -> None:
     ctx = alfred.build_analysis_context({}, event)
     assert ctx["trigger_kind"] == "speech"
     assert ctx["assistant_mode"] == "alfred"
-    assert "SILENT" in ctx["action_menu"]
+    assert "send_to_meeting_chat" in ctx["tool_menu"]
     assert ctx["bias_toward_silence"] is True
 
 
@@ -53,18 +61,21 @@ def test_alfred_context_marks_trigger_kind_for_meeting_event_chat() -> None:
     assert ctx["trigger_kind"] == "chat"
 
 
-def test_alfred_transform_passes_through() -> None:
+def test_alfred_transform_passes_through_extraction() -> None:
     alfred = load_variant("alfred")
     item = AnalysisItem(
         response_id="r1",
         response_text="Sample response",
-        alfred_action=AlfredAction(
-            action="SILENT",
+        extraction=AlfredExtraction(
             rationale="not enough signal yet",
             running_summary="",
             topics=[],
+            decisions=[Decision(id="d1", text="ship v2 behind a flag")],
+            open_questions=[OpenQuestion(id="q1", text="who owns the rollout?")],
         ),
     )
     transformed = alfred.transform_analysis_item(item)
-    assert transformed.alfred_action is not None
-    assert transformed.alfred_action.action == "SILENT"
+    assert transformed.extraction is not None
+    assert len(transformed.extraction.decisions) == 1
+    assert transformed.extraction.decisions[0].text == "ship v2 behind a flag"
+    assert transformed.extraction.open_questions[0].id == "q1"

@@ -44,6 +44,7 @@ from meeting_agent.models import (
     TranscriptEvent,
 )
 from meeting_agent.output import AnalysisOutputWriter
+from meeting_agent.persistence import SessionStore, build_store
 from meeting_agent.session import InterviewSessionManager
 from meeting_agent.checklist_state import ChecklistDefinition, ChecklistStateManager
 from legionmeet_platform import (
@@ -80,6 +81,7 @@ class RuntimeConfig:
     sink_port: int
     output_dir: Path
     transcript_file: Path
+    store_db_path: Path
 
 
 def load_runtime_config() -> RuntimeConfig:
@@ -134,6 +136,12 @@ def load_runtime_config() -> RuntimeConfig:
         else:
             transcript_file = desktop_path / f"meeting_transcript_{instance_id}.txt"
 
+    store_override = os.environ.get("STORE_DB_PATH")
+    if store_override:
+        store_db_path = Path(store_override).expanduser()
+    else:
+        store_db_path = output_dir / "alfred.sqlite3"
+
     return RuntimeConfig(
         variant_id=variant_id,
         product_spec_path=product_spec_path,
@@ -142,6 +150,7 @@ def load_runtime_config() -> RuntimeConfig:
         sink_port=sink_port,
         output_dir=output_dir,
         transcript_file=transcript_file,
+        store_db_path=store_db_path,
     )
 
 
@@ -367,6 +376,10 @@ class SessionStatusResponse(BaseModel):
     running_summary: str = Field(default="")
     topics: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+    decisions: list[dict[str, Any]] = Field(default_factory=list)
+    open_questions: list[dict[str, Any]] = Field(default_factory=list)
+    action_items: list[dict[str, Any]] = Field(default_factory=list)
+    risks: list[dict[str, Any]] = Field(default_factory=list)
     total_events: int = Field(default=0, description="Total transcript events received")
     final_events: int = Field(default=0, description="Final transcript events")
     analysis_count: int = Field(default=0, description="Number of analyses performed")
@@ -467,6 +480,7 @@ class AppState(TypedDict):
 
     session_manager: InterviewSessionManager
     output_writer: AnalysisOutputWriter
+    store: SessionStore
     transcript_queue: asyncio.Queue[TranscriptEvent]
     agent_queue: asyncio.Queue[MeetingEvent]
     stats: AppStats
@@ -564,6 +578,7 @@ def get_app_state(request: Request) -> AppState:
     return AppState(
         session_manager=state.session_manager,
         output_writer=state.output_writer,
+        store=state.store,
         transcript_queue=state.transcript_queue,
         agent_queue=state.agent_queue,
         stats=state.stats,
@@ -761,6 +776,7 @@ async def agent_processing_loop(
     agent_queue: asyncio.Queue[MeetingEvent],
     session_manager: InterviewSessionManager,
     output_writer: AnalysisOutputWriter,
+    store: SessionStore,
     stats: AppStats,
     variant_plugin: VariantPlugin,
     checklist_manager: ChecklistStateManager,
@@ -776,9 +792,11 @@ async def agent_processing_loop(
         try:
             analyzer = InterviewAnalyzer(
                 model=PRODUCT_SPEC.agent.model,
+                session_manager=session_manager,
                 publish_thoughts=True,
                 reasoning_effort=PRODUCT_SPEC.agent.reasoning_effort,
                 instructions=PRODUCT_SPEC.agent.prompt_template,
+                send_chat_url=os.environ.get("BOT_SEND_CHAT_URL") or None,
             )
             publisher = get_publisher() if get_publisher else None
             logger.info("Alfred analyzer initialized with real-time publishing")
@@ -812,20 +830,28 @@ async def agent_processing_loop(
                         speaker_id=event.speaker_id,
                     )
                     analysis_item = variant_plugin.transform_analysis_item(analysis_item)
-                    session_manager.apply_alfred_action(analysis_item.alfred_action)
-                    if (
-                        analysis_item.alfred_action is not None
-                        and analysis_item.alfred_action.action in {"SEND", "ASK"}
-                        and (analysis_item.alfred_action.chat_text or "").strip()
-                    ):
-                        session_manager.record_outbound_chat_intent(
-                            analysis_item.alfred_action.chat_text or "",
-                            analysis_item.alfred_action.reply_to_message_id,
-                        )
+                    session_manager.apply_extraction(analysis_item.extraction)
                     latest_response_id = None
                     if analysis_item.raw_model_output:
                         latest_response_id = analysis_item.raw_model_output.get("latest_response_id")
                     session_manager.mark_agent_progress(event.event_id, latest_response_id)
+
+                    # Persist — session snapshot, extraction, tool calls,
+                    # dossier upserts. Writes are sync but small; done on
+                    # the agent thread so we don't block the event loop
+                    # tail with FastAPI handlers.
+                    if session_manager.session is not None:
+                        try:
+                            store.upsert_session(session_manager.session)
+                            store.append_extraction(
+                                session_manager.session.session_id,
+                                analysis_item,
+                            )
+                        except Exception as persist_exc:  # noqa: BLE001
+                            logger.warning(
+                                "Persistence write failed for extraction: %s",
+                                persist_exc,
+                            )
 
                     stats["agent_analyses"] += 1
                     response_counter += 1
@@ -851,12 +877,13 @@ async def agent_processing_loop(
                             payload=payload,
                         )
 
-                    action_name = (
-                        analysis_item.alfred_action.action
-                        if analysis_item.alfred_action is not None
-                        else "UNKNOWN"
+                    tool_call_count = len(analysis_item.tool_calls or [])
+                    logger.info(
+                        "Analysis #%d complete: extraction_ok=%s tool_calls=%d",
+                        response_counter,
+                        analysis_item.extraction is not None,
+                        tool_call_count,
                     )
-                    logger.info("Analysis #%d complete: action=%s", response_counter, action_name)
 
                 except Exception as e:
                     logger.error("Alfred analysis failed: %s", e, exc_info=True)
@@ -956,10 +983,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[dict[str, Any]]:
     )
     logger.info("Product spec path: %s", PRODUCT_SPEC_PATH)
 
-    # Initialize output directory and writer
+    # Initialize output directory, analysis writer, and SQLite store
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     output_writer = AnalysisOutputWriter(OUTPUT_DIR)
     logger.info("Analysis output directory: %s", OUTPUT_DIR)
+    store = build_store(RUNTIME_CONFIG.store_db_path)
+    logger.info("Session store: %s", RUNTIME_CONFIG.store_db_path)
 
     # Initialize state components
     session_manager = InterviewSessionManager()
@@ -996,6 +1025,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[dict[str, Any]]:
             agent_queue,
             session_manager,
             output_writer,
+            store,
             stats,
             VARIANT,
             checklist_manager,
@@ -1007,6 +1037,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[dict[str, Any]]:
     state = {
         "session_manager": session_manager,
         "output_writer": output_writer,
+        "store": store,
         "transcript_queue": transcript_queue,
         "agent_queue": agent_queue,
         "stats": stats,
@@ -1099,6 +1130,7 @@ async def receive_transcript(
     stats = state["stats"]
     session_manager = state["session_manager"]
     output_writer = state["output_writer"]
+    store = state["store"]
     transcript_queue = state["transcript_queue"]
     agent_queue = state["agent_queue"]
     variant_plugin = state["variant_plugin"]
@@ -1167,6 +1199,10 @@ async def receive_transcript(
                     current_analysis.running_summary = session_manager.session.running_summary
                     current_analysis.topics = list(session_manager.session.topics)
                     current_analysis.notes = list(session_manager.session.notes)
+                    current_analysis.decisions = list(session_manager.session.decisions)
+                    current_analysis.open_questions = list(session_manager.session.open_questions)
+                    current_analysis.action_items = list(session_manager.session.action_items)
+                    current_analysis.risks = list(session_manager.session.risks)
                     current_analysis.checklist_state = checklist_manager.snapshot()
                     output_writer.write_analysis(
                         session_manager.session.session_id, current_analysis
@@ -1187,7 +1223,14 @@ async def receive_transcript(
                 )
 
             maybe_auto_map_candidate(session_manager)
-            await enqueue_analysis_event(state, session_manager.get_latest_meeting_event())
+            latest_event = session_manager.get_latest_meeting_event()
+            if session_manager.session is not None and latest_event is not None:
+                try:
+                    store.upsert_session(session_manager.session)
+                    store.append_meeting_event(session_manager.session.session_id, latest_event)
+                except Exception as persist_exc:  # noqa: BLE001
+                    logger.warning("Persistence write failed for transcript event: %s", persist_exc)
+            await enqueue_analysis_event(state, latest_event)
 
     elif event.event_type == "session_started":
         stats["session_events"] += 1
@@ -1235,6 +1278,7 @@ async def receive_chat_message(
     session_manager = state["session_manager"]
     variant_plugin = state["variant_plugin"]
     route_orchestrator = state["route_orchestrator"]
+    store = state["store"]
 
     stats["events_received"] += 1
 
@@ -1281,8 +1325,16 @@ async def receive_chat_message(
             (chat.text or "")[:120],
         )
 
+        latest_event = session_manager.get_latest_meeting_event()
+        if session_manager.session is not None and latest_event is not None:
+            try:
+                store.upsert_session(session_manager.session)
+                store.append_meeting_event(session_manager.session.session_id, latest_event)
+            except Exception as persist_exc:  # noqa: BLE001
+                logger.warning("Persistence write failed for chat event: %s", persist_exc)
+
         if should_analyze:
-            await enqueue_analysis_event(state, session_manager.get_latest_meeting_event())
+            await enqueue_analysis_event(state, latest_event)
 
     await variant_plugin.on_chat_message(chat, session_manager.get_session_context())
 
@@ -1316,6 +1368,7 @@ async def start_session(
     route_orchestrator = state["route_orchestrator"]
     stats = state["stats"]
     variant_plugin = state["variant_plugin"]
+    store = state["store"]
 
     if session_manager.is_active:
         raise SessionAlreadyActiveError()
@@ -1346,7 +1399,7 @@ async def start_session(
             request.candidate_name,
         )
 
-    # Initialize analysis file
+    # Initialize analysis file and session row in the store
     analysis = SessionAnalysis(
         session_id=session.session_id,
         candidate_name=request.candidate_name,
@@ -1354,6 +1407,10 @@ async def start_session(
         checklist_state=checklist_manager.snapshot(),
     )
     output_writer.write_analysis(session.session_id, analysis)
+    try:
+        store.upsert_session(session)
+    except Exception as persist_exc:  # noqa: BLE001
+        logger.warning("Persistence write failed on session start: %s", persist_exc)
 
     # Publish session start to real-time stream
     if AGENT_AVAILABLE and get_publisher:
@@ -1456,6 +1513,10 @@ async def get_session_status(state: AppStateDep) -> SessionStatusWrapper:
         running_summary=context.get("running_summary", ""),
         topics=context.get("topics", []),
         notes=context.get("notes", []),
+        decisions=context.get("decisions", []),
+        open_questions=context.get("open_questions", []),
+        action_items=context.get("action_items", []),
+        risks=context.get("risks", []),
         total_events=context.get("total_events", 0),
         final_events=context.get("final_events", 0),
         analysis_count=stats["agent_analyses"],
@@ -1542,6 +1603,7 @@ async def end_session(state: AppStateDep) -> SessionEndResponse:
     route_orchestrator = state["route_orchestrator"]
     stats = state["stats"]
     variant_plugin = state["variant_plugin"]
+    store = state["store"]
 
     if not session_manager.is_active:
         raise SessionNotActiveError("No active session to end.")
@@ -1567,8 +1629,16 @@ async def end_session(state: AppStateDep) -> SessionEndResponse:
                 analysis.running_summary = ended_session.running_summary
                 analysis.topics = list(ended_session.topics)
                 analysis.notes = list(ended_session.notes)
+                analysis.decisions = list(ended_session.decisions)
+                analysis.open_questions = list(ended_session.open_questions)
+                analysis.action_items = list(ended_session.action_items)
+                analysis.risks = list(ended_session.risks)
                 analysis.compute_overall_scores()
                 output_writer.write_analysis(session_id, analysis)
+            try:
+                store.upsert_session(ended_session)
+            except Exception as persist_exc:  # noqa: BLE001
+                logger.warning("Persistence write failed on session end: %s", persist_exc)
         except Exception as e:
             logger.error("Failed to finalize analysis: %s", e)
 
@@ -1710,6 +1780,99 @@ async def get_product_spec() -> ProductSpecResponse:
             for route in PRODUCT_SPEC.outputs.routes
         ],
     )
+
+
+# =============================================================================
+# History Endpoints (SQLite-backed)
+# =============================================================================
+
+
+class SessionSummaryRow(BaseModel):
+    session_id: str
+    candidate_name: str | None = None
+    meeting_url: str | None = None
+    started_at: str
+    ended_at: str | None = None
+    running_summary: str = ""
+
+
+class SessionListResponse(BaseModel):
+    sessions: list[SessionSummaryRow]
+
+
+class LedgerResponse(BaseModel):
+    session_id: str
+    events: list[dict[str, Any]]
+
+
+class DossierResponse(BaseModel):
+    session_id: str
+    decisions: list[dict[str, Any]]
+    open_questions: list[dict[str, Any]]
+    action_items: list[dict[str, Any]]
+    risks: list[dict[str, Any]]
+
+
+class ExtractionsResponse(BaseModel):
+    session_id: str
+    extractions: list[dict[str, Any]]
+
+
+class ToolCallsResponse(BaseModel):
+    session_id: str
+    tool_calls: list[dict[str, Any]]
+
+
+@app.get("/sessions", response_model=SessionListResponse)
+async def list_sessions(state: AppStateDep, limit: int = 100) -> SessionListResponse:
+    """List recent persisted sessions (most recent first)."""
+    rows = await asyncio.to_thread(state["store"].list_sessions, limit)
+    return SessionListResponse(
+        sessions=[SessionSummaryRow(**row) for row in rows],
+    )
+
+
+@app.get("/sessions/{session_id}/ledger", response_model=LedgerResponse)
+async def get_session_ledger(
+    session_id: str,
+    state: AppStateDep,
+    limit: int | None = None,
+) -> LedgerResponse:
+    """Return the persisted meeting-event ledger for a session."""
+    events = await asyncio.to_thread(state["store"].get_ledger, session_id, limit)
+    return LedgerResponse(session_id=session_id, events=events)
+
+
+@app.get("/sessions/{session_id}/dossier", response_model=DossierResponse)
+async def get_session_dossier(session_id: str, state: AppStateDep) -> DossierResponse:
+    """Return Alfred's latest intent-alignment state for a session."""
+    bundle = await asyncio.to_thread(state["store"].get_dossier, session_id)
+    return DossierResponse(session_id=session_id, **bundle)
+
+
+@app.get("/sessions/{session_id}/extractions", response_model=ExtractionsResponse)
+async def get_session_extractions(
+    session_id: str,
+    state: AppStateDep,
+    since: str | None = None,
+    limit: int | None = None,
+) -> ExtractionsResponse:
+    """Return Alfred's per-tick extraction history for a session."""
+    rows = await asyncio.to_thread(
+        state["store"].get_extractions, session_id, since, limit
+    )
+    return ExtractionsResponse(session_id=session_id, extractions=rows)
+
+
+@app.get("/sessions/{session_id}/tool-calls", response_model=ToolCallsResponse)
+async def get_session_tool_calls(
+    session_id: str,
+    state: AppStateDep,
+    limit: int | None = None,
+) -> ToolCallsResponse:
+    """Return the audit log of agent tool calls for a session."""
+    rows = await asyncio.to_thread(state["store"].get_tool_calls, session_id, limit)
+    return ToolCallsResponse(session_id=session_id, tool_calls=rows)
 
 
 # =============================================================================

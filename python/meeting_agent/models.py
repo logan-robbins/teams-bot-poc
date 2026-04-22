@@ -1,9 +1,11 @@
 """
 Pydantic models for the meeting-agent pipeline.
 
-The current product is Alfred: a meeting assistant that consumes speech +
-chat as a unified append-only meeting ledger and emits one structured
-AlfredAction per analyzed event.
+Alfred consumes speech + chat as a unified append-only meeting ledger and
+emits one structured ``AlfredExtraction`` per analyzed event. Outbound
+meeting-chat sends are side effects produced by tool calls (see
+``meeting_agent.tools.send_to_meeting_chat``), not by a magic ``action``
+enum in the extraction payload.
 """
 
 from datetime import datetime, timezone
@@ -14,6 +16,11 @@ from pydantic import BaseModel, Field
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+# ---------------------------------------------------------------------------
+# Ingress event contracts
+# ---------------------------------------------------------------------------
 
 
 class EventMetadata(BaseModel):
@@ -62,11 +69,7 @@ class SpeakerMapping(BaseModel):
 
 
 class ChatMessage(BaseModel):
-    """
-    A single meeting-chat message ingested from the C# bot.
-
-    These are first-class timeline events alongside transcript turns.
-    """
+    """A single meeting-chat message ingested from the C# bot."""
 
     event_type: Literal["chat_created", "chat_updated", "chat_deleted"] = Field(
         default="chat_created"
@@ -127,68 +130,129 @@ class OutboundChatIntent(BaseModel):
     reply_to_message_id: Optional[str] = None
 
 
-class InterviewSession(BaseModel):
+# ---------------------------------------------------------------------------
+# Intent-alignment extraction types
+# ---------------------------------------------------------------------------
+
+
+DecisionStatus = Literal["tentative", "committed", "superseded"]
+QuestionStatus = Literal["open", "answered", "deferred"]
+ActionItemStatus = Literal["proposed", "owned", "done"]
+RiskSeverity = Literal["low", "medium", "high"]
+
+
+class Decision(BaseModel):
+    """Something the meeting has committed to."""
+
+    id: str
+    text: str
+    committed_by: list[str] = Field(default_factory=list)
+    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    first_seen_at: str = Field(default_factory=utc_now_iso)
+    source_event_ids: list[str] = Field(default_factory=list)
+    status: DecisionStatus = "tentative"
+
+
+class OpenQuestion(BaseModel):
+    """A question raised in the meeting that is not yet resolved."""
+
+    id: str
+    text: str
+    raised_by: Optional[str] = None
+    answer: Optional[str] = None
+    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    first_seen_at: str = Field(default_factory=utc_now_iso)
+    source_event_ids: list[str] = Field(default_factory=list)
+    status: QuestionStatus = "open"
+
+
+class ActionItem(BaseModel):
+    """A commitment: who does what, by when."""
+
+    id: str
+    text: str
+    owner: Optional[str] = None
+    due: Optional[str] = None
+    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    first_seen_at: str = Field(default_factory=utc_now_iso)
+    source_event_ids: list[str] = Field(default_factory=list)
+    status: ActionItemStatus = "proposed"
+
+
+class Risk(BaseModel):
+    """A concern Alfred has flagged."""
+
+    id: str
+    text: str
+    severity: RiskSeverity = "medium"
+    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    first_seen_at: str = Field(default_factory=utc_now_iso)
+    source_event_ids: list[str] = Field(default_factory=list)
+
+
+class AlfredExtraction(BaseModel):
     """
-    Tracks an active meeting session.
+    Alfred's per-tick structured output.
 
-    Name kept as InterviewSession for compatibility with the existing code,
-    but the state is meeting-generic and Alfred-specific.
+    This is purely *what Alfred thinks*. Outbound actions (sending into the
+    meeting chat) happen via the ``send_to_meeting_chat`` tool and do NOT
+    live on this payload.
+
+    All list fields are *deltas for this tick* (what is newly observed),
+    except ``running_summary``/``topics`` which replace prior values. The
+    session layer merges deltas into the session's rolling state.
     """
 
-    session_id: str
-    candidate_name: str = Field(..., description="Primary meeting subject label (freeform)")
-    meeting_url: str
-    started_at: str
-    ended_at: Optional[str] = None
-    speaker_mappings: list[SpeakerMapping] = Field(default_factory=list)
-    transcript_events: list[TranscriptEvent] = Field(default_factory=list)
-    chat_messages: list[ChatMessage] = Field(default_factory=list)
-    meeting_events: list[MeetingEvent] = Field(default_factory=list)
-    conversation_reference_id: Optional[str] = Field(
-        default=None,
-        description="Captured once the first chat message arrives; used by the sink to emit send-intent payloads",
-    )
-    graph_chat_thread_id: Optional[str] = None
-    prompt_cache_key: Optional[str] = None
-    latest_response_id: Optional[str] = None
-    latest_agent_cursor: int = 0
-    last_compaction_at: Optional[str] = None
-    running_summary: str = ""
-    topics: list[str] = Field(default_factory=list)
-    notes: list[str] = Field(default_factory=list)
-    alfred_muted: bool = False
-    outbound_chat_intents: list[OutboundChatIntent] = Field(default_factory=list)
-
-
-class AlfredAction(BaseModel):
-    """
-    Alfred's per-turn decision + note-taking output.
-
-    SILENT → update notes/summary/topics only.
-    SEND   → post `chat_text` to the meeting chat.
-    ASK    → same as SEND, framed as a clarifying question.
-    """
-
-    action: Literal["SILENT", "SEND", "ASK"]
-    rationale: str = Field(..., description="One-line justification for the decision")
-    chat_text: Optional[str] = Field(
-        default=None,
-        description="Body to post when action is SEND or ASK; required for those actions",
-    )
-    mentions: list[str] = Field(default_factory=list, description="@-mention handles to attach")
-    reply_to_message_id: Optional[str] = None
-    notes: list[str] = Field(
-        default_factory=list,
-        description="NEW notes added this tick (delta — not the full list)",
+    rationale: str = Field(
+        default="",
+        description="One-line justification of why Alfred did (or did not) act this tick",
     )
     running_summary: str = Field(
         default="",
-        description="Full running summary replacing prior (markdown)",
+        description="Full running summary replacing prior (markdown); <=150 words",
     )
     topics: list[str] = Field(
         default_factory=list,
-        description="Current discovered topics (running; replaces prior)",
+        description="Current discovered topics (running list; replaces prior)",
     )
+    notes: list[str] = Field(
+        default_factory=list,
+        description="New notes added this tick (delta — not the full list)",
+    )
+    decisions: list[Decision] = Field(
+        default_factory=list,
+        description="New or updated decisions this tick",
+    )
+    open_questions: list[OpenQuestion] = Field(
+        default_factory=list,
+        description="New or updated open questions this tick",
+    )
+    action_items: list[ActionItem] = Field(
+        default_factory=list,
+        description="New or updated action items this tick",
+    )
+    risks: list[Risk] = Field(
+        default_factory=list,
+        description="New or updated risks this tick",
+    )
+
+
+# Backwards-compat alias during migration (still imported by a handful of
+# call sites that merely need "something named AlfredAction"). New code
+# should use AlfredExtraction directly.
+AlfredAction = AlfredExtraction
+
+
+class ToolCallRecord(BaseModel):
+    """Audit record of one tool invocation made by the agent."""
+
+    id: str = Field(default_factory=lambda: f"tc_{utc_now_iso()}")
+    tool_name: str
+    timestamp_utc: str = Field(default_factory=utc_now_iso)
+    arguments: dict = Field(default_factory=dict)
+    ok: bool = True
+    result: dict = Field(default_factory=dict)
+    error: Optional[str] = None
 
 
 class AnalysisItem(BaseModel):
@@ -204,11 +268,53 @@ class AnalysisItem(BaseModel):
     clarity_score: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     key_points: list[str] = Field(default_factory=list)
     follow_up_suggestions: list[str] = Field(default_factory=list)
-    alfred_action: Optional[AlfredAction] = Field(
+    extraction: Optional[AlfredExtraction] = Field(
         default=None,
-        description="Alfred's per-turn decision when the Alfred analyzer produced this item",
+        description="Alfred's structured extraction for this tick",
+    )
+    tool_calls: list[ToolCallRecord] = Field(
+        default_factory=list,
+        description="Tool invocations the agent made while producing this item",
     )
     raw_model_output: Optional[dict] = None
+
+
+class InterviewSession(BaseModel):
+    """
+    Tracks an active meeting session.
+
+    Name kept for compatibility with existing code, but the state is
+    meeting-generic and Alfred-specific.
+    """
+
+    session_id: str
+    candidate_name: str = Field(..., description="Primary meeting subject label (freeform)")
+    meeting_url: str
+    started_at: str
+    ended_at: Optional[str] = None
+    speaker_mappings: list[SpeakerMapping] = Field(default_factory=list)
+    transcript_events: list[TranscriptEvent] = Field(default_factory=list)
+    chat_messages: list[ChatMessage] = Field(default_factory=list)
+    meeting_events: list[MeetingEvent] = Field(default_factory=list)
+    conversation_reference_id: Optional[str] = Field(
+        default=None,
+        description="Captured once the first chat message arrives; used by the send tool",
+    )
+    graph_chat_thread_id: Optional[str] = None
+    prompt_cache_key: Optional[str] = None
+    latest_response_id: Optional[str] = None
+    latest_agent_cursor: int = 0
+    last_compaction_at: Optional[str] = None
+    running_summary: str = ""
+    topics: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+    alfred_muted: bool = False
+    outbound_chat_intents: list[OutboundChatIntent] = Field(default_factory=list)
+    # Rolling intent-alignment state — merged from each AlfredExtraction.
+    decisions: list[Decision] = Field(default_factory=list)
+    open_questions: list[OpenQuestion] = Field(default_factory=list)
+    action_items: list[ActionItem] = Field(default_factory=list)
+    risks: list[Risk] = Field(default_factory=list)
 
 
 class SessionAnalysis(BaseModel):
@@ -226,6 +332,10 @@ class SessionAnalysis(BaseModel):
     running_summary: str = ""
     topics: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+    decisions: list[Decision] = Field(default_factory=list)
+    open_questions: list[OpenQuestion] = Field(default_factory=list)
+    action_items: list[ActionItem] = Field(default_factory=list)
+    risks: list[Risk] = Field(default_factory=list)
 
     def compute_overall_scores(self) -> None:
         """Compute overall scores from scored analysis items (no-op for Alfred items)."""

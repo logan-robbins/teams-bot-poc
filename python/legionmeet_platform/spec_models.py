@@ -15,11 +15,14 @@ class AgentTool(str, Enum):
 
 
 class OutputRouteType(str, Enum):
-    """Supported output route types."""
+    """Supported output route types.
+
+    ``teams_chat`` was retired when outbound Teams chat moved into the
+    ``send_to_meeting_chat`` agent tool (see ``meeting_agent/tools.py``).
+    """
 
     UI_STREAM = "ui_stream"
     WEBHOOK = "webhook"
-    TEAMS_CHAT = "teams_chat"
     TEAMS_DM = "teams_dm"
 
 
@@ -103,11 +106,6 @@ class OutputRouteSpec(BaseModel):
     def validate_route(self) -> "OutputRouteSpec":
         if self.type == OutputRouteType.WEBHOOK and self.enabled and not self.url:
             raise ValueError("outputs.routes[].url is required for enabled webhook routes")
-        if self.type == OutputRouteType.TEAMS_CHAT and self.enabled and not self.url:
-            raise ValueError(
-                "outputs.routes[].url is required for enabled teams_chat routes"
-                " (must point to the C# bot's /api/send-chat endpoint)"
-            )
         return self
 
     model_config = {"extra": "forbid"}

@@ -1,9 +1,18 @@
 """
 Alfred meeting agent using the OpenAI Agents SDK.
 
-The live-turn agent consumes the unified meeting ledger (speech + chat),
-maintains Alfred's running notes/summary/topics, and emits one structured
-AlfredAction per analyzed event.
+The live-turn agent consumes the unified meeting ledger (speech + chat)
+and produces, on each trigger event:
+
+  - Exactly one structured ``AlfredExtraction`` (his "mind"): rolling
+    notes, decisions, open questions, action items, risks, topics,
+    running summary.
+  - Zero or more tool calls. Today the only tool is
+    ``send_to_meeting_chat``; silence is the default — simply do not call
+    the tool.
+
+There is no more magic ``action`` enum and no more "SEND/ASK/SILENT"
+post-hoc router. The agent acts via tools; it thinks via structured output.
 """
 
 from __future__ import annotations
@@ -22,10 +31,11 @@ from openai import AsyncOpenAI
 from openai.types.shared import Reasoning
 from pydantic import BaseModel
 
-from .models import AlfredAction, AnalysisItem
+from .models import AlfredExtraction, AnalysisItem
 from .output import AnalysisOutputWriter
 from .pubsub import get_publisher
 from .session import InterviewSessionManager
+from .tools import AlfredAgentContext, build_alfred_tools
 
 _env_path = Path(__file__).parent.parent / ".env"
 load_dotenv(_env_path)
@@ -73,23 +83,40 @@ class RunningAssessment(BaseModel):
     summary: str = ""
 
 
-InterviewAnalysisOutput = AlfredAction
+# Public alias so callers can import ``InterviewAnalysisOutput`` without
+# knowing the concrete name; it always refers to the current extraction shape.
+InterviewAnalysisOutput = AlfredExtraction
 
 
 DEFAULT_ALFRED_INSTRUCTIONS = """You are Alfred, a quiet meeting assistant joining a Teams meeting.
 
 You can hear everything said (diarized transcript) and see every chat
-message. On each tick you receive the full meeting context and must emit
-exactly one AlfredAction.
+message. On each tick you receive the full meeting context.
+
+Two things happen per tick, independently:
+
+1. You ALWAYS return a structured ``AlfredExtraction`` describing your
+   current thinking: updated running_summary, topics, new notes, and
+   — most importantly — any new or updated decisions, open_questions,
+   action_items, and risks you can identify from the conversation.
+
+2. You MAY call the ``send_to_meeting_chat`` tool to post into the meeting
+   chat. Silence is the default. Only call the tool when you have
+   concrete value to add (a decision, a missing link, a clarifying
+   question that is genuinely blocking progress). Never call to recap
+   or narrate. If you would post, prefer one or two sentences.
 
 Rules:
-- Strong bias toward SILENT.
-- Never interrupt flow just to recap.
-- SEND only when you add concrete value.
-- ASK only when material ambiguity is blocking progress.
-- Keep SEND/ASK concise.
-- Update running_summary, notes, and topics on every useful turn.
-- If context.alfred_muted is true, emit SILENT.
+- Strong bias toward silence. Not calling the tool is the right answer
+  most of the time.
+- Never interrupt flow just to acknowledge.
+- If the meeting is muted (`context.alfred_muted == true`), never call
+  the tool.
+- Intent-alignment matters: when participants commit to something,
+  record it as a decision. When they leave something unresolved,
+  record it as an open_question. When someone agrees to do something,
+  record it as an action_item with an owner if stated.
+- Keep notes terse. Lists are deltas, not full history.
 """
 
 
@@ -111,7 +138,7 @@ def _extract_response_id(result: Any) -> str | None:
 
 
 class AlfredAnalyzer:
-    """Analyze a live meeting event and emit one AlfredAction."""
+    """Analyze a live meeting event and emit one AlfredExtraction plus any tool calls."""
 
     def __init__(
         self,
@@ -121,6 +148,7 @@ class AlfredAnalyzer:
         publish_thoughts: bool = True,
         reasoning_effort: Optional[str] = None,
         instructions: Optional[str] = None,
+        send_chat_url: Optional[str] = None,
     ) -> None:
         self.model = model or DEFAULT_MODEL
         self.reasoning_effort = reasoning_effort or DEFAULT_REASONING_EFFORT
@@ -128,6 +156,7 @@ class AlfredAnalyzer:
         self.session_manager = session_manager
         self.output_writer = output_writer
         self.publish_thoughts = publish_thoughts
+        self.send_chat_url = send_chat_url
         self._publisher = get_publisher() if publish_thoughts else None
 
         if not _IS_AZURE_CONFIGURED and not os.environ.get("OPENAI_API_KEY"):
@@ -137,11 +166,12 @@ class AlfredAnalyzer:
         if any(prefix in self.model.lower() for prefix in ("gpt-5", "o1", "o3")):
             model_settings = ModelSettings(reasoning=Reasoning(effort=self.reasoning_effort))
 
-        self._agent = Agent(
+        self._agent = Agent[AlfredAgentContext](
             name="Alfred Live Turn Agent",
             instructions=self.instructions,
             model=self.model,
-            output_type=AlfredAction,
+            output_type=AlfredExtraction,
+            tools=list(build_alfred_tools()),
             model_settings=model_settings,
         )
         logger.info("AlfredAnalyzer initialized model=%s reasoning=%s", self.model, self.reasoning_effort)
@@ -208,43 +238,10 @@ class AlfredAnalyzer:
                 "## Text To Analyze",
                 response_text,
                 "",
-                "Return AlfredAction only.",
+                "Return an AlfredExtraction. Optionally call send_to_meeting_chat.",
             ]
         )
         return "\n".join(parts)
-
-    def _sanitize_action(self, action: AlfredAction, context: Optional[dict[str, Any]]) -> AlfredAction:
-        ctx = context or {}
-        muted = bool(ctx.get("alfred_muted") or (ctx.get("stable_prefix") or {}).get("alfred_muted"))
-        if muted:
-            return AlfredAction(
-                action="SILENT",
-                rationale="Alfred is muted for this meeting.",
-                chat_text=None,
-                notes=action.notes,
-                running_summary=action.running_summary,
-                topics=action.topics,
-            )
-
-        if action.action == "SILENT":
-            action.chat_text = None
-            return action
-
-        if not (action.chat_text or "").strip():
-            return AlfredAction(
-                action="SILENT",
-                rationale=f"{action.action} was downgraded because no chat_text was provided.",
-                chat_text=None,
-                notes=action.notes,
-                running_summary=action.running_summary,
-                topics=action.topics,
-            )
-
-        if action.action == "ASK" and not action.chat_text.rstrip().endswith("?"):
-            action.chat_text = f"{action.chat_text.rstrip()}?"
-
-        action.chat_text = action.chat_text.strip()
-        return action
 
     async def analyze_async(
         self,
@@ -253,9 +250,14 @@ class AlfredAnalyzer:
         response_id: Optional[str] = None,
         speaker_id: Optional[str] = None,
     ) -> AnalysisItem:
+        if self.session_manager is None:
+            raise ValueError(
+                "AlfredAnalyzer.analyze_async requires a configured session_manager"
+                " so tools can target the active session."
+            )
+
         if not response_text or not response_text.strip():
-            fallback = AlfredAction(
-                action="SILENT",
+            fallback = AlfredExtraction(
                 rationale="Empty event text; nothing to analyze.",
                 running_summary=str((context or {}).get("running_summary") or ""),
                 topics=list((context or {}).get("topics") or []),
@@ -264,7 +266,7 @@ class AlfredAnalyzer:
                 response_id=response_id or f"resp_{uuid.uuid4().hex[:8]}",
                 response_text=response_text or "",
                 speaker_id=speaker_id,
-                alfred_action=fallback,
+                extraction=fallback,
                 key_points=fallback.notes,
                 raw_model_output={"warning": "empty_response_text"},
             )
@@ -277,10 +279,14 @@ class AlfredAnalyzer:
 
         prompt = self._build_prompt(response_text, context)
 
+        run_ctx = AlfredAgentContext(
+            session_manager=self.session_manager,
+            send_chat_url=self.send_chat_url,
+        )
+
         try:
-            result = await Runner.run(self._agent, prompt)
-            action = result.final_output_as(AlfredAction)
-            action = self._sanitize_action(action, context)
+            result = await Runner.run(self._agent, prompt, context=run_ctx)
+            extraction = result.final_output_as(AlfredExtraction)
             latest_response_id = _extract_response_id(result)
 
             analysis_item = AnalysisItem(
@@ -289,9 +295,10 @@ class AlfredAnalyzer:
                 response_text=response_text,
                 speaker_id=speaker_id,
                 trigger_event_id=str(((context or {}).get("trigger_event") or {}).get("event_id") or "") or None,
-                key_points=list(action.notes),
-                follow_up_suggestions=[action.chat_text] if action.chat_text else [],
-                alfred_action=action,
+                key_points=list(extraction.notes),
+                follow_up_suggestions=[],
+                extraction=extraction,
+                tool_calls=list(run_ctx.tool_records),
                 raw_model_output={
                     "model": self.model,
                     "latest_response_id": latest_response_id,
@@ -300,16 +307,20 @@ class AlfredAnalyzer:
 
             if self._publisher and self.publish_thoughts:
                 await self._publisher.publish_analysis(
-                    content=action.rationale,
+                    content=extraction.rationale,
                     speaker_id=speaker_id,
                     speaker_role=str(((context or {}).get("trigger_event") or {}).get("role") or "unknown"),
                     response_text=response_text[:240],
-                    key_points=action.notes,
-                    follow_up_suggestions=[action.chat_text] if action.chat_text else [],
+                    key_points=extraction.notes,
+                    follow_up_suggestions=[],
                     running_assessment={
-                        "running_summary": action.running_summary,
-                        "topics": action.topics,
-                        "action": action.action,
+                        "running_summary": extraction.running_summary,
+                        "topics": extraction.topics,
+                        "decisions": [d.model_dump() for d in extraction.decisions],
+                        "open_questions": [q.model_dump() for q in extraction.open_questions],
+                        "action_items": [a.model_dump() for a in extraction.action_items],
+                        "risks": [r.model_dump() for r in extraction.risks],
+                        "tool_calls": [tc.model_dump() for tc in run_ctx.tool_records],
                     },
                 )
 
@@ -319,8 +330,7 @@ class AlfredAnalyzer:
             if self._publisher and self.publish_thoughts:
                 await self._publisher.publish_error(f"Alfred analysis failed: {exc!s}")
 
-            fallback = AlfredAction(
-                action="SILENT",
+            fallback = AlfredExtraction(
                 rationale="Analysis failed; Alfred stayed silent.",
                 running_summary=str((context or {}).get("running_summary") or ""),
                 topics=list((context or {}).get("topics") or []),
@@ -331,7 +341,7 @@ class AlfredAnalyzer:
                 speaker_id=speaker_id,
                 trigger_event_id=str(((context or {}).get("trigger_event") or {}).get("event_id") or "") or None,
                 key_points=fallback.notes,
-                alfred_action=fallback,
+                extraction=fallback,
                 raw_model_output={"error": str(exc), "model": self.model},
             )
 
@@ -387,6 +397,7 @@ def create_alfred_analyzer(
     publish_thoughts: bool = True,
     reasoning_effort: Optional[str] = None,
     instructions: Optional[str] = None,
+    send_chat_url: Optional[str] = None,
 ) -> AlfredAnalyzer:
     output_writer: AnalysisOutputWriter | None = None
     if output_dir:
@@ -399,6 +410,7 @@ def create_alfred_analyzer(
         publish_thoughts=publish_thoughts,
         reasoning_effort=reasoning_effort,
         instructions=instructions,
+        send_chat_url=send_chat_url,
     )
 
 
@@ -409,6 +421,7 @@ def create_interview_analyzer(
     publish_thoughts: bool = True,
     reasoning_effort: Optional[str] = None,
     instructions: Optional[str] = None,
+    send_chat_url: Optional[str] = None,
 ) -> AlfredAnalyzer:
     return create_alfred_analyzer(
         model=model,
@@ -417,4 +430,5 @@ def create_interview_analyzer(
         publish_thoughts=publish_thoughts,
         reasoning_effort=reasoning_effort,
         instructions=instructions,
+        send_chat_url=send_chat_url,
     )

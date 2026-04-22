@@ -1,0 +1,121 @@
+@import "tailwindcss";
+
+/*
+ * Alfred theme — "Wayne Manor study at night"
+ * ---------------------------------------------
+ * Ink: the charcoal greys that form the page.
+ * Gold: reserved *exclusively* for Alfred's own contributions.
+ * Emerald / Amber / Azure / Crimson: the four intent-alignment channels.
+ */
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-serif: "Fraunces", "Iowan Old Style", Georgia, serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+
+  --color-ink-50: #F4F7FC;
+  --color-ink-100: #DDE5F0;
+  --color-ink-200: #C4CFDE;
+  --color-ink-300: #A6B2C3;
+  --color-ink-400: #8592A6;
+  --color-ink-500: #6A788E;
+  --color-ink-600: #3A4555;
+  --color-ink-700: #2E3A4A;
+  --color-ink-800: #1A2330;
+  --color-ink-900: #131A22;
+  --color-ink-950: #0D1218;
+
+  --color-gold-400: #E6C35A;
+  --color-gold-500: #D4AF37;
+  --color-gold-600: #B8962C;
+
+  --color-emerald-400: #34D399;
+  --color-emerald-500: #10B981;
+  --color-amber-400: #FBBF24;
+  --color-amber-500: #F59E0B;
+  --color-azure-400: #60A5FA;
+  --color-azure-500: #3B82F6;
+  --color-crimson-400: #F87171;
+  --color-crimson-500: #EF4444;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  font-feature-settings: "ss01", "cv11";
+  background:
+    radial-gradient(1200px 700px at 85% -10%, rgba(212, 175, 55, 0.07), transparent 60%),
+    radial-gradient(900px 500px at -10% 110%, rgba(96, 165, 250, 0.05), transparent 60%),
+    #0D1218;
+}
+
+/* Scrollbar — Wayne Manor, not Apple Store. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #1B2530;
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #2A3441;
+  background-clip: padding-box;
+  border: 2px solid transparent;
+}
+
+@keyframes ink-in {
+  0% {
+    opacity: 0;
+    transform: translateY(6px);
+    filter: blur(2px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+    filter: blur(0);
+  }
+}
+@keyframes dossier-glow {
+  0% {
+    box-shadow: 0 0 0 0 rgba(212, 175, 55, 0.35);
+  }
+  60% {
+    box-shadow: 0 0 0 6px rgba(212, 175, 55, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(212, 175, 55, 0);
+  }
+}
+@keyframes pulse-gold {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(212, 175, 55, 0.55);
+  }
+  70% {
+    box-shadow: 0 0 0 8px rgba(212, 175, 55, 0);
+  }
+}
+
+.ink-in {
+  animation: ink-in 260ms ease-out both;
+}
+.dossier-new {
+  animation: dossier-glow 1100ms ease-out 1;
+}
+.pulse-gold {
+  animation: pulse-gold 1800ms ease-in-out infinite;
+}
+
+/* Selection */
+::selection {
+  background: rgba(212, 175, 55, 0.35);
+  color: #fff;
+}

@@ -50,6 +50,23 @@ def _format_utc_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _merge_by_id(data: dict, key: str, incoming: list[dict]) -> None:
+    """Upsert items into a list-of-dicts on ``data[key]`` by their ``id`` field."""
+    if not incoming:
+        return
+    existing = list(data.get(key) or [])
+    by_id: dict[str, dict] = {}
+    for entry in existing:
+        entry_id = entry.get("id")
+        if entry_id:
+            by_id[str(entry_id)] = entry
+    for entry in incoming:
+        entry_id = entry.get("id")
+        if entry_id:
+            by_id[str(entry_id)] = entry
+    data[key] = list(by_id.values())[-200:]
+
+
 class AnalysisOutputWriter:
     """
     Writes interview analysis results to JSON files.
@@ -199,6 +216,10 @@ class AnalysisOutputWriter:
                 "running_summary": "",
                 "topics": [],
                 "notes": [],
+                "decisions": [],
+                "open_questions": [],
+                "action_items": [],
+                "risks": [],
                 "_meta": {
                     "created_at": current_timestamp,
                     "version": "1.0",
@@ -209,16 +230,21 @@ class AnalysisOutputWriter:
         data["analysis_items"].append(item.model_dump())
         data["total_responses_analyzed"] = len(data["analysis_items"])
 
-        action = item.alfred_action
-        if action is not None:
-            if action.running_summary:
-                data["running_summary"] = action.running_summary
-            if action.topics:
-                data["topics"] = list(action.topics)
-            if action.notes:
+        extraction = item.extraction
+        if extraction is not None:
+            if extraction.running_summary:
+                data["running_summary"] = extraction.running_summary
+            if extraction.topics:
+                data["topics"] = list(extraction.topics)
+            if extraction.notes:
                 notes = list(data.get("notes") or [])
-                notes.extend(action.notes)
+                notes.extend(extraction.notes)
                 data["notes"] = notes[-200:]
+            # Intent-alignment rolling state: merge by id.
+            _merge_by_id(data, "decisions", [d.model_dump() for d in extraction.decisions])
+            _merge_by_id(data, "open_questions", [q.model_dump() for q in extraction.open_questions])
+            _merge_by_id(data, "action_items", [a.model_dump() for a in extraction.action_items])
+            _merge_by_id(data, "risks", [r.model_dump() for r in extraction.risks])
 
         # Recompute overall scores using only scored items.
         scored_items = [

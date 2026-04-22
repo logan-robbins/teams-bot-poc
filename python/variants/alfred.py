@@ -2,9 +2,11 @@
 Alfred variant — passive meeting assistant with chat read/send.
 
 Alfred reads the unified meeting timeline (transcript turns + chat messages)
-and on each tick emits one of three actions: SILENT, SEND, or ASK. SILENT
-means note-taking only; SEND/ASK post a message to the meeting chat via
-the bot's proactive-messaging endpoint.
+and per tick produces a structured ``AlfredExtraction`` (his notes,
+decisions, open questions, action items, risks, topics, running summary).
+
+Outbound chat messages are side effects produced by the
+``send_to_meeting_chat`` tool — silence is simply "did not call the tool".
 
 The persona, prompt, and decision rules are driven by the product spec
 (see legionmeet_platform/specs/alfred.yaml), not hardcoded here.
@@ -45,8 +47,8 @@ class AlfredVariantPlugin(BaseVariantPlugin):
     ) -> dict[str, Any]:
         enriched = dict(base_context)
         enriched["assistant_mode"] = "alfred"
-        enriched["action_menu"] = ["SILENT", "SEND", "ASK"]
         enriched["bias_toward_silence"] = True
+        enriched["tool_menu"] = ["send_to_meeting_chat"]
         if isinstance(event, MeetingEvent):
             enriched["trigger_kind"] = "chat" if event.kind == "chat" else "speech"
         else:
@@ -54,7 +56,6 @@ class AlfredVariantPlugin(BaseVariantPlugin):
         return enriched
 
     def transform_analysis_item(self, analysis_item: AnalysisItem) -> AnalysisItem:
-        # Alfred populates alfred_action directly in the agent layer; nothing
-        # to transform here, but returning the item allows future augmentation
-        # (e.g., rate-limit-aware downgrades from SEND to SILENT).
+        # Alfred populates `extraction` and `tool_calls` directly in the agent
+        # layer; nothing to transform here.
         return analysis_item
