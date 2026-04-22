@@ -1,24 +1,20 @@
 """
-Pydantic models for Interview Analysis Agent.
+Pydantic models for the meeting-agent pipeline.
 
-Defines data structures for transcript events (v2 with diarization),
-interview sessions, and analysis outputs.
-
-Last Grunted: 02/05/2026
+Models here are product-agnostic: they describe inputs and outputs of the
+analysis pipeline, not any specific persona. Alfred-specific action output
+is defined alongside because it's emitted by the same agent and flows
+through the same AnalysisItem envelope.
 """
 
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Literal, Optional
+
 from pydantic import BaseModel, Field
 
 
 class EventMetadata(BaseModel):
-    """
-    Optional metadata attached to transcript events.
-    
-    Contains additional context such as meeting details,
-    audio processing info, or custom application data.
-    """
+    """Optional metadata attached to transcript events."""
     meeting_id: Optional[str] = None
     call_id: Optional[str] = None
     raw_response: Optional[dict] = None
@@ -26,247 +22,178 @@ class EventMetadata(BaseModel):
 
 
 class EventError(BaseModel):
-    """
-    Error details for error events.
-    
-    Captures error code and message from STT provider failures.
-    """
+    """Error details for error events."""
     code: str = Field(..., description="Error code from STT provider")
     message: str = Field(..., description="Human-readable error message")
 
 
 class TranscriptEvent(BaseModel):
-    """
-    Transcript event from STT provider (v2 format with speaker diarization).
-    
-    This model represents real-time transcript data received from the C# bot,
-    including speaker identification for multi-participant meetings.
-    
-    Event Types:
-        - "partial": Interim recognition result (still processing)
-        - "final": Completed recognition result
-        - "session_started": STT session began
-        - "session_stopped": STT session ended
-        - "error": Recognition error occurred
-    
-    Example:
-        >>> event = TranscriptEvent(
-        ...     event_type="final",
-        ...     text="Tell me about your experience with Python.",
-        ...     timestamp_utc="2026-01-31T10:30:00.000Z",
-        ...     speaker_id="speaker_0",
-        ...     confidence=0.95
-        ... )
-    """
+    """Transcript event from STT provider (v2 format with speaker diarization)."""
     event_type: str = Field(
         ...,
-        description="Event type: 'partial', 'final', 'session_started', 'session_stopped', 'error'"
+        description="Event type: 'partial', 'final', 'session_started', 'session_stopped', 'error'",
     )
-    text: Optional[str] = Field(
-        default=None,
-        description="Transcript text content (null for status events)"
-    )
-    timestamp_utc: str = Field(
-        ...,
-        description="ISO 8601 UTC timestamp when event occurred"
-    )
-    speaker_id: Optional[str] = Field(
-        default=None,
-        description="Speaker identifier from diarization: 'speaker_0', 'speaker_1', etc."
-    )
-    audio_start_ms: Optional[float] = Field(
-        default=None,
-        description="Audio offset start in milliseconds from session start"
-    )
-    audio_end_ms: Optional[float] = Field(
-        default=None,
-        description="Audio offset end in milliseconds from session start"
-    )
-    confidence: Optional[float] = Field(
-        default=None,
-        ge=0.0,
-        le=1.0,
-        description="Recognition confidence score (0.0 to 1.0)"
-    )
-    metadata: Optional[EventMetadata] = Field(
-        default=None,
-        description="Optional metadata with provider-specific details"
-    )
-    error: Optional[EventError] = Field(
-        default=None,
-        description="Error details (only for error events)"
-    )
+    text: Optional[str] = None
+    timestamp_utc: str = Field(..., description="ISO 8601 UTC timestamp when event occurred")
+    speaker_id: Optional[str] = None
+    audio_start_ms: Optional[float] = None
+    audio_end_ms: Optional[float] = None
+    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    metadata: Optional[EventMetadata] = None
+    error: Optional[EventError] = None
 
 
 class SpeakerMapping(BaseModel):
+    """Maps a speaker ID to a role in the meeting."""
+    speaker_id: str
+    role: str = Field(..., description="Role: 'candidate', 'interviewer', 'participant', 'bot'")
+    name: Optional[str] = None
+
+
+class ChatMessage(BaseModel):
     """
-    Maps a speaker ID to a role in the interview.
-    
-    Used to track which speaker_id corresponds to the candidate
-    vs the interviewer(s).
+    A single meeting-chat message ingested from the C# bot.
+
+    The bot forwards every meeting chat message (human or bot) through
+    POST /chat on the sink. These are first-class timeline events alongside
+    transcript turns, and the agent reads them both.
     """
-    speaker_id: str = Field(..., description="Speaker ID from diarization (e.g., 'speaker_0')")
-    role: str = Field(..., description="Role: 'candidate' or 'interviewer'")
-    name: Optional[str] = Field(default=None, description="Display name if known")
+    event_type: Literal["chat_created", "chat_updated", "chat_deleted"] = Field(
+        default="chat_created"
+    )
+    chat_thread_id: str = Field(..., description="Teams chat thread id backing the meeting")
+    message_id: str = Field(..., description="Teams chat message id (for reply/edit threading)")
+    text: Optional[str] = Field(default=None, description="Plain-text message body")
+    html: Optional[str] = Field(default=None, description="HTML body as rendered in Teams")
+    sender_id: Optional[str] = None
+    sender_display_name: Optional[str] = None
+    timestamp_utc: str
+    conversation_reference_id: Optional[str] = Field(
+        default=None,
+        description="Stable key used by the C# bot to call adapter.ContinueConversationAsync",
+    )
+    attachments: list[dict] = Field(default_factory=list)
+    mentions: list[dict] = Field(default_factory=list)
+    reply_to_message_id: Optional[str] = Field(
+        default=None,
+        description="Message id this one is threaded under, if any",
+    )
+    from_bot: bool = Field(
+        default=False,
+        description="True when this chat was sent by our own bot (our outbound echo)",
+    )
+    raw: Optional[dict] = Field(default=None, description="Raw Graph chatMessage body")
 
 
 class InterviewSession(BaseModel):
     """
-    Tracks an active interview session.
-    
-    Contains session metadata, speaker mappings, and accumulated transcript.
-    The session is initialized with the candidate's name and meeting URL,
-    then speaker mappings are added as diarization identifies participants.
-    
-    Example:
-        >>> session = InterviewSession(
-        ...     session_id="int_20260131_103000",
-        ...     candidate_name="John Smith",
-        ...     meeting_url="https://teams.microsoft.com/l/meetup-join/...",
-        ...     started_at="2026-01-31T10:30:00.000Z"
-        ... )
+    Tracks an active meeting session.
+
+    Name kept as InterviewSession for now to minimise churn across the
+    code base; the schema is generic (speech + chat). `candidate_name`
+    acts as a freeform label for the primary meeting subject.
     """
-    session_id: str = Field(..., description="Unique session identifier")
-    candidate_name: str = Field(..., description="Name of the candidate being interviewed")
-    meeting_url: str = Field(..., description="Teams meeting join URL")
-    started_at: str = Field(..., description="ISO 8601 UTC timestamp when session started")
-    ended_at: Optional[str] = Field(default=None, description="ISO 8601 UTC timestamp when session ended")
-    speaker_mappings: list[SpeakerMapping] = Field(
+    session_id: str
+    candidate_name: str = Field(..., description="Primary meeting subject label (freeform)")
+    meeting_url: str
+    started_at: str
+    ended_at: Optional[str] = None
+    speaker_mappings: list[SpeakerMapping] = Field(default_factory=list)
+    transcript_events: list[TranscriptEvent] = Field(default_factory=list)
+    chat_messages: list[ChatMessage] = Field(
         default_factory=list,
-        description="List of speaker ID to role mappings"
+        description="All chat messages ingested during the session (merged into the timeline alongside speech)",
     )
-    transcript_events: list[TranscriptEvent] = Field(
+    conversation_reference_id: Optional[str] = Field(
+        default=None,
+        description="Captured once the first chat message arrives; used by the sink to emit send-intent payloads",
+    )
+
+
+class AlfredAction(BaseModel):
+    """
+    Alfred's per-turn decision + note-taking output.
+
+    The agent emits one of these on each transcript or chat tick.
+    SILENT → just update notes/summary/topics; do not post.
+    SEND   → post `chat_text` to the meeting chat.
+    ASK    → same as SEND, semantically framed as a clarifying question.
+    """
+    action: Literal["SILENT", "SEND", "ASK"]
+    rationale: str = Field(..., description="One-line justification for the decision")
+    chat_text: Optional[str] = Field(
+        default=None,
+        description="Body to post when action is SEND or ASK; required for those actions",
+    )
+    mentions: list[str] = Field(default_factory=list, description="@-mention handles to attach")
+    reply_to_message_id: Optional[str] = None
+    notes: list[str] = Field(
         default_factory=list,
-        description="All transcript events received during session"
+        description="NEW notes added this tick (delta — not the full list)",
+    )
+    running_summary: str = Field(
+        default="",
+        description="Full running summary replacing prior (markdown)",
+    )
+    topics: list[str] = Field(
+        default_factory=list,
+        description="Current discovered topics (running; replaces prior)",
     )
 
 
 class AnalysisItem(BaseModel):
     """
-    Analysis of a single candidate response.
-    
-    Generated by the Interview Analyzer agent after processing
-    a candidate's response to an interview question.
-    
-    Scores:
-        - relevance_score: How well the response addresses the question (0-1)
-        - clarity_score: How clearly the response is articulated (0-1)
-    
-    Example:
-        >>> item = AnalysisItem(
-        ...     response_id="resp_001",
-        ...     question_text="Tell me about your Python experience.",
-        ...     response_text="I've worked with Python for 5 years...",
-        ...     relevance_score=0.85,
-        ...     clarity_score=0.90,
-        ...     key_points=["5 years experience", "Backend development"],
-        ...     follow_up_suggestions=["Ask about specific frameworks used"]
-        ... )
+    Envelope for per-turn analysis output.
+
+    The relevance/clarity scores are optional because Alfred doesn't
+    compute them — they're retained for legacy interview-style use.
+    Alfred-specific output goes into `alfred_action`.
     """
-    response_id: str = Field(..., description="Unique identifier for this response")
+    response_id: str
     timestamp_utc: str = Field(
-        default_factory=lambda: datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        description="When analysis was generated"
+        default_factory=lambda: datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     )
-    question_text: Optional[str] = Field(
+    question_text: Optional[str] = None
+    response_text: str
+    speaker_id: Optional[str] = None
+    relevance_score: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    clarity_score: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    key_points: list[str] = Field(default_factory=list)
+    follow_up_suggestions: list[str] = Field(default_factory=list)
+    alfred_action: Optional[AlfredAction] = Field(
         default=None,
-        description="The interviewer question that prompted this response"
+        description="Alfred's per-turn decision when the Alfred analyzer produced this item",
     )
-    response_text: str = Field(..., description="The candidate's response text")
-    speaker_id: Optional[str] = Field(
-        default=None,
-        description="Speaker ID of the candidate"
-    )
-    relevance_score: float = Field(
-        ...,
-        ge=0.0,
-        le=1.0,
-        description="How relevant the response is to the question (0.0 to 1.0)"
-    )
-    clarity_score: float = Field(
-        ...,
-        ge=0.0,
-        le=1.0,
-        description="How clearly the response is articulated (0.0 to 1.0)"
-    )
-    key_points: list[str] = Field(
-        default_factory=list,
-        description="Key points extracted from the response"
-    )
-    follow_up_suggestions: list[str] = Field(
-        default_factory=list,
-        description="Suggested follow-up questions for the interviewer"
-    )
-    raw_model_output: Optional[dict] = Field(
-        default=None,
-        description="Raw output from the analysis model (for debugging)"
-    )
+    raw_model_output: Optional[dict] = None
 
 
 class SessionAnalysis(BaseModel):
-    """
-    Complete analysis output for an interview session.
-    
-    Aggregates all individual response analyses along with session metadata
-    and summary statistics.
-    
-    Example:
-        >>> analysis = SessionAnalysis(
-        ...     session_id="int_20260131_103000",
-        ...     candidate_name="John Smith",
-        ...     analysis_items=[item1, item2, item3],
-        ...     overall_relevance=0.82,
-        ...     overall_clarity=0.88
-        ... )
-    """
-    session_id: str = Field(..., description="Session this analysis belongs to")
-    candidate_name: str = Field(..., description="Name of the candidate")
-    started_at: str = Field(..., description="Session start timestamp")
-    ended_at: Optional[str] = Field(default=None, description="Session end timestamp")
-    analysis_items: list[AnalysisItem] = Field(
-        default_factory=list,
-        description="List of individual response analyses"
+    """Complete analysis output for a meeting session."""
+    session_id: str
+    candidate_name: str
+    started_at: str
+    ended_at: Optional[str] = None
+    analysis_items: list[AnalysisItem] = Field(default_factory=list)
+    overall_relevance: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    overall_clarity: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    total_responses_analyzed: int = 0
+    checklist_state: list[dict[str, str | None]] = Field(default_factory=list)
+    running_summary: str = Field(
+        default="",
+        description="Alfred's latest running summary (replaces prior)",
     )
-    overall_relevance: Optional[float] = Field(
-        default=None,
-        ge=0.0,
-        le=1.0,
-        description="Average relevance score across all responses"
-    )
-    overall_clarity: Optional[float] = Field(
-        default=None,
-        ge=0.0,
-        le=1.0,
-        description="Average clarity score across all responses"
-    )
-    total_responses_analyzed: int = Field(
-        default=0,
-        description="Total number of candidate responses analyzed"
-    )
-    checklist_state: list[dict[str, str | None]] = Field(
-        default_factory=list,
-        description="Checklist snapshot at latest analysis write"
-    )
-    
+    topics: list[str] = Field(default_factory=list)
+
     def compute_overall_scores(self) -> None:
-        """
-        Compute overall scores from individual analysis items.
-        
-        Updates the following instance attributes:
-            - overall_relevance: Average relevance score, or None if no items
-            - overall_clarity: Average clarity score, or None if no items  
-            - total_responses_analyzed: Count of analysis items
-        """
-        if not self.analysis_items:
+        """Compute overall scores from scored analysis items (no-op for Alfred items)."""
+        scored = [
+            item for item in self.analysis_items
+            if item.relevance_score is not None and item.clarity_score is not None
+        ]
+        self.total_responses_analyzed = len(self.analysis_items)
+        if not scored:
             self.overall_relevance = None
             self.overall_clarity = None
-            self.total_responses_analyzed = 0
             return
-        
-        self.total_responses_analyzed = len(self.analysis_items)
-        self.overall_relevance = sum(
-            item.relevance_score for item in self.analysis_items
-        ) / len(self.analysis_items)
-        self.overall_clarity = sum(
-            item.clarity_score for item in self.analysis_items
-        ) / len(self.analysis_items)
+        self.overall_relevance = sum(i.relevance_score for i in scored) / len(scored)
+        self.overall_clarity = sum(i.clarity_score for i in scored) / len(scored)

@@ -7,7 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from meeting_agent.models import AnalysisItem, TranscriptEvent
+from meeting_agent.models import AnalysisItem, ChatMessage, TranscriptEvent
 
 
 @dataclass(frozen=True)
@@ -49,13 +49,20 @@ class VariantPlugin(Protocol):
     ) -> None:
         """Lifecycle hook for each transcript event."""
 
+    async def on_chat_message(
+        self,
+        message: ChatMessage,
+        session_context: dict[str, Any],
+    ) -> None:
+        """Lifecycle hook for each meeting chat message."""
+
     async def on_session_end(self, session_summary: dict[str, Any]) -> None:
         """Lifecycle hook when a session ends."""
 
     def build_analysis_context(
         self,
         base_context: dict[str, Any],
-        event: TranscriptEvent,
+        event: TranscriptEvent | ChatMessage,
     ) -> dict[str, Any]:
         """Inject variant-specific context before agent analysis."""
 
@@ -80,13 +87,20 @@ class BaseVariantPlugin:
     ) -> None:
         return
 
+    async def on_chat_message(
+        self,
+        message: ChatMessage,
+        session_context: dict[str, Any],
+    ) -> None:
+        return
+
     async def on_session_end(self, session_summary: dict[str, Any]) -> None:
         return
 
     def build_analysis_context(
         self,
         base_context: dict[str, Any],
-        event: TranscriptEvent,
+        event: TranscriptEvent | ChatMessage,
     ) -> dict[str, Any]:
         return base_context
 

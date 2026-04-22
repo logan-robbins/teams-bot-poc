@@ -38,6 +38,7 @@ from pydantic import BaseModel, Field
 
 from meeting_agent.models import (
     AnalysisItem,
+    ChatMessage,
     SessionAnalysis,
     TranscriptEvent,
 )
@@ -82,7 +83,7 @@ class RuntimeConfig:
 
 def load_runtime_config() -> RuntimeConfig:
     """Load runtime config from environment with strict validation."""
-    variant_id = (os.environ.get("VARIANT_ID", "default") or "").strip().lower()
+    variant_id = (os.environ.get("VARIANT_ID", "alfred") or "").strip().lower()
     if not variant_id:
         raise RuntimeError("VARIANT_ID resolved to empty value.")
 
@@ -271,6 +272,30 @@ class SpeakerMapRequest(BaseModel):
     role: SpeakerRole = Field(..., description="Role: candidate or interviewer")
 
 
+class ChatMessageRequest(BaseModel):
+    """Meeting chat message pushed from the C# bot to POST /chat."""
+
+    event_type: str = Field(
+        default="chat_created",
+        description="chat_created | chat_updated | chat_deleted",
+    )
+    chat_thread_id: str = Field(..., min_length=1)
+    message_id: str = Field(..., min_length=1)
+    text: str | None = None
+    html: str | None = None
+    sender_id: str | None = None
+    sender_display_name: str | None = None
+    timestamp_utc: str = Field(..., min_length=1)
+    conversation_reference_id: str | None = None
+    attachments: list[dict[str, Any]] = Field(default_factory=list)
+    mentions: list[dict[str, Any]] = Field(default_factory=list)
+    reply_to_message_id: str | None = None
+    from_bot: bool = False
+    raw: dict[str, Any] | None = None
+
+    model_config = {"extra": "ignore"}
+
+
 # =============================================================================
 # Response Models
 # =============================================================================
@@ -326,6 +351,17 @@ class SessionStatusResponse(BaseModel):
     recent_conversation: list[dict[str, str | None]] = Field(
         default_factory=list,
         description="Recent final transcript turns with speaker role annotations",
+    )
+    meeting_history: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Unified timeline: speech turns + chat messages, ordered by timestamp",
+    )
+    chat_messages_count: int = Field(
+        default=0, description="Total meeting chat messages ingested"
+    )
+    conversation_reference_id: str | None = Field(
+        default=None,
+        description="Captured ConversationReference id for the meeting chat (once bot sees first chat)",
     )
     total_events: int = Field(default=0, description="Total transcript events received")
     final_events: int = Field(default=0, description="Final transcript events")
@@ -1267,6 +1303,74 @@ async def receive_transcript(
     )
 
 
+@app.post("/chat", response_model=TranscriptResponse)
+async def receive_chat_message(
+    request: ChatMessageRequest,
+    state: AppStateDep,
+) -> TranscriptResponse:
+    """
+    Receive a meeting chat message from the C# bot.
+
+    Every meeting chat message (human or bot-echoed) flows through here
+    and becomes a first-class event in the unified meeting timeline.
+    """
+    stats = state["stats"]
+    session_manager = state["session_manager"]
+    variant_plugin = state["variant_plugin"]
+    route_orchestrator = state["route_orchestrator"]
+
+    stats["events_received"] += 1
+
+    chat = ChatMessage(
+        event_type=request.event_type,  # type: ignore[arg-type]
+        chat_thread_id=request.chat_thread_id,
+        message_id=request.message_id,
+        text=request.text,
+        html=request.html,
+        sender_id=request.sender_id,
+        sender_display_name=request.sender_display_name,
+        timestamp_utc=request.timestamp_utc,
+        conversation_reference_id=request.conversation_reference_id,
+        attachments=request.attachments,
+        mentions=request.mentions,
+        reply_to_message_id=request.reply_to_message_id,
+        from_bot=request.from_bot,
+        raw=request.raw,
+    )
+
+    if session_manager.is_active:
+        session_manager.add_chat_message(chat)
+
+        if session_manager.session:
+            await dispatch_route_payload(
+                route_orchestrator=route_orchestrator,
+                stats=stats,
+                payload={
+                    "event_type": "chat",
+                    "product_id": PRODUCT_SPEC.product_id,
+                    "instance_id": RUNTIME_CONFIG.instance_id,
+                    "session_id": session_manager.session.session_id,
+                    "chat_message": chat.model_dump(),
+                    "session_context": session_manager.get_session_context(),
+                },
+            )
+
+        logger.info(
+            "[CHAT] %s from %s (%s): %s",
+            chat.event_type,
+            chat.sender_display_name or chat.sender_id or "unknown",
+            "bot" if chat.from_bot else "human",
+            (chat.text or "")[:120],
+        )
+
+    await variant_plugin.on_chat_message(chat, session_manager.get_session_context())
+
+    return TranscriptResponse(
+        ok=True,
+        received_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    )
+
+
 @app.post("/session/start", response_model=SessionStartResponse)
 async def start_session(
     request: SessionStartRequest,
@@ -1422,6 +1526,9 @@ async def get_session_status(state: AppStateDep) -> SessionStatusWrapper:
         started_at=context.get("started_at"),
         speaker_mappings=context.get("speaker_mappings", {}),
         recent_conversation=context.get("recent_conversation", []),
+        meeting_history=context.get("meeting_history", []),
+        chat_messages_count=context.get("chat_messages_count", 0),
+        conversation_reference_id=context.get("conversation_reference_id"),
         total_events=context.get("total_events", 0),
         final_events=context.get("final_events", 0),
         analysis_count=stats["agent_analyses"],

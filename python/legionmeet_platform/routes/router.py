@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from legionmeet_platform.routes.base import OutputRoute, RouteDispatchResult
+from legionmeet_platform.routes.teams_chat import TeamsChatRoute
 from legionmeet_platform.routes.ui_stream import UiStreamRoute
 from legionmeet_platform.routes.webhook import WebhookRoute
 from legionmeet_platform.spec_models import OutputRouteType, ProductSpec
@@ -54,7 +55,23 @@ def build_route_orchestrator(spec: ProductSpec) -> RouteOrchestrator:
             )
             continue
 
-        if route.type in {OutputRouteType.TEAMS_CHAT, OutputRouteType.TEAMS_DM}:
+        if route.type == OutputRouteType.TEAMS_CHAT:
+            if not route.url:
+                raise RuntimeError(
+                    f"Route '{route.id}' is teams_chat but has no URL configured."
+                )
+            routes.append(
+                TeamsChatRoute(
+                    route_id=route.id,
+                    url=route.url,
+                    headers=route.headers,
+                    timeout_seconds=route.timeout_seconds,
+                    max_rps=route.max_rps,
+                )
+            )
+            continue
+
+        if route.type == OutputRouteType.TEAMS_DM:
             raise RuntimeError(
                 f"Route '{route.id}' uses unimplemented type '{route.type.value}'."
             )

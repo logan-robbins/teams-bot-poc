@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from .models import (
+    ChatMessage,
     TranscriptEvent,
     InterviewSession,
     SpeakerMapping,
@@ -271,8 +272,8 @@ class InterviewSessionManager:
         """
         if self._session is None:
             raise ValueError("No active session. Call start_session() first.")
-        
-        valid_roles = {"candidate", "interviewer"}
+
+        valid_roles = {"candidate", "interviewer", "participant", "bot"}
         if role not in valid_roles:
             raise ValueError(f"Invalid role '{role}'. Must be one of: {valid_roles}")
         
@@ -544,6 +545,7 @@ class InterviewSessionManager:
         
         conversation = self.get_recent_conversation(count=20)
         candidate_speaker_id = self.infer_candidate_speaker_id()
+        timeline = self.get_unified_timeline(count=40)
 
         return {
             "session_active": self.is_active,
@@ -554,9 +556,12 @@ class InterviewSessionManager:
             "speaker_mappings": dict(self._speaker_roles),
             "candidate_speaker_id": candidate_speaker_id,
             "recent_conversation": conversation,
+            "meeting_history": timeline,
+            "chat_messages_count": len(self._session.chat_messages),
+            "conversation_reference_id": self._session.conversation_reference_id,
             "total_events": len(self._session.transcript_events),
             "final_events": len([
-                e for e in self._session.transcript_events 
+                e for e in self._session.transcript_events
                 if e.event_type == "final"
             ]),
         }
@@ -591,5 +596,77 @@ class InterviewSessionManager:
                 and event.text
             ):
                 return event.text
-        
+
         return None
+
+    # ------------------------------------------------------------------
+    # Meeting chat (Alfred)
+    # ------------------------------------------------------------------
+
+    def add_chat_message(self, message: ChatMessage) -> None:
+        """Append a meeting chat message to the session and capture the conversation ref."""
+        if self._session is None:
+            raise ValueError("No active session. Call start_session() first.")
+
+        self._session.chat_messages.append(message)
+
+        if (
+            message.conversation_reference_id
+            and self._session.conversation_reference_id is None
+        ):
+            self._session.conversation_reference_id = message.conversation_reference_id
+            logger.info(
+                "Captured conversation_reference_id=%s for session %s",
+                message.conversation_reference_id,
+                self._session.session_id,
+            )
+
+    def get_unified_timeline(self, count: int = 40) -> list[dict[str, object]]:
+        """
+        Merge transcript turns + chat messages into a single ordered timeline.
+
+        Each entry has: kind, timestamp, speaker/sender, role, text, and a
+        kind-specific id. Used by the Alfred agent as "meeting history" and
+        by the UI for the note-taking timeline.
+        """
+        if self._session is None:
+            return []
+
+        entries: list[dict[str, object]] = []
+
+        for turn in self.get_recent_conversation(count=count * 2):
+            entries.append(
+                {
+                    "kind": "speech",
+                    "timestamp_utc": turn.get("timestamp"),
+                    "speaker_id": turn.get("speaker_id"),
+                    "role": turn.get("role") or "unknown",
+                    "display_name": None,
+                    "text": turn.get("text") or "",
+                    "message_id": None,
+                    "from_bot": False,
+                }
+            )
+
+        for chat in self._session.chat_messages:
+            if chat.event_type == "chat_deleted" or not (chat.text or "").strip():
+                continue
+            role = (
+                "bot" if chat.from_bot
+                else (self.get_speaker_role(chat.sender_id or "") or "participant")
+            )
+            entries.append(
+                {
+                    "kind": "chat",
+                    "timestamp_utc": chat.timestamp_utc,
+                    "speaker_id": chat.sender_id,
+                    "role": role,
+                    "display_name": chat.sender_display_name,
+                    "text": chat.text or "",
+                    "message_id": chat.message_id,
+                    "from_bot": chat.from_bot,
+                }
+            )
+
+        entries.sort(key=lambda e: str(e.get("timestamp_utc") or ""))
+        return entries[-count:] if len(entries) > count else entries

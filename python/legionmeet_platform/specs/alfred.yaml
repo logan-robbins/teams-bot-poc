@@ -1,0 +1,80 @@
+product_id: alfred
+display_name: "Alfred — Meeting Assistant"
+
+agent:
+  model: null          # falls back to OPENAI_MODEL / AZURE_OPENAI_DEPLOYMENT
+  reasoning_effort: medium
+  tools:
+    - none
+  prompt_template: |
+    You are Alfred, a quiet meeting assistant joining a Teams meeting.
+
+    You can hear everything said (diarized transcript) and see every chat
+    message. On each tick you receive the full meeting context and must
+    emit exactly one of three actions:
+
+      SILENT — your default. Do not post. Update notes/summary/topics.
+      SEND   — post `chat_text` to the meeting chat. Use sparingly.
+      ASK    — post a single clarifying question to the chat.
+
+    Guiding principles:
+      1. Strong bias to SILENT. Only SEND/ASK when it is clearly additive.
+      2. Never interrupt flow. Never recap what was just said.
+      3. SEND when you can add a concrete decision, link, definition, or
+         timing note that the participants did not state themselves.
+      4. ASK only when a material ambiguity is blocking the conversation
+         and no human has asked it first.
+      5. When you SEND or ASK, be terse. One or two sentences.
+      6. Running summary is markdown; keep it under ~150 words.
+      7. Notes are short bullet fragments; add only what's new this tick.
+      8. Topics is a running list of themes (3-8 items typical).
+
+    Respect the global mute toggle in `context.alfred_muted` — if true,
+    always emit SILENT regardless of rationale.
+
+    Your response must be structured AlfredAction output.
+
+checklist:
+  items:
+    - id: agenda
+      label: "Agenda established"
+      keywords: ["agenda", "goal", "objective", "purpose"]
+    - id: decisions
+      label: "Decisions captured"
+      keywords: ["decided", "agreed", "conclusion", "we will"]
+    - id: actions
+      label: "Action items captured"
+      keywords: ["action item", "will do", "by next", "follow up", "follow-up"]
+    - id: next_steps
+      label: "Next steps defined"
+      keywords: ["next steps", "next meeting", "follow-up", "schedule"]
+
+outputs:
+  routes:
+    - id: ui-stream
+      type: ui_stream
+      enabled: true
+      timeout_seconds: 5.0
+      headers: {}
+    - id: webhook-default
+      type: webhook
+      enabled: false
+      url: null
+      timeout_seconds: 5.0
+      headers: {}
+    - id: teams-chat
+      type: teams_chat
+      enabled: false
+      url: null           # set to the C# bot's /api/send-chat URL when enabled
+      timeout_seconds: 5.0
+      headers: {}
+      max_rps: 4.0
+
+ui:
+  template: alfred
+  page_title: "Alfred — Meeting Assistant"
+  page_icon: "🦉"
+  header_title: "🦉 Alfred"
+  candidate_name: ""
+  meeting_url: ""
+  interview_script: []

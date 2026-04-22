@@ -69,15 +69,18 @@ class AgentSpec(BaseModel):
 
 
 class UiSpec(BaseModel):
-    """Default UI template content and simulation data."""
+    """Default UI template content and (optional) simulation data."""
 
-    template: str = Field(default="talestral", min_length=1)
+    template: str = Field(default="alfred", min_length=1)
     page_title: str = Field(..., min_length=1)
     page_icon: str = Field(..., min_length=1)
     header_title: str = Field(..., min_length=1)
-    candidate_name: str = Field(..., min_length=1)
-    meeting_url: str = Field(..., min_length=1)
-    interview_script: tuple[tuple[str, str], ...] = Field(..., min_length=1)
+    candidate_name: str = Field(default="", description="Freeform subject label (may be empty)")
+    meeting_url: str = Field(default="", description="Optional default meeting URL for simulation")
+    interview_script: tuple[tuple[str, str], ...] = Field(
+        default_factory=tuple,
+        description="Optional simulation script for local demo mode",
+    )
 
     model_config = {"extra": "forbid"}
 
@@ -91,11 +94,20 @@ class OutputRouteSpec(BaseModel):
     url: str | None = None
     headers: dict[str, str] = Field(default_factory=dict)
     timeout_seconds: float = 5.0
+    max_rps: float = Field(
+        default=4.0,
+        description="Client-side rate limit for this route (requests per second)",
+    )
 
     @model_validator(mode="after")
     def validate_route(self) -> "OutputRouteSpec":
         if self.type == OutputRouteType.WEBHOOK and self.enabled and not self.url:
             raise ValueError("outputs.routes[].url is required for enabled webhook routes")
+        if self.type == OutputRouteType.TEAMS_CHAT and self.enabled and not self.url:
+            raise ValueError(
+                "outputs.routes[].url is required for enabled teams_chat routes"
+                " (must point to the C# bot's /api/send-chat endpoint)"
+            )
         return self
 
     model_config = {"extra": "forbid"}

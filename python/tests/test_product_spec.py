@@ -12,34 +12,22 @@ from legionmeet_platform.routes import build_route_orchestrator
 from legionmeet_platform.spec_models import ProductSpec
 
 
-def test_load_product_spec_from_explicit_path() -> None:
-    """Explicit product spec path is required and loads successfully."""
-    spec_path = (
-        Path(__file__).resolve().parent.parent
-        / "legionmeet_platform"
-        / "specs"
-        / "talestral.json"
-    ).resolve()
-    spec, loaded_path = load_product_spec(str(spec_path))
+ALFRED_SPEC = (
+    Path(__file__).resolve().parent.parent
+    / "legionmeet_platform"
+    / "specs"
+    / "alfred.yaml"
+).resolve()
 
-    assert spec.product_id == "talestral"
-    assert loaded_path == spec_path
+
+def test_load_alfred_spec_from_explicit_path() -> None:
+    """Alfred YAML spec loads via explicit path."""
+    spec, loaded_path = load_product_spec(str(ALFRED_SPEC))
+
+    assert spec.product_id == "alfred"
+    assert "Alfred" in spec.display_name
+    assert loaded_path == ALFRED_SPEC
     assert len(spec.checklist.items) > 0
-
-
-def test_load_prd_pro_spec_from_explicit_path() -> None:
-    """PRD Pro spec loads from explicit path."""
-    spec_path = (
-        Path(__file__).resolve().parent.parent
-        / "legionmeet_platform"
-        / "specs"
-        / "prd-pro.json"
-    ).resolve()
-    spec, loaded_path = load_product_spec(str(spec_path))
-
-    assert spec.product_id == "prd-pro"
-    assert spec.display_name == "PRD Pro"
-    assert loaded_path == spec_path
 
 
 def test_spec_path_is_required(monkeypatch) -> None:
@@ -73,13 +61,10 @@ def test_product_spec_requires_non_empty_checklist(tmp_path) -> None:
             ]
         },
         "ui": {
-            "template": "talestral",
+            "template": "alfred",
             "page_title": "Test",
             "page_icon": "T",
             "header_title": "Test",
-            "candidate_name": "Test",
-            "meeting_url": "https://teams.microsoft.com/l/meetup-join/test",
-            "interview_script": [["speaker_0", "hello"]],
         },
     }
     spec_file = tmp_path / "invalid.json"
@@ -89,26 +74,55 @@ def test_product_spec_requires_non_empty_checklist(tmp_path) -> None:
         load_product_spec(str(spec_file))
 
 
-def test_unimplemented_route_type_fails_fast() -> None:
-    """Enabled teams routes are declared but intentionally not implemented yet."""
-    spec_path = (
-        Path(__file__).resolve().parent.parent
-        / "legionmeet_platform"
-        / "specs"
-        / "talestral.json"
-    ).resolve()
-    spec, _ = load_product_spec(str(spec_path))
+def test_yaml_spec_loads_equivalently(tmp_path) -> None:
+    """YAML and JSON specs parse to the same ProductSpec shape."""
+    import yaml
+    raw = yaml.safe_load(ALFRED_SPEC.read_text(encoding="utf-8"))
+    json_path = tmp_path / "alfred.json"
+    json_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    yaml_spec, _ = load_product_spec(str(ALFRED_SPEC))
+    json_spec, _ = load_product_spec(str(json_path))
+
+    assert yaml_spec.model_dump() == json_spec.model_dump()
+
+
+def test_teams_dm_route_is_unimplemented() -> None:
+    """teams_dm is declared but intentionally not implemented yet."""
+    spec, _ = load_product_spec(str(ALFRED_SPEC))
     raw = spec.model_dump()
-    routes = list(raw["outputs"]["routes"])
-    routes[0] = {
-        "id": "teams-dm",
-        "type": "teams_dm",
-        "enabled": True,
-        "headers": {},
-        "timeout_seconds": 5.0,
-    }
-    raw["outputs"]["routes"] = routes
+    raw["outputs"]["routes"] = [
+        {
+            "id": "teams-dm",
+            "type": "teams_dm",
+            "enabled": True,
+            "headers": {},
+            "timeout_seconds": 5.0,
+            "max_rps": 4.0,
+        }
+    ]
     parsed = ProductSpec.model_validate(raw)
 
     with pytest.raises(RuntimeError, match="unimplemented"):
         build_route_orchestrator(parsed)
+
+
+def test_teams_chat_route_requires_url_when_enabled() -> None:
+    """teams_chat routes must declare a URL when enabled."""
+    spec, _ = load_product_spec(str(ALFRED_SPEC))
+    raw = spec.model_dump()
+    raw["outputs"]["routes"] = [
+        {
+            "id": "teams-chat-broken",
+            "type": "teams_chat",
+            "enabled": True,
+            "url": None,
+            "headers": {},
+            "timeout_seconds": 5.0,
+            "max_rps": 4.0,
+        }
+    ]
+
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError):
+        ProductSpec.model_validate(raw)

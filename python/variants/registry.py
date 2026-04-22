@@ -1,18 +1,14 @@
-"""
-Variant plugin registry.
-"""
+"""Variant plugin registry."""
 
 from __future__ import annotations
 
+from variants.alfred import AlfredVariantPlugin
 from variants.base import VariantPlugin
-from variants.behavioral import BehavioralVariantPlugin
-from variants.default import DefaultVariantPlugin
 
 
 def _build_registry() -> dict[str, VariantPlugin]:
     plugins: tuple[VariantPlugin, ...] = (
-        DefaultVariantPlugin(),
-        BehavioralVariantPlugin(),
+        AlfredVariantPlugin(),
     )
     return {plugin.variant_id: plugin for plugin in plugins}
 

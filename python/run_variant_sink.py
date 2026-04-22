@@ -18,8 +18,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--variant",
-        default="default",
-        help="Variant plugin id for compatibility (default: default).",
+        default="alfred",
+        help="Variant plugin id (default: alfred).",
     )
     parser.add_argument("--instance", required=True, help="Instance id (e.g. meeting-a).")
     parser.add_argument("--host", default="0.0.0.0", help="Sink bind host.")
@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--product-spec",
         required=True,
-        help="Required path to product spec JSON (e.g. ./legionmeet_platform/specs/prd-pro.json).",
+        help="Required path to product spec (JSON or YAML), e.g. ./legionmeet_platform/specs/alfred.yaml.",
     )
     parser.add_argument("--log-level", default="info", help="Uvicorn log level.")
     return parser.parse_args()

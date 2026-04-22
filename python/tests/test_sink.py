@@ -28,9 +28,11 @@ TEST_PRODUCT_SPEC_PATH = (
     Path(__file__).resolve().parent.parent
     / "legionmeet_platform"
     / "specs"
-    / "talestral.json"
+    / "alfred.yaml"
 )
 os.environ.setdefault("PRODUCT_SPEC_PATH", str(TEST_PRODUCT_SPEC_PATH))
+os.environ.setdefault("VARIANT_ID", "alfred")
+os.environ.setdefault("INSTANCE_ID", "alfred-test")
 
 
 # =============================================================================
@@ -737,3 +739,116 @@ class TestIntegrationFlow:
         # Stats should still update
         stats_response = await client.get("/stats")
         assert stats_response.json()["stats"]["final_transcripts"] >= 1
+
+
+# =============================================================================
+# Chat Endpoint Tests (Alfred meeting-chat ingest)
+# =============================================================================
+
+
+class TestChatEndpoint:
+    """Tests for POST /chat endpoint (meeting chat messages from C# bot)."""
+
+    @pytest.mark.asyncio
+    async def test_chat_message_stored_and_exposed_in_timeline(
+        self, client: AsyncClient
+    ) -> None:
+        """A chat message arriving during an active session shows up in the unified timeline."""
+        await client.post(
+            "/session/start",
+            json={"candidate_name": "Meeting", "meeting_url": "https://teams.microsoft.com/meet/x"},
+        )
+        response = await client.post(
+            "/chat",
+            json={
+                "chat_thread_id": "19:meeting_x@thread.v2",
+                "message_id": "m-1",
+                "text": "Hello from Alice",
+                "sender_display_name": "Alice",
+                "sender_id": "alice-upn",
+                "timestamp_utc": "2026-04-22T16:00:00Z",
+                "conversation_reference_id": "ref-abc",
+            },
+        )
+        assert response.status_code == 200
+
+        status = (await client.get("/session/status")).json()["session"]
+        assert status["chat_messages_count"] == 1
+        assert status["conversation_reference_id"] == "ref-abc"
+        assert any(
+            entry["kind"] == "chat" and entry["display_name"] == "Alice"
+            for entry in status["meeting_history"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_unified_timeline_orders_chat_and_speech_by_timestamp(
+        self, client: AsyncClient
+    ) -> None:
+        """Speech and chat merge into a single ordered timeline."""
+        await client.post(
+            "/session/start",
+            json={"candidate_name": "Meeting", "meeting_url": "https://teams.microsoft.com/meet/x"},
+        )
+
+        await client.post(
+            "/chat",
+            json={
+                "chat_thread_id": "19:meeting_x@thread.v2",
+                "message_id": "m-early",
+                "text": "early chat",
+                "timestamp_utc": "2026-04-22T16:00:00Z",
+            },
+        )
+        await client.post(
+            "/transcript",
+            json={
+                "event_type": "final",
+                "text": "middle speech",
+                "timestamp_utc": "2026-04-22T16:00:30Z",
+                "speaker_id": "speaker_0",
+            },
+        )
+        await client.post(
+            "/chat",
+            json={
+                "chat_thread_id": "19:meeting_x@thread.v2",
+                "message_id": "m-late",
+                "text": "late chat",
+                "timestamp_utc": "2026-04-22T16:01:00Z",
+            },
+        )
+
+        history = (await client.get("/session/status")).json()["session"][
+            "meeting_history"
+        ]
+        kinds = [(e["kind"], e["text"]) for e in history]
+        # Timeline is in ascending timestamp order.
+        assert kinds == [
+            ("chat", "early chat"),
+            ("speech", "middle speech"),
+            ("chat", "late chat"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_deleted_chat_is_dropped_from_timeline(
+        self, client: AsyncClient
+    ) -> None:
+        """chat_deleted events do not show up in the unified timeline."""
+        await client.post(
+            "/session/start",
+            json={"candidate_name": "Meeting", "meeting_url": "https://teams.microsoft.com/meet/x"},
+        )
+        await client.post(
+            "/chat",
+            json={
+                "event_type": "chat_deleted",
+                "chat_thread_id": "19:meeting_x@thread.v2",
+                "message_id": "m-del",
+                "text": "this was deleted",
+                "timestamp_utc": "2026-04-22T16:00:00Z",
+            },
+        )
+        history = (await client.get("/session/status")).json()["session"][
+            "meeting_history"
+        ]
+        assert history == []
