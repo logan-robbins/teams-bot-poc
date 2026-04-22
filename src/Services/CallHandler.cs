@@ -43,6 +43,7 @@ public class CallHandler : HeartbeatHandler
     private bool _isTranscriberStarted;
     private long _audioFramesReceived;
     private bool _isShuttingDown;
+    private uint _lastDominantSpeaker = DominantSpeakerChangedEventArgs.None;
 
     /// <summary>
     /// Gets the call being handled.
@@ -93,6 +94,7 @@ public class CallHandler : HeartbeatHandler
         if (MediaSession.AudioSocket is not null)
         {
             MediaSession.AudioSocket.AudioMediaReceived += OnAudioMediaReceived;
+            MediaSession.AudioSocket.DominantSpeakerChanged += OnDominantSpeakerChanged;
             _logger.LogInformation("CallHandler created for call {CallId} - audio socket wired", call.Id);
         }
         else
@@ -158,6 +160,15 @@ public class CallHandler : HeartbeatHandler
         }
     }
 
+    private void OnDominantSpeakerChanged(object? sender, DominantSpeakerChangedEventArgs e)
+    {
+        _lastDominantSpeaker = e.CurrentDominantSpeaker;
+        _logger.LogDebug(
+            "Call {CallId}: dominant speaker changed to MediaSourceId={MediaSourceId}",
+            Call.Id,
+            e.CurrentDominantSpeaker);
+    }
+
     /// <summary>
     /// Handles incoming audio frames from Teams Media SDK.
     /// </summary>
@@ -191,11 +202,16 @@ public class CallHandler : HeartbeatHandler
             // Log stats periodically (~1 second intervals)
             if (_audioFramesReceived % StatsLogInterval == 0)
             {
+                var activeSpeakers = buffer.ActiveSpeakers;
+                var unmixedCount = buffer.UnmixedAudioBuffers?.Length ?? 0;
                 _logger.LogDebug(
-                    "Call {CallId}: Received {FrameCount} audio frames ({DurationSeconds:F1}s of audio)",
+                    "Call {CallId}: Received {FrameCount} audio frames ({DurationSeconds:F1}s of audio), ActiveSpeakers={ActiveSpeakerCount}, UnmixedBuffers={UnmixedBufferCount}, DominantSpeaker={DominantSpeaker}",
                     Call.Id,
                     _audioFramesReceived,
-                    _audioFramesReceived * 0.02);
+                    _audioFramesReceived * 0.02,
+                    activeSpeakers?.Length ?? 0,
+                    unmixedCount,
+                    _lastDominantSpeaker);
             }
         }
         catch (Exception ex)
@@ -292,6 +308,7 @@ public class CallHandler : HeartbeatHandler
         if (MediaSession.AudioSocket is not null)
         {
             MediaSession.AudioSocket.AudioMediaReceived -= OnAudioMediaReceived;
+            MediaSession.AudioSocket.DominantSpeakerChanged -= OnDominantSpeakerChanged;
         }
 
         _logger.LogInformation(

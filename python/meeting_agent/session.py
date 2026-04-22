@@ -14,14 +14,16 @@ Last Grunted: 02/05/2026
 
 import logging
 import uuid
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
 
 from .models import (
     ChatMessage,
-    TranscriptEvent,
     InterviewSession,
+    MeetingEvent,
+    OutboundChatIntent,
     SpeakerMapping,
+    TranscriptEvent,
 )
 
 
@@ -36,6 +38,8 @@ SHORT_FRAGMENT_WORDS = 5
 DOMINANT_SPEAKER_MIN_CHARS = 24
 DOMINANT_SPEAKER_MIN_TURNS = 2
 DOMINANT_SPEAKER_SHARE = 0.68
+MAX_OUTBOUND_INTENTS = 24
+BOT_ECHO_WINDOW_SECONDS = 180
 
 
 def _format_utc_timestamp(dt: datetime) -> str:
@@ -70,6 +74,11 @@ def _normalize_token(token: str) -> str:
 def _normalize_text(text: str) -> str:
     """Normalize transcript text for comparisons."""
     return " ".join(_normalize_token(token) for token in text.split() if _normalize_token(token))
+
+
+def _build_prompt_cache_key(session_id: str) -> str:
+    """Create a stable prompt-cache key for one meeting session."""
+    return f"alfred:{session_id}"
 
 
 def _merge_transcript_text(existing_text: str, new_text: str) -> str:
@@ -217,6 +226,7 @@ class InterviewSessionManager:
             candidate_name=candidate_name,
             meeting_url=meeting_url,
             started_at=_format_utc_timestamp(timestamp),
+            prompt_cache_key=_build_prompt_cache_key(session_id),
         )
         self._speaker_roles = {}
         
@@ -330,6 +340,129 @@ class InterviewSessionManager:
             The role ("candidate" or "interviewer"), or None if not mapped.
         """
         return self._speaker_roles.get(speaker_id)
+
+    def _role_for_chat_sender(self, sender_id: str | None, from_bot: bool) -> str:
+        if from_bot:
+            return "bot"
+        if sender_id:
+            return self.get_speaker_role(sender_id) or "participant"
+        return "participant"
+
+    def _append_meeting_event(self, event: MeetingEvent) -> MeetingEvent:
+        """Append to the canonical meeting ledger with light speech consolidation."""
+        if self._session is None:
+            raise ValueError("No active session. Call start_session() first.")
+
+        if event.kind == "speech" and self._session.meeting_events:
+            previous = self._session.meeting_events[-1]
+            previous_turn = {
+                "speaker_id": previous.speaker_id,
+                "role": previous.role,
+                "text": previous.text,
+                "timestamp": previous.timestamp_utc,
+            }
+            current_turn = {
+                "speaker_id": event.speaker_id,
+                "role": event.role,
+                "text": event.text,
+                "timestamp": event.timestamp_utc,
+            }
+            if previous.kind == "speech" and _should_merge_turn(previous_turn, current_turn):
+                previous.text = _merge_transcript_text(previous.text, event.text)
+                previous.timestamp_utc = event.timestamp_utc
+                previous.confidence = event.confidence or previous.confidence
+                if previous.role == "unknown" and event.role != "unknown":
+                    previous.role = event.role
+                    previous.speaker_id = event.speaker_id
+                    previous.display_name = event.display_name
+                return previous
+
+        self._session.meeting_events.append(event)
+        return event
+
+    def get_latest_meeting_event(self) -> Optional[MeetingEvent]:
+        if self._session is None or not self._session.meeting_events:
+            return None
+        return self._session.meeting_events[-1]
+
+    def get_recent_events_since_cursor(self, count: Optional[int] = None) -> list[MeetingEvent]:
+        """Return meeting events added after the last processed agent cursor."""
+        if self._session is None:
+            return []
+        events = self._session.meeting_events[self._session.latest_agent_cursor :]
+        if count is not None and len(events) > count:
+            return events[-count:]
+        return list(events)
+
+    def mark_agent_progress(self, event_id: str | None = None, latest_response_id: str | None = None) -> None:
+        """Advance the agent cursor after a successful live-turn analysis."""
+        if self._session is None:
+            return
+
+        if event_id:
+            for index, event in enumerate(self._session.meeting_events, start=1):
+                if event.event_id == event_id:
+                    self._session.latest_agent_cursor = max(self._session.latest_agent_cursor, index)
+                    break
+        else:
+            self._session.latest_agent_cursor = len(self._session.meeting_events)
+
+        if latest_response_id:
+            self._session.latest_response_id = latest_response_id
+
+    def apply_alfred_action(self, action: Any) -> None:
+        """Persist Alfred's latest running state on the session."""
+        if self._session is None or action is None:
+            return
+
+        running_summary = str(getattr(action, "running_summary", "") or "").strip()
+        if running_summary:
+            self._session.running_summary = running_summary
+
+        topics = [str(topic).strip() for topic in list(getattr(action, "topics", []) or []) if str(topic).strip()]
+        if topics:
+            self._session.topics = topics
+
+        notes = [str(note).strip() for note in list(getattr(action, "notes", []) or []) if str(note).strip()]
+        if notes:
+            self._session.notes.extend(notes)
+            self._session.notes = self._session.notes[-200:]
+
+    def record_outbound_chat_intent(self, text: str, reply_to_message_id: str | None = None) -> None:
+        """Remember recent outbound chat so the bot echo does not re-trigger Alfred."""
+        if self._session is None or not text.strip():
+            return
+
+        self._session.outbound_chat_intents.append(
+            OutboundChatIntent(
+                text=text,
+                normalized_text=_normalize_text(text),
+                reply_to_message_id=reply_to_message_id,
+            )
+        )
+        self._session.outbound_chat_intents = self._session.outbound_chat_intents[-MAX_OUTBOUND_INTENTS:]
+
+    def is_expected_bot_echo(self, message: ChatMessage) -> bool:
+        """Return True when an inbound bot chat matches a recent Alfred send intent."""
+        if self._session is None or not message.from_bot:
+            return False
+
+        normalized_text = _normalize_text(message.text or "")
+        if not normalized_text:
+            return False
+
+        message_ts = _parse_utc_timestamp(message.timestamp_utc)
+        for intent in reversed(self._session.outbound_chat_intents):
+            if intent.normalized_text != normalized_text:
+                continue
+            if intent.reply_to_message_id and intent.reply_to_message_id != message.reply_to_message_id:
+                continue
+            intent_ts = _parse_utc_timestamp(intent.timestamp_utc)
+            if message_ts and intent_ts:
+                if abs((message_ts - intent_ts).total_seconds()) > BOT_ECHO_WINDOW_SECONDS:
+                    continue
+            return True
+        return False
     
     def add_transcript(self, event: TranscriptEvent) -> None:
         """
@@ -357,8 +490,28 @@ class InterviewSessionManager:
             raise ValueError("No active session. Call start_session() first.")
         
         self._session.transcript_events.append(event)
-        
-        if event.event_type == "final":
+
+        if event.event_type == "final" and event.text and event.text.strip():
+            metadata = event.metadata
+            self._append_meeting_event(
+                MeetingEvent(
+                    event_id=f"speech:{event.timestamp_utc}:{event.speaker_id or 'unknown'}",
+                    kind="speech",
+                    timestamp_utc=event.timestamp_utc,
+                    source="teams_media",
+                    text=event.text.strip(),
+                    speaker_id=event.speaker_id,
+                    participant_id=metadata.participant_id if metadata else None,
+                    aad_object_id=metadata.aad_object_id if metadata else None,
+                    media_source_id=metadata.media_source_id if metadata else None,
+                    display_name=metadata.display_name if metadata else None,
+                    role=self.get_speaker_role(event.speaker_id or "") or "unknown",
+                    transcript_provider=metadata.provider if metadata else None,
+                    confidence=event.confidence,
+                    raw=metadata.raw_response if metadata else None,
+                )
+            )
+
             logger.debug(
                 "Added final transcript: speaker=%s, len=%d",
                 event.speaker_id,
@@ -423,48 +576,22 @@ class InterviewSessionManager:
 
     def get_recent_conversation(self, count: int = 10) -> list[dict[str, str | None]]:
         """
-        Return recent final transcript turns with light consolidation applied.
-
-        Adjacent short fragments are merged so diarization churn and STT chunking
-        do not create a bubble for every partial sentence fragment.
+        Return recent consolidated speech turns from the canonical meeting ledger.
         """
         if self._session is None:
             return []
-
-        recent_events = self.get_recent_transcripts(
-            count=max(count * 3, count),
-            final_only=True,
-        )
         conversation: list[dict[str, str | None]] = []
 
-        for event in recent_events:
-            if not event.text or not event.text.strip():
+        for event in self._session.meeting_events:
+            if event.kind != "speech" or not event.text.strip():
                 continue
 
-            role = self.get_speaker_role(event.speaker_id) if event.speaker_id else None
             turn: dict[str, str | None] = {
                 "speaker_id": event.speaker_id,
-                "role": role or "unknown",
+                "role": event.role or "unknown",
                 "text": event.text.strip(),
                 "timestamp": event.timestamp_utc,
             }
-
-            if conversation and _should_merge_turn(conversation[-1], turn):
-                previous = conversation[-1]
-                previous["text"] = _merge_transcript_text(
-                    str(previous.get("text") or ""),
-                    turn["text"] or "",
-                )
-                previous["timestamp"] = turn["timestamp"]
-
-                previous_role = str(previous.get("role") or "unknown")
-                current_role = str(turn.get("role") or "unknown")
-                if previous_role == "unknown" and current_role != "unknown":
-                    previous["role"] = current_role
-                    previous["speaker_id"] = turn["speaker_id"]
-
-                continue
-
             conversation.append(turn)
 
         return conversation[-count:] if len(conversation) > count else conversation
@@ -541,11 +668,15 @@ class InterviewSessionManager:
                 "speaker_mappings": {},
                 "recent_conversation": [],
                 "candidate_speaker_id": None,
+                "meeting_history": [],
+                "running_summary": "",
+                "topics": [],
+                "notes": [],
             }
         
         conversation = self.get_recent_conversation(count=20)
         candidate_speaker_id = self.infer_candidate_speaker_id()
-        timeline = self.get_unified_timeline(count=40)
+        timeline = self.get_unified_timeline()
 
         return {
             "session_active": self.is_active,
@@ -559,11 +690,52 @@ class InterviewSessionManager:
             "meeting_history": timeline,
             "chat_messages_count": len(self._session.chat_messages),
             "conversation_reference_id": self._session.conversation_reference_id,
+            "graph_chat_thread_id": self._session.graph_chat_thread_id,
+            "prompt_cache_key": self._session.prompt_cache_key,
+            "latest_response_id": self._session.latest_response_id,
+            "latest_agent_cursor": self._session.latest_agent_cursor,
+            "running_summary": self._session.running_summary,
+            "topics": list(self._session.topics),
+            "notes": list(self._session.notes),
+            "alfred_muted": self._session.alfred_muted,
             "total_events": len(self._session.transcript_events),
             "final_events": len([
                 e for e in self._session.transcript_events
                 if e.event_type == "final"
             ]),
+        }
+
+    def get_agent_context_snapshot(
+        self,
+        trigger_event: MeetingEvent | None = None,
+    ) -> dict[str, Any]:
+        """Return the stable Alfred context plus the newest appended events."""
+        if self._session is None:
+            return {
+                "session_active": False,
+                "stable_prefix": {},
+                "dynamic_tail": [],
+            }
+
+        session_context = self.get_session_context()
+        dynamic_tail = [event.model_dump() for event in self.get_recent_events_since_cursor()]
+        return {
+            **session_context,
+            "stable_prefix": {
+                "session_id": self._session.session_id,
+                "candidate_name": self._session.candidate_name,
+                "meeting_url": self._session.meeting_url,
+                "started_at": self._session.started_at,
+                "speaker_mappings": dict(self._speaker_roles),
+                "prompt_cache_key": self._session.prompt_cache_key,
+                "latest_response_id": self._session.latest_response_id,
+                "running_summary": self._session.running_summary,
+                "topics": list(self._session.topics),
+                "notes": list(self._session.notes),
+                "alfred_muted": self._session.alfred_muted,
+            },
+            "dynamic_tail": dynamic_tail,
+            "trigger_event": trigger_event.model_dump() if trigger_event else None,
         }
     
     def get_last_interviewer_question(self) -> Optional[str]:
@@ -608,7 +780,28 @@ class InterviewSessionManager:
         if self._session is None:
             raise ValueError("No active session. Call start_session() first.")
 
+        for existing in self._session.chat_messages:
+            if (
+                existing.message_id == message.message_id
+                and existing.event_type == message.event_type
+            ):
+                if (
+                    message.conversation_reference_id
+                    and existing.conversation_reference_id is None
+                ):
+                    existing.conversation_reference_id = message.conversation_reference_id
+                if message.raw is not None and existing.raw is None:
+                    existing.raw = message.raw
+                if message.html and not existing.html:
+                    existing.html = message.html
+                if message.text and not existing.text:
+                    existing.text = message.text
+                return
+
         self._session.chat_messages.append(message)
+
+        if self._session.graph_chat_thread_id is None:
+            self._session.graph_chat_thread_id = message.chat_thread_id
 
         if (
             message.conversation_reference_id
@@ -621,52 +814,31 @@ class InterviewSessionManager:
                 self._session.session_id,
             )
 
-    def get_unified_timeline(self, count: int = 40) -> list[dict[str, object]]:
-        """
-        Merge transcript turns + chat messages into a single ordered timeline.
+        if message.event_type != "chat_deleted" and (message.text or "").strip():
+            self._append_meeting_event(
+                MeetingEvent(
+                    event_id=f"chat:{message.message_id}",
+                    kind="chat",
+                    timestamp_utc=message.timestamp_utc,
+                    source="bot_framework" if message.raw is None else "graph_notification",
+                    text=(message.text or "").strip(),
+                    html=message.html,
+                    speaker_id=message.sender_id,
+                    display_name=message.sender_display_name,
+                    role=self._role_for_chat_sender(message.sender_id, message.from_bot),
+                    message_id=message.message_id,
+                    reply_to_message_id=message.reply_to_message_id,
+                    from_bot=message.from_bot,
+                    raw=message.raw,
+                )
+            )
 
-        Each entry has: kind, timestamp, speaker/sender, role, text, and a
-        kind-specific id. Used by the Alfred agent as "meeting history" and
-        by the UI for the note-taking timeline.
+    def get_unified_timeline(self, count: Optional[int] = None) -> list[dict[str, object]]:
+        """
+        Return the canonical meeting ledger as an ordered timeline.
         """
         if self._session is None:
             return []
 
-        entries: list[dict[str, object]] = []
-
-        for turn in self.get_recent_conversation(count=count * 2):
-            entries.append(
-                {
-                    "kind": "speech",
-                    "timestamp_utc": turn.get("timestamp"),
-                    "speaker_id": turn.get("speaker_id"),
-                    "role": turn.get("role") or "unknown",
-                    "display_name": None,
-                    "text": turn.get("text") or "",
-                    "message_id": None,
-                    "from_bot": False,
-                }
-            )
-
-        for chat in self._session.chat_messages:
-            if chat.event_type == "chat_deleted" or not (chat.text or "").strip():
-                continue
-            role = (
-                "bot" if chat.from_bot
-                else (self.get_speaker_role(chat.sender_id or "") or "participant")
-            )
-            entries.append(
-                {
-                    "kind": "chat",
-                    "timestamp_utc": chat.timestamp_utc,
-                    "speaker_id": chat.sender_id,
-                    "role": role,
-                    "display_name": chat.sender_display_name,
-                    "text": chat.text or "",
-                    "message_id": chat.message_id,
-                    "from_bot": chat.from_bot,
-                }
-            )
-
-        entries.sort(key=lambda e: str(e.get("timestamp_utc") or ""))
-        return entries[-count:] if len(entries) > count else entries
+        entries = [event.model_dump() for event in self._session.meeting_events]
+        return entries[-count:] if count is not None and len(entries) > count else entries

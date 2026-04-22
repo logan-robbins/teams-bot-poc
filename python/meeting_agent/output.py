@@ -196,6 +196,9 @@ class AnalysisOutputWriter:
                 "overall_clarity": None,
                 "total_responses_analyzed": 0,
                 "checklist_state": checklist_state or [],
+                "running_summary": "",
+                "topics": [],
+                "notes": [],
                 "_meta": {
                     "created_at": current_timestamp,
                     "version": "1.0",
@@ -205,12 +208,35 @@ class AnalysisOutputWriter:
         # Append new item
         data["analysis_items"].append(item.model_dump())
         data["total_responses_analyzed"] = len(data["analysis_items"])
-        
-        # Recompute overall scores
-        items = data["analysis_items"]
-        if items:
-            data["overall_relevance"] = sum(i["relevance_score"] for i in items) / len(items)
-            data["overall_clarity"] = sum(i["clarity_score"] for i in items) / len(items)
+
+        action = item.alfred_action
+        if action is not None:
+            if action.running_summary:
+                data["running_summary"] = action.running_summary
+            if action.topics:
+                data["topics"] = list(action.topics)
+            if action.notes:
+                notes = list(data.get("notes") or [])
+                notes.extend(action.notes)
+                data["notes"] = notes[-200:]
+
+        # Recompute overall scores using only scored items.
+        scored_items = [
+            analysis_item
+            for analysis_item in data["analysis_items"]
+            if analysis_item.get("relevance_score") is not None
+            and analysis_item.get("clarity_score") is not None
+        ]
+        if scored_items:
+            data["overall_relevance"] = (
+                sum(float(i["relevance_score"]) for i in scored_items) / len(scored_items)
+            )
+            data["overall_clarity"] = (
+                sum(float(i["clarity_score"]) for i in scored_items) / len(scored_items)
+            )
+        else:
+            data["overall_relevance"] = None
+            data["overall_clarity"] = None
 
         if checklist_state is not None:
             data["checklist_state"] = checklist_state

@@ -1,10 +1,9 @@
 """
 Pydantic models for the meeting-agent pipeline.
 
-Models here are product-agnostic: they describe inputs and outputs of the
-analysis pipeline, not any specific persona. Alfred-specific action output
-is defined alongside because it's emitted by the same agent and flows
-through the same AnalysisItem envelope.
+The current product is Alfred: a meeting assistant that consumes speech +
+chat as a unified append-only meeting ledger and emits one structured
+AlfredAction per analyzed event.
 """
 
 from datetime import datetime, timezone
@@ -13,22 +12,33 @@ from typing import Literal, Optional
 from pydantic import BaseModel, Field
 
 
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 class EventMetadata(BaseModel):
     """Optional metadata attached to transcript events."""
+
     meeting_id: Optional[str] = None
     call_id: Optional[str] = None
     raw_response: Optional[dict] = None
-    provider: Optional[str] = None  # "azure_speech", "deepgram", etc.
+    provider: Optional[str] = None
+    participant_id: Optional[str] = None
+    aad_object_id: Optional[str] = None
+    media_source_id: Optional[str] = None
+    display_name: Optional[str] = None
 
 
 class EventError(BaseModel):
     """Error details for error events."""
+
     code: str = Field(..., description="Error code from STT provider")
     message: str = Field(..., description="Human-readable error message")
 
 
 class TranscriptEvent(BaseModel):
     """Transcript event from STT provider (v2 format with speaker diarization)."""
+
     event_type: str = Field(
         ...,
         description="Event type: 'partial', 'final', 'session_started', 'session_stopped', 'error'",
@@ -45,6 +55,7 @@ class TranscriptEvent(BaseModel):
 
 class SpeakerMapping(BaseModel):
     """Maps a speaker ID to a role in the meeting."""
+
     speaker_id: str
     role: str = Field(..., description="Role: 'candidate', 'interviewer', 'participant', 'bot'")
     name: Optional[str] = None
@@ -54,10 +65,9 @@ class ChatMessage(BaseModel):
     """
     A single meeting-chat message ingested from the C# bot.
 
-    The bot forwards every meeting chat message (human or bot) through
-    POST /chat on the sink. These are first-class timeline events alongside
-    transcript turns, and the agent reads them both.
+    These are first-class timeline events alongside transcript turns.
     """
+
     event_type: Literal["chat_created", "chat_updated", "chat_deleted"] = Field(
         default="chat_created"
     )
@@ -85,14 +95,46 @@ class ChatMessage(BaseModel):
     raw: Optional[dict] = Field(default=None, description="Raw Graph chatMessage body")
 
 
+class MeetingEvent(BaseModel):
+    """Append-only normalized meeting ledger event used by Alfred."""
+
+    event_id: str
+    kind: Literal["speech", "chat", "system"]
+    timestamp_utc: str
+    source: Literal["teams_media", "bot_framework", "graph_notification", "alfred", "system"]
+    text: str = ""
+    html: Optional[str] = None
+    speaker_id: Optional[str] = None
+    participant_id: Optional[str] = None
+    aad_object_id: Optional[str] = None
+    media_source_id: Optional[str] = None
+    display_name: Optional[str] = None
+    role: str = "unknown"
+    message_id: Optional[str] = None
+    reply_to_message_id: Optional[str] = None
+    from_bot: bool = False
+    transcript_provider: Optional[str] = None
+    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    raw: Optional[dict] = None
+
+
+class OutboundChatIntent(BaseModel):
+    """Recent outbound Alfred chat intent used for bot-echo suppression."""
+
+    text: str
+    normalized_text: str
+    timestamp_utc: str = Field(default_factory=utc_now_iso)
+    reply_to_message_id: Optional[str] = None
+
+
 class InterviewSession(BaseModel):
     """
     Tracks an active meeting session.
 
-    Name kept as InterviewSession for now to minimise churn across the
-    code base; the schema is generic (speech + chat). `candidate_name`
-    acts as a freeform label for the primary meeting subject.
+    Name kept as InterviewSession for compatibility with the existing code,
+    but the state is meeting-generic and Alfred-specific.
     """
+
     session_id: str
     candidate_name: str = Field(..., description="Primary meeting subject label (freeform)")
     meeting_url: str
@@ -100,25 +142,33 @@ class InterviewSession(BaseModel):
     ended_at: Optional[str] = None
     speaker_mappings: list[SpeakerMapping] = Field(default_factory=list)
     transcript_events: list[TranscriptEvent] = Field(default_factory=list)
-    chat_messages: list[ChatMessage] = Field(
-        default_factory=list,
-        description="All chat messages ingested during the session (merged into the timeline alongside speech)",
-    )
+    chat_messages: list[ChatMessage] = Field(default_factory=list)
+    meeting_events: list[MeetingEvent] = Field(default_factory=list)
     conversation_reference_id: Optional[str] = Field(
         default=None,
         description="Captured once the first chat message arrives; used by the sink to emit send-intent payloads",
     )
+    graph_chat_thread_id: Optional[str] = None
+    prompt_cache_key: Optional[str] = None
+    latest_response_id: Optional[str] = None
+    latest_agent_cursor: int = 0
+    last_compaction_at: Optional[str] = None
+    running_summary: str = ""
+    topics: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+    alfred_muted: bool = False
+    outbound_chat_intents: list[OutboundChatIntent] = Field(default_factory=list)
 
 
 class AlfredAction(BaseModel):
     """
     Alfred's per-turn decision + note-taking output.
 
-    The agent emits one of these on each transcript or chat tick.
-    SILENT → just update notes/summary/topics; do not post.
+    SILENT → update notes/summary/topics only.
     SEND   → post `chat_text` to the meeting chat.
-    ASK    → same as SEND, semantically framed as a clarifying question.
+    ASK    → same as SEND, framed as a clarifying question.
     """
+
     action: Literal["SILENT", "SEND", "ASK"]
     rationale: str = Field(..., description="One-line justification for the decision")
     chat_text: Optional[str] = Field(
@@ -142,20 +192,14 @@ class AlfredAction(BaseModel):
 
 
 class AnalysisItem(BaseModel):
-    """
-    Envelope for per-turn analysis output.
+    """Envelope for per-turn analysis output."""
 
-    The relevance/clarity scores are optional because Alfred doesn't
-    compute them — they're retained for legacy interview-style use.
-    Alfred-specific output goes into `alfred_action`.
-    """
     response_id: str
-    timestamp_utc: str = Field(
-        default_factory=lambda: datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    )
+    timestamp_utc: str = Field(default_factory=utc_now_iso)
     question_text: Optional[str] = None
     response_text: str
     speaker_id: Optional[str] = None
+    trigger_event_id: Optional[str] = None
     relevance_score: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     clarity_score: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     key_points: list[str] = Field(default_factory=list)
@@ -169,6 +213,7 @@ class AnalysisItem(BaseModel):
 
 class SessionAnalysis(BaseModel):
     """Complete analysis output for a meeting session."""
+
     session_id: str
     candidate_name: str
     started_at: str
@@ -178,16 +223,16 @@ class SessionAnalysis(BaseModel):
     overall_clarity: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     total_responses_analyzed: int = 0
     checklist_state: list[dict[str, str | None]] = Field(default_factory=list)
-    running_summary: str = Field(
-        default="",
-        description="Alfred's latest running summary (replaces prior)",
-    )
+    running_summary: str = ""
     topics: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
 
     def compute_overall_scores(self) -> None:
         """Compute overall scores from scored analysis items (no-op for Alfred items)."""
+
         scored = [
-            item for item in self.analysis_items
+            item
+            for item in self.analysis_items
             if item.relevance_score is not None and item.clarity_score is not None
         ]
         self.total_responses_analyzed = len(self.analysis_items)

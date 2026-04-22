@@ -253,6 +253,18 @@ public sealed class MeetingChatConfiguration
     /// </summary>
     public string? GraphSubscriptionEncryptionCertPath { get; init; }
 
+    /// <summary>
+    /// Optional password for the Graph subscription encryption PFX/P12 file.
+    /// Leave null for unprotected cert files.
+    /// </summary>
+    public string? GraphSubscriptionEncryptionCertPassword { get; init; }
+
+    /// <summary>
+    /// Optional stable id passed to Graph as encryptionCertificateId.
+    /// When omitted, the cert thumbprint is used.
+    /// </summary>
+    public string? GraphSubscriptionEncryptionCertId { get; init; }
+
     /// <summary>Opaque clientState secret echoed in Graph notifications for auth.</summary>
     public string? ChatSubscriptionClientStateSecret { get; init; }
 
@@ -265,4 +277,11 @@ public sealed class MeetingChatConfiguration
     /// the app is installed via admin policy / scripts/install-bot-in-chat.ps1.
     /// </summary>
     public string? TeamsAppCatalogId { get; init; }
+
+    /// <summary>
+    /// When true, create one app-scoped subscription for all chats where Alfred is
+    /// installed and filter to active meeting chats in-process.
+    /// When false, create per-chat subscriptions tied to active calls.
+    /// </summary>
+    public bool UseInstalledToChatsSubscription { get; init; } = true;
 }

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from meeting_agent.models import AnalysisItem, ChatMessage, TranscriptEvent
+from meeting_agent.models import AnalysisItem, ChatMessage, MeetingEvent, TranscriptEvent
 from variants.base import BaseVariantPlugin, ChecklistItem, VariantUiConfig
 
 
@@ -41,15 +41,16 @@ class AlfredVariantPlugin(BaseVariantPlugin):
     def build_analysis_context(
         self,
         base_context: dict[str, Any],
-        event: TranscriptEvent | ChatMessage,
+        event: TranscriptEvent | ChatMessage | MeetingEvent,
     ) -> dict[str, Any]:
         enriched = dict(base_context)
         enriched["assistant_mode"] = "alfred"
         enriched["action_menu"] = ["SILENT", "SEND", "ASK"]
         enriched["bias_toward_silence"] = True
-        enriched["trigger_kind"] = (
-            "chat" if isinstance(event, ChatMessage) else "speech"
-        )
+        if isinstance(event, MeetingEvent):
+            enriched["trigger_kind"] = "chat" if event.kind == "chat" else "speech"
+        else:
+            enriched["trigger_kind"] = "chat" if isinstance(event, ChatMessage) else "speech"
         return enriched
 
     def transform_analysis_item(self, analysis_item: AnalysisItem) -> AnalysisItem:

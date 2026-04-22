@@ -39,6 +39,7 @@ from pydantic import BaseModel, Field
 from meeting_agent.models import (
     AnalysisItem,
     ChatMessage,
+    MeetingEvent,
     SessionAnalysis,
     TranscriptEvent,
 )
@@ -162,9 +163,6 @@ CORS_ORIGINS: list[str] = [
     "https://agent.qmachina.com",
 ]
 
-AGENT_DEBOUNCE_SECONDS = float(os.environ.get("AGENT_DEBOUNCE_SECONDS", "1.8"))
-
-
 # =============================================================================
 # Optional Agent Import (graceful degradation)
 # =============================================================================
@@ -175,7 +173,7 @@ try:
     from meeting_agent.pubsub import ThoughtType, get_publisher
 
     AGENT_AVAILABLE = True
-    logger.info("InterviewAnalyzer loaded successfully")
+    logger.info("Alfred analyzer loaded successfully")
 except ImportError as e:
     AGENT_AVAILABLE = False
     InterviewAnalyzer = None  # type: ignore[misc, assignment]
@@ -363,6 +361,12 @@ class SessionStatusResponse(BaseModel):
         default=None,
         description="Captured ConversationReference id for the meeting chat (once bot sees first chat)",
     )
+    graph_chat_thread_id: str | None = Field(default=None)
+    prompt_cache_key: str | None = Field(default=None)
+    latest_response_id: str | None = Field(default=None)
+    running_summary: str = Field(default="")
+    topics: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
     total_events: int = Field(default=0, description="Total transcript events received")
     final_events: int = Field(default=0, description="Final transcript events")
     analysis_count: int = Field(default=0, description="Number of analyses performed")
@@ -464,15 +468,14 @@ class AppState(TypedDict):
     session_manager: InterviewSessionManager
     output_writer: AnalysisOutputWriter
     transcript_queue: asyncio.Queue[TranscriptEvent]
-    agent_queue: asyncio.Queue[TranscriptEvent]
+    agent_queue: asyncio.Queue[MeetingEvent]
     stats: AppStats
     agent_task: asyncio.Task[None] | None
     variant_plugin: VariantPlugin
     checklist_manager: ChecklistStateManager
     route_orchestrator: RouteOrchestrator
     checklist_agent: ChecklistAgent | None
-    analysis_debounce_tasks: dict[str, asyncio.Task[None]]
-    last_enqueued_turns: dict[str, str]
+    last_enqueued_event_ids: dict[str, str]
 
 
 def get_initial_stats() -> AppStats:
@@ -569,8 +572,7 @@ def get_app_state(request: Request) -> AppState:
         checklist_manager=state.checklist_manager,
         route_orchestrator=state.route_orchestrator,
         checklist_agent=state.checklist_agent,
-        analysis_debounce_tasks=state.analysis_debounce_tasks,
-        last_enqueued_turns=state.last_enqueued_turns,
+        last_enqueued_event_ids=state.last_enqueued_event_ids,
     )
 
 
@@ -727,88 +729,27 @@ def maybe_auto_map_candidate(session_manager: InterviewSessionManager) -> str | 
     return session_manager.get_candidate_speaker_id() or inferred_candidate
 
 
-def _build_turn_signature(turn: dict[str, str | None]) -> str:
-    """Create a stable signature for a consolidated transcript turn."""
-    return "|".join(
-        (
-            str(turn.get("speaker_id") or ""),
-            str(turn.get("timestamp") or ""),
-            str(turn.get("text") or ""),
-        )
-    )
+async def enqueue_analysis_event(state: AppState, event: MeetingEvent | None) -> None:
+    """Queue a normalized meeting event for Alfred live-turn analysis."""
+    if event is None:
+        return
 
-
-async def queue_latest_candidate_turn(state: AppState, session_id: str) -> None:
-    """
-    Debounce STT fragments and queue the latest consolidated candidate turn once.
-    """
-    try:
-        await asyncio.sleep(AGENT_DEBOUNCE_SECONDS)
-
-        session_manager = state["session_manager"]
-        agent_queue = state["agent_queue"]
-
-        if not session_manager.is_active or session_manager.session is None:
-            return
-        if session_manager.session.session_id != session_id:
-            return
-
-        candidate_speaker_id = maybe_auto_map_candidate(session_manager)
-        if candidate_speaker_id is None:
-            return
-
-        recent_conversation = session_manager.get_recent_conversation(count=12)
-        latest_candidate_turn = next(
-            (
-                turn
-                for turn in reversed(recent_conversation)
-                if turn.get("speaker_id") == candidate_speaker_id
-                and turn.get("text")
-            ),
-            None,
-        )
-        if latest_candidate_turn is None:
-            return
-
-        turn_signature = _build_turn_signature(latest_candidate_turn)
-        if state["last_enqueued_turns"].get(session_id) == turn_signature:
-            return
-
-        consolidated_event = TranscriptEvent(
-            event_type="final",
-            text=str(latest_candidate_turn.get("text") or ""),
-            timestamp_utc=str(
-                latest_candidate_turn.get("timestamp")
-                or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-            ),
-            speaker_id=candidate_speaker_id,
-        )
-        await agent_queue.put(consolidated_event)
-        state["last_enqueued_turns"][session_id] = turn_signature
-        logger.info(
-            "Queued consolidated candidate turn for analysis: %s...",
-            consolidated_event.text[:100],
-        )
-
-    except asyncio.CancelledError:
-        logger.debug("Cancelled candidate-turn debounce for session %s", session_id)
-        raise
-
-
-def schedule_candidate_analysis(state: AppState) -> None:
-    """Reset the per-session debounce timer for candidate analysis."""
     session = state["session_manager"].session
     if session is None:
         return
 
-    session_id = session.session_id
-    existing_task = state["analysis_debounce_tasks"].get(session_id)
-    if existing_task is not None and not existing_task.done():
-        existing_task.cancel()
+    if event.kind == "speech" and not event.text.strip():
+        return
+    if event.kind == "chat" and (event.from_bot or not event.text.strip()):
+        return
 
-    state["analysis_debounce_tasks"][session_id] = asyncio.create_task(
-        queue_latest_candidate_turn(state, session_id)
-    )
+    last_event_id = state["last_enqueued_event_ids"].get(session.session_id)
+    if last_event_id == event.event_id:
+        return
+
+    await state["agent_queue"].put(event)
+    state["last_enqueued_event_ids"][session.session_id] = event.event_id
+    logger.info("Queued Alfred analysis event kind=%s event_id=%s", event.kind, event.event_id)
 
 
 # =============================================================================
@@ -817,7 +758,7 @@ def schedule_candidate_analysis(state: AppState) -> None:
 
 
 async def agent_processing_loop(
-    agent_queue: asyncio.Queue[TranscriptEvent],
+    agent_queue: asyncio.Queue[MeetingEvent],
     session_manager: InterviewSessionManager,
     output_writer: AnalysisOutputWriter,
     stats: AppStats,
@@ -825,25 +766,9 @@ async def agent_processing_loop(
     checklist_manager: ChecklistStateManager,
     route_orchestrator: RouteOrchestrator,
 ) -> None:
-    """
-    Background task that processes candidate transcripts through the interview agent.
-
-    Only processes:
-    - "final" transcript events
-    - From speakers mapped as "candidate"
-
-    Publishes real-time thoughts to the pub-sub system for Streamlit UI.
-
-    Args:
-        agent_queue: Queue of transcript events to process.
-        session_manager: Session manager instance.
-        output_writer: Output writer for analysis results.
-        stats: Statistics dictionary to update.
-        variant_plugin: Active variant plugin.
-    """
+    """Background task that processes unified meeting events through Alfred."""
     logger.info("Agent processing loop started")
 
-    # Initialize analyzer if available
     analyzer = None
     publisher = None
 
@@ -856,57 +781,55 @@ async def agent_processing_loop(
                 instructions=PRODUCT_SPEC.agent.prompt_template,
             )
             publisher = get_publisher() if get_publisher else None
-            logger.info("InterviewAnalyzer initialized with real-time publishing")
+            logger.info("Alfred analyzer initialized with real-time publishing")
         except Exception as e:
-            logger.error("Failed to initialize InterviewAnalyzer: %s", e)
+            logger.error("Failed to initialize Alfred analyzer: %s", e)
 
     response_counter = 0
 
     while True:
         try:
-            # Wait for next candidate transcript
             event = await agent_queue.get()
 
             if not event.text:
                 continue
 
-            logger.info("AGENT_INPUT [%s]: %s...", event.speaker_id, event.text[:100])
+            logger.info("AGENT_INPUT [%s/%s]: %s...", event.kind, event.speaker_id, event.text[:100])
 
-            # Process with agent if available
             if analyzer and session_manager.is_active:
                 try:
-                    # Get conversation context
-                    context = session_manager.get_session_context()
-
-                    # Build conversation history for context
-                    conversation_history = []
-                    for turn in context.get("recent_conversation", [])[-10:]:
-                        conversation_history.append({
-                            "role": turn.get("role", "unknown"),
-                            "text": turn.get("text", ""),
-                        })
-
-                    analysis_context = {
-                        "candidate_name": context.get("candidate_name", "Unknown"),
-                        "conversation_history": conversation_history,
-                    }
+                    analysis_context = session_manager.get_agent_context_snapshot(
+                        trigger_event=event,
+                    )
                     analysis_context = variant_plugin.build_analysis_context(
                         analysis_context,
                         event,
                     )
 
-                    # Run analysis (publishes to pub-sub automatically)
                     analysis_item: AnalysisItem = await analyzer.analyze_async(
                         response_text=event.text,
                         context=analysis_context,
                         speaker_id=event.speaker_id,
                     )
                     analysis_item = variant_plugin.transform_analysis_item(analysis_item)
+                    session_manager.apply_alfred_action(analysis_item.alfred_action)
+                    if (
+                        analysis_item.alfred_action is not None
+                        and analysis_item.alfred_action.action in {"SEND", "ASK"}
+                        and (analysis_item.alfred_action.chat_text or "").strip()
+                    ):
+                        session_manager.record_outbound_chat_intent(
+                            analysis_item.alfred_action.chat_text or "",
+                            analysis_item.alfred_action.reply_to_message_id,
+                        )
+                    latest_response_id = None
+                    if analysis_item.raw_model_output:
+                        latest_response_id = analysis_item.raw_model_output.get("latest_response_id")
+                    session_manager.mark_agent_progress(event.event_id, latest_response_id)
 
                     stats["agent_analyses"] += 1
                     response_counter += 1
 
-                    # Write to output file
                     if session_manager.session:
                         output_writer.append_item(
                             session_manager.session.session_id,
@@ -928,17 +851,17 @@ async def agent_processing_loop(
                             payload=payload,
                         )
 
-                    logger.info(
-                        "Analysis #%d complete: relevance=%.2f, clarity=%.2f",
-                        response_counter,
-                        analysis_item.relevance_score,
-                        analysis_item.clarity_score,
+                    action_name = (
+                        analysis_item.alfred_action.action
+                        if analysis_item.alfred_action is not None
+                        else "UNKNOWN"
                     )
+                    logger.info("Analysis #%d complete: action=%s", response_counter, action_name)
 
                 except Exception as e:
-                    logger.error("Agent analysis failed: %s", e, exc_info=True)
+                    logger.error("Alfred analysis failed: %s", e, exc_info=True)
                     if publisher:
-                        await publisher.publish_error(f"Analysis failed: {e!s}")
+                        await publisher.publish_error(f"Alfred analysis failed: {e!s}")
             else:
                 if not AGENT_AVAILABLE:
                     logger.debug("Skipping analysis - agent not available")
@@ -1042,9 +965,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[dict[str, Any]]:
     session_manager = InterviewSessionManager()
     checklist_manager = build_checklist_manager()
     transcript_queue: asyncio.Queue[TranscriptEvent] = asyncio.Queue()
-    agent_queue: asyncio.Queue[TranscriptEvent] = asyncio.Queue()
-    analysis_debounce_tasks: dict[str, asyncio.Task[None]] = {}
-    last_enqueued_turns: dict[str, str] = {}
+    agent_queue: asyncio.Queue[MeetingEvent] = asyncio.Queue()
+    last_enqueued_event_ids: dict[str, str] = {}
     stats = get_initial_stats()
     route_orchestrator = ROUTES
     logger.info("Enabled output routes: %d", route_orchestrator.route_count)
@@ -1093,21 +1015,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[dict[str, Any]]:
         "checklist_manager": checklist_manager,
         "route_orchestrator": route_orchestrator,
         "checklist_agent": checklist_agent,
-        "analysis_debounce_tasks": analysis_debounce_tasks,
-        "last_enqueued_turns": last_enqueued_turns,
+        "last_enqueued_event_ids": last_enqueued_event_ids,
     }
 
     yield state
 
     # Shutdown
     logger.info("Shutting down...")
-    for task in analysis_debounce_tasks.values():
-        task.cancel()
-    for task in analysis_debounce_tasks.values():
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
     agent_task.cancel()
     try:
         await agent_task
@@ -1250,6 +1164,9 @@ async def receive_transcript(
                     session_manager.session.session_id
                 )
                 if current_analysis is not None:
+                    current_analysis.running_summary = session_manager.session.running_summary
+                    current_analysis.topics = list(session_manager.session.topics)
+                    current_analysis.notes = list(session_manager.session.notes)
                     current_analysis.checklist_state = checklist_manager.snapshot()
                     output_writer.write_analysis(
                         session_manager.session.session_id, current_analysis
@@ -1270,7 +1187,7 @@ async def receive_transcript(
                 )
 
             maybe_auto_map_candidate(session_manager)
-            schedule_candidate_analysis(state)
+            await enqueue_analysis_event(state, session_manager.get_latest_meeting_event())
 
     elif event.event_type == "session_started":
         stats["session_events"] += 1
@@ -1340,6 +1257,7 @@ async def receive_chat_message(
 
     if session_manager.is_active:
         session_manager.add_chat_message(chat)
+        should_analyze = not session_manager.is_expected_bot_echo(chat)
 
         if session_manager.session:
             await dispatch_route_payload(
@@ -1362,6 +1280,9 @@ async def receive_chat_message(
             "bot" if chat.from_bot else "human",
             (chat.text or "")[:120],
         )
+
+        if should_analyze:
+            await enqueue_analysis_event(state, session_manager.get_latest_meeting_event())
 
     await variant_plugin.on_chat_message(chat, session_manager.get_session_context())
 
@@ -1415,7 +1336,7 @@ async def start_session(
         candidate_name=request.candidate_name,
         meeting_url=request.meeting_url,
     )
-    state["last_enqueued_turns"].pop(session.session_id, None)
+    state["last_enqueued_event_ids"].pop(session.session_id, None)
 
     # Map candidate speaker if provided
     if request.candidate_speaker_id:
@@ -1529,6 +1450,12 @@ async def get_session_status(state: AppStateDep) -> SessionStatusWrapper:
         meeting_history=context.get("meeting_history", []),
         chat_messages_count=context.get("chat_messages_count", 0),
         conversation_reference_id=context.get("conversation_reference_id"),
+        graph_chat_thread_id=context.get("graph_chat_thread_id"),
+        prompt_cache_key=context.get("prompt_cache_key"),
+        latest_response_id=context.get("latest_response_id"),
+        running_summary=context.get("running_summary", ""),
+        topics=context.get("topics", []),
+        notes=context.get("notes", []),
         total_events=context.get("total_events", 0),
         final_events=context.get("final_events", 0),
         analysis_count=stats["agent_analyses"],
@@ -1624,9 +1551,6 @@ async def end_session(state: AppStateDep) -> SessionEndResponse:
         raise SessionNotActiveError("No session data available.")
 
     session_id = session.session_id
-    debounce_task = state["analysis_debounce_tasks"].pop(session_id, None)
-    if debounce_task is not None and not debounce_task.done():
-        debounce_task.cancel()
     candidate_name = session.candidate_name
     started_at = session.started_at
 
@@ -1640,6 +1564,9 @@ async def end_session(state: AppStateDep) -> SessionEndResponse:
             if analysis:
                 analysis.ended_at = ended_session.ended_at
                 analysis.checklist_state = checklist_manager.snapshot()
+                analysis.running_summary = ended_session.running_summary
+                analysis.topics = list(ended_session.topics)
+                analysis.notes = list(ended_session.notes)
                 analysis.compute_overall_scores()
                 output_writer.write_analysis(session_id, analysis)
         except Exception as e:
@@ -1654,7 +1581,7 @@ async def end_session(state: AppStateDep) -> SessionEndResponse:
             if ended_session
             else datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         ),
-        "total_events": len(ended_session.transcript_events) if ended_session else 0,
+        "total_events": len(ended_session.meeting_events) if ended_session else 0,
         "analyses_generated": stats["agent_analyses"],
     }
 
@@ -1668,7 +1595,7 @@ async def end_session(state: AppStateDep) -> SessionEndResponse:
 
     logger.info("Session ended: %s", session_id)
     await variant_plugin.on_session_end(summary)
-    state["last_enqueued_turns"].pop(session_id, None)
+    state["last_enqueued_event_ids"].pop(session_id, None)
 
     await dispatch_route_payload(
         route_orchestrator=route_orchestrator,

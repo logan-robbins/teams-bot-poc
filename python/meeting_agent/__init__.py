@@ -1,33 +1,4 @@
-"""
-Interview Analysis Agent Package.
-
-Provides real-time interview analysis using the OpenAI Agents SDK (GPT-5).
-
-Components:
-    - InterviewAnalyzer: Main agent for analyzing candidate responses
-    - ChecklistAgent: Parallel agent for tracking interview progress
-    - InterviewSessionManager: Manages session state and transcript history
-    - AnalysisOutputWriter: Persists analysis results to JSON files
-    - AgentThoughtPublisher: Real-time pub/sub for streaming thoughts to UI
-    - Models: Pydantic models for transcripts, sessions, and analysis items
-
-Example:
-    >>> from meeting_agent import InterviewAnalyzer
-    >>> 
-    >>> analyzer = InterviewAnalyzer()  # Uses gpt-5 by default
-    >>> result = await analyzer.analyze_async(
-    ...     response_text="I have 5 years of experience with Python...",
-    ...     context={
-    ...         "candidate_name": "John Smith",
-    ...         "conversation_history": [
-    ...             {"role": "interviewer", "text": "Tell me about your Python experience."}
-    ...         ]
-    ...     }
-    ... )
-    >>> print(f"Relevance: {result.relevance_score}, Clarity: {result.clarity_score}")
-
-Last Grunted: 02/01/2026
-"""
+"""Alfred meeting-agent package."""
 
 from .models import (
     TranscriptEvent,
@@ -35,6 +6,7 @@ from .models import (
     EventError,
     SpeakerMapping,
     InterviewSession,
+    MeetingEvent,
     AnalysisItem,
     SessionAnalysis,
 )
@@ -44,9 +16,11 @@ from .session import InterviewSessionManager
 from .output import AnalysisOutputWriter
 
 from .agent import (
+    AlfredAnalyzer,
     InterviewAnalyzer,
     InterviewAnalysisOutput,
     RunningAssessment,
+    create_alfred_analyzer,
     create_interview_analyzer,
 )
 
@@ -74,6 +48,7 @@ __all__ = [
     "EventError",
     "SpeakerMapping",
     "InterviewSession",
+    "MeetingEvent",
     "AnalysisItem",
     "SessionAnalysis",
     # Session management
@@ -81,9 +56,11 @@ __all__ = [
     # Output
     "AnalysisOutputWriter",
     # Agent
+    "AlfredAnalyzer",
     "InterviewAnalyzer",
     "InterviewAnalysisOutput",
     "RunningAssessment",
+    "create_alfred_analyzer",
     "create_interview_analyzer",
     # Pub/Sub
     "AgentThought",

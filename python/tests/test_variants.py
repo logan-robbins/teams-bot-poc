@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from meeting_agent.models import AnalysisItem, AlfredAction, ChatMessage, TranscriptEvent
+from meeting_agent.models import AnalysisItem, AlfredAction, ChatMessage, MeetingEvent, TranscriptEvent
 from variants import available_variants, load_variant
 
 
@@ -37,6 +37,19 @@ def test_alfred_context_marks_trigger_kind_for_chat() -> None:
         text="hi",
     )
     ctx = alfred.build_analysis_context({}, message)
+    assert ctx["trigger_kind"] == "chat"
+
+
+def test_alfred_context_marks_trigger_kind_for_meeting_event_chat() -> None:
+    alfred = load_variant("alfred")
+    event = MeetingEvent(
+        event_id="chat:m1",
+        kind="chat",
+        timestamp_utc="2026-04-22T16:00:00Z",
+        source="bot_framework",
+        text="hi",
+    )
+    ctx = alfred.build_analysis_context({}, event)
     assert ctx["trigger_kind"] == "chat"
 
 

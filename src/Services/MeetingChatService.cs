@@ -3,47 +3,48 @@ using TeamsMediaBot.Models;
 
 namespace TeamsMediaBot.Services;
 
-/// <summary>
-/// Bridges the Graph Communications Calling SDK to the meeting-chat world.
-///
-/// On each established call this service should:
-///   1. Extract the meeting join URL from the call resource.
-///   2. Resolve chatInfo.threadId from Graph (/users/{upn}/onlineMeetings/getByJoinWebUrl).
-///   3. Create a Graph change-notification subscription on /chats/{chatId}/messages
-///      with encryptionCertificate + lifecycleNotificationUrl + clientState.
-///   4. Renew that subscription every ~50 minutes while the call is active.
-///   5. Tear down the subscription when the call ends.
-///
-/// This file is the interface + lifecycle plumbing. The Graph subscription
-/// specifics (encryption cert wiring, renewal loop, decryption) are intentionally
-/// stubbed with TODOs — they need live-tenant iteration to get right and will
-/// land on feat/alfred-chat-modality as a separate commit once Bot Framework
-/// messaging (Alfred send path) is proven end-to-end against a real meeting.
-/// See docs: https://learn.microsoft.com/en-us/graph/teams-changenotifications-chatmessage
-/// </summary>
 public interface IMeetingChatService
 {
     Task AttachToCallAsync(ICall call, CancellationToken cancellationToken = default);
     Task DetachFromCallAsync(ICall call, CancellationToken cancellationToken = default);
-
-    /// <summary>Return the cached chat thread id for a given call, if resolved.</summary>
     string? GetChatThreadIdForCall(string callId);
+    bool IsTrackedChatThread(string chatThreadId);
+    Task HandleLifecycleEventAsync(
+        string? subscriptionId,
+        string? lifecycleEvent,
+        CancellationToken cancellationToken = default);
 }
 
 public sealed class MeetingChatService : IMeetingChatService, IAsyncDisposable
 {
+    private static readonly TimeSpan SubscriptionLength = TimeSpan.FromMinutes(55);
+    private static readonly TimeSpan RenewalLeadTime = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan RenewalCheckInterval = TimeSpan.FromMinutes(5);
+
     private readonly MeetingChatConfiguration _config;
+    private readonly GraphApiClient _graphApiClient;
+    private readonly GraphNotificationCrypto _crypto;
     private readonly ILogger<MeetingChatService> _logger;
-    private readonly Dictionary<string, string> _callToChatThread = new(); // callId -> threadId
-    private readonly Dictionary<string, string> _chatThreadToSubscription = new(); // threadId -> graph subscription id
     private readonly SemaphoreSlim _mutex = new(1, 1);
+    private readonly CancellationTokenSource _renewalLoopCts = new();
+
+    private readonly Dictionary<string, string> _callToChatThread = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, int> _activeChatThreadRefCounts = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> _resourceToSubscriptionId = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, GraphSubscriptionRecord> _subscriptionsById = new(StringComparer.Ordinal);
+
+    private Task? _renewalLoopTask;
     private bool _disposed;
 
     public MeetingChatService(
         MeetingChatConfiguration config,
+        GraphApiClient graphApiClient,
+        GraphNotificationCrypto crypto,
         ILogger<MeetingChatService> logger)
     {
         _config = config;
+        _graphApiClient = graphApiClient;
+        _crypto = crypto;
         _logger = logger;
     }
 
@@ -51,30 +52,38 @@ public sealed class MeetingChatService : IMeetingChatService, IAsyncDisposable
     {
         if (!_config.Enabled)
         {
-            _logger.LogInformation("MeetingChatService disabled via config; not attaching to call {CallId}", call.Id);
+            return;
+        }
+
+        var chatThreadId = ExtractChatThreadId(call);
+        if (string.IsNullOrWhiteSpace(chatThreadId))
+        {
+            _logger.LogWarning("Call {CallId} has no chatInfo.threadId; skipping Graph chat tracking.", call.Id);
             return;
         }
 
         await _mutex.WaitAsync(cancellationToken);
         try
         {
-            var joinUrl = ExtractJoinUrl(call);
-            if (string.IsNullOrWhiteSpace(joinUrl))
+            _callToChatThread[call.Id] = chatThreadId;
+            _activeChatThreadRefCounts[chatThreadId] = _activeChatThreadRefCounts.GetValueOrDefault(chatThreadId) + 1;
+            EnsureRenewalLoopStarted();
+
+            if (!CanManageGraphSubscriptions())
             {
-                _logger.LogWarning("Cannot attach chat subscription — call {CallId} has no resolvable join URL", call.Id);
+                _logger.LogInformation(
+                    "Meeting chat tracking enabled for thread {ChatThreadId}, but Graph subscription configuration is incomplete.",
+                    chatThreadId);
                 return;
             }
 
-            // TODO[Alfred]: Implement once live-tenant iteration begins.
-            //   1. var chatThreadId = await _graphClient.Users[organizerUpn]
-            //        .OnlineMeetings.GetByJoinWebUrl(joinUrl).GetAsync(cancellationToken);
-            //   2. var subscription = await CreateGraphSubscriptionAsync(chatThreadId, cancellationToken);
-            //   3. _callToChatThread[call.Id] = chatThreadId;
-            //   4. _chatThreadToSubscription[chatThreadId] = subscription.Id;
-            //   5. Kick off renewal loop (50-min interval).
+            var resource = ResolveSubscriptionResource(chatThreadId);
+            var subscription = await EnsureSubscriptionLockedAsync(resource, cancellationToken);
+
             _logger.LogInformation(
-                "TODO: create Graph /chats/{{chatId}}/messages subscription for call {CallId} (join={JoinUrl})",
-                call.Id, joinUrl);
+                "Tracking meeting chat thread {ChatThreadId} with subscription {SubscriptionId}",
+                chatThreadId,
+                subscription.Id);
         }
         finally
         {
@@ -84,40 +93,145 @@ public sealed class MeetingChatService : IMeetingChatService, IAsyncDisposable
 
     public async Task DetachFromCallAsync(ICall call, CancellationToken cancellationToken = default)
     {
+        var chatThreadId = ExtractChatThreadId(call);
+        if (string.IsNullOrWhiteSpace(chatThreadId))
+        {
+            return;
+        }
+
+        string? resourceToDelete = null;
+        string? subscriptionIdToDelete = null;
+
         await _mutex.WaitAsync(cancellationToken);
         try
         {
-            if (!_callToChatThread.TryGetValue(call.Id, out var chatThreadId))
+            _callToChatThread.Remove(call.Id);
+
+            if (_activeChatThreadRefCounts.TryGetValue(chatThreadId, out var currentCount))
+            {
+                if (currentCount <= 1)
+                {
+                    _activeChatThreadRefCounts.Remove(chatThreadId);
+                }
+                else
+                {
+                    _activeChatThreadRefCounts[chatThreadId] = currentCount - 1;
+                }
+            }
+
+            if (ShouldUseSharedInstalledChatsSubscription() || _activeChatThreadRefCounts.ContainsKey(chatThreadId))
             {
                 return;
             }
-            _callToChatThread.Remove(call.Id);
 
-            if (_chatThreadToSubscription.TryGetValue(chatThreadId, out var subscriptionId))
+            resourceToDelete = BuildPerChatMessagesResource(chatThreadId);
+            if (_resourceToSubscriptionId.TryGetValue(resourceToDelete, out var subscriptionId))
             {
-                _chatThreadToSubscription.Remove(chatThreadId);
-                // TODO[Alfred]: DELETE /subscriptions/{subscriptionId}
-                _logger.LogInformation("TODO: tear down Graph subscription {SubscriptionId} for chat {ChatThreadId}",
-                    subscriptionId, chatThreadId);
+                subscriptionIdToDelete = subscriptionId;
+                UnregisterSubscriptionLocked(subscriptionId);
             }
         }
         finally
         {
             _mutex.Release();
         }
+
+        if (!string.IsNullOrWhiteSpace(subscriptionIdToDelete))
+        {
+            try
+            {
+                await _graphApiClient.DeleteSubscriptionAsync(subscriptionIdToDelete, cancellationToken);
+                _logger.LogInformation(
+                    "Deleted per-chat Graph subscription {SubscriptionId} for resource {Resource}",
+                    subscriptionIdToDelete,
+                    resourceToDelete);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Failed to delete Graph subscription {SubscriptionId} for resource {Resource}",
+                    subscriptionIdToDelete,
+                    resourceToDelete);
+            }
+        }
     }
 
     public string? GetChatThreadIdForCall(string callId) =>
-        _callToChatThread.TryGetValue(callId, out var thread) ? thread : null;
+        _callToChatThread.TryGetValue(callId, out var threadId) ? threadId : null;
 
-    private static string? ExtractJoinUrl(ICall call)
+    public bool IsTrackedChatThread(string chatThreadId)
     {
-        // The join URL is exposed via ICall.Resource (IResource<Call>). Different
-        // Calling SDK versions surface it differently; the safest cross-version
-        // approach is reflection on the resource, or to grab it from the
-        // MeetingInfo / JoinUrl fields when available. Left as TODO to
-        // validate against the installed SDK in the target VM.
-        return null;
+        if (string.IsNullOrWhiteSpace(chatThreadId))
+        {
+            return false;
+        }
+
+        return _activeChatThreadRefCounts.ContainsKey(chatThreadId);
+    }
+
+    public async Task HandleLifecycleEventAsync(
+        string? subscriptionId,
+        string? lifecycleEvent,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(lifecycleEvent))
+        {
+            return;
+        }
+
+        GraphSubscriptionRecord? knownSubscription = null;
+        string? recreateResource = null;
+
+        await _mutex.WaitAsync(cancellationToken);
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(subscriptionId)
+                && _subscriptionsById.TryGetValue(subscriptionId, out var subscription))
+            {
+                knownSubscription = subscription;
+            }
+
+            switch (lifecycleEvent.Trim())
+            {
+                case "reauthorizationRequired":
+                    break;
+
+                case "subscriptionRemoved":
+                case "missed":
+                    recreateResource = knownSubscription?.Resource;
+                    if (!string.IsNullOrWhiteSpace(subscriptionId))
+                    {
+                        UnregisterSubscriptionLocked(subscriptionId);
+                    }
+                    break;
+            }
+
+            if (string.IsNullOrWhiteSpace(recreateResource) && ShouldUseSharedInstalledChatsSubscription())
+            {
+                recreateResource = BuildInstalledChatsResource();
+            }
+        }
+        finally
+        {
+            _mutex.Release();
+        }
+
+        if (knownSubscription is not null
+            && string.Equals(lifecycleEvent, "reauthorizationRequired", StringComparison.OrdinalIgnoreCase))
+        {
+            var renewed = await _graphApiClient.RenewSubscriptionAsync(
+                knownSubscription.Id,
+                DateTimeOffset.UtcNow.Add(SubscriptionLength),
+                cancellationToken);
+            await RememberSubscriptionAsync(renewed, cancellationToken);
+            return;
+        }
+
+        if (!string.IsNullOrWhiteSpace(recreateResource))
+        {
+            await EnsureSubscriptionAsync(recreateResource, cancellationToken);
+        }
     }
 
     public async ValueTask DisposeAsync()
@@ -126,9 +240,189 @@ public sealed class MeetingChatService : IMeetingChatService, IAsyncDisposable
         {
             return;
         }
+
         _disposed = true;
-        await _mutex.WaitAsync();
-        _mutex.Release();
+        _renewalLoopCts.Cancel();
+
+        if (_renewalLoopTask is not null)
+        {
+            try
+            {
+                await _renewalLoopTask;
+            }
+            catch (OperationCanceledException)
+            {
+                // normal shutdown
+            }
+        }
+
+        _renewalLoopCts.Dispose();
         _mutex.Dispose();
+    }
+
+    private bool CanManageGraphSubscriptions() =>
+        !string.IsNullOrWhiteSpace(_config.GraphNotificationBaseUrl)
+        && !string.IsNullOrWhiteSpace(_config.ChatSubscriptionClientStateSecret);
+
+    private bool ShouldUseSharedInstalledChatsSubscription() =>
+        _config.UseInstalledToChatsSubscription
+        && !string.IsNullOrWhiteSpace(_config.TeamsAppCatalogId);
+
+    private string ResolveSubscriptionResource(string chatThreadId)
+    {
+        if (ShouldUseSharedInstalledChatsSubscription())
+        {
+            return BuildInstalledChatsResource();
+        }
+
+        return BuildPerChatMessagesResource(chatThreadId);
+    }
+
+    private async Task<GraphSubscriptionRecord> EnsureSubscriptionAsync(
+        string resource,
+        CancellationToken cancellationToken)
+    {
+        await _mutex.WaitAsync(cancellationToken);
+        try
+        {
+            return await EnsureSubscriptionLockedAsync(resource, cancellationToken);
+        }
+        finally
+        {
+            _mutex.Release();
+        }
+    }
+
+    private async Task<GraphSubscriptionRecord> EnsureSubscriptionLockedAsync(
+        string resource,
+        CancellationToken cancellationToken)
+    {
+        if (_resourceToSubscriptionId.TryGetValue(resource, out var knownId)
+            && _subscriptionsById.TryGetValue(knownId, out var knownSubscription)
+            && !knownSubscription.IsExpiredSoon(RenewalLeadTime))
+        {
+            return knownSubscription;
+        }
+
+        var request = new GraphSubscriptionCreateRequest
+        {
+            ChangeType = "created,updated,deleted",
+            NotificationUrl = BuildNotificationUrl(),
+            LifecycleNotificationUrl = BuildNotificationUrl(),
+            Resource = resource,
+            ExpirationDateTime = DateTimeOffset.UtcNow.Add(SubscriptionLength),
+            ClientState = _config.ChatSubscriptionClientStateSecret,
+            IncludeResourceData = _crypto.IsEnabled,
+            EncryptionCertificate = _crypto.GetPublicCertificateBase64(),
+            EncryptionCertificateId = _crypto.EncryptionCertificateId,
+        };
+
+        var subscription = await _graphApiClient.EnsureSubscriptionAsync(request, cancellationToken);
+        RegisterSubscriptionLocked(subscription);
+        return subscription;
+    }
+
+    private async Task RememberSubscriptionAsync(
+        GraphSubscriptionRecord subscription,
+        CancellationToken cancellationToken)
+    {
+        await _mutex.WaitAsync(cancellationToken);
+        try
+        {
+            RegisterSubscriptionLocked(subscription);
+        }
+        finally
+        {
+            _mutex.Release();
+        }
+    }
+
+    private void RegisterSubscriptionLocked(GraphSubscriptionRecord subscription)
+    {
+        _subscriptionsById[subscription.Id] = subscription;
+        _resourceToSubscriptionId[subscription.Resource] = subscription.Id;
+    }
+
+    private void UnregisterSubscriptionLocked(string subscriptionId)
+    {
+        if (_subscriptionsById.Remove(subscriptionId, out var subscription))
+        {
+            _resourceToSubscriptionId.Remove(subscription.Resource);
+        }
+    }
+
+    private void EnsureRenewalLoopStarted()
+    {
+        if (_renewalLoopTask is null)
+        {
+            _renewalLoopTask = Task.Run(() => RenewalLoopAsync(_renewalLoopCts.Token));
+        }
+    }
+
+    private async Task RenewalLoopAsync(CancellationToken cancellationToken)
+    {
+        using var timer = new PeriodicTimer(RenewalCheckInterval);
+
+        while (await timer.WaitForNextTickAsync(cancellationToken))
+        {
+            List<GraphSubscriptionRecord> renewals;
+
+            await _mutex.WaitAsync(cancellationToken);
+            try
+            {
+                renewals = _subscriptionsById.Values
+                    .Where(subscription => subscription.IsExpiredSoon(RenewalLeadTime))
+                    .ToList();
+            }
+            finally
+            {
+                _mutex.Release();
+            }
+
+            foreach (var subscription in renewals)
+            {
+                try
+                {
+                    var renewed = await _graphApiClient.RenewSubscriptionAsync(
+                        subscription.Id,
+                        DateTimeOffset.UtcNow.Add(SubscriptionLength),
+                        cancellationToken);
+                    await RememberSubscriptionAsync(renewed, cancellationToken);
+                    _logger.LogInformation(
+                        "Renewed Graph subscription {SubscriptionId} for resource {Resource}",
+                        renewed.Id,
+                        renewed.Resource);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "Failed to renew Graph subscription {SubscriptionId} for resource {Resource}",
+                        subscription.Id,
+                        subscription.Resource);
+                }
+            }
+        }
+    }
+
+    private string BuildNotificationUrl()
+    {
+        var baseUrl = _config.GraphNotificationBaseUrl!.TrimEnd('/');
+        return $"{baseUrl}/api/graph-notifications";
+    }
+
+    private string BuildInstalledChatsResource()
+    {
+        return $"appCatalogs/teamsApps/{Uri.EscapeDataString(_config.TeamsAppCatalogId!)}/installedToChats/getAllMessages";
+    }
+
+    private static string BuildPerChatMessagesResource(string chatThreadId)
+    {
+        return $"chats/{Uri.EscapeDataString(chatThreadId)}/messages";
+    }
+
+    private static string? ExtractChatThreadId(ICall call)
+    {
+        return call.Resource.ChatInfo?.ThreadId;
     }
 }

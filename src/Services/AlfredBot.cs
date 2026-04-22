@@ -24,15 +24,21 @@ public sealed class AlfredBot : TeamsActivityHandler
 {
     private readonly IConversationReferenceStore _references;
     private readonly PythonChatPublisher _chatPublisher;
+    private readonly bool _forwardInboundChatToPython;
     private readonly ILogger<AlfredBot> _logger;
 
     public AlfredBot(
         IConversationReferenceStore references,
         PythonChatPublisher chatPublisher,
+        MeetingChatConfiguration chatConfig,
         ILogger<AlfredBot> logger)
     {
         _references = references;
         _chatPublisher = chatPublisher;
+        _forwardInboundChatToPython =
+            !chatConfig.Enabled
+            || string.IsNullOrWhiteSpace(chatConfig.GraphNotificationBaseUrl)
+            || string.IsNullOrWhiteSpace(chatConfig.ChatSubscriptionClientStateSecret);
         _logger = logger;
     }
 
@@ -55,6 +61,11 @@ public sealed class AlfredBot : TeamsActivityHandler
         if (string.IsNullOrWhiteSpace(chatThreadId))
         {
             return; // not a meeting chat
+        }
+
+        if (!_forwardInboundChatToPython)
+        {
+            return;
         }
 
         var payload = new ChatEventPayload

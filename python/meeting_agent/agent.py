@@ -1,39 +1,32 @@
 """
-Interview Analysis Agent using OpenAI Agents SDK.
+Alfred meeting agent using the OpenAI Agents SDK.
 
-Analyzes candidate interview responses in real-time using the openai-agents SDK.
-Provides relevance scoring, clarity scoring, key point extraction, and follow-up suggestions.
-Maintains a running assessment of the candidate and publishes thoughts in real-time.
-
-Supports both OpenAI and Azure OpenAI backends:
-  - OpenAI: Set OPENAI_API_KEY
-  - Azure OpenAI: Set AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_KEY, AZURE_OPENAI_DEPLOYMENT
-
-Last Grunted: 02/05/2026
+The live-turn agent consumes the unified meeting ledger (speech + chat),
+maintains Alfred's running notes/summary/topics, and emits one structured
+AlfredAction per analyzed event.
 """
+
+from __future__ import annotations
 
 import asyncio
 import logging
 import os
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Optional
 from pathlib import Path
+from typing import Any, Optional
 
+from agents import Agent, ModelSettings, Runner, set_default_openai_client
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from openai.types.shared import Reasoning
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
-from agents import Agent, ModelSettings, Runner, set_default_openai_client
-
-from .models import AnalysisItem
-from .session import InterviewSessionManager
+from .models import AlfredAction, AnalysisItem
 from .output import AnalysisOutputWriter
-from .pubsub import get_publisher, ThoughtType
+from .pubsub import get_publisher
+from .session import InterviewSessionManager
 
-
-# Load environment variables from .env file
 _env_path = Path(__file__).parent.parent / ".env"
 load_dotenv(_env_path)
 
@@ -41,7 +34,6 @@ logger = logging.getLogger(__name__)
 
 
 def _build_azure_base_url(endpoint: str) -> str:
-    """Convert an Azure resource endpoint into the OpenAI-compatible v1 base URL."""
     trimmed = endpoint.rstrip("/")
     if trimmed.endswith("/openai/v1"):
         return f"{trimmed}/"
@@ -49,254 +41,78 @@ def _build_azure_base_url(endpoint: str) -> str:
 
 
 def _configure_openai_client() -> tuple[str, bool]:
-    """
-    Configure OpenAI client based on environment variables.
-    
-    Sets the default client for the OpenAI Agents SDK using set_default_openai_client().
-    This is the recommended pattern for Azure OpenAI integration.
-    
-    Returns:
-        Tuple of (model_name, is_azure)
-        
-    Azure OpenAI requires:
-        - AZURE_OPENAI_ENDPOINT: The endpoint URL
-        - AZURE_OPENAI_KEY: The API key
-        - AZURE_OPENAI_DEPLOYMENT: The deployment name (used as model)
-        
-    Standard OpenAI requires:
-        - OPENAI_API_KEY: The API key
-        - OPENAI_MODEL (optional): Model name, defaults to gpt-5-mini
-        
-    Raises:
-        ValueError: If Azure is configured but missing required environment variables.
-    """
     azure_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
     azure_key = os.environ.get("AZURE_OPENAI_KEY")
     azure_deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT")
     api_type = os.environ.get("OPENAI_API_TYPE", "").lower()
-    
-    # Check if Azure OpenAI is configured
+
     if api_type == "azure" or (azure_endpoint and azure_key and azure_deployment):
         if not all([azure_endpoint, azure_key, azure_deployment]):
             raise ValueError(
                 "Azure OpenAI requires AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_KEY, "
                 "and AZURE_OPENAI_DEPLOYMENT environment variables"
             )
-        
         base_url = _build_azure_base_url(azure_endpoint)
-        logger.info(
-            "Using Azure OpenAI v1: %s, deployment: %s",
-            base_url,
-            azure_deployment,
-        )
-
-        azure_client = AsyncOpenAI(
-            base_url=base_url,
-            api_key=azure_key,
-        )
-        
-        # Set as default client for the Agents SDK
+        azure_client = AsyncOpenAI(base_url=base_url, api_key=azure_key)
         set_default_openai_client(azure_client)
-        
+        logger.info("Using Azure OpenAI v1: %s deployment=%s", base_url, azure_deployment)
         return azure_deployment, True
-    
-    # Fall back to standard OpenAI (SDK will use OPENAI_API_KEY automatically)
-    # Note: gpt-5.2 requires registration at https://aka.ms/oai/gpt5access
-    # Using gpt-5-mini as default (no registration required, has reasoning)
-    model = os.environ.get("OPENAI_MODEL", "gpt-5-mini")
-    logger.info(f"Using OpenAI: model {model}")
+
+    model = os.environ.get("OPENAI_MODEL", "gpt-5.4-mini")
+    logger.info("Using OpenAI model=%s", model)
     return model, False
 
 
-# Configure default client on module load
 DEFAULT_MODEL, _IS_AZURE_CONFIGURED = _configure_openai_client()
+DEFAULT_REASONING_EFFORT = os.environ.get("OPENAI_REASONING_EFFORT", "medium")
 
-# Default reasoning effort for GPT-5 (low for faster responses in real-time analysis)
-DEFAULT_REASONING_EFFORT = os.environ.get("OPENAI_REASONING_EFFORT", "low")
-
-
-# =============================================================================
-# Structured Output Models for Agent
-# =============================================================================
 
 class RunningAssessment(BaseModel):
-    """Running assessment of the candidate based on all responses so far."""
-    technical_competence: str = Field(
-        ...,
-        description="Assessment of technical foundation (e.g., 'Strong', 'Moderate', 'Weak', 'Not yet demonstrated')"
-    )
-    communication: str = Field(
-        ...,
-        description="Assessment of communication skills"
-    )
-    problem_solving: str = Field(
-        ...,
-        description="Assessment of structured thinking and problem-solving"
-    )
-    culture_fit: str = Field(
-        ...,
-        description="Assessment of collaboration and growth orientation"
-    )
-    overall_signal: str = Field(
-        ...,
-        description="Current hiring signal: 'Strong hire', 'Lean hire', 'Lean no', 'Strong no', or 'Too early to tell'"
-    )
-    key_strengths: list[str] = Field(
-        default_factory=list,
-        description="Top strengths observed so far"
-    )
-    areas_of_concern: list[str] = Field(
-        default_factory=list,
-        description="Any concerns or red flags"
-    )
+    """Legacy compatibility placeholder retained for package exports."""
+
+    summary: str = ""
 
 
-class InterviewAnalysisOutput(BaseModel):
-    """
-    Structured output from the interview coaching agent.
-    
-    This model is used as the agent's output_type to ensure
-    structured, validated responses focused on real-time coaching.
-    """
-    identified_question: Optional[str] = Field(
-        default=None,
-        description="The interview question being addressed (from recent context)"
-    )
-    relevance_score: float = Field(
-        ...,
-        ge=0.0,
-        le=1.0,
-        description="How relevant this specific response is (0.0 to 1.0)"
-    )
-    clarity_score: float = Field(
-        ...,
-        ge=0.0,
-        le=1.0,
-        description="How clearly articulated (0.0 to 1.0)"
-    )
-    key_points: list[str] = Field(
-        default_factory=list,
-        description="NEW key observations from this response only - do not repeat previous points (2-4 items)"
-    )
-    follow_up_suggestions: list[str] = Field(
-        default_factory=list,
-        description="Coaching for interviewer: What to do RIGHT NOW - specific follow-up questions or actions (1-2 items)"
-    )
-    reasoning: str = Field(
-        ...,
-        description="What's NEW in this response and why the interviewer should care"
-    )
-    running_assessment: RunningAssessment = Field(
-        ...,
-        description="Cumulative assessment based on ALL responses so far"
-    )
+InterviewAnalysisOutput = AlfredAction
 
 
-# =============================================================================
-# Agent Instructions
-# =============================================================================
+DEFAULT_ALFRED_INSTRUCTIONS = """You are Alfred, a quiet meeting assistant joining a Teams meeting.
 
-INTERVIEW_ANALYZER_INSTRUCTIONS = """You are an expert REAL-TIME INTERVIEW COACH helping the interviewer conduct a better interview. You are watching the interview unfold LIVE and providing continuous guidance.
+You can hear everything said (diarized transcript) and see every chat
+message. On each tick you receive the full meeting context and must emit
+exactly one AlfredAction.
 
-## Your Role
-You are the AI co-pilot for the interviewer, whispering helpful insights in their ear as the conversation happens. Your coaching should be:
-- **Contextual**: Build on the conversation flow, not isolated responses
-- **Non-redundant**: NEVER repeat analysis you've already provided
-- **Actionable**: Tell the interviewer what to DO next
-- **Concise**: They're conducting an interview, keep it brief
-
-## CRITICAL: You ONLY Analyze CANDIDATE Messages
-You will ONLY be triggered when the CANDIDATE speaks. You will NOT receive interviewer messages for analysis.
-- The conversation history shows both interviewer and candidate for context
-- But the "NEW MESSAGE TO ANALYZE" is ALWAYS from the candidate
-- Your job: analyze what the candidate said and coach the interviewer on what to do next
-
-## CRITICAL: Wait for NEW Candidate Content
-- If the candidate's message seems like a continuation or the same topic, acknowledge what's NEW
-- The candidate may speak multiple times in a row before the interviewer responds
-- In that case, each message you analyze should build on prior context
-- NEVER provide empty or placeholder analysis - always find something actionable
-
-## CRITICAL: Avoid Redundancy
-You will receive your PREVIOUS coaching response in the context. DO NOT:
-- Re-analyze topics you already covered
-- Repeat follow-up suggestions you already made
-- Restate key points you already noted
-
-Instead, focus on what is NEW in the latest candidate statement.
-
-## For Each New Exchange, Provide:
-
-### 1. RELEVANCE SCORE (0.0-1.0)
-How well did the candidate address the question?
-- Only score the CURRENT response, but consider if it adds to previous context
-
-### 2. CLARITY SCORE (0.0-1.0)  
-How clearly did they communicate?
-- Consider if they're improving or declining in articulation
-
-### 3. KEY POINTS (NEW observations only)
-Extract 2-4 NEW takeaways that you haven't mentioned before:
-- New skills, technologies, or experiences revealed
-- New quantifiable achievements or metrics
-- New problem-solving approaches demonstrated
-- Any new red flags or concerns
-- Skip anything you've already noted in previous coaching
-
-### 4. COACHING FOR INTERVIEWER
-This is your most important output. Tell the interviewer:
-- What they should probe deeper on RIGHT NOW
-- Any flags to watch for in the next response
-- Whether to move on to a new topic or dig deeper
-- Specific follow-up question to ask (1-2 max)
-
-### 5. RUNNING ASSESSMENT UPDATE
-Cumulative view based on ALL responses:
-- Technical Competence / Communication / Problem Solving / Culture Fit
-- Overall Hire Signal: Strong hire / Lean hire / Lean no / Strong no
-
-## Important Guidelines
-- Your reasoning should explain what's NEW in this response
-- If the candidate repeated themselves, note that instead of re-analyzing
-- Focus on helping the interviewer succeed, not just documenting
-- Be direct and actionable - imagine you have 3 seconds of their attention"""
+Rules:
+- Strong bias toward SILENT.
+- Never interrupt flow just to recap.
+- SEND only when you add concrete value.
+- ASK only when material ambiguity is blocking progress.
+- Keep SEND/ASK concise.
+- Update running_summary, notes, and topics on every useful turn.
+- If context.alfred_muted is true, emit SILENT.
+"""
 
 
-# =============================================================================
-# Interview Analyzer Class
-# =============================================================================
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-class InterviewAnalyzer:
-    """
-    Analyzes candidate interview responses using the OpenAI Agents SDK.
-    
-    This class wraps the openai-agents SDK Agent to provide interview-specific
-    analysis capabilities. It can be used synchronously or asynchronously.
-    
-    Features:
-        - Real-time response analysis with GPT-4o (or Azure OpenAI)
-        - Structured output with scores and suggestions
-        - Running assessment tracking across all responses
-        - Real-time thought publishing to Streamlit UI
-        - Context-aware (uses conversation history)
-        - Integrates with InterviewSessionManager
-        - Supports both OpenAI and Azure OpenAI backends
-    
-    Example:
-        >>> analyzer = InterviewAnalyzer()
-        >>> result = await analyzer.analyze_async(
-        ...     response_text="I have 5 years of Python experience...",
-        ...     context={
-        ...         "candidate_name": "John Smith",
-        ...         "conversation_history": [
-        ...             {"role": "interviewer", "text": "Tell me about your Python experience."}
-        ...         ]
-        ...     }
-        ... )
-        >>> print(result.relevance_score)
-        0.85
-    """
-    
+
+def _extract_response_id(result: Any) -> str | None:
+    for attr in ("response_id", "last_response_id", "id"):
+        value = getattr(result, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value
+    raw_response = getattr(result, "raw_response", None)
+    if raw_response is not None:
+        value = getattr(raw_response, "id", None)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+class AlfredAnalyzer:
+    """Analyze a live meeting event and emit one AlfredAction."""
+
     def __init__(
         self,
         model: Optional[str] = None,
@@ -306,151 +122,130 @@ class InterviewAnalyzer:
         reasoning_effort: Optional[str] = None,
         instructions: Optional[str] = None,
     ) -> None:
-        """
-        Initialize the InterviewAnalyzer.
-        
-        The OpenAI client (standard or Azure) is configured globally via
-        set_default_openai_client() during module initialization based on
-        environment variables.
-        
-        Args:
-            model: Model/deployment to use. If None, uses AZURE_OPENAI_DEPLOYMENT 
-                   for Azure or OPENAI_MODEL for standard OpenAI.
-            session_manager: Optional session manager for context.
-            output_writer: Optional output writer for persisting analyses.
-            publish_thoughts: Whether to publish thoughts to the pub-sub system.
-            reasoning_effort: Reasoning effort for GPT-5 ("low", "medium", "high").
-                              Default: "low" for faster real-time responses.
-            
-        Environment Variables:
-            Azure OpenAI:
-                AZURE_OPENAI_ENDPOINT: Azure OpenAI endpoint URL
-                AZURE_OPENAI_KEY: Azure OpenAI API key
-                AZURE_OPENAI_DEPLOYMENT: Model deployment name
-                AZURE_OPENAI_API_VERSION: API version (default: 2024-08-01-preview)
-                OPENAI_API_TYPE: Set to "azure" to force Azure mode
-                
-            Standard OpenAI:
-                OPENAI_API_KEY: OpenAI API key
-                OPENAI_MODEL: Model name (default: gpt-5-mini)
-                
-            GPT-5 Settings:
-                OPENAI_REASONING_EFFORT: Reasoning effort level (default: low)
-        """
         self.model = model or DEFAULT_MODEL
         self.reasoning_effort = reasoning_effort or DEFAULT_REASONING_EFFORT
-        self.instructions = instructions or INTERVIEW_ANALYZER_INSTRUCTIONS
-        
-        # Validate configuration
-        if not _IS_AZURE_CONFIGURED and not os.environ.get("OPENAI_API_KEY"):
-            logger.warning(
-                "No OpenAI credentials configured. Set either:\n"
-                "  - OPENAI_API_KEY for standard OpenAI, or\n"
-                "  - AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_KEY, AZURE_OPENAI_DEPLOYMENT for Azure OpenAI\n"
-                "Agent will fail at runtime."
-            )
-        
+        self.instructions = instructions or DEFAULT_ALFRED_INSTRUCTIONS
         self.session_manager = session_manager
         self.output_writer = output_writer
         self.publish_thoughts = publish_thoughts
         self._publisher = get_publisher() if publish_thoughts else None
-        
-        # Track running assessment across responses
-        self._response_count: int = 0
-        self._cumulative_relevance: float = 0.0
-        self._cumulative_clarity: float = 0.0
-        self._all_key_points: list[str] = []
-        
-        # Track previous coaching for context (avoid repetition)
-        self._previous_coaching: Optional[dict[str, Any]] = None
-        
-        # Configure model settings for GPT-5/reasoning models
-        # Uses Reasoning type from openai.types.shared per SDK documentation
+
+        if not _IS_AZURE_CONFIGURED and not os.environ.get("OPENAI_API_KEY"):
+            logger.warning("No OpenAI credentials configured. Alfred analysis will fail at runtime.")
+
         model_settings: ModelSettings | None = None
-        is_reasoning_model = any(
-            prefix in self.model.lower() 
-            for prefix in ("gpt-5", "o1", "o3")
-        )
-        if is_reasoning_model:
-            model_settings = ModelSettings(
-                reasoning=Reasoning(effort=self.reasoning_effort),
-            )
-        
-        # Create the analysis agent with structured output
+        if any(prefix in self.model.lower() for prefix in ("gpt-5", "o1", "o3")):
+            model_settings = ModelSettings(reasoning=Reasoning(effort=self.reasoning_effort))
+
         self._agent = Agent(
-            name="Interview Analyzer",
+            name="Alfred Live Turn Agent",
             instructions=self.instructions,
             model=self.model,
-            output_type=InterviewAnalysisOutput,
+            output_type=AlfredAction,
             model_settings=model_settings,
         )
-        
-        provider_info = "Azure OpenAI" if _IS_AZURE_CONFIGURED else "OpenAI"
-        reasoning_info = f", reasoning_effort: {self.reasoning_effort}" if model_settings else ""
-        logger.info(f"InterviewAnalyzer initialized with {provider_info}, model: {self.model}{reasoning_info}")
-        logger.info(f"Thought publishing: {'enabled' if publish_thoughts else 'disabled'}")
-    
-    def _build_prompt(
-        self,
-        response_text: str,
-        context: Optional[dict[str, Any]] = None,
-    ) -> str:
-        """
-        Build the coaching prompt with conversation history and previous agent response.
-        
-        Args:
-            response_text: The candidate's response to analyze.
-            context: Optional context with conversation history and previous coaching.
-            
-        Returns:
-            Formatted prompt string for the agent.
-        """
-        parts = []
-        
-        parts.append("# REAL-TIME INTERVIEW COACHING SESSION")
-        parts.append("You are continuously coaching an interviewer. Provide NEW insights only.\n")
-        
-        # Add context information
-        if context:
-            candidate_name = context.get("candidate_name", "Unknown Candidate")
-            parts.append(f"**Candidate:** {candidate_name}\n")
-            
-            # Add PREVIOUS COACHING (so agent knows what it already said)
-            previous_coaching = context.get("previous_coaching")
-            if previous_coaching:
-                parts.append("## YOUR PREVIOUS COACHING (DO NOT REPEAT)")
-                parts.append("You already provided this analysis. Build on it, don't repeat it:")
-                parts.append(f"- Key points noted: {', '.join(previous_coaching.get('key_points', []))}")
-                parts.append(f"- Follow-ups suggested: {', '.join(previous_coaching.get('follow_up_suggestions', []))}")
-                parts.append(f"- Reasoning: {previous_coaching.get('reasoning', 'N/A')}")
-                parts.append("")
-            
-            # Add conversation history (last 4 messages for context)
-            history = context.get("conversation_history", [])
-            if history:
-                # Take last 4 messages for tight context
-                recent = history[-4:]
-                parts.append("## LAST 4 MESSAGES (conversation context)")
-                for i, turn in enumerate(recent, 1):
-                    role = turn.get("role", "unknown")
-                    text = turn.get("text", "")
-                    speaker_label = "🎤 INTERVIEWER" if role == "interviewer" else "👤 CANDIDATE"
-                    # Truncate for prompt efficiency but keep enough context
-                    display_text = text[:300] + "..." if len(text) > 300 else text
-                    parts.append(f"{i}. {speaker_label}: {display_text}")
-                parts.append("")
-        
-        # Add the CURRENT response to analyze (this is the new input)
-        parts.append("## NEW CANDIDATE MESSAGE TO ANALYZE")
-        parts.append("(You are triggered because the CANDIDATE just spoke. Analyze their message below.)")
-        parts.append(f"👤 CANDIDATE: {response_text}")
-        parts.append("")
-        parts.append("## YOUR TASK")
-        parts.append("Analyze what the CANDIDATE just said. Focus on what's NEW - don't repeat previous analysis.")
-        parts.append("What should the interviewer do RIGHT NOW in response to this candidate statement?")
-        
+        logger.info("AlfredAnalyzer initialized model=%s reasoning=%s", self.model, self.reasoning_effort)
+
+    def _format_history_line(self, index: int, event: dict[str, Any]) -> str:
+        kind = str(event.get("kind") or "system").upper()
+        role = str(event.get("role") or "unknown")
+        display_name = str(event.get("display_name") or event.get("speaker_id") or role)
+        prefix = f"{index}. [{event.get('timestamp_utc')}] {kind} {display_name} ({role})"
+        text = str(event.get("text") or "").strip()
+        if not text:
+            return prefix
+        return f"{prefix}: {text}"
+
+    def _build_prompt(self, response_text: str, context: Optional[dict[str, Any]]) -> str:
+        ctx = context or {}
+        stable_prefix = dict(ctx.get("stable_prefix") or {})
+        meeting_history = list(ctx.get("meeting_history") or [])
+        dynamic_tail = list(ctx.get("dynamic_tail") or [])
+        trigger_event = dict(ctx.get("trigger_event") or {})
+
+        parts: list[str] = [
+            "# Alfred Meeting Context",
+            "## Stable Prefix",
+            f"- session_id: {stable_prefix.get('session_id') or ctx.get('session_id') or 'unknown'}",
+            f"- candidate_name: {stable_prefix.get('candidate_name') or ctx.get('candidate_name') or 'unknown'}",
+            f"- meeting_url: {stable_prefix.get('meeting_url') or ctx.get('meeting_url') or 'unknown'}",
+            f"- started_at: {stable_prefix.get('started_at') or ctx.get('started_at') or 'unknown'}",
+            f"- prompt_cache_key: {stable_prefix.get('prompt_cache_key') or ctx.get('prompt_cache_key') or ''}",
+            f"- latest_response_id: {stable_prefix.get('latest_response_id') or ctx.get('latest_response_id') or ''}",
+            f"- alfred_muted: {bool(stable_prefix.get('alfred_muted') or ctx.get('alfred_muted'))}",
+            "",
+            "## Current Alfred State",
+            f"running_summary:\n{stable_prefix.get('running_summary') or ctx.get('running_summary') or '(empty)'}",
+            "",
+            f"topics: {', '.join(stable_prefix.get('topics') or ctx.get('topics') or []) or '(none)'}",
+            f"notes: {' | '.join(stable_prefix.get('notes') or ctx.get('notes') or []) or '(none)'}",
+            "",
+            "## Full Meeting History",
+        ]
+        if meeting_history:
+            parts.extend(
+                self._format_history_line(index, event)
+                for index, event in enumerate(meeting_history, start=1)
+            )
+        else:
+            parts.append("(no meeting history yet)")
+
+        parts.extend(["", "## Newly Appended Events"])
+        if dynamic_tail:
+            parts.extend(
+                self._format_history_line(index, event)
+                for index, event in enumerate(dynamic_tail, start=1)
+            )
+        else:
+            parts.append("(none)")
+
+        parts.extend(
+            [
+                "",
+                "## Trigger Event",
+                self._format_history_line(1, trigger_event) if trigger_event else "(none)",
+                "",
+                "## Text To Analyze",
+                response_text,
+                "",
+                "Return AlfredAction only.",
+            ]
+        )
         return "\n".join(parts)
-    
+
+    def _sanitize_action(self, action: AlfredAction, context: Optional[dict[str, Any]]) -> AlfredAction:
+        ctx = context or {}
+        muted = bool(ctx.get("alfred_muted") or (ctx.get("stable_prefix") or {}).get("alfred_muted"))
+        if muted:
+            return AlfredAction(
+                action="SILENT",
+                rationale="Alfred is muted for this meeting.",
+                chat_text=None,
+                notes=action.notes,
+                running_summary=action.running_summary,
+                topics=action.topics,
+            )
+
+        if action.action == "SILENT":
+            action.chat_text = None
+            return action
+
+        if not (action.chat_text or "").strip():
+            return AlfredAction(
+                action="SILENT",
+                rationale=f"{action.action} was downgraded because no chat_text was provided.",
+                chat_text=None,
+                notes=action.notes,
+                running_summary=action.running_summary,
+                topics=action.topics,
+            )
+
+        if action.action == "ASK" and not action.chat_text.rstrip().endswith("?"):
+            action.chat_text = f"{action.chat_text.rstrip()}?"
+
+        action.chat_text = action.chat_text.strip()
+        return action
+
     async def analyze_async(
         self,
         response_text: str,
@@ -458,165 +253,88 @@ class InterviewAnalyzer:
         response_id: Optional[str] = None,
         speaker_id: Optional[str] = None,
     ) -> AnalysisItem:
-        """
-        Analyze a candidate response asynchronously.
-        
-        This is the primary analysis method. It runs the agent and returns
-        a structured AnalysisItem. Also publishes thoughts to the real-time stream.
-        
-        Args:
-            response_text: The candidate's response text.
-            context: Optional dict with candidate_name and conversation_history.
-            response_id: Optional unique ID for this response (auto-generated if not provided).
-            speaker_id: Optional speaker ID from diarization.
-            
-        Returns:
-            AnalysisItem with scores, key points, and suggestions.
-            
-        Raises:
-            Exception: If agent execution fails.
-            
-        Example:
-            >>> result = await analyzer.analyze_async(
-            ...     response_text="In my previous role, I led a team of 5 engineers...",
-            ...     context={"candidate_name": "Jane Doe", "conversation_history": [...]}
-            ... )
-        """
         if not response_text or not response_text.strip():
-            logger.warning("Empty response text provided, returning minimal analysis")
-            if self._publisher and self.publish_thoughts:
-                await self._publisher.publish_observation(
-                    "Received empty response - skipping analysis",
-                    speaker_id=speaker_id
-                )
+            fallback = AlfredAction(
+                action="SILENT",
+                rationale="Empty event text; nothing to analyze.",
+                running_summary=str((context or {}).get("running_summary") or ""),
+                topics=list((context or {}).get("topics") or []),
+            )
             return AnalysisItem(
                 response_id=response_id or f"resp_{uuid.uuid4().hex[:8]}",
                 response_text=response_text or "",
-                relevance_score=0.0,
-                clarity_score=0.0,
-                key_points=[],
-                follow_up_suggestions=["Unable to analyze empty response"],
+                speaker_id=speaker_id,
+                alfred_action=fallback,
+                key_points=fallback.notes,
+                raw_model_output={"warning": "empty_response_text"},
             )
-        
-        # Publish observation that we're analyzing
+
         if self._publisher and self.publish_thoughts:
-            candidate_name = context.get("candidate_name", "Candidate") if context else "Candidate"
             await self._publisher.publish_observation(
-                f"Analyzing response from {candidate_name}...",
-                speaker_id=speaker_id
+                "Analyzing new Alfred meeting event...",
+                speaker_id=speaker_id,
             )
-        
-        # Inject previous coaching into context for continuity
-        if context is None:
-            context = {}
-        if self._previous_coaching:
-            context["previous_coaching"] = self._previous_coaching
-        
-        # Build the prompt
+
         prompt = self._build_prompt(response_text, context)
-        
-        logger.debug(f"Running analysis for response: {response_text[:100]}...")
-        
+
         try:
-            # Run the agent (client is configured globally via set_default_openai_client)
             result = await Runner.run(self._agent, prompt)
-            
-            # Extract the structured output
-            analysis_output: InterviewAnalysisOutput = result.final_output_as(InterviewAnalysisOutput)
-            
-            # Update cumulative tracking
-            self._response_count += 1
-            self._cumulative_relevance += analysis_output.relevance_score
-            self._cumulative_clarity += analysis_output.clarity_score
-            self._all_key_points.extend(analysis_output.key_points)
-            
-            # Save this coaching for next analysis (avoid repetition)
-            self._previous_coaching = {
-                "key_points": analysis_output.key_points,
-                "follow_up_suggestions": analysis_output.follow_up_suggestions,
-                "reasoning": analysis_output.reasoning,
-            }
-            
-            # Create AnalysisItem from agent output
-            running_assessment_dict = None
-            if analysis_output.running_assessment:
-                running_assessment_dict = {
-                    "technical_competence": analysis_output.running_assessment.technical_competence,
-                    "communication": analysis_output.running_assessment.communication,
-                    "problem_solving": analysis_output.running_assessment.problem_solving,
-                    "culture_fit": analysis_output.running_assessment.culture_fit,
-                    "overall_signal": analysis_output.running_assessment.overall_signal,
-                    "key_strengths": analysis_output.running_assessment.key_strengths,
-                    "areas_of_concern": analysis_output.running_assessment.areas_of_concern,
-                    "responses_analyzed": self._response_count,
-                    "avg_relevance": self._cumulative_relevance / self._response_count,
-                    "avg_clarity": self._cumulative_clarity / self._response_count,
-                }
-            
+            action = result.final_output_as(AlfredAction)
+            action = self._sanitize_action(action, context)
+            latest_response_id = _extract_response_id(result)
+
             analysis_item = AnalysisItem(
                 response_id=response_id or f"resp_{uuid.uuid4().hex[:8]}",
-                timestamp_utc=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                question_text=analysis_output.identified_question,
+                timestamp_utc=_utc_now(),
                 response_text=response_text,
                 speaker_id=speaker_id,
-                relevance_score=analysis_output.relevance_score,
-                clarity_score=analysis_output.clarity_score,
-                key_points=analysis_output.key_points,
-                follow_up_suggestions=analysis_output.follow_up_suggestions,
+                trigger_event_id=str(((context or {}).get("trigger_event") or {}).get("event_id") or "") or None,
+                key_points=list(action.notes),
+                follow_up_suggestions=[action.chat_text] if action.chat_text else [],
+                alfred_action=action,
                 raw_model_output={
-                    "reasoning": analysis_output.reasoning,
                     "model": self.model,
-                    "running_assessment": running_assessment_dict,
+                    "latest_response_id": latest_response_id,
                 },
             )
-            
-            logger.info(
-                f"Analysis complete - relevance: {analysis_item.relevance_score:.2f}, "
-                f"clarity: {analysis_item.clarity_score:.2f}, "
-                f"key_points: {len(analysis_item.key_points)}"
-            )
-            
-            # Publish analysis to real-time stream
+
             if self._publisher and self.publish_thoughts:
                 await self._publisher.publish_analysis(
-                    content=analysis_output.reasoning,
+                    content=action.rationale,
                     speaker_id=speaker_id,
-                    speaker_role="candidate",
-                    response_text=response_text[:200] + ("..." if len(response_text) > 200 else ""),
-                    relevance_score=analysis_output.relevance_score,
-                    clarity_score=analysis_output.clarity_score,
-                    key_points=analysis_output.key_points,
-                    follow_up_suggestions=analysis_output.follow_up_suggestions,
-                    running_assessment=running_assessment_dict,
+                    speaker_role=str(((context or {}).get("trigger_event") or {}).get("role") or "unknown"),
+                    response_text=response_text[:240],
+                    key_points=action.notes,
+                    follow_up_suggestions=[action.chat_text] if action.chat_text else [],
+                    running_assessment={
+                        "running_summary": action.running_summary,
+                        "topics": action.topics,
+                        "action": action.action,
+                    },
                 )
-            
-            # Optionally persist the analysis
-            if self.output_writer and self.session_manager and self.session_manager.session:
-                self.output_writer.append_item(
-                    self.session_manager.session.session_id,
-                    analysis_item
-                )
-            
+
             return analysis_item
-            
-        except Exception as e:
-            logger.error(f"Agent analysis failed: {e}", exc_info=True)
-            
-            # Publish error to stream
+        except Exception as exc:
+            logger.error("Alfred analysis failed: %s", exc, exc_info=True)
             if self._publisher and self.publish_thoughts:
-                await self._publisher.publish_error(f"Analysis failed: {str(e)}")
-            
-            # Return a fallback analysis item on error
+                await self._publisher.publish_error(f"Alfred analysis failed: {exc!s}")
+
+            fallback = AlfredAction(
+                action="SILENT",
+                rationale="Analysis failed; Alfred stayed silent.",
+                running_summary=str((context or {}).get("running_summary") or ""),
+                topics=list((context or {}).get("topics") or []),
+            )
             return AnalysisItem(
                 response_id=response_id or f"resp_{uuid.uuid4().hex[:8]}",
                 response_text=response_text,
-                relevance_score=0.5,
-                clarity_score=0.5,
-                key_points=["Analysis failed - manual review required"],
-                follow_up_suggestions=[],
-                raw_model_output={"error": str(e)},
+                speaker_id=speaker_id,
+                trigger_event_id=str(((context or {}).get("trigger_event") or {}).get("event_id") or "") or None,
+                key_points=fallback.notes,
+                alfred_action=fallback,
+                raw_model_output={"error": str(exc), "model": self.model},
             )
-    
+
     def analyze(
         self,
         transcript: str,
@@ -624,41 +342,14 @@ class InterviewAnalyzer:
         response_id: Optional[str] = None,
         speaker_id: Optional[str] = None,
     ) -> AnalysisItem:
-        """
-        Analyze a candidate response synchronously.
-        
-        This is a convenience wrapper that runs the async analysis
-        in a new event loop. Prefer analyze_async when possible.
-        
-        Args:
-            transcript: The candidate's response text (alias for response_text).
-            context: Optional dict with candidate_name and conversation_history.
-            response_id: Optional unique ID for this response.
-            speaker_id: Optional speaker ID from diarization.
-            
-        Returns:
-            AnalysisItem with scores, key points, and suggestions.
-            
-        Raises:
-            RuntimeError: If called from within an existing async context.
-            
-        Note:
-            This method creates a new event loop if one is not running.
-            Use analyze_async in async contexts to avoid overhead.
-        """
         try:
-            # Check if there's already a running event loop
             asyncio.get_running_loop()
-            # If we get here, there IS a running loop - we can't use asyncio.run()
             raise RuntimeError(
-                "Cannot call sync analyze() from an async context. "
-                "Use 'await analyze_async()' instead."
+                "Cannot call sync analyze() from an async context. Use 'await analyze_async()' instead."
             )
-        except RuntimeError as e:
-            # Re-raise if it's our custom error
-            if "Cannot call sync analyze" in str(e):
+        except RuntimeError as exc:
+            if "Cannot call sync analyze" in str(exc):
                 raise
-            # No running loop exists, safe to create one
             return asyncio.run(
                 self.analyze_async(
                     response_text=transcript,
@@ -667,51 +358,18 @@ class InterviewAnalyzer:
                     speaker_id=speaker_id,
                 )
             )
-    
+
     async def analyze_with_session(
         self,
         response_text: str,
         speaker_id: Optional[str] = None,
     ) -> Optional[AnalysisItem]:
-        """
-        Analyze using context from the attached session manager.
-        
-        Requires a session_manager to be configured at initialization.
-        Automatically extracts context from the current session.
-        
-        Args:
-            response_text: The candidate's response text.
-            speaker_id: Optional speaker ID from diarization.
-            
-        Returns:
-            AnalysisItem if analysis succeeds, None if no active session.
-            
-        Raises:
-            ValueError: If no session_manager is configured.
-        """
         if not self.session_manager:
             raise ValueError("No session_manager configured. Pass one to __init__.")
-        
         if not self.session_manager.is_active:
-            logger.warning("No active session - skipping analysis")
+            logger.warning("No active session - skipping Alfred analysis")
             return None
-        
-        # Build context from session
-        context = self.session_manager.get_session_context()
-        
-        # Get the last interviewer question for better context
-        last_question = self.session_manager.get_last_interviewer_question()
-        if last_question:
-            # Ensure it's in the conversation history
-            history = context.get("recent_conversation", [])
-            if not any(h.get("text") == last_question for h in history):
-                history.append({
-                    "role": "interviewer",
-                    "text": last_question,
-                    "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                })
-                context["recent_conversation"] = history
-        
+        context = self.session_manager.get_agent_context_snapshot()
         return await self.analyze_async(
             response_text=response_text,
             context=context,
@@ -719,9 +377,30 @@ class InterviewAnalyzer:
         )
 
 
-# =============================================================================
-# Factory Function
-# =============================================================================
+InterviewAnalyzer = AlfredAnalyzer
+
+
+def create_alfred_analyzer(
+    model: Optional[str] = None,
+    session_manager: Optional[InterviewSessionManager] = None,
+    output_dir: Optional[str] = None,
+    publish_thoughts: bool = True,
+    reasoning_effort: Optional[str] = None,
+    instructions: Optional[str] = None,
+) -> AlfredAnalyzer:
+    output_writer: AnalysisOutputWriter | None = None
+    if output_dir:
+        output_writer = AnalysisOutputWriter(Path(output_dir))
+
+    return AlfredAnalyzer(
+        model=model,
+        session_manager=session_manager,
+        output_writer=output_writer,
+        publish_thoughts=publish_thoughts,
+        reasoning_effort=reasoning_effort,
+        instructions=instructions,
+    )
+
 
 def create_interview_analyzer(
     model: Optional[str] = None,
@@ -730,49 +409,11 @@ def create_interview_analyzer(
     publish_thoughts: bool = True,
     reasoning_effort: Optional[str] = None,
     instructions: Optional[str] = None,
-) -> InterviewAnalyzer:
-    """
-    Factory function to create a configured InterviewAnalyzer.
-    
-    The OpenAI client (standard or Azure) is configured globally during module
-    initialization based on environment variables. This function creates an
-    analyzer instance that uses that global configuration.
-    
-    Environment-based detection:
-        - Azure: AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_KEY, AZURE_OPENAI_DEPLOYMENT
-        - OpenAI: OPENAI_API_KEY
-    
-    Args:
-        model: Model/deployment to use. If None, auto-detects from environment
-               (default: gpt-5-mini for OpenAI, deployment name for Azure).
-        session_manager: Optional session manager for context.
-        output_dir: Optional directory for analysis output files.
-        publish_thoughts: Whether to publish thoughts to real-time stream.
-        reasoning_effort: Reasoning effort for GPT-5 ("low", "medium", "high"). 
-                          Default: "low" for faster real-time responses.
-        
-    Returns:
-        Configured InterviewAnalyzer instance.
-        
-    Example:
-        >>> # GPT-5 with low reasoning (default, fastest)
-        >>> analyzer = create_interview_analyzer()
-        
-        >>> # GPT-5 with high reasoning (slower, more thorough)
-        >>> analyzer = create_interview_analyzer(reasoning_effort="high")
-        
-        >>> # Azure OpenAI (auto-detected from environment)
-        >>> # Set AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_KEY, AZURE_OPENAI_DEPLOYMENT
-        >>> analyzer = create_interview_analyzer()
-    """
-    output_writer: AnalysisOutputWriter | None = None
-    if output_dir:
-        output_writer = AnalysisOutputWriter(Path(output_dir))
-    
-    return InterviewAnalyzer(
+) -> AlfredAnalyzer:
+    return create_alfred_analyzer(
         model=model,
         session_manager=session_manager,
-        output_writer=output_writer,
+        output_dir=output_dir,
         publish_thoughts=publish_thoughts,
         reasoning_effort=reasoning_effort,
         instructions=instructions,

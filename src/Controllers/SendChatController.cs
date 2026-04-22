@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.Bot.Builder;
 using Microsoft.Bot.Builder.Integration.AspNet.Core;
 using Microsoft.Bot.Schema;
+using System.Collections.Concurrent;
 using TeamsMediaBot.Models;
 using TeamsMediaBot.Services;
 
@@ -20,7 +21,9 @@ namespace TeamsMediaBot.Controllers;
 [Route("api/send-chat")]
 public sealed class SendChatController : ControllerBase
 {
-    private static readonly SemaphoreSlim Gate = new(1, 1);
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> Gates = new();
+    private static readonly ConcurrentDictionary<string, DateTimeOffset> RecentRequests = new();
+    private static readonly TimeSpan DuplicateWindow = TimeSpan.FromSeconds(20);
 
     private readonly IBotFrameworkHttpAdapter _adapter;
     private readonly IConversationReferenceStore _references;
@@ -54,16 +57,36 @@ public sealed class SendChatController : ControllerBase
             return BadRequest(new { error = "text is required" });
         }
 
-        var reference = _references.Get(request.ConversationReferenceId);
+        var conversationReferenceId = request.ConversationReferenceId.Trim();
+        var messageText = request.Text.Trim();
+
+        var reference = _references.Get(conversationReferenceId);
         if (reference is null)
         {
             _logger.LogWarning(
                 "No ConversationReference cached for {RefId}. Has the bot seen any chat in that thread?",
-                request.ConversationReferenceId);
+                conversationReferenceId);
             return NotFound(new { error = "No ConversationReference for that chat; bot must see chat activity first." });
         }
 
-        await Gate.WaitAsync(ct);
+        var dedupeKey = string.Join("|",
+            conversationReferenceId,
+            request.ReplyToMessageId?.Trim(),
+            request.Action?.Trim(),
+            messageText);
+
+        var now = DateTimeOffset.UtcNow;
+        if (RecentRequests.TryGetValue(dedupeKey, out var lastSeen)
+            && now - lastSeen <= DuplicateWindow)
+        {
+            _logger.LogInformation("Suppressing duplicate send-chat request for {RefId}", conversationReferenceId);
+            return Ok(new { ok = true, deduped = true });
+        }
+
+        RecentRequests[dedupeKey] = now;
+
+        var gate = Gates.GetOrAdd(conversationReferenceId, static _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct);
         try
         {
             var adapter = (BotAdapter)_adapter;
@@ -72,7 +95,7 @@ public sealed class SendChatController : ControllerBase
                 reference,
                 async (turnCtx, innerCt) =>
                 {
-                    var activity = MessageFactory.Text(request.Text);
+                    var activity = MessageFactory.Text(messageText);
                     if (!string.IsNullOrWhiteSpace(request.ReplyToMessageId))
                     {
                         activity.ReplyToId = request.ReplyToMessageId;
@@ -83,7 +106,7 @@ public sealed class SendChatController : ControllerBase
         }
         finally
         {
-            Gate.Release();
+            gate.Release();
         }
 
         return Ok(new { ok = true });

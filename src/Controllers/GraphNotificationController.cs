@@ -23,17 +23,14 @@ namespace TeamsMediaBot.Controllers;
 [Route("api/graph-notifications")]
 public sealed class GraphNotificationController : ControllerBase
 {
-    private readonly PythonChatPublisher _chatPublisher;
-    private readonly MeetingChatConfiguration _config;
+    private readonly GraphNotificationProcessor _processor;
     private readonly ILogger<GraphNotificationController> _logger;
 
     public GraphNotificationController(
-        PythonChatPublisher chatPublisher,
-        MeetingChatConfiguration config,
+        GraphNotificationProcessor processor,
         ILogger<GraphNotificationController> logger)
     {
-        _chatPublisher = chatPublisher;
-        _config = config;
+        _processor = processor;
         _logger = logger;
     }
 
@@ -55,15 +52,18 @@ public sealed class GraphNotificationController : ControllerBase
         _logger.LogDebug("Graph notification body ({Bytes} bytes): {Preview}",
             body.Length, body.Length > 200 ? body[..200] : body);
 
-        // TODO[Alfred]: implement once live-tenant iteration begins.
-        //   - Validate clientState against _config.ChatSubscriptionClientStateSecret
-        //   - If encryptedContent present: RSA-OAEP unwrap dataKey, AES-CBC decrypt
-        //     dataSignature-verified payload, deserialize to chatMessage resource.
-        //   - If not encrypted: GET the resource by URL to fetch the chatMessage.
-        //   - Handle lifecycleEvent types: reauthorizationRequired, subscriptionRemoved, missed.
-        //   - For chatMessage.created/updated: translate to ChatEventPayload and call
-        //     _chatPublisher.PublishAsync.
-        //   - For chatMessage.deleted: publish with event_type=chat_deleted.
+        _ = Task.Run(
+            async () =>
+            {
+                try
+                {
+                    await _processor.ProcessAsync(body, CancellationToken.None);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Unhandled error while processing Graph notification batch.");
+                }
+            });
 
         return Accepted();
     }

@@ -47,6 +47,7 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
     private readonly BotConfiguration _botConfig;
     private readonly MediaPlatformConfiguration _mediaConfig;
     private readonly JoinModeSettings _joinModeSettings;
+    private readonly IMeetingChatService _meetingChatService;
     private readonly ILogger<TeamsCallingBotService> _logger;
     private readonly IGraphLogger _graphLogger;
     private readonly TranscriberFactory _transcriberFactory;
@@ -102,6 +103,7 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
         BotConfiguration botConfig,
         MediaPlatformConfiguration mediaConfig,
         JoinModeSettings joinModeSettings,
+        IMeetingChatService meetingChatService,
         ILogger<TeamsCallingBotService> logger,
         IGraphLogger graphLogger,
         IServiceProvider serviceProvider,
@@ -110,6 +112,7 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(botConfig);
         ArgumentNullException.ThrowIfNull(mediaConfig);
         ArgumentNullException.ThrowIfNull(joinModeSettings);
+        ArgumentNullException.ThrowIfNull(meetingChatService);
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(graphLogger);
         ArgumentNullException.ThrowIfNull(transcriberFactory);
@@ -117,6 +120,7 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
         _botConfig = botConfig;
         _mediaConfig = mediaConfig;
         _joinModeSettings = joinModeSettings;
+        _meetingChatService = meetingChatService;
         _logger = logger;
         _graphLogger = graphLogger;
         _transcriberFactory = transcriberFactory;
@@ -296,6 +300,8 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
         // Create handler with heartbeat keepalive
         var handler = new CallHandler(call, mediaSession, transcriber, _logger);
         CallHandlers[threadId] = handler;
+
+        _ = _meetingChatService.AttachToCallAsync(call);
         
         _logger.LogInformation(
             "Created CallHandler for thread: {ThreadId} (heartbeat enabled every 10 min)", 
@@ -321,6 +327,8 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
             // Fire-and-forget cleanup
             _ = CleanupHandlerAsync(handler, threadId);
         }
+
+        _ = _meetingChatService.DetachFromCallAsync(call);
         
         // Clean up any pending transcribers that weren't used
         _pendingTranscribers.TryRemove(threadId, out _);
@@ -364,7 +372,7 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
             {
                 StreamDirections = StreamDirection.Recvonly,  // We only need to receive audio
                 SupportedAudioFormat = AudioFormat.Pcm16K,    // 16 kHz PCM
-                ReceiveUnmixedMeetingAudio = false            // Mixed audio is fine for transcription
+                ReceiveUnmixedMeetingAudio = true             // Keep mixed audio via Data and expose Teams speaker metadata/unmixed buffers
             },
             new VideoSocketSettings
             {
