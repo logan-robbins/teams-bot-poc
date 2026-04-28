@@ -1,4 +1,4 @@
-# LegionMeet (Alfred)
+# Alfred
 
 Teams meeting bot that auto-joins meetings, captures audio, transcribes it, and runs LLM analysis on the transcript. Two runtimes:
 
