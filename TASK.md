@@ -1,3 +1,19 @@
+# TASK: Finish Alfred VM Deployment (2026-04-28)
+
+Status legend: `[ ]` pending, `[-]` in progress, `[x]` complete.
+
+1. [x] Read README.md and STATE.md to establish current deployment state
+2. [x] Discover canonical VM deployment scripts and stale deployment entrypoints
+3. [x] Research Microsoft Learn/Azure CLI docs for Run Command behavior and VM extension recovery
+4. [x] Convert VM deployment from action RunCommand invoke to documented managed Run Command resources
+5. [x] Clear or bypass wedged action RunCommand state using documented recovery steps
+6. [-] Execute canonical VM phases one at a time
+7. [ ] Verify public bot health and service state
+8. [ ] Update README.md with current VM deployment command/state
+9. [ ] Final task status update
+
+---
+
 # TASK: Teams Auto-Add Join Modes + Fail-Fast Validation (2026-02-24)
 
 Status legend: `[ ]` pending, `[-]` in progress, `[x]` complete.

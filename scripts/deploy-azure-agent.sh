@@ -14,13 +14,15 @@ echo "========================================"
 echo ""
 
 # Configuration
-RG_NAME="rg-teams-media-bot-poc"
+RG_NAME="rg-alfred-poc"
 LOCATION="eastus"
-OPENAI_NAME="aoai-alfred-poc"
+OPENAI_NAME="aoai-alfred"
 OPENAI_DEPLOYMENT_NAME="gpt-5-mini"
-CONTAINER_ENV_NAME="cae-alfred-poc"
+CONTAINER_ENV_NAME="cae-alfred"
 FASTAPI_APP_NAME="ca-alfred-api"
 WEB_APP_NAME="ca-alfred-web"
+ACR_NAME="acralfredpoc70464868"
+ACR_LOGIN_SERVER="${ACR_NAME}.azurecr.io"
 DOMAIN="qmachina.com"
 SUBDOMAIN="agent"
 FQDN="${SUBDOMAIN}.${DOMAIN}"
@@ -193,6 +195,7 @@ else
         --resource-group "$RG_NAME" \
         --environment "$CONTAINER_ENV_NAME" \
         --source "$PYTHON_DIR" \
+        --registry-server "$ACR_LOGIN_SERVER" \
         --ingress external \
         --target-port 8765 \
         --cpu "$FASTAPI_CPU" \
@@ -247,6 +250,7 @@ else
         --resource-group "$RG_NAME" \
         --environment "$CONTAINER_ENV_NAME" \
         --source "$WEB_DIR" \
+        --registry-server "$ACR_LOGIN_SERVER" \
         --ingress external \
         --target-port 80 \
         --cpu "$WEB_CPU" \

@@ -34,11 +34,11 @@ echo "User: $USER_EMAIL"
 echo ""
 
 # Configuration
-RG_NAME="rg-teams-media-bot-poc"
+RG_NAME="rg-alfred-poc"
 LOCATION="eastus"
-BOT_NAME="teams-media-bot-poc"
-SPEECH_NAME="speech-teams-bot-poc"
-APP_DISPLAY_NAME="Alfred-Sandbox"
+BOT_NAME="alfred-bot"
+SPEECH_NAME="speech-alfred"
+APP_DISPLAY_NAME="Alfred"
 
 echo "Configuration:"
 echo "  Resource Group: $RG_NAME"

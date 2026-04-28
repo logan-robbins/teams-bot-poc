@@ -692,7 +692,7 @@
       "location": "East US",
       "properties": {
         "domainControlValidation": "CNAME",
-        "subjectName": "interview.qmachina.com"
+        "subjectName": "alfred.qmachina.com"
       },
       "dependsOn": [
         "[resourceId('Microsoft.App/managedEnvironments', parameters('managedEnvironments_cae_alfred_poc_name'))]"
@@ -807,7 +807,7 @@
               {
                 "bindingType": "SniEnabled",
                 "certificateId": "[resourceId('Microsoft.App/managedEnvironments/managedCertificates', parameters('managedEnvironments_cae_alfred_poc_name'), 'mc-cae-alfred--interview-qmachi-6822')]",
-                "name": "interview.qmachina.com"
+                "name": "alfred.qmachina.com"
               }
             ],
             "external": true,

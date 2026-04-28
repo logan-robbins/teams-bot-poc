@@ -13,14 +13,14 @@
 - **Old RG** `rg-teams-media-bot-poc` (eastus) contains only a leftover `vault832` Recovery Services vault. Everything else torn down.
 - **DNS (GoDaddy, live)**:
   - `agent.qmachina.com` → CNAME `ca-alfred-api.grayglacier-84d7709e.eastus.azurecontainerapps.io` (NXDOMAIN — stale)
-  - `interview.qmachina.com` → CNAME `ca-alfred-ui.grayglacier-84d7709e.eastus.azurecontainerapps.io` (NXDOMAIN — stale)
+  - `alfred.qmachina.com` → CNAME `ca-alfred-ui.grayglacier-84d7709e.eastus.azurecontainerapps.io` (NXDOMAIN — stale)
   - `teamsbot.qmachina.com` → A `52.188.117.153` (unreachable — stale)
   - `media.qmachina.com` → A `52.188.117.153` (unreachable — stale)
 - **westus quotas**: 10 vCPU for `Standard_DSv3` family — sufficient for one `Standard_D4s_v3` (4 vCPU).
 
 ## End state
 
-Inviting the Alfred bot to a Teams meeting causes it to auto-join, capture audio, stream transcripts to the Python sink at `agent.qmachina.com`, and render live analysis at `interview.qmachina.com`.
+Inviting the Alfred bot to a Teams meeting causes it to auto-join, capture audio, stream transcripts to the Python sink at `agent.qmachina.com`, and render live analysis at `alfred.qmachina.com`.
 
 ---
 
@@ -43,7 +43,7 @@ Inviting the Alfred bot to a Teams meeting causes it to auto-join, capture audio
 7. Capture new env default-domain (format: `<word>-<hex>.westus.azurecontainerapps.io`).
 8. **Manual (user)**: Update GoDaddy DNS:
    - `agent` CNAME → `ca-alfred-api.<new-env-domain>`
-   - `interview` CNAME → `ca-alfred-ui.<new-env-domain>`
+   - `alfred` CNAME → `ca-alfred-web.<new-env-domain>`
 9. Wait for propagation (typically 1–5 min on GoDaddy).
 10. `az containerapp hostname add` + `az containerapp hostname bind --validation-method CNAME` to attach custom domains with managed certs.
 11. Verify: `curl https://agent.qmachina.com/health` → `200 OK`.
@@ -102,7 +102,7 @@ These are preemptive fixes based on reading the code; real symptoms will show up
 1. Start Teams meeting → invite bot.
 2. Tail Serilog on VM: `Get-Content C:\teams-bot-poc\src\bin\Release\net8.0\logs\teamsbot-*.log -Wait -Tail 50`.
 3. Expect: `"Incoming call received"` → `"Answered incoming call"` → `"Call added to collection"` → audio frames flowing → transcripts POST to `/transcript`.
-4. Browse `https://interview.qmachina.com` — live InterviewAnalysis output.
+4. Browse `https://alfred.qmachina.com` — Alfred Dossier UI.
 
 ---
 
@@ -112,7 +112,7 @@ These are preemptive fixes based on reading the code; real symptoms will show up
 - Phase 0, 1 (Azure resource creation), 2 (C# code edit), 3 (`az bot create`), 4 (VM create + PowerShell bootstrap via `az vm run-command`), 5 (build zip), 6 (log tailing + validation).
 
 ### User executes (will prompt with exact records/steps)
-- GoDaddy DNS updates ×3 rounds (agent/interview after Phase 1, teamsbot/media after Phase 4).
+- GoDaddy DNS updates ×3 rounds (agent/alfred after Phase 1, teamsbot/media after Phase 4).
 - Admin consent if `az ad app permission admin-consent` fails (portal click).
 - SSL cert provisioning for `teamsbot.qmachina.com` + `media.qmachina.com` (PFX or Let's Encrypt approval).
 - Teams app sideload.
@@ -136,7 +136,7 @@ These are preemptive fixes based on reading the code; real symptoms will show up
 
 - [ ] `curl https://agent.qmachina.com/health` → 200
 - [ ] `curl https://teamsbot.qmachina.com/api/calling/health` → 200
-- [ ] `https://interview.qmachina.com` loads Streamlit UI
+- [ ] `https://alfred.qmachina.com` loads React Dossier UI
 - [ ] Azure Bot channel "Microsoft Teams" shows Running
 - [ ] App Registration Graph permissions show "Granted for <tenant>"
 - [ ] Bot sideloaded in Teams; shows calling icon in app catalog

@@ -15,70 +15,82 @@ if (-not (Test-Path $ConfigPath)) {
     throw "Production config not found at '$ConfigPath'."
 }
 
-$bootstrapScript = Join-Path $ProjectRoot "scripts\bootstrap-production-vm.ps1"
-if (-not (Test-Path $bootstrapScript)) {
-    throw "Bootstrap script not found at '$bootstrapScript'."
-}
-
 $config = Get-Content -Path $ConfigPath -Raw | ConvertFrom-Json
 
 $cert = Get-ChildItem Cert:\LocalMachine\My |
     Where-Object {
         $_.Subject -match "CN=teamsbot\.qmachina\.com" -or
+        $_.Subject -match "CN=media\.qmachina\.com" -or
         $_.FriendlyName -like "qmachina-teamsbot-media*"
     } |
     Sort-Object NotAfter -Descending |
     Select-Object -First 1
 
 if (-not $cert) {
-    throw "No bot certificate was found in Cert:\\LocalMachine\\My."
+    throw "No bot certificate was found in Cert:\LocalMachine\My."
 }
 
-$sttProvider = if ([string]::IsNullOrWhiteSpace($config.Stt.Provider)) { "Deepgram" } else { [string]$config.Stt.Provider }
-$botListenPort = if ($config.Bot.LocalHttpListenPort) { [int]$config.Bot.LocalHttpListenPort } else { 443 }
-$mediaPort = if ($config.MediaPlatformSettings.InstancePublicPort) { [int]$config.MediaPlatformSettings.InstancePublicPort } else { 8445 }
+$config.MediaPlatformSettings.CertificateThumbprint = $cert.Thumbprint
+$config | ConvertTo-Json -Depth 8 | Set-Content -Path $ConfigPath -Encoding UTF8
 
-$params = @{
-    ProjectRoot = $ProjectRoot
-    ConfigPath = $ConfigPath
-    AppId = [string]$config.Bot.AppId
-    AppSecret = [string]$config.Bot.AppSecret
-    TenantId = [string]$config.Bot.TenantId
-    NotificationUrl = [string]$config.Bot.NotificationUrl
-    ServiceFqdn = [string]$config.MediaPlatformSettings.ServiceFqdn
-    InstancePublicIPAddress = [string]$config.MediaPlatformSettings.InstancePublicIPAddress
-    CertificateThumbprint = [string]$cert.Thumbprint
-    TranscriptSinkPythonEndpoint = [string]$config.TranscriptSink.PythonEndpoint
-    RunAsUser = $RunAsUser
-    RunAsPassword = $RunAsPassword
-    SttProvider = $sttProvider
-    BotListenPort = $botListenPort
-    MediaPort = $mediaPort
-    SkipRepositorySync = 1
-    BootstrapOnly = 0
+$publishDir = Join-Path $ProjectRoot "src\bin\Release\net8.0\publish"
+$exePath = Join-Path $publishDir "TeamsMediaBot.exe"
+$logsDir = Join-Path $ProjectRoot "logs"
+$stdoutLog = Join-Path $logsDir "service-output.log"
+$stderrLog = Join-Path $logsDir "service-error.log"
+
+if (-not (Test-Path $exePath)) {
+    throw "Published executable not found at '$exePath'."
 }
 
-if ($sttProvider -ieq "AzureSpeech" -and $null -ne $config.Stt.AzureSpeech) {
-    $params.AzureSpeechKey = [string]$config.Stt.AzureSpeech.Key
-    $params.AzureSpeechRegion = [string]$config.Stt.AzureSpeech.Region
-    $params.AzureSpeechRecognitionLanguage = [string]$config.Stt.AzureSpeech.RecognitionLanguage
+if (-not (Test-Path $logsDir)) {
+    New-Item -ItemType Directory -Path $logsDir -Force | Out-Null
 }
-elseif ($sttProvider -ieq "Deepgram" -and $null -ne $config.Stt.Deepgram) {
-    $params.DeepgramApiKey = [string]$config.Stt.Deepgram.ApiKey
-    $params.DeepgramModel = [string]$config.Stt.Deepgram.Model
-    if ($null -ne $config.Stt.Deepgram.Diarize) {
-        $params.DeepgramDiarize = [bool]$config.Stt.Deepgram.Diarize
+
+if (-not (Get-Command nssm -ErrorAction SilentlyContinue)) {
+    $nssmPath = "C:\ProgramData\chocolatey\bin\nssm.exe"
+    if (Test-Path $nssmPath) {
+        $env:Path = "C:\ProgramData\chocolatey\bin;$env:Path"
+    }
+    else {
+        throw "nssm is not installed."
     }
 }
 
-$bootstrapResult = & $bootstrapScript @params | Out-String
-
 $service = Get-Service -Name "TeamsMediaBot" -ErrorAction SilentlyContinue
+if (-not $service) {
+    nssm install TeamsMediaBot $exePath "--config $ConfigPath"
+}
+else {
+    try {
+        Stop-Service TeamsMediaBot -Force -ErrorAction SilentlyContinue
+    }
+    catch {
+    }
+}
+
+nssm set TeamsMediaBot Application $exePath
+nssm set TeamsMediaBot AppDirectory $publishDir
+nssm set TeamsMediaBot AppParameters "--config $ConfigPath"
+nssm set TeamsMediaBot Start SERVICE_AUTO_START
+nssm set TeamsMediaBot AppStdout $stdoutLog
+nssm set TeamsMediaBot AppStderr $stderrLog
+nssm set TeamsMediaBot ObjectName ".\$RunAsUser" $RunAsPassword
+
+Start-Service TeamsMediaBot
+Start-Sleep -Seconds 8
+
+$finalService = Get-Service -Name "TeamsMediaBot" -ErrorAction Stop
+$tailStdout = if (Test-Path $stdoutLog) { Get-Content -Path $stdoutLog -Tail 40 | Out-String } else { "" }
+$tailStderr = if (Test-Path $stderrLog) { Get-Content -Path $stderrLog -Tail 40 | Out-String } else { "" }
 
 [ordered]@{
     CertificateSubject = $cert.Subject
     CertificateThumbprint = $cert.Thumbprint
     CertificateNotAfter = $cert.NotAfter
-    ServiceStatus = if ($service) { [string]$service.Status } else { "NotInstalled" }
-    BootstrapResult = $bootstrapResult.Trim()
+    ServiceStatus = [string]$finalService.Status
+    ConfigPath = $ConfigPath
+    PublishDirectory = $publishDir
+    StdoutLogTail = $tailStdout.Trim()
+    StderrLogTail = $tailStderr.Trim()
 } | ConvertTo-Json -Depth 6
