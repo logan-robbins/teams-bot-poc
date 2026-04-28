@@ -7,7 +7,7 @@ Usage:
   ./scripts/join_meeting.sh "<meeting-url>" "<candidate-name>" [display-name] [bot-endpoint] [sink-endpoint]
 
 Defaults:
-  display-name: Talestral
+  display-name: Alfred
   bot-endpoint: https://teamsbot.qmachina.com
   sink-endpoint: https://agent.qmachina.com
 EOF
@@ -16,7 +16,7 @@ fi
 
 MEETING_URL="$1"
 CANDIDATE_NAME="$2"
-DISPLAY_NAME="${3:-Talestral}"
+DISPLAY_NAME="${3:-Alfred}"
 BOT_ENDPOINT="${4:-https://teamsbot.qmachina.com}"
 SINK_ENDPOINT="${5:-https://agent.qmachina.com}"
 EXTRA_ARGS=()

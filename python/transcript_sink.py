@@ -1218,7 +1218,7 @@ async def receive_transcript(
                 session_manager.get_speaker_role(event.speaker_id) if event.speaker_id else None
             ) or "unknown"
 
-            if event.text and checklist_manager.apply_talestral_heuristic(
+            if event.text and checklist_manager.apply_alfred_heuristic(
                 text=event.text,
                 speaker_role=speaker_role,
             ):

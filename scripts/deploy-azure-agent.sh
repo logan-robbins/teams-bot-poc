@@ -1,7 +1,7 @@
 #!/bin/bash
 # =====================================================================
 # Teams Media Bot - Azure Agent Deployment Script
-# Deploys FastAPI transcript sink + Streamlit UI to Azure Container Apps
+# Deploys FastAPI transcript sink + React Dossier UI to Azure Container Apps
 # with Azure OpenAI backend
 # =====================================================================
 
@@ -16,11 +16,11 @@ echo ""
 # Configuration
 RG_NAME="rg-teams-media-bot-poc"
 LOCATION="eastus"
-OPENAI_NAME="aoai-talestral-poc"
+OPENAI_NAME="aoai-alfred-poc"
 OPENAI_DEPLOYMENT_NAME="gpt-5-mini"
-CONTAINER_ENV_NAME="cae-talestral-poc"
-FASTAPI_APP_NAME="ca-talestral-api"
-STREAMLIT_APP_NAME="ca-talestral-ui"
+CONTAINER_ENV_NAME="cae-alfred-poc"
+FASTAPI_APP_NAME="ca-alfred-api"
+WEB_APP_NAME="ca-alfred-web"
 DOMAIN="qmachina.com"
 SUBDOMAIN="agent"
 FQDN="${SUBDOMAIN}.${DOMAIN}"
@@ -28,8 +28,18 @@ FQDN="${SUBDOMAIN}.${DOMAIN}"
 # Container configuration (minimal for POC)
 FASTAPI_CPU="0.25"
 FASTAPI_MEMORY="0.5Gi"
-STREAMLIT_CPU="0.25"
-STREAMLIT_MEMORY="0.5Gi"
+WEB_CPU="0.25"
+WEB_MEMORY="0.5Gi"
+
+# ALFRED runtime env. Required by transcript_sink.load_runtime_config().
+ALFRED_VARIANT_ID="alfred"
+ALFRED_INSTANCE_ID="alfred"
+ALFRED_PRODUCT_SPEC_PATH="/app/legionmeet_platform/specs/alfred.yaml"
+
+# Optional: URL of the C# bot's /api/send-chat endpoint. Set to enable the
+# send_to_meeting_chat agent tool. Leave empty for dry-run mode (sink logs
+# the would-be message and appends to the ledger but does not POST).
+BOT_SEND_CHAT_URL="${BOT_SEND_CHAT_URL:-}"
 
 # Check if logged into Azure
 echo "Checking Azure CLI login..."
@@ -146,25 +156,37 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 PYTHON_DIR="$PROJECT_ROOT/python"
 
+# Build the env-var list for the FastAPI sink. Includes ALFRED runtime
+# requirements; conditionally includes BOT_SEND_CHAT_URL when set.
+FASTAPI_ENV_VARS=(
+    "AZURE_OPENAI_ENDPOINT=$AOAI_ENDPOINT"
+    "AZURE_OPENAI_KEY=$AOAI_KEY"
+    "AZURE_OPENAI_DEPLOYMENT=$OPENAI_DEPLOYMENT_NAME"
+    "OPENAI_API_TYPE=azure"
+    "OPENAI_REASONING_EFFORT=low"
+    "VARIANT_ID=$ALFRED_VARIANT_ID"
+    "INSTANCE_ID=$ALFRED_INSTANCE_ID"
+    "PRODUCT_SPEC_PATH=$ALFRED_PRODUCT_SPEC_PATH"
+    "SINK_PORT=8765"
+)
+if [ -n "$BOT_SEND_CHAT_URL" ]; then
+    FASTAPI_ENV_VARS+=("BOT_SEND_CHAT_URL=$BOT_SEND_CHAT_URL")
+fi
+
 # Check if FastAPI app exists
 if az containerapp show --name "$FASTAPI_APP_NAME" --resource-group "$RG_NAME" > /dev/null 2>&1; then
     echo "⚠️  FastAPI container app already exists, updating..."
-    
+
     az containerapp update \
         --name "$FASTAPI_APP_NAME" \
         --resource-group "$RG_NAME" \
-        --set-env-vars \
-            "AZURE_OPENAI_ENDPOINT=$AOAI_ENDPOINT" \
-            "AZURE_OPENAI_KEY=$AOAI_KEY" \
-            "AZURE_OPENAI_DEPLOYMENT=$OPENAI_DEPLOYMENT_NAME" \
-            "OPENAI_API_TYPE=azure" \
-            "OPENAI_REASONING_EFFORT=low" \
+        --set-env-vars "${FASTAPI_ENV_VARS[@]}" \
         --output none
-    
+
     echo "✅ FastAPI container updated"
 else
     echo "Creating FastAPI container app..."
-    
+
     # Create the container app with source code deployment
     az containerapp create \
         --name "$FASTAPI_APP_NAME" \
@@ -177,14 +199,9 @@ else
         --memory "$FASTAPI_MEMORY" \
         --min-replicas 0 \
         --max-replicas 3 \
-        --env-vars \
-            "AZURE_OPENAI_ENDPOINT=$AOAI_ENDPOINT" \
-            "AZURE_OPENAI_KEY=$AOAI_KEY" \
-            "AZURE_OPENAI_DEPLOYMENT=$OPENAI_DEPLOYMENT_NAME" \
-            "OPENAI_API_TYPE=azure" \
-            "OPENAI_REASONING_EFFORT=low" \
+        --env-vars "${FASTAPI_ENV_VARS[@]}" \
         --output none
-    
+
     echo "✅ FastAPI container app created"
 fi
 
@@ -198,53 +215,57 @@ echo "  FastAPI URL: https://$FASTAPI_FQDN"
 echo ""
 
 # =====================================================================
-# Step 4: Build and Deploy Streamlit Container
+# Step 4: Build and Deploy React Dossier UI (the product surface)
 # =====================================================================
-echo "📦 Step 4: Deploying Streamlit UI..."
+echo "📦 Step 4: Deploying React Dossier UI..."
 
-# Check if Streamlit app exists
-if az containerapp show --name "$STREAMLIT_APP_NAME" --resource-group "$RG_NAME" > /dev/null 2>&1; then
-    echo "⚠️  Streamlit container app already exists, updating..."
-    
+# nginx in the React container proxies /sink/* to the FastAPI sink, mirroring
+# the Vite dev proxy in vite.config.ts. SINK_URL is substituted into the nginx
+# config via NGINX_ENVSUBST_FILTER at container start.
+WEB_DIR="$PROJECT_ROOT/web"
+
+WEB_ENV_VARS=(
+    "SINK_URL=https://$FASTAPI_FQDN"
+    "NGINX_ENVSUBST_FILTER=^SINK_URL$"
+)
+
+if az containerapp show --name "$WEB_APP_NAME" --resource-group "$RG_NAME" > /dev/null 2>&1; then
+    echo "⚠️  Web container app already exists, updating..."
+
     az containerapp update \
-        --name "$STREAMLIT_APP_NAME" \
+        --name "$WEB_APP_NAME" \
         --resource-group "$RG_NAME" \
-        --set-env-vars \
-            "SINK_URL=https://$FASTAPI_FQDN" \
+        --set-env-vars "${WEB_ENV_VARS[@]}" \
         --output none
-    
-    echo "✅ Streamlit container updated"
+
+    echo "✅ Web container updated"
 else
-    echo "Creating Streamlit container app..."
-    
-    # Create the container app with source code deployment
-    # Uses Dockerfile.streamlit (separate from the default Dockerfile which targets FastAPI)
+    echo "Creating Web container app..."
+
     az containerapp create \
-        --name "$STREAMLIT_APP_NAME" \
+        --name "$WEB_APP_NAME" \
         --resource-group "$RG_NAME" \
         --environment "$CONTAINER_ENV_NAME" \
-        --source "$PYTHON_DIR" \
-        --dockerfile Dockerfile.streamlit \
+        --source "$WEB_DIR" \
         --ingress external \
-        --target-port 8501 \
-        --cpu "$STREAMLIT_CPU" \
-        --memory "$STREAMLIT_MEMORY" \
+        --target-port 80 \
+        --cpu "$WEB_CPU" \
+        --memory "$WEB_MEMORY" \
         --min-replicas 0 \
         --max-replicas 2 \
-        --env-vars \
-            "SINK_URL=https://$FASTAPI_FQDN" \
+        --env-vars "${WEB_ENV_VARS[@]}" \
         --output none
-    
-    echo "✅ Streamlit container app created"
+
+    echo "✅ Web container app created"
 fi
 
-# Get Streamlit FQDN
-STREAMLIT_FQDN=$(az containerapp show \
-    --name "$STREAMLIT_APP_NAME" \
+# Get Web FQDN
+WEB_FQDN=$(az containerapp show \
+    --name "$WEB_APP_NAME" \
     --resource-group "$RG_NAME" \
     --query properties.configuration.ingress.fqdn -o tsv)
 
-echo "  Streamlit URL: https://$STREAMLIT_FQDN"
+echo "  Web URL: https://$WEB_FQDN"
 echo ""
 
 # =====================================================================
@@ -269,31 +290,21 @@ echo "  Endpoint: $AOAI_ENDPOINT"
 echo "  Deployment: $OPENAI_DEPLOYMENT_NAME"
 echo ""
 echo "📊 Container Apps:"
-echo "  FastAPI: https://$FASTAPI_FQDN"
-echo "  Streamlit: https://$STREAMLIT_FQDN"
+echo "  FastAPI sink: https://$FASTAPI_FQDN"
+echo "  React UI:     https://$WEB_FQDN"
 echo ""
 echo "========================================"
-echo "📝 GODADDY DNS CONFIGURATION"
+echo "📝 OPTIONAL DNS CONFIGURATION"
 echo "========================================"
 echo ""
-echo "Go to GoDaddy DNS Management for $DOMAIN:"
-echo "  https://dcc.godaddy.com/manage/dns"
+echo "Default Container Apps FQDNs above are publicly trusted (managed cert)."
+echo "Skip this section if you want to use them as-is."
 echo ""
-echo "Create the following CNAME record:"
-echo ""
-echo "┌────────────────────────────────────────────────────────────┐"
-echo "│  Type:  CNAME                                              │"
-echo "│  Name:  $SUBDOMAIN                                         │"
-echo "│  Value: $FASTAPI_FQDN                                      │"
-echo "│  TTL:   600 (10 minutes)                                   │"
-echo "└────────────────────────────────────────────────────────────┘"
-echo ""
-echo "For Streamlit UI (optional separate subdomain):"
+echo "If you want a custom domain on $DOMAIN, create CNAMEs at your DNS host:"
 echo ""
 echo "┌────────────────────────────────────────────────────────────┐"
-echo "│  Type:  CNAME                                              │"
-echo "│  Name:  interview                                          │"
-echo "│  Value: $STREAMLIT_FQDN                                    │"
+echo "│  Type:  CNAME   Name: $SUBDOMAIN   Value: $FASTAPI_FQDN     │"
+echo "│  Type:  CNAME   Name: web          Value: $WEB_FQDN         │"
 echo "│  TTL:   600 (10 minutes)                                   │"
 echo "└────────────────────────────────────────────────────────────┘"
 echo ""
@@ -324,11 +335,20 @@ echo "========================================"
 echo "🔧 UPDATE C# BOT CONFIGURATION"
 echo "========================================"
 echo ""
-echo "Update the C# bot's appsettings.json TranscriptSink section:"
+echo "Update the C# bot's appsettings.json TranscriptSink section to point"
+echo "at the FastAPI sink. Use the Container Apps FQDN by default; swap in"
+echo "your custom domain only after the optional DNS+binding steps above."
 echo ""
 echo '  "TranscriptSink": {'
-echo "    \"PythonEndpoint\": \"https://$FQDN/transcript\""
+echo "    \"PythonEndpoint\": \"https://$FASTAPI_FQDN/transcript\","
+echo "    \"ChatEndpoint\":   \"https://$FASTAPI_FQDN/chat\""
 echo '  }'
+echo ""
+echo "Once the C# bot is running on its public hostname, re-run this script"
+echo "with BOT_SEND_CHAT_URL set so the send_to_meeting_chat tool posts:"
+echo ""
+echo "  BOT_SEND_CHAT_URL=https://<bot-host>/api/send-chat \\"
+echo "    ./scripts/deploy-azure-agent.sh"
 echo ""
 echo "Then restart the bot service on the Windows VM:"
 echo "  Restart-Service TeamsMediaBot"

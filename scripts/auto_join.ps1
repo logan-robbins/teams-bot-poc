@@ -21,7 +21,7 @@
     Python sink endpoint (default: http://127.0.0.1:8765)
 
 .PARAMETER DisplayName
-    Bot display name in meeting (default: Talestral)
+    Bot display name in meeting (default: Alfred)
 
 .PARAMETER MeetingId
     Optional external meeting identifier used for correlation.
@@ -71,7 +71,7 @@ param(
     [string]$SinkEndpoint = "https://agent.qmachina.com",
 
     [Parameter(Mandatory=$false)]
-    [string]$DisplayName = "Talestral",
+    [string]$DisplayName = "Alfred",
 
     [Parameter(Mandatory=$false)]
     [string]$MeetingId = "",
@@ -157,7 +157,7 @@ function Test-Prerequisites {
 
 function Invoke-AutoJoin {
     Write-Log "=========================================="
-    Write-Log "Talestral - Auto Join (PowerShell)"
+    Write-Log "Alfred - Auto Join (PowerShell)"
     Write-Log "=========================================="
     Write-Log "Meeting URL: $MeetingUrl"
     Write-Log "Candidate: $CandidateName"

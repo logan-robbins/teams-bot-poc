@@ -18,8 +18,17 @@ RG_NAME="rg-teams-media-bot-poc"
 VM_NAME="vm-tbot-prod"
 LOCATION="eastus"
 VM_SIZE="Standard_D4s_v3"
-ADMIN_USER="azureuser"
-ADMIN_PASS="SecureTeamsBot2026!"  # Change this!
+ADMIN_USER="${ADMIN_USER:-azureuser}"
+ADMIN_PASS="${ADMIN_PASS:-}"
+
+# Fail fast if no admin password supplied. Refuse to ship a default to keep
+# the VM from being publicly reachable with a known credential.
+if [ -z "$ADMIN_PASS" ]; then
+    echo "❌ ADMIN_PASS is not set."
+    echo "   Export a strong password before running this script:"
+    echo "   export ADMIN_PASS='<your-strong-password>'"
+    exit 1
+fi
 
 # Check if logged into Azure
 echo "Checking Azure CLI login..."

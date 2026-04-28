@@ -2,7 +2,7 @@
   "$schema": "https://developer.microsoft.com/json-schemas/teams/v1.21/MicrosoftTeams.schema.json",
   "manifestVersion": "1.21",
   "version": "1.0.4",
-  "id": "ff4b0902-5ae8-450b-bf45-7e2338292554",
+  "id": "e68b49d1-0aae-4761-a595-4df482d8d4fe",
   "packageName": "com.qmachina.alfred",
   "developer": {
     "name": "QMachina",
@@ -25,7 +25,7 @@
   "accentColor": "#FFFFFF",
   "bots": [
     {
-      "botId": "ff4b0902-5ae8-450b-bf45-7e2338292554",
+      "botId": "e68b49d1-0aae-4761-a595-4df482d8d4fe",
       "scopes": ["personal", "team", "groupchat"],
       "supportsFiles": false,
       "isNotificationOnly": false,

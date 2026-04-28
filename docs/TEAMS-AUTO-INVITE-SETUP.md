@@ -24,9 +24,9 @@ Connect-MicrosoftTeams
 
 .\scripts\setup-policy-auto-invite.ps1 `
   -AppId "<bot-app-id>" `
-  -ApplicationInstanceUpn "talestral-recorder@contoso.onmicrosoft.com" `
-  -ApplicationInstanceDisplayName "Talestral Auto Invite" `
-  -PolicyName "TalestralAutoInvitePolicy" `
+  -ApplicationInstanceUpn "alfred-recorder@contoso.onmicrosoft.com" `
+  -ApplicationInstanceDisplayName "Alfred Auto Invite" `
+  -PolicyName "AlfredAutoInvitePolicy" `
   -RecordedUsers "organizer@contoso.com"
 ```
 
@@ -71,15 +71,15 @@ New-CsOnlineApplicationInstance `
 Sync-CsOnlineApplicationInstance -ObjectId "<application-instance-object-id>"
 
 New-CsTeamsComplianceRecordingPolicy `
-  -Identity "TalestralAutoInvitePolicy" `
+  -Identity "AlfredAutoInvitePolicy" `
   -Enabled $true `
-  -Description "Talestral policy-based auto-invite policy"
+  -Description "Alfred policy-based auto-invite policy"
 
 Set-CsTeamsComplianceRecordingPolicy `
-  -Identity "TalestralAutoInvitePolicy" `
+  -Identity "AlfredAutoInvitePolicy" `
   -ComplianceRecordingApplications @(
     New-CsTeamsComplianceRecordingApplication `
-      -Parent "TalestralAutoInvitePolicy" `
+      -Parent "AlfredAutoInvitePolicy" `
       -Id "<application-instance-object-id>" `
       -RequiredBeforeMeetingJoin $false `
       -RequiredDuringMeeting $false
@@ -87,19 +87,19 @@ Set-CsTeamsComplianceRecordingPolicy `
 
 Grant-CsTeamsComplianceRecordingPolicy `
   -Identity "organizer@contoso.onmicrosoft.com" `
-  -PolicyName "TalestralAutoInvitePolicy"
+  -PolicyName "AlfredAutoInvitePolicy"
 ```
 
 If your workflow also needs Graph application-permission access to online meetings, configure the separate application access policy:
 
 ```powershell
 New-CsApplicationAccessPolicy `
-  -Identity "TalestralOnlineMeetingsPolicy" `
+  -Identity "AlfredOnlineMeetingsPolicy" `
   -AppIds "<bot-app-id>" `
-  -Description "Allow Talestral to access online meetings"
+  -Description "Allow Alfred to access online meetings"
 
 Grant-CsApplicationAccessPolicy `
-  -PolicyName "TalestralOnlineMeetingsPolicy" `
+  -PolicyName "AlfredOnlineMeetingsPolicy" `
   -Identity "<organizer-object-id>"
 ```
 

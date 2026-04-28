@@ -1,5 +1,5 @@
 // ==============================================
-// Talestral Teams Media Bot - Program Entry Point
+// Alfred Teams Media Bot - Program Entry Point
 // ==============================================
 // ASP.NET Core 8.0 application for Teams meeting transcription.
 // Receives real-time audio via Graph Communications SDK and 
@@ -180,7 +180,7 @@ static ConfigResolution ResolveConfiguration(string[] args)
         return BuildConfigResolution(fromArgs, "command-line");
     }
 
-    var fromEnv = Environment.GetEnvironmentVariable("TALESTRAL_CONFIG_PATH");
+    var fromEnv = Environment.GetEnvironmentVariable("ALFRED_CONFIG_PATH");
     if (!string.IsNullOrWhiteSpace(fromEnv))
     {
         return BuildConfigResolution(fromEnv, "environment");
@@ -243,7 +243,7 @@ static ConfigResolution BuildConfigResolution(string rawPath, string source)
     {
         throw new InvalidOperationException(
             $"Configuration file not found at '{fullPath}'. " +
-            "Set a valid path via '--config <path>' or TALESTRAL_CONFIG_PATH.");
+            "Set a valid path via '--config <path>' or ALFRED_CONFIG_PATH.");
     }
 
     var fileName = Path.GetFileNameWithoutExtension(fullPath);

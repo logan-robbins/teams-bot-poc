@@ -12,15 +12,15 @@
 - **No Azure Bot Service** anywhere in subscription — root cause of the "auto-accept doesn't work" symptom (Teams has no route to deliver incoming-call webhooks to the bot).
 - **Old RG** `rg-teams-media-bot-poc` (eastus) contains only a leftover `vault832` Recovery Services vault. Everything else torn down.
 - **DNS (GoDaddy, live)**:
-  - `agent.qmachina.com` → CNAME `ca-talestral-api.grayglacier-84d7709e.eastus.azurecontainerapps.io` (NXDOMAIN — stale)
-  - `interview.qmachina.com` → CNAME `ca-talestral-ui.grayglacier-84d7709e.eastus.azurecontainerapps.io` (NXDOMAIN — stale)
+  - `agent.qmachina.com` → CNAME `ca-alfred-api.grayglacier-84d7709e.eastus.azurecontainerapps.io` (NXDOMAIN — stale)
+  - `interview.qmachina.com` → CNAME `ca-alfred-ui.grayglacier-84d7709e.eastus.azurecontainerapps.io` (NXDOMAIN — stale)
   - `teamsbot.qmachina.com` → A `52.188.117.153` (unreachable — stale)
   - `media.qmachina.com` → A `52.188.117.153` (unreachable — stale)
 - **westus quotas**: 10 vCPU for `Standard_DSv3` family — sufficient for one `Standard_D4s_v3` (4 vCPU).
 
 ## End state
 
-Inviting the Talestral bot to a Teams meeting causes it to auto-join, capture audio, stream transcripts to the Python sink at `agent.qmachina.com`, and render live analysis at `interview.qmachina.com`.
+Inviting the Alfred bot to a Teams meeting causes it to auto-join, capture audio, stream transcripts to the Python sink at `agent.qmachina.com`, and render live analysis at `interview.qmachina.com`.
 
 ---
 
@@ -32,18 +32,18 @@ Inviting the Talestral bot to a Teams meeting causes it to auto-join, capture au
 ## Phase 1 — Python agent + Azure OpenAI in westus (~20 min)
 
 1. `az group create -n rg-teams-bot-westus -l westus`
-2. Create Azure OpenAI `aoai-talestral-westus` (S0) in westus. If gpt-5-mini capacity is missing there, place AOAI in `westus3` or `eastus` and cross-region-call from ACA.
+2. Create Azure OpenAI `aoai-alfred-westus` (S0) in westus. If gpt-5-mini capacity is missing there, place AOAI in `westus3` or `eastus` and cross-region-call from ACA.
 3. Deploy `gpt-5-mini` model version `2025-08-07`, SKU `GlobalStandard`, capacity 10.
-4. Create Container Apps env `cae-talestral-westus` (Consumption workload profile, Log Analytics auto-create).
-5. `az containerapp create --source python/ --ingress external --target-port 8765` → `ca-talestral-api`, env vars:
+4. Create Container Apps env `cae-alfred-westus` (Consumption workload profile, Log Analytics auto-create).
+5. `az containerapp create --source python/ --ingress external --target-port 8765` → `ca-alfred-api`, env vars:
    - `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_KEY`, `AZURE_OPENAI_DEPLOYMENT=gpt-5-mini`, `OPENAI_API_TYPE=azure`, `OPENAI_REASONING_EFFORT=low`
-   - `PRODUCT_SPEC_PATH=/app/legionmeet_platform/specs/talestral.json`, `VARIANT_ID=default`, `INSTANCE_ID=prod`
-6. `az containerapp create --source python/ --dockerfile Dockerfile.streamlit --ingress external --target-port 8501` → `ca-talestral-ui`, env vars:
+   - `PRODUCT_SPEC_PATH=/app/legionmeet_platform/specs/alfred.json`, `VARIANT_ID=default`, `INSTANCE_ID=prod`
+6. `az containerapp create --source python/ --dockerfile Dockerfile.streamlit --ingress external --target-port 8501` → `ca-alfred-ui`, env vars:
    - `SINK_URL=https://<api-fqdn>`
 7. Capture new env default-domain (format: `<word>-<hex>.westus.azurecontainerapps.io`).
 8. **Manual (user)**: Update GoDaddy DNS:
-   - `agent` CNAME → `ca-talestral-api.<new-env-domain>`
-   - `interview` CNAME → `ca-talestral-ui.<new-env-domain>`
+   - `agent` CNAME → `ca-alfred-api.<new-env-domain>`
+   - `interview` CNAME → `ca-alfred-ui.<new-env-domain>`
 9. Wait for propagation (typically 1–5 min on GoDaddy).
 10. `az containerapp hostname add` + `az containerapp hostname bind --validation-method CNAME` to attach custom domains with managed certs.
 11. Verify: `curl https://agent.qmachina.com/health` → `200 OK`.
@@ -62,7 +62,7 @@ These are preemptive fixes based on reading the code; real symptoms will show up
 
 **This is the real fix** — without an Azure Bot registration, Teams never sends incoming-call webhooks.
 
-1. `az bot create --resource-group rg-teams-bot-westus --name talestral-bot --kind registration --app-type MultiTenant --appid ff4b0902-5ae8-450b-bf45-7e2338292554 --endpoint https://teamsbot.qmachina.com/api/messages --sku F0 --location global`
+1. `az bot create --resource-group rg-teams-bot-westus --name alfred-bot --kind registration --app-type MultiTenant --appid ff4b0902-5ae8-450b-bf45-7e2338292554 --endpoint https://teamsbot.qmachina.com/api/messages --sku F0 --location global`
 2. Enable Microsoft Teams channel.
 3. Configure calling webhook: `https://teamsbot.qmachina.com/api/calling`.
 4. Grant admin consent on the App Registration's Graph permissions:

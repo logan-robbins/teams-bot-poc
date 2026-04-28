@@ -167,7 +167,7 @@ public class CallingController : ControllerBase
                     new JoinMeetingCommand
                     {
                         JoinUrl = request.JoinUrl,
-                        DisplayName = request.DisplayName ?? "Talestral",
+                        DisplayName = request.DisplayName ?? "Alfred",
                         JoinAsGuest = request.JoinAsGuest,
                         RequestedJoinMode = request.JoinMode,
                         MeetingId = request.MeetingId,
@@ -251,7 +251,7 @@ public class CallingController : ControllerBase
         {
             Status = "Healthy",
             TimestampUtc = DateTime.UtcNow,
-            Service = "Talestral",
+            Service = "Alfred",
             ActiveCalls = _botService.CallHandlers.Count
         });
     }
@@ -511,7 +511,7 @@ public class ConfigureController : ControllerBase
             <head>
                 <meta charset="utf-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>Talestral Configuration</title>
+                <title>Alfred Configuration</title>
                 <script src="https://res.cdn.office.net/teams-js/2.0.0/js/MicrosoftTeams.min.js" crossorigin="anonymous"></script>
                 <style>
                     body {
@@ -562,7 +562,7 @@ public class ConfigureController : ControllerBase
             </head>
             <body>
                 <div class="container">
-                    <h1>Talestral</h1>
+                    <h1>Alfred</h1>
                     <p>This bot automatically joins Teams meetings to provide real-time audio transcription.</p>
                     
                     <div class="info-box">
@@ -590,7 +590,7 @@ public class ConfigureController : ControllerBase
                         // Save configuration (no settings needed for this bot)
                         microsoftTeams.settings.setSettings({
                             contentUrl: window.location.origin + '/configure',
-                            suggestedDisplayName: 'Talestral',
+                            suggestedDisplayName: 'Alfred',
                             websiteUrl: window.location.origin
                         });
                         

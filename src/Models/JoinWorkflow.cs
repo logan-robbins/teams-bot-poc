@@ -76,7 +76,7 @@ public sealed class TenantJoinModeOverride
 public sealed class JoinMeetingCommand
 {
     public required string JoinUrl { get; init; }
-    public string DisplayName { get; init; } = "Talestral";
+    public string DisplayName { get; init; } = "Alfred";
     public bool JoinAsGuest { get; init; }
     public string? RequestedJoinMode { get; init; }
     public string? MeetingId { get; init; }

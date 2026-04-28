@@ -13,25 +13,25 @@
       "type": "string",
       "defaultValue": "eastus"
     },
-    "accounts_aoai_talestral_poc_name": {
+    "accounts_aoai_alfred_poc_name": {
       "type": "string",
-      "defaultValue": "aoai-talestral-poc"
+      "defaultValue": "aoai-alfred-poc"
     },
     "accounts_speech_teams_bot_poc_name": {
       "type": "string",
       "defaultValue": "speech-teams-bot-poc"
     },
-    "containerapps_ca_talestral_api_name": {
+    "containerapps_ca_alfred_api_name": {
       "type": "string",
-      "defaultValue": "ca-talestral-api"
+      "defaultValue": "ca-alfred-api"
     },
-    "containerapps_ca_talestral_ui_name": {
+    "containerapps_ca_alfred_ui_name": {
       "type": "string",
-      "defaultValue": "ca-talestral-ui"
+      "defaultValue": "ca-alfred-ui"
     },
-    "managedEnvironments_cae_talestral_poc_name": {
+    "managedEnvironments_cae_alfred_poc_name": {
       "type": "string",
-      "defaultValue": "cae-talestral-poc"
+      "defaultValue": "cae-alfred-poc"
     },
     "networkInterfaces_vm_tbot_prodVMNic_name": {
       "type": "string",
@@ -84,7 +84,7 @@
     {
       "type": "Microsoft.App/managedEnvironments",
       "apiVersion": "2025-10-02-preview",
-      "name": "[parameters('managedEnvironments_cae_talestral_poc_name')]",
+      "name": "[parameters('managedEnvironments_cae_alfred_poc_name')]",
       "location": "East US",
       "properties": {
         "appLogsConfiguration": {
@@ -121,13 +121,13 @@
     {
       "type": "Microsoft.CognitiveServices/accounts",
       "apiVersion": "2025-10-01-preview",
-      "name": "[parameters('accounts_aoai_talestral_poc_name')]",
+      "name": "[parameters('accounts_aoai_alfred_poc_name')]",
       "kind": "OpenAI",
       "location": "[parameters('location')]",
       "properties": {
         "allowProjectManagement": false,
         "apiProperties": {},
-        "customSubDomainName": "[parameters('accounts_aoai_talestral_poc_name')]",
+        "customSubDomainName": "[parameters('accounts_aoai_alfred_poc_name')]",
         "publicNetworkAccess": "Enabled"
       },
       "sku": {
@@ -151,18 +151,18 @@
     {
       "type": "Microsoft.CognitiveServices/accounts/defenderForAISettings",
       "apiVersion": "2025-10-01-preview",
-      "name": "[format('{0}/{1}', parameters('accounts_aoai_talestral_poc_name'), 'Default')]",
+      "name": "[format('{0}/{1}', parameters('accounts_aoai_alfred_poc_name'), 'Default')]",
       "properties": {
         "state": "Disabled"
       },
       "dependsOn": [
-        "[resourceId('Microsoft.CognitiveServices/accounts', parameters('accounts_aoai_talestral_poc_name'))]"
+        "[resourceId('Microsoft.CognitiveServices/accounts', parameters('accounts_aoai_alfred_poc_name'))]"
       ]
     },
     {
       "type": "Microsoft.CognitiveServices/accounts/raiPolicies",
       "apiVersion": "2025-10-01-preview",
-      "name": "[format('{0}/{1}', parameters('accounts_aoai_talestral_poc_name'), 'Microsoft.Default')]",
+      "name": "[format('{0}/{1}', parameters('accounts_aoai_alfred_poc_name'), 'Microsoft.Default')]",
       "properties": {
         "contentFilters": [
           {
@@ -233,13 +233,13 @@
         "mode": "Blocking"
       },
       "dependsOn": [
-        "[resourceId('Microsoft.CognitiveServices/accounts', parameters('accounts_aoai_talestral_poc_name'))]"
+        "[resourceId('Microsoft.CognitiveServices/accounts', parameters('accounts_aoai_alfred_poc_name'))]"
       ]
     },
     {
       "type": "Microsoft.CognitiveServices/accounts/raiPolicies",
       "apiVersion": "2025-10-01-preview",
-      "name": "[format('{0}/{1}', parameters('accounts_aoai_talestral_poc_name'), 'Microsoft.DefaultV2')]",
+      "name": "[format('{0}/{1}', parameters('accounts_aoai_alfred_poc_name'), 'Microsoft.DefaultV2')]",
       "properties": {
         "contentFilters": [
           {
@@ -331,7 +331,7 @@
         "mode": "Blocking"
       },
       "dependsOn": [
-        "[resourceId('Microsoft.CognitiveServices/accounts', parameters('accounts_aoai_talestral_poc_name'))]"
+        "[resourceId('Microsoft.CognitiveServices/accounts', parameters('accounts_aoai_alfred_poc_name'))]"
       ]
     },
     {
@@ -675,33 +675,33 @@
     {
       "type": "Microsoft.App/managedEnvironments/managedCertificates",
       "apiVersion": "2025-10-02-preview",
-      "name": "[format('{0}/{1}', parameters('managedEnvironments_cae_talestral_poc_name'), 'mc-cae-talestral--agent-qmachina-c-2151')]",
+      "name": "[format('{0}/{1}', parameters('managedEnvironments_cae_alfred_poc_name'), 'mc-cae-alfred--agent-qmachina-c-2151')]",
       "location": "East US",
       "properties": {
         "domainControlValidation": "CNAME",
         "subjectName": "agent.qmachina.com"
       },
       "dependsOn": [
-        "[resourceId('Microsoft.App/managedEnvironments', parameters('managedEnvironments_cae_talestral_poc_name'))]"
+        "[resourceId('Microsoft.App/managedEnvironments', parameters('managedEnvironments_cae_alfred_poc_name'))]"
       ]
     },
     {
       "type": "Microsoft.App/managedEnvironments/managedCertificates",
       "apiVersion": "2025-10-02-preview",
-      "name": "[format('{0}/{1}', parameters('managedEnvironments_cae_talestral_poc_name'), 'mc-cae-talestral--interview-qmachi-6822')]",
+      "name": "[format('{0}/{1}', parameters('managedEnvironments_cae_alfred_poc_name'), 'mc-cae-alfred--interview-qmachi-6822')]",
       "location": "East US",
       "properties": {
         "domainControlValidation": "CNAME",
         "subjectName": "interview.qmachina.com"
       },
       "dependsOn": [
-        "[resourceId('Microsoft.App/managedEnvironments', parameters('managedEnvironments_cae_talestral_poc_name'))]"
+        "[resourceId('Microsoft.App/managedEnvironments', parameters('managedEnvironments_cae_alfred_poc_name'))]"
       ]
     },
     {
       "type": "Microsoft.App/containerApps",
       "apiVersion": "2025-10-02-preview",
-      "name": "[parameters('containerapps_ca_talestral_api_name')]",
+      "name": "[parameters('containerapps_ca_alfred_api_name')]",
       "identity": {
         "type": "None"
       },
@@ -714,7 +714,7 @@
             "customDomains": [
               {
                 "bindingType": "SniEnabled",
-                "certificateId": "[resourceId('Microsoft.App/managedEnvironments/managedCertificates', parameters('managedEnvironments_cae_talestral_poc_name'), 'mc-cae-talestral--agent-qmachina-c-2151')]",
+                "certificateId": "[resourceId('Microsoft.App/managedEnvironments/managedCertificates', parameters('managedEnvironments_cae_alfred_poc_name'), 'mc-cae-alfred--agent-qmachina-c-2151')]",
                 "name": "agent.qmachina.com"
               }
             ],
@@ -742,15 +742,15 @@
             }
           ]
         },
-        "environmentId": "[resourceId('Microsoft.App/managedEnvironments', parameters('managedEnvironments_cae_talestral_poc_name'))]",
-        "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', parameters('managedEnvironments_cae_talestral_poc_name'))]",
+        "environmentId": "[resourceId('Microsoft.App/managedEnvironments', parameters('managedEnvironments_cae_alfred_poc_name'))]",
+        "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', parameters('managedEnvironments_cae_alfred_poc_name'))]",
         "template": {
           "containers": [
             {
               "env": [
                 {
                   "name": "AZURE_OPENAI_ENDPOINT",
-                  "value": "[format('https://{0}.openai.azure.com/', parameters('accounts_aoai_talestral_poc_name'))]"
+                  "value": "[format('https://{0}.openai.azure.com/', parameters('accounts_aoai_alfred_poc_name'))]"
                 },
                 {
                   "name": "AZURE_OPENAI_KEY",
@@ -769,8 +769,8 @@
                   "value": "low"
                 }
               ],
-              "image": "[format('{0}.azurecr.io/{1}:latest', parameters('registries_caf4a2db536cacr_name'), parameters('containerapps_ca_talestral_api_name'))]",
-              "name": "[parameters('containerapps_ca_talestral_api_name')]",
+              "image": "[format('{0}.azurecr.io/{1}:latest', parameters('registries_caf4a2db536cacr_name'), parameters('containerapps_ca_alfred_api_name'))]",
+              "name": "[parameters('containerapps_ca_alfred_api_name')]",
               "resources": {
                 "cpu": "[json('0.5')]",
                 "memory": "1Gi"
@@ -786,14 +786,14 @@
         "workloadProfileName": "Consumption"
       },
       "dependsOn": [
-        "[resourceId('Microsoft.App/managedEnvironments/managedCertificates', parameters('managedEnvironments_cae_talestral_poc_name'), 'mc-cae-talestral--agent-qmachina-c-2151')]",
-        "[resourceId('Microsoft.App/managedEnvironments', parameters('managedEnvironments_cae_talestral_poc_name'))]"
+        "[resourceId('Microsoft.App/managedEnvironments/managedCertificates', parameters('managedEnvironments_cae_alfred_poc_name'), 'mc-cae-alfred--agent-qmachina-c-2151')]",
+        "[resourceId('Microsoft.App/managedEnvironments', parameters('managedEnvironments_cae_alfred_poc_name'))]"
       ]
     },
     {
       "type": "Microsoft.App/containerApps",
       "apiVersion": "2025-10-02-preview",
-      "name": "[parameters('containerapps_ca_talestral_ui_name')]",
+      "name": "[parameters('containerapps_ca_alfred_ui_name')]",
       "identity": {
         "type": "None"
       },
@@ -806,7 +806,7 @@
             "customDomains": [
               {
                 "bindingType": "SniEnabled",
-                "certificateId": "[resourceId('Microsoft.App/managedEnvironments/managedCertificates', parameters('managedEnvironments_cae_talestral_poc_name'), 'mc-cae-talestral--interview-qmachi-6822')]",
+                "certificateId": "[resourceId('Microsoft.App/managedEnvironments/managedCertificates', parameters('managedEnvironments_cae_alfred_poc_name'), 'mc-cae-alfred--interview-qmachi-6822')]",
                 "name": "interview.qmachina.com"
               }
             ],
@@ -834,8 +834,8 @@
             }
           ]
         },
-        "environmentId": "[resourceId('Microsoft.App/managedEnvironments', parameters('managedEnvironments_cae_talestral_poc_name'))]",
-        "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', parameters('managedEnvironments_cae_talestral_poc_name'))]",
+        "environmentId": "[resourceId('Microsoft.App/managedEnvironments', parameters('managedEnvironments_cae_alfred_poc_name'))]",
+        "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', parameters('managedEnvironments_cae_alfred_poc_name'))]",
         "template": {
           "containers": [
             {
@@ -845,8 +845,8 @@
                   "value": "https://agent.qmachina.com"
                 }
               ],
-              "image": "[format('{0}.azurecr.io/{1}:latest', parameters('registries_caf4a2db536cacr_name'), parameters('containerapps_ca_talestral_ui_name'))]",
-              "name": "[parameters('containerapps_ca_talestral_ui_name')]",
+              "image": "[format('{0}.azurecr.io/{1}:latest', parameters('registries_caf4a2db536cacr_name'), parameters('containerapps_ca_alfred_ui_name'))]",
+              "name": "[parameters('containerapps_ca_alfred_ui_name')]",
               "resources": {
                 "cpu": "[json('0.25')]",
                 "memory": "0.5Gi"
@@ -863,8 +863,8 @@
         "workloadProfileName": "Consumption"
       },
       "dependsOn": [
-        "[resourceId('Microsoft.App/managedEnvironments/managedCertificates', parameters('managedEnvironments_cae_talestral_poc_name'), 'mc-cae-talestral--interview-qmachi-6822')]",
-        "[resourceId('Microsoft.App/managedEnvironments', parameters('managedEnvironments_cae_talestral_poc_name'))]"
+        "[resourceId('Microsoft.App/managedEnvironments/managedCertificates', parameters('managedEnvironments_cae_alfred_poc_name'), 'mc-cae-alfred--interview-qmachi-6822')]",
+        "[resourceId('Microsoft.App/managedEnvironments', parameters('managedEnvironments_cae_alfred_poc_name'))]"
       ]
     },
     {

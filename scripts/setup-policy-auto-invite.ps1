@@ -9,7 +9,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$PolicyName,
 
-    [string]$ApplicationInstanceDisplayName = "Talestral Auto Invite",
+    [string]$ApplicationInstanceDisplayName = "Alfred Auto Invite",
     [string[]]$RecordedUsers = @(),
     [string]$RecordedGroup = "",
     [switch]$Global,
@@ -94,7 +94,7 @@ function Ensure-CompliancePolicy {
     return New-CsTeamsComplianceRecordingPolicy `
         -Identity $Identity `
         -Enabled $true `
-        -Description "Talestral policy-based auto-invite policy"
+        -Description "Alfred policy-based auto-invite policy"
 }
 
 function Set-PolicyApplication {

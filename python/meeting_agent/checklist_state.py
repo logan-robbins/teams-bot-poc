@@ -92,7 +92,7 @@ class ChecklistStateManager:
         current.source = source
         return True
 
-    def apply_talestral_heuristic(self, text: str, speaker_role: str) -> bool:
+    def apply_alfred_heuristic(self, text: str, speaker_role: str) -> bool:
         """Apply current baseline checklist behavior from transcript text."""
         if not text:
             return False

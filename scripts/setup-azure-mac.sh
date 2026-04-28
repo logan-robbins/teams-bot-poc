@@ -38,7 +38,7 @@ RG_NAME="rg-teams-media-bot-poc"
 LOCATION="eastus"
 BOT_NAME="teams-media-bot-poc"
 SPEECH_NAME="speech-teams-bot-poc"
-APP_DISPLAY_NAME="TeamsMediaBotPOC"
+APP_DISPLAY_NAME="Alfred-Sandbox"
 
 echo "Configuration:"
 echo "  Resource Group: $RG_NAME"
