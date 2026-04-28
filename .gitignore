@@ -62,9 +62,8 @@ InspectLiveSchema/
 inspect_*.ps1
 list_*.ps1
 
-# Build artifacts
-manifest/teams-bot-poc.zip
-teams-bot-poc-*.zip
+# Build artifacts (Teams app sideload packages)
+manifest/*.zip
 
 # OS
 .DS_Store

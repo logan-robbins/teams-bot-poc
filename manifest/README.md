@@ -1,53 +1,55 @@
-# Teams App Manifest
+# Alfred — Teams App Manifest
 
-## Files Required
+This directory holds the Teams app sideload package contents. The deployed app is **Alfred** (Entra app id `ff4b0902-5ae8-450b-bf45-7e2338292554`, Azure Bot `alfred-bot-qmachina`).
 
-- `manifest.json` - App configuration ✅
-- `color.png` - 192x192px app icon (required)
-- `outline.png` - 32x32px outline icon (required)
+## Files
 
-## Creating Icon Files
+| File | Purpose | Spec |
+|---|---|---|
+| `manifest.json` | Teams app manifest v1.21 | `id` and `bots[0].botId` must match the production Entra app id |
+| `color.png` | Full-color icon | 192×192 PNG |
+| `outline.png` | Outline icon | 32×32 PNG, transparent background |
 
-You need to create two PNG images:
+`alfred.zip` is the build output (gitignored). Don't commit it.
 
-### color.png (192x192px)
+## Build the sideload package
+
 ```bash
-# Option 1: Use ImageMagick to create a simple placeholder
-convert -size 192x192 xc:'#0078D4' -fill white -pointsize 120 -gravity center -annotate +0+0 'TB' color.png
-
-# Option 2: Use online tool
-# Go to https://www.canva.com and create 192x192 image with "TB" text
+cd manifest
+zip alfred.zip manifest.json color.png outline.png
 ```
 
-### outline.png (32x32px)
-```bash
-# Option 1: Use ImageMagick
-convert -size 32x32 xc:white -fill '#0078D4' -pointsize 24 -gravity center -annotate +0+0 'TB' outline.png
+Files must be at the archive root (no nested directory).
 
-# Option 2: Use online tool
-# Go to https://www.canva.com and create 32x32 image with "TB" text
+## Upload
+
+See the **Deploy** section of the project root [`README.md`](../README.md) for upload paths (Teams Admin Center vs. single team / chat).
+
+## Replace the icons
+
+```bash
+# color.png (192×192, full color)
+convert -size 192x192 xc:'#0078D4' -fill white -pointsize 96 -gravity center \
+  -annotate +0+0 'A' manifest/color.png
+
+# outline.png (32×32, transparent background, white outline)
+convert -size 32x32 xc:none -fill white -pointsize 24 -gravity center \
+  -annotate +0+0 'A' manifest/outline.png
 ```
 
-## Before Uploading to Teams
+After regenerating, re-zip and re-upload (Teams treats sideload packages as immutable per upload — bumping `manifest.json:version` is the canonical way to ship a new package).
 
-1. **Update manifest.json:**
-   - Replace `CHANGE_ME.ngrok-free.app` with your actual ngrok subdomain
-   - Replace `0.botpoc.YOURDOMAIN.com` with your actual media domain
+## Manifest validation checklist
 
-2. **Create the ZIP file:**
-   ```bash
-   cd manifest
-   zip teams-bot-poc.zip manifest.json color.png outline.png
-   ```
+Critical fields for a calling bot:
 
-3. **Upload to Teams:**
-   - Teams → Apps → Upload a custom app
-   - Select `teams-bot-poc.zip`
-   - Click Add
+- `bots[0].supportsCalling: true`
+- `bots[0].supportsVideo: false` (audio-only)
+- `validDomains` includes `teamsbot.qmachina.com` and `media.qmachina.com`
+- `bots[0].botId` and top-level `id` both equal the Entra app id (`ff4b0902-5ae8-450b-bf45-7e2338292554`)
 
-## Manifest Validation
+Quick check:
 
-The critical fields for calling bots (per S1):
-- `bots[0].supportsCalling: true` ✅
-- `bots[0].supportsVideo: false` ✅ (audio-only POC)
-- `validDomains` must include your ngrok and media domains ✅
+```bash
+jq '{id, botId: .bots[0].botId, calling: .bots[0].supportsCalling, video: .bots[0].supportsVideo, validDomains}' manifest/manifest.json
+```
