@@ -14,6 +14,7 @@ param(
     [string]$InstancePublicIPAddress,
     [string]$CertificateThumbprint,
     [string]$TranscriptSinkPythonEndpoint,
+    [string]$TranscriptSinkChatEndpoint,
     [string]$RunAsUser = "azureuser",
     [string]$RunAsPassword,
     [string]$SttProvider = "Deepgram",
@@ -62,7 +63,20 @@ function Install-ChocolateyIfMissing {
     Write-Host "Installing Chocolatey..." -ForegroundColor Yellow
     Set-ExecutionPolicy Bypass -Scope Process -Force
     [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
-    Invoke-Expression ((New-Object System.Net.WebClient).DownloadString("https://community.chocolatey.org/install.ps1"))
+    $installerPath = Join-Path $env:TEMP "install-chocolatey.ps1"
+    try {
+        Invoke-WebRequest `
+            -Uri "https://community.chocolatey.org/install.ps1" `
+            -OutFile $installerPath `
+            -UseBasicParsing `
+            -TimeoutSec 180
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installerPath
+    }
+    finally {
+        Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+    }
+
+    $env:Path = "C:\ProgramData\chocolatey\bin;$env:Path"
 }
 
 function Install-PackageIfMissing([string]$CommandName, [string]$PackageName) {
@@ -72,7 +86,55 @@ function Install-PackageIfMissing([string]$CommandName, [string]$PackageName) {
 
     Write-Host "Installing $PackageName..." -ForegroundColor Yellow
     $choco = Get-ChocolateyCommand
-    & $choco install $PackageName -y --no-progress
+    & $choco install $PackageName -y --no-progress --execution-timeout=600
+}
+
+function Install-MediaPlatformPrereqs {
+    # Required by Microsoft.Graph.Communications.Calls.Media (NativeMedia.dll).
+    # Without these the bot crashloops with: DllNotFoundException: Unable to
+    # load DLL 'NativeMedia' or one of its dependencies.
+    $smf = Get-WindowsFeature -Name Server-Media-Foundation -ErrorAction SilentlyContinue
+    if ($smf -and -not $smf.Installed) {
+        Write-Host "Installing Server-Media-Foundation Windows feature..." -ForegroundColor Yellow
+        Install-WindowsFeature -Name Server-Media-Foundation | Out-Null
+    }
+
+    if (-not (Test-Path 'C:\Windows\System32\msvcp140.dll')) {
+        Write-Host "Installing Visual C++ 2015-2022 Redistributable (vcredist140)..." -ForegroundColor Yellow
+        $choco = Get-ChocolateyCommand
+        & $choco install vcredist140 -y --no-progress --execution-timeout=600
+    }
+}
+
+function Install-OpenSSHServerIfMissing {
+    # Installs sshd so future recovery does not require RDP. Companion NSG
+    # rules for ports 22 and 5986 are added in scripts/deploy-azure-vm.sh.
+    $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0' -ErrorAction SilentlyContinue
+    if (-not $cap -or $cap.State -ne 'Installed') {
+        Write-Host "Installing OpenSSH Server capability..." -ForegroundColor Yellow
+        Add-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0' | Out-Null
+    }
+
+    $sshd = Get-Service sshd -ErrorAction SilentlyContinue
+    if (-not $sshd) {
+        Write-Warning "OpenSSH Server installed but sshd service not found; skipping startup config."
+        return
+    }
+    if ($sshd.StartType -ne 'Automatic') {
+        Set-Service -Name sshd -StartupType Automatic
+    }
+    if ($sshd.Status -ne 'Running') {
+        Start-Service sshd
+    }
+
+    if (-not (Get-NetFirewallRule -Name 'sshd-22' -ErrorAction SilentlyContinue)) {
+        New-NetFirewallRule -Name 'sshd-22' -DisplayName 'OpenSSH Server (sshd)' `
+            -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null
+    }
+    if (-not (Get-NetFirewallRule -Name 'WinRM-HTTPS-5986' -ErrorAction SilentlyContinue)) {
+        New-NetFirewallRule -Name 'WinRM-HTTPS-5986' -DisplayName 'WinRM HTTPS' `
+            -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 5986 | Out-Null
+    }
 }
 
 function Ensure-Repository([string]$Root, [string]$Url, [string]$Branch) {
@@ -111,6 +173,7 @@ function Write-ProductionConfig {
         [string]$PublicIp,
         [string]$CertThumbprint,
         [string]$SinkEndpoint,
+        [string]$SinkChatEndpoint,
         [string]$Provider,
         [string]$DeepgramKey,
         [string]$DeepgramSelectedModel,
@@ -158,6 +221,7 @@ function Write-ProductionConfig {
         }
         TranscriptSink = @{
             PythonEndpoint = $SinkEndpoint
+            ChatEndpoint = if ([string]::IsNullOrWhiteSpace($SinkChatEndpoint)) { ($SinkEndpoint -replace '/transcript$', '/chat') } else { $SinkChatEndpoint }
         }
         JoinMode = @{
             PreferredMode = $preferredJoinMode
@@ -263,6 +327,8 @@ Install-ChocolateyIfMissing
 Install-PackageIfMissing "git" "git"
 Install-PackageIfMissing "dotnet" "dotnet-8.0-sdk"
 Install-PackageIfMissing "nssm" "nssm"
+Install-MediaPlatformPrereqs
+Install-OpenSSHServerIfMissing
 
 $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
     [System.Environment]::GetEnvironmentVariable("Path", "User")
@@ -292,6 +358,7 @@ Write-ProductionConfig `
     -PublicIp $InstancePublicIPAddress `
     -CertThumbprint $CertificateThumbprint `
     -SinkEndpoint $TranscriptSinkPythonEndpoint `
+    -SinkChatEndpoint $TranscriptSinkChatEndpoint `
     -Provider $SttProvider `
     -DeepgramKey $DeepgramApiKey `
     -DeepgramSelectedModel $DeepgramModel `
