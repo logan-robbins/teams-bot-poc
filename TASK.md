@@ -1,3 +1,25 @@
+# TASK: Verify Live Alfred App ID (2026-04-28)
+
+Status legend: `[ ]` pending, `[-]` in progress, `[x]` complete.
+
+1. [x] Check local Teams manifest and deploy app-secret app ID
+2. [x] Query live Azure Bot and Entra app registration state
+3. [x] Determine canonical app ID for IT approval
+4. [x] Report any docs/files that are stale
+
+---
+
+# TASK: Update Documentation With Live Alfred State (2026-04-28)
+
+Status legend: `[ ]` pending, `[-]` in progress, `[x]` complete.
+
+1. [x] Discover stale docs and historical app-ID references
+2. [x] Update README/STATE with live app identity and Graph permission state
+3. [x] Mark historical sandbox/westus deployment docs as superseded
+4. [x] Verify docs and commit/push updates
+
+---
+
 # TASK: Finish Alfred VM Deployment (2026-04-28)
 
 Status legend: `[ ]` pending, `[-]` in progress, `[x]` complete.
@@ -71,7 +93,7 @@ teamsbot.qmachina.com         agent.qmachina.com
 
 ## Completed Items
 
-### 1. [COMPLETE] Interview Analysis Agent (`python/interview_agent/`)
+### 1. [COMPLETE] Interview Analysis Agent (`python/interview_agent/`, historical; current code lives in `python/meeting_agent/`)
 - `agent.py` - OpenAI Agents SDK interview analyzer
 - `__init__.py` - Package exports
 - `models.py` - TranscriptEvent, AnalysisItem, SessionAnalysis

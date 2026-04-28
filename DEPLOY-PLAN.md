@@ -1,4 +1,14 @@
-# teams-bot-poc — westus redeploy + auto-accept fix plan
+# teams-bot-poc — historical westus redeploy + auto-accept fix plan
+
+Current status: **superseded; do not execute as the current runbook**.
+Production is now the eastus Alfred stack documented in `README.md` and
+`STATE.md`: resource group `rg-alfred-poc`, Entra app/Azure Bot app ID
+`ff4b0902-5ae8-450b-bf45-7e2338292554`, Azure Bot
+`alfred-bot-qmachina`, Windows VM `vm-alfred`, FastAPI Container App
+`ca-alfred-api`, and React/nginx Container App `ca-alfred-web`.
+
+Keep this file only as historical incident/planning context for the previous
+westus redeploy attempt.
 
 **Date:** 2026-04-20
 **Subscription:** `Azure subscription 1` (`70464868-52ea-435d-93a6-8002e83f0b89`)
@@ -6,12 +16,12 @@
 **User:** logan@qmachina.com
 **Target region:** westus (all new resources)
 
-## Current-state inventory
+## Historical-state inventory
 
-- **App Registration** `TeamsMediaBotPOC` (`ff4b0902-5ae8-450b-bf45-7e2338292554`) exists. Has Graph app permissions `Calls.AccessMedia.All` + `Calls.JoinGroupCall.All`. Admin consent status TBD.
-- **No Azure Bot Service** anywhere in subscription — root cause of the "auto-accept doesn't work" symptom (Teams has no route to deliver incoming-call webhooks to the bot).
+- **App Registration** `Alfred` (`ff4b0902-5ae8-450b-bf45-7e2338292554`) exists. Live verification on 2026-04-28 confirmed Graph app-role assignments for `Calls.AccessMedia.All` and `Calls.JoinGroupCall.All`.
+- At the time of this historical plan, no Azure Bot Service existed. Current production has Azure Bot `alfred-bot-qmachina` with Teams channel and calling enabled.
 - **Old RG** `rg-teams-media-bot-poc` (eastus) contains only a leftover `vault832` Recovery Services vault. Everything else torn down.
-- **DNS (GoDaddy, live)**:
+- **DNS at the time of this historical plan**:
   - `agent.qmachina.com` → CNAME `ca-alfred-api.grayglacier-84d7709e.eastus.azurecontainerapps.io` (NXDOMAIN — stale)
   - `alfred.qmachina.com` → CNAME `ca-alfred-ui.grayglacier-84d7709e.eastus.azurecontainerapps.io` (NXDOMAIN — stale)
   - `teamsbot.qmachina.com` → A `52.188.117.153` (unreachable — stale)
@@ -37,8 +47,8 @@ Inviting the Alfred bot to a Teams meeting causes it to auto-join, capture audio
 4. Create Container Apps env `cae-alfred-westus` (Consumption workload profile, Log Analytics auto-create).
 5. `az containerapp create --source python/ --ingress external --target-port 8765` → `ca-alfred-api`, env vars:
    - `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_KEY`, `AZURE_OPENAI_DEPLOYMENT=gpt-5-mini`, `OPENAI_API_TYPE=azure`, `OPENAI_REASONING_EFFORT=low`
-   - `PRODUCT_SPEC_PATH=/app/legionmeet_platform/specs/alfred.json`, `VARIANT_ID=default`, `INSTANCE_ID=prod`
-6. `az containerapp create --source python/ --dockerfile Dockerfile.streamlit --ingress external --target-port 8501` → `ca-alfred-ui`, env vars:
+   - `PRODUCT_SPEC_PATH=/app/legionmeet_platform/specs/alfred.yaml`, `VARIANT_ID=alfred`, `INSTANCE_ID=prod`
+6. Current production uses React/nginx `ca-alfred-web` (see `web/Dockerfile`), not the old Streamlit container.
    - `SINK_URL=https://<api-fqdn>`
 7. Capture new env default-domain (format: `<word>-<hex>.westus.azurecontainerapps.io`).
 8. **Manual (user)**: Update GoDaddy DNS:
@@ -67,7 +77,7 @@ These are preemptive fixes based on reading the code; real symptoms will show up
 3. Configure calling webhook: `https://teamsbot.qmachina.com/api/calling`.
 4. Grant admin consent on the App Registration's Graph permissions:
    `az ad app permission admin-consent --id ff4b0902-5ae8-450b-bf45-7e2338292554`
-   (Requires caller to be a Global Admin or Privileged Role Admin. If this fails, do it via Azure portal: Entra ID → App registrations → TeamsMediaBotPOC → API permissions → Grant admin consent.)
+   (Requires caller to be a Global Admin or Privileged Role Admin. If this fails, do it via Azure portal: Entra ID → App registrations → Alfred → API permissions → Grant admin consent.)
 
 ## Phase 4 — Windows VM + C# bot in westus (~30 min + manual)
 
@@ -120,7 +130,7 @@ These are preemptive fixes based on reading the code; real symptoms will show up
 
 ## Risks / unknowns
 
-- **gpt-5-mini in westus**: may not have capacity for GlobalStandard. Fallback: place AOAI in `westus3` or `eastus`.
+- **gpt-5-mini in westus**: may not have capacity for GlobalStandard. Current production uses eastus.
 - **`az bot create` permissions**: requires privileged role on tenant. If it fails, do it via portal.
 - **`deploy-production.ps1` gap**: no repo clone step. Will patch before running.
 - **SSL cert** for `media.qmachina.com` is a hard requirement — Graph Communications Media SDK refuses to start without a valid cert matching `ServiceFqdn`.
@@ -142,4 +152,4 @@ These are preemptive fixes based on reading the code; real symptoms will show up
 - [ ] Bot sideloaded in Teams; shows calling icon in app catalog
 - [ ] Invited bot to test meeting; Serilog shows `"Answered incoming call"`
 - [ ] Transcript events hit `/transcript` with non-empty text
-- [ ] Streamlit shows live running-assessment updates
+- [ ] React Dossier UI shows live ledger/dossier updates

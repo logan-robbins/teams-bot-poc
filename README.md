@@ -46,6 +46,33 @@ TeamsMediaBot.exe (Windows VM, port 443/8445, public IP 172.190.7.169)
 | ACR | `acralfredpoc70464868` | hosts `ca-alfred-api`, `ca-alfred-web` images |
 | Container Apps env | `cae-alfred` | default domain `orangecoast-aa65f885.eastus.azurecontainerapps.io` |
 
+### Live App Identity and Permissions
+
+Verified against Azure on 2026-04-28:
+
+| Item | Current value |
+|---|---|
+| Entra tenant | `2843abed-8970-461e-a260-a59dc1398dbf` |
+| Subscription | `70464868-52ea-435d-93a6-8002e83f0b89` |
+| Entra app display name | `Alfred` |
+| Entra app ID / Teams manifest ID / bot ID | `ff4b0902-5ae8-450b-bf45-7e2338292554` |
+| Service principal | Enabled, display name `Alfred` |
+| Azure Bot | `alfred-bot-qmachina` |
+| Azure Bot messaging endpoint | `https://teamsbot.qmachina.com/api/messages` |
+| Azure Bot Teams calling webhook | `https://teamsbot.qmachina.com/api/calling` |
+
+The live Entra app has these Microsoft Graph application app-role assignments:
+
+| Permission | App role ID | Applied to |
+|---|---|---|
+| `Calls.AccessMedia.All` | `a7a681dc-756e-4909-b988-f160edc6655f` | C# Graph Communications SDK app-hosted media path |
+| `Calls.JoinGroupCall.All` | `f6b49018-60ab-4f81-83bd-22caeabfed2d` | C# Graph Communications SDK meeting join/answer path |
+
+Resource-specific Teams permissions are declared in `manifest/manifest.json`
+and are granted when the Teams app is installed in the target chat/meeting.
+Historical sandbox notes may reference `e68b49d1-...`; that ID is not the
+current qMachina production app.
+
 ## Repository Layout
 
 | Path | Purpose |
@@ -68,7 +95,7 @@ TeamsMediaBot.exe (Windows VM, port 443/8445, public IP 172.190.7.169)
 | Transcript event contract (C#) | `src/Models/TranscriptEvent.cs` |
 | Bot → sink forwarder | `src/Services/PythonTranscriptPublisher.cs` |
 | Sink ingest endpoints + state flow | `python/transcript_sink.py` |
-| LLM analysis behavior | `python/interview_agent/` |
+| LLM analysis behavior | `python/meeting_agent/agent.py`, `python/meeting_agent/tools.py` |
 | Product/spec validation | `python/legionmeet_platform/spec_loader.py` |
 | Output route dispatch | `python/legionmeet_platform/routes/router.py` |
 | React UI | `web/` |

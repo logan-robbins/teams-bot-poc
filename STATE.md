@@ -29,6 +29,31 @@ Stand Alfred up end-to-end in qMachina sub `70464868-...`, eastus, RG `rg-alfred
 | DNS | `teamsbot/media → 172.190.7.169`, `agent/alfred → CAE FQDNs` | All resolving correctly |
 | Westus teardown | `rg-teams-bot-westus` | Deleted |
 
+## Live app identity verification — 2026-04-28 21:30 UTC
+
+Do not use historical sandbox app IDs for qMachina production. The live app
+identity is:
+
+| Check | Result |
+|---|---|
+| `az account show` | sub `70464868-52ea-435d-93a6-8002e83f0b89`, tenant `2843abed-8970-461e-a260-a59dc1398dbf`, user `logan@qmachina.com` |
+| `az bot show -g rg-alfred-poc -n alfred-bot-qmachina` | appId `ff4b0902-5ae8-450b-bf45-7e2338292554`, endpoint `https://teamsbot.qmachina.com/api/messages` |
+| `az ad app show --id ff4b0902-5ae8-450b-bf45-7e2338292554` | displayName `Alfred`, signInAudience `AzureADMyOrg` |
+| `az ad sp show --id ff4b0902-5ae8-450b-bf45-7e2338292554` | service principal enabled, displayName `Alfred` |
+| Azure Bot Teams channel | enabled, calling enabled, calling webhook `https://teamsbot.qmachina.com/api/calling` |
+| Public bot health | `https://teamsbot.qmachina.com/api/calling/health` returned `{"status":"Healthy","service":"Alfred"}` |
+
+Current Microsoft Graph application app-role assignments on the Alfred service
+principal:
+
+| Permission | App role ID |
+|---|---|
+| `Calls.JoinGroupCall.All` | `f6b49018-60ab-4f81-83bd-22caeabfed2d` |
+| `Calls.AccessMedia.All` | `a7a681dc-756e-4909-b988-f160edc6655f` |
+
+The older `e68b49d1-0aae-4761-a595-4df482d8d4fe` value was for a Disney
+sandbox attempt and does not exist in the current qMachina tenant.
+
 ## Recovery 2026-04-28
 
 The deploy went through three classes of failure before reaching healthy:

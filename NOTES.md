@@ -2,6 +2,14 @@
 
 Date: 2026-04-27. Branch: `feat/alfred-chat-modality`. For AI session continuity.
 
+Current status: **historical sandbox notes, not production truth**. Live qMachina
+production was verified on 2026-04-28 against Azure subscription
+`70464868-52ea-435d-93a6-8002e83f0b89` / tenant
+`2843abed-8970-461e-a260-a59dc1398dbf`; the live Alfred Entra app, Azure Bot,
+deploy secret, and Teams manifest use app ID
+`ff4b0902-5ae8-450b-bf45-7e2338292554`. The `e68b49d1-...` app ID below was a
+Disney sandbox attempt and does not exist in the current qMachina tenant.
+
 ## Tenant + subscription state
 
 - Target tenant: Disney sandbox `38387f0b-9a6f-46e2-8373-67422f8c2cb0`. Identity `Logan.Robbins@plutosdoghouse.onmicrosoft.com`.
@@ -21,7 +29,10 @@ Entra app reg in 38387f (`az ad app create`):
 - Secret: `alfred-sandbox-bootstrap-secret`, ~1y. Value held by user only.
 - Graph perms requested, **not admin-consented**: `Calls.AccessMedia.All`, `Calls.JoinGroupCall.All`.
 
-Manifest committed: `manifest/manifest.json` `id` and `bots[0].botId` rewritten to the new App ID.
+Historical sandbox note: during that Disney sandbox attempt,
+`manifest/manifest.json` `id` and `bots[0].botId` were temporarily rewritten
+to the sandbox app ID. Current qMachina production manifest uses
+`ff4b0902-5ae8-450b-bf45-7e2338292554`.
 
 ## Required Graph scope set (for ESIS)
 
@@ -109,7 +120,9 @@ Microsoft cloud → your bot. No Private Link / VPN / ExpressRoute path delivers
 
 - `ALFRED.md` — system architecture (canonical)
 - `docs/TEAMS-AUTO-INVITE-SETUP.md` — compliance recording auto-invite flow
-- `manifest/manifest.json` — already updated to App ID `e68b49d1-...`
+- `manifest/manifest.json` — current qMachina production app ID is
+  `ff4b0902-5ae8-450b-bf45-7e2338292554`; the `e68b49d1-...` value was only
+  for the historical Disney sandbox attempt above.
 - `src/Config/appsettings.example.json` — bot config schema (still has placeholder values)
 - `scripts/setup-azure-mac.sh`, `scripts/deploy-azure-vm.sh`, `scripts/deploy-azure-agent.sh` — deploy scripts (ALFRED gaps noted above)
 - `scripts/setup-policy-auto-invite.ps1` — PowerShell for compliance recording mode
