@@ -71,7 +71,13 @@ try
     // so this is the only compliant route.
     builder.Services.AddSingleton<BotFrameworkAuthentication>(sp =>
         new ConfigurationBotFrameworkAuthentication(sp.GetRequiredService<IConfiguration>()));
-    builder.Services.AddSingleton<IBotFrameworkHttpAdapter, CloudAdapter>();
+    // CloudAdapter has two public ctors that DI can't disambiguate
+    // (IConfiguration/IHttpClientFactory/ILogger vs BotFrameworkAuthentication/ILogger)
+    // so we pick the auth-based ctor explicitly.
+    builder.Services.AddSingleton<IBotFrameworkHttpAdapter>(sp =>
+        new CloudAdapter(
+            sp.GetRequiredService<BotFrameworkAuthentication>(),
+            sp.GetRequiredService<ILogger<IBotFrameworkHttpAdapter>>()));
     builder.Services.AddSingleton<IConversationReferenceStore, InMemoryConversationReferenceStore>();
     builder.Services.AddSingleton<IBot, AlfredBot>();
 
