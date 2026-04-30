@@ -1,326 +1,223 @@
 # Alfred
 
-Teams meeting bot that auto-joins meetings, captures audio, transcribes it, and runs LLM analysis on the transcript. Two runtimes:
+Microsoft Teams meeting assistant. Joins meetings, captures audio, transcribes per-speaker, ingests meeting chat, runs an LLM agent that produces a live "dossier" (decisions, open questions, action items, risks), and posts back into the meeting chat. Read `ALFRED.md` first if you're modifying behavior.
 
-1. **C# media bot** on a Windows Server VM — joins calls via Microsoft Graph Communications, captures media, streams transcript events to the sink.
-2. **Python FastAPI sink + React UI** on Azure Container Apps — receives transcripts, runs OpenAI Agents SDK analysis, renders a live "dossier" UI.
+## Live environments
 
-This README is the **operational source of truth**. If a runbook command in here is wrong, the deploy is wrong.
-
-## System Architecture
-
-```text
-Teams Meeting
-    ↓
-TeamsMediaBot.exe (Windows VM, port 443/8445, public IP 172.190.7.169)
-    │  • POST /api/calling/health  • POST /api/calling     • POST /api/messages
-    │
-    ├──► STT Provider (Deepgram or Azure Speech, runtime-configured)
-    │
-    └──► POST https://agent.qmachina.com/transcript
-              ↓
-         FastAPI sink (ca-alfred-api Container App)
-              │  • / health  • /transcript  • /session/*  • /chat
-              │
-              ├──► Azure OpenAI (gpt-5-mini in aoai-alfred)
-              │
-              └──► SQLite + dossier state
-                       ↓
-                  React UI (ca-alfred-web Container App, served via nginx)
-                  https://alfred.qmachina.com
-```
-
-## Production Topology (eastus)
-
-| Component | Azure resource | Endpoint |
+| | qMachina (prod) | Disney sandbox |
 |---|---|---|
-| Subscription | `70464868-52ea-435d-93a6-8002e83f0b89` | tenant `2843abed-8970-461e-a260-a59dc1398dbf` |
-| Resource group | `rg-alfred-poc` (eastus) | — |
-| Entra app | `Alfred` | appId `ff4b0902-5ae8-450b-bf45-7e2338292554` |
-| Azure Bot | `alfred-bot-qmachina` | messaging `https://teamsbot.qmachina.com/api/messages`, calling `https://teamsbot.qmachina.com/api/calling` |
-| Bot VM | `vm-alfred` (Standard_D4s_v3, Win2022 g2 Trusted Launch) | `172.190.7.169`, FQDN `vm-alfred-eastus.eastus.cloudapp.azure.com` |
-| FastAPI sink | `ca-alfred-api` | `https://agent.qmachina.com` (custom) / `https://ca-alfred-api.orangecoast-aa65f885.eastus.azurecontainerapps.io` (default) |
-| React UI | `ca-alfred-web` | `https://alfred.qmachina.com` (custom) / default CAE FQDN |
-| Azure OpenAI | `aoai-alfred` | deployment `gpt-5-mini`, GlobalStandard, capacity 10 |
-| Azure Speech | `speech-alfred` | S0, region eastus |
-| ACR | `acralfredpoc70464868` | hosts `ca-alfred-api`, `ca-alfred-web` images |
-| Container Apps env | `cae-alfred` | default domain `orangecoast-aa65f885.eastus.azurecontainerapps.io` |
+| Azure subscription | `70464868-52ea-435d-93a6-8002e83f0b89` | `e02c0038-82c8-4655-9647-38083f301099` |
+| Azure tenant | `2843abed-...` (qmachina) | `56b731a8-...` (disney.com) |
+| M365 tenant (Teams + Entra app) | same as Azure tenant | `38387f0b-...` (plutosdoghouse.com) |
+| Resource group | `rg-alfred-poc` | `rg-alfred-disney` |
+| Bot VM | `vm-alfred` (`172.190.7.169`, `teamsbot.qmachina.com`) | `vm-alfred-disney` (`alfred-disney-bot.eastus.cloudapp.azure.com`) |
+| Azure Bot Service | `alfred-bot-qmachina` | `bot-alfred-disney` (SingleTenant, app tenant Disney M365) |
+| Bot AppId | `ff4b0902-5ae8-450b-bf45-7e2338292554` | `207a38a4-67c5-4ef9-ada8-ea7998734d59` |
+| Sink (Container App) | `https://agent.qmachina.com` | `https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io` |
+| UI (Container App) | `https://alfred.qmachina.com` | `https://ca-alfred-web.gentlewater-5aa74a73.eastus.azurecontainerapps.io` |
+| Azure OpenAI | `aoai-alfred` (`gpt-5-mini`, GlobalStandard cap 10) | `aoai-alfred-disney` (same) |
+| Manifest zip | `manifest/alfred.zip` | `manifest/disney/alfred-sandbox.zip` |
 
-### Live App Identity and Permissions
+## Start (install Alfred in a tenant)
 
-Verified against Azure on 2026-04-28:
+1. Upload the manifest zip via **Teams Developer Portal** (`https://dev.teams.microsoft.com/apps`) → **Import app**.
+2. Click **Preview in Teams** → **Add to a chat** (or to a meeting). The install grants the 5 chat-scoped Application RSC perms (`ChatMessage.Read.Chat`, `ChatMessageReadReceipt.Read.Chat`, `OnlineMeetingParticipant.Read.Chat`, `Calls.AccessMedia.Chat`, `Calls.JoinGroupCalls.Chat`). No tenant-wide Graph perms are requested.
+3. Start a session, then DM the bot or invite it to a meeting. Trigger an explicit join with:
+   ```bash
+   ./scripts/join_meeting.sh "<teams-meeting-join-url>" "Alfred"
+   ```
 
-| Item | Current value |
-|---|---|
-| Entra tenant | `2843abed-8970-461e-a260-a59dc1398dbf` |
-| Subscription | `70464868-52ea-435d-93a6-8002e83f0b89` |
-| Entra app display name | `Alfred` |
-| Entra app ID / Teams manifest ID / bot ID | `ff4b0902-5ae8-450b-bf45-7e2338292554` |
-| Service principal | Enabled, display name `Alfred` |
-| Azure Bot | `alfred-bot-qmachina` |
-| Azure Bot messaging endpoint | `https://teamsbot.qmachina.com/api/messages` |
-| Azure Bot Teams calling webhook | `https://teamsbot.qmachina.com/api/calling` |
-
-The live Entra app has these Microsoft Graph application app-role assignments:
-
-| Permission | App role ID | Applied to |
-|---|---|---|
-| `Calls.AccessMedia.All` | `a7a681dc-756e-4909-b988-f160edc6655f` | C# Graph Communications SDK app-hosted media path |
-| `Calls.JoinGroupCall.All` | `f6b49018-60ab-4f81-83bd-22caeabfed2d` | C# Graph Communications SDK meeting join/answer path |
-
-Resource-specific Teams permissions are declared in `manifest/manifest.json`
-and are granted when the Teams app is installed in the target chat/meeting.
-Historical sandbox notes may reference `e68b49d1-...`; that ID is not the
-current qMachina production app.
-
-## Repository Layout
-
-| Path | Purpose |
-|---|---|
-| `src/` | C# Teams bot runtime + HTTP API |
-| `python/` | FastAPI sink, React UI build inputs, analysis package, tests |
-| `web/` | nginx config template that fronts the React UI Container App |
-| `scripts/` | All deployment, bootstrap, and operational entrypoints |
-| `manifest/` | Teams app manifest (`manifest.json` + icons; zipped for sideload) |
-| `infra/` | Azure resource export (reference / drift detection only) |
-
-## Where to Change What
-
-| If you need to change… | Start here |
-|---|---|
-| Bot startup wiring | `src/Program.cs` |
-| Bot HTTP API (`/api/calling/*`, `/api/messages`) | `src/Controllers/CallingController.cs` |
-| Call join/leave/media handling | `src/Services/TeamsCallingBotService.cs` |
-| Per-call audio buffering and forwarding | `src/Services/CallHandler.cs` |
-| Transcript event contract (C#) | `src/Models/TranscriptEvent.cs` |
-| Bot → sink forwarder | `src/Services/PythonTranscriptPublisher.cs` |
-| Sink ingest endpoints + state flow | `python/transcript_sink.py` |
-| LLM analysis behavior | `python/meeting_agent/agent.py`, `python/meeting_agent/tools.py` |
-| Product/spec validation | `python/legionmeet_platform/spec_loader.py` |
-| Output route dispatch | `python/legionmeet_platform/routes/router.py` |
-| React UI | `web/` |
-| nginx /sink/ proxy behavior | `web/nginx.conf.template` |
-| Teams app manifest fields | `manifest/manifest.json` |
-| VM bootstrap (prereqs, config, build, service) | `scripts/bootstrap-production-vm.ps1` |
-| VM cert issuance | `scripts/vm-request-letsencrypt-cert.ps1` |
-| End-to-end VM deploy orchestration | `scripts/deploy-azure-vm.sh` |
-| Python services deploy | `scripts/deploy-azure-agent.sh` |
-
-## Deploy
-
-### Prerequisites (one-time on dev machine)
-
-```bash
-# Azure CLI logged in to the Alfred tenant
-az account show --query '{sub:id, tenant:tenantId, user:user.name}'
-# Expected: sub 70464868-... tenant 2843abed-... user logan@qmachina.com
-
-# Required secret files (read by scripts/deploy-azure-vm.sh)
-test -s /tmp/app-secret.json    # {"appId":"ff4b0902-...","password":"..."}
-test -s /tmp/vm-admin-pass.txt  # single-line VM azureuser password
-test -s /tmp/speech-key.txt     # single-line Azure Speech key
-
-# DNS pointing at the VM (must resolve to 172.190.7.169)
-dig +short teamsbot.qmachina.com media.qmachina.com
-```
-
-### Bootstrap / re-bootstrap the bot VM
-
-```bash
-./scripts/deploy-azure-vm.sh
-```
-
-Idempotent. Runs five managed Run Command phases on `vm-alfred`:
-
-| Phase | Script | What it does | Typical duration |
-|---|---|---|---|
-| 1/5 | `bootstrap-production-vm.ps1` | Installs prereqs (git, dotnet 8, nssm, choco, Server-Media-Foundation, VCRedist 140, OpenSSH), syncs repo, writes `appsettings.production.json`, runs `dotnet publish` | 5–10 min on first run, ~2 min on re-run |
-| 2/5 | `vm-open-firewall.ps1` | Opens Windows Firewall 80/443/8445 | <1 min |
-| 3/5 | `vm-install-win-acme.ps1` | Installs win-acme via Chocolatey | 2–3 min |
-| 4/5 | `vm-request-letsencrypt-cert.ps1` | HTTP-01 issues TLS cert for `teamsbot.qmachina.com,media.qmachina.com`, registers Task Scheduler renewal | 2–3 min |
-| 5/5 | `vm-finalize-bootstrap.ps1` | Writes cert thumbprint into config, installs/updates `TeamsMediaBot` Windows service via nssm, starts it | 1–2 min |
-
-Preflight inside `deploy-azure-vm.sh` also enables boot diagnostics, ensures NSG recovery rules (22, 5986), and probes the guest agent via Run Command if the instance view shows null (ARM cache lag). See `scripts/deploy-azure-vm.sh`.
-
-### Deploy / redeploy the Python sink + React UI
-
-```bash
-./scripts/deploy-azure-agent.sh
-```
-
-Builds Docker images via ACR (`acralfredpoc70464868`), updates Container Apps `ca-alfred-api` and `ca-alfred-web`, attaches/binds custom domains.
-
-### Local development
-
-```bash
-cd python && uv sync
-
-# Terminal 1: sink
-uv run python run_variant_sink.py \
-  --instance dev --port 8765 \
-  --product-spec legionmeet_platform/specs/alfred.yaml
-
-# Terminal 2: UI
-uv run python run_variant_ui.py \
-  --instance dev --port 8501 \
-  --sink-url http://127.0.0.1:8765 \
-  --product-spec legionmeet_platform/specs/alfred.yaml
-
-# Tests
-uv run pytest tests -v
-```
-
-C# build:
-
-```bash
-cd src && dotnet restore && dotnet build --configuration Release
-```
+If user-consent is gated by an "unverified publisher" tenant policy, an M365 Global Administrator must grant org-wide consent for the app in **Teams Admin Center → Manage apps → Permissions tab**. Only an admin can do this; the manifest can't bypass it.
 
 ## Operate
 
-All on-VM operations go through **managed Run Command** (`az vm run-command create`). **Never** use `az vm run-command invoke` — see Troubleshoot.
-
-### Restart the bot service
+All commands assume the right `az account set --subscription <sub>` for the target environment. Replace `<rg>` / `<vm>` / `<sink-fqdn>` per the environment table above.
 
 ```bash
-az vm run-command create -g rg-alfred-poc --vm-name vm-alfred \
-  --run-command-name restart-bot --location eastus \
+# Public health (run from anywhere)
+curl -sS -m 10 https://teamsbot.qmachina.com/api/calling/health
+curl -sS -m 10 https://agent.qmachina.com/health
+curl -sS -m 10 -o /dev/null -w "%{http_code}\n" https://alfred.qmachina.com
+
+# Sink stats (events_received, session, agent_analyses, etc.)
+curl -sS https://<sink-fqdn>/stats | jq
+
+# Restart bot service on the VM
+az vm run-command create -g <rg> --vm-name <vm> --location eastus \
+  --run-command-name restart-bot \
   --script 'Restart-Service TeamsMediaBot -Force; Start-Sleep -Seconds 8; Get-Service TeamsMediaBot' \
   --async-execution false --timeout-in-seconds 60
-az vm run-command delete -g rg-alfred-poc --vm-name vm-alfred --run-command-name restart-bot --yes
-```
+az vm run-command delete -g <rg> --vm-name <vm> --run-command-name restart-bot --yes
 
-### Tail bot logs
-
-```bash
-az vm run-command create -g rg-alfred-poc --vm-name vm-alfred \
-  --run-command-name tail-logs --location eastus \
+# Tail bot logs (stdout + stderr)
+az vm run-command create -g <rg> --vm-name <vm> --location eastus \
+  --run-command-name tail-logs \
   --script 'Get-Content C:\teams-bot-poc\logs\service-output.log -Tail 80; Write-Host "---STDERR---"; Get-Content C:\teams-bot-poc\logs\service-error.log -Tail 40 -ErrorAction SilentlyContinue' \
   --async-execution false --timeout-in-seconds 60
-az vm run-command show -g rg-alfred-poc --vm-name vm-alfred --run-command-name tail-logs --instance-view --query "instanceView.output" -o tsv
-az vm run-command delete -g rg-alfred-poc --vm-name vm-alfred --run-command-name tail-logs --yes
+az vm run-command show -g <rg> --vm-name <vm> --run-command-name tail-logs --instance-view --query "instanceView.output" -o tsv
+az vm run-command delete -g <rg> --vm-name <vm> --run-command-name tail-logs --yes
 ```
 
-### Push a code change to production
+**Always use `az vm run-command create`. Never `az vm run-command invoke`** — the legacy action variant wedges the extension and forces a manual `Microsoft.CPlat.Core.RunCommandWindows*` cleanup over RDP.
+
+## Push a code change
 
 ```bash
-git push origin feat/alfred-chat-modality   # or whichever branch is deployed
-./scripts/deploy-azure-vm.sh                 # re-bootstraps in-place; pulls + republishes + restarts service
+git push origin feat/alfred-chat-modality
+
+# qMachina
+./scripts/deploy-azure-vm.sh        # uses defaults
+./scripts/deploy-azure-agent.sh     # rebuilds + redeploys sink/UI
+
+# Disney sandbox (env overrides)
+RG_NAME=rg-alfred-disney VM_NAME=vm-alfred-disney \
+  TENANT_ID=38387f0b-9a6f-46e2-8373-67422f8c2cb0 \
+  APP_SECRET_FILE=/tmp/alfred-disney-app-secret.json \
+  VM_ADMIN_PASS_FILE=/tmp/alfred-disney-vm-admin-pass.txt \
+  SPEECH_KEY_FILE=/tmp/alfred-disney-speech-key.txt \
+  BOT_HOSTNAME=alfred-disney-bot.eastus.cloudapp.azure.com \
+  MEDIA_HOSTNAME=alfred-disney-bot.eastus.cloudapp.azure.com \
+  CERT_FRIENDLY_NAME=alfred-disney-cert CERT_EMAIL=Logan.Robbins@disney.com \
+  STT_PROVIDER=AzureSpeech AZURE_SPEECH_REGION=eastus \
+  REPO_BRANCH=feat/alfred-chat-modality SKIP_REPO_SYNC=1 \
+  ./scripts/deploy-azure-vm.sh
 ```
 
-### Force a TLS cert renewal
+The deploy script stops the bot service before publishing so the running DLL doesn't lock the new build. If you ever see "file in use" during publish, the service wasn't stopped — re-run the script.
 
-The win-acme scheduled task auto-renews. To force now:
+## Debug
+
+| Symptom | Fix |
+|---|---|
+| `/api/calling/health` Healthy but Teams calls don't join | Microsoft RTM media allowlist required for the bot AppId. Submit at `https://aka.ms/teams-rtm-onboarding` (~2 weeks). Until approved, bot joins the call but the media SDK fails to attach to audio. |
+| Bot service Running but stderr shows `MediaPlatform needs at least 2 cores` | VM has <2 physical cores. Resize to `Standard_D4s_v3` (or larger): `az vm resize -g <rg> -n <vm> --size Standard_D4s_v3`, then restart bot service. |
+| Bot service Running but stderr shows `DllNotFoundException: NativeMedia` | Server-Media-Foundation feature or VC++ Redistributable missing. Re-run `./scripts/deploy-azure-vm.sh`; Phase 1 reinstalls both. |
+| `POST /api/messages` returns 401 `Invalid AppId passed on token` | `appsettings.production.json` is missing `MicrosoftAppId/Password/Type/TenantId` at the **root** (Bot Framework reads these, distinct from `Bot.*`). Re-run `./scripts/deploy-azure-vm.sh` (the bootstrap script writes them now). |
+| `POST /api/messages` returns 500 `CloudAdapter ambiguous constructors` | DI registration regressed. The factory in `src/Program.cs` must explicitly select `CloudAdapter(BotFrameworkAuthentication, ILogger)`. |
+| Sink `events_received` increments but `session_events: 0` and no `[CHAT]` log line | No active session. The sink only persists chat to SQLite when a session is active. `POST /session/start` first. |
+| `az containerapp` op returns 403 + RBAC role-assignment error during create | Use ACR admin credentials inline: `az containerapp registry set --server <acr>.azurecr.io --username <u> --password <p>` after create. |
+| ACR build fails on `nginx:alpine`/`node:20-alpine` with `429 toomanyrequests` | Pre-import into ACR: `az acr import --name <acr> --source docker.io/library/nginx:alpine --image nginx:alpine`. Use `web/Dockerfile.disney-acrcache` which references the local mirror. |
+| `az vm get-instance-view` returns `vmAgent: null` | ARM cache lag. Probe directly with a Run Command (`Write-Host alive`); if it returns Succeeded the agent is fine. |
+| `Conflict: Run command extension execution is in progress` | Legacy `az vm run-command invoke` wedged the extension. RDP in, remove `C:\Packages\Plugins\Microsoft.CPlat.Core.RunCommandWindows*`, restart `WindowsAzureGuestAgent` + `RdAgent`. |
+
+## Deploy a new tenant
+
+Prerequisite: target Azure subscription accessible via `az login`, plus an Entra app in the target M365 tenant with a client secret. The Entra app must be `AzureADMultipleOrgs` (Teams calling bot requirement) with an `identifierUri` of `api://botid-<appId>`.
+
+The full sequence is in `PLAN-disney-deploy.md`. Summary:
 
 ```bash
-az vm run-command create -g rg-alfred-poc --vm-name vm-alfred \
-  --run-command-name force-renew --location eastus \
-  --script 'Start-ScheduledTask -TaskName "win-acme renew (acme-v02.api.letsencrypt.org)"' \
-  --async-execution false --timeout-in-seconds 60
+# 1. Foundation (RG, AOAI, Speech, ACR, CAE)
+az group create -n rg-alfred-<env> -l eastus
+az cognitiveservices account create -n aoai-alfred-<env> -g rg-alfred-<env> -l eastus --kind OpenAI --sku S0 --custom-domain aoai-alfred-<env>
+az cognitiveservices account deployment create -n aoai-alfred-<env> -g rg-alfred-<env> --deployment-name gpt-5-mini --model-name gpt-5-mini --model-version 2025-08-07 --model-format OpenAI --sku-capacity 10 --sku-name GlobalStandard
+az cognitiveservices account create -n speech-alfred-<env> -g rg-alfred-<env> -l eastus --kind SpeechServices --sku S0
+az acr create -n acralfred<env><sub-suffix> -g rg-alfred-<env> -l eastus --sku Standard --admin-enabled true
+az containerapp env create -n cae-alfred-<env> -g rg-alfred-<env> -l eastus
+
+# 2. Container Apps for sink + UI (build images via ACR, then create apps)
+az acr build --registry acralfred<env><sub-suffix> --image ca-alfred-api:1 --file python/Dockerfile python/
+az acr build --registry acralfred<env><sub-suffix> --image ca-alfred-web:1 --file web/Dockerfile web/
+
+# 3. Azure Bot Service (SingleTenant, MicrosoftAppTenantId = home tenant of the Entra app)
+az bot create -g rg-alfred-<env> -n bot-alfred-<env> \
+  --app-type SingleTenant --appid <appId> --tenant-id <m365-tenantId> \
+  --endpoint "https://<vm-fqdn>/api/messages" --location global --sku F0
+az bot msteams create -g rg-alfred-<env> -n bot-alfred-<env> \
+  --enable-calling true --calling-web-hook "https://<vm-fqdn>/api/calling"
+
+# 4. VM (Standard_D4s_v3 minimum — Graph media SDK requires ≥2 physical cores)
+az network public-ip create -g rg-alfred-<env> -n pip-alfred-<env> -l eastus \
+  --sku Standard --allocation-method Static --dns-name alfred-<env>-bot
+# NSG with 22, 80, 443, 3389, 5986, 8445
+az vm create -g rg-alfred-<env> -n vm-alfred-<env> -l eastus \
+  --image MicrosoftWindowsServer:WindowsServer:2022-datacenter-azure-edition:latest \
+  --size Standard_D4s_v3 --admin-username azureuser --admin-password "<pwd>" \
+  --public-ip-address pip-alfred-<env> --nsg <nsg> \
+  --security-type TrustedLaunch --enable-secure-boot true --enable-vtpm true \
+  --computer-name alfred-<env>-bot   # 15-char Windows limit
+
+# 5. Bootstrap the VM (parameterized; SKIP_REPO_SYNC=0 first time)
+RG_NAME=rg-alfred-<env> VM_NAME=vm-alfred-<env> \
+  TENANT_ID=<m365-tenantId> APP_SECRET_FILE=/tmp/<env>-app-secret.json \
+  VM_ADMIN_PASS_FILE=/tmp/<env>-vm-admin-pass.txt SPEECH_KEY_FILE=/tmp/<env>-speech-key.txt \
+  BOT_HOSTNAME=<vm-fqdn> MEDIA_HOSTNAME=<vm-fqdn> \
+  CERT_FRIENDLY_NAME=<env>-cert CERT_EMAIL=<email> \
+  STT_PROVIDER=AzureSpeech AZURE_SPEECH_REGION=eastus \
+  SKIP_REPO_SYNC=0 ./scripts/deploy-azure-vm.sh
 ```
 
-## Check
+Generate the manifest from `manifest/disney/manifest.json` as a template — replace the Entra app id, name, branding, then `zip -j alfred-<env>.zip manifest.json color.png outline.png`.
 
-### Public health (run from anywhere)
+## Local dev
 
 ```bash
-curl -sS -m 10 https://teamsbot.qmachina.com/api/calling/health
-# → {"status":"Healthy","timestampUtc":"...","service":"Alfred","activeCalls":0}
-
-curl -sS -m 10 https://agent.qmachina.com/health
-# → {"status":"healthy","variant_id":"alfred","product_id":"alfred"}
-
-curl -sS -m 10 -o /dev/null -w "%{http_code}\n" https://alfred.qmachina.com
-# → 200
+cd python && uv sync
+uv run python run_variant_sink.py --instance dev --port 8765 --product-spec legionmeet_platform/specs/alfred.yaml
+# UI: cd web && npm install && npm run dev
+# Tests: cd python && uv run pytest tests -v
+# C# build: cd src && dotnet restore && dotnet build --configuration Release
 ```
 
-### Service + cert state on the VM
+---
+
+## Next Steps
+
+### 1. Persistent sink storage
+
+The sink's SQLite (`/app/output/alfred/alfred.sqlite3`) lives in the container's ephemeral filesystem. Any Container App revision rollout (env var change, image bump, scale config) destroys it along with the in-memory session. Two-part fix:
+
+- **Mount Azure Files at `/app/output/`** so SQLite survives rollouts.
+  ```bash
+  STORAGE=stalfred<env><suffix>
+  SHARE=alfred-state
+  az storage account create -n $STORAGE -g rg-alfred-<env> -l eastus --sku Standard_LRS
+  az storage share-rm create --resource-group rg-alfred-<env> --storage-account $STORAGE --name $SHARE --quota 5
+  KEY=$(az storage account keys list -g rg-alfred-<env> -n $STORAGE --query "[0].value" -o tsv)
+  az containerapp env storage set -g rg-alfred-<env> -n cae-alfred-<env> --storage-name alfred-files \
+    --azure-file-account-name $STORAGE --azure-file-account-key "$KEY" --azure-file-share-name $SHARE \
+    --access-mode ReadWrite
+  # Re-create ca-alfred-api YAML with volume mount /app/output → alfred-files
+  ```
+- **Auto-resume the active session on sink startup** (small change in `python/transcript_sink.py` to query the most recent open session from SQLite and re-activate it). Without this, even with persistent SQLite the in-memory `session_manager.is_active` flag starts False after every restart.
+
+### 2. Test and retrieve a sink transcript
+
+Verifying end-to-end without a real meeting:
 
 ```bash
-az vm run-command create -g rg-alfred-poc --vm-name vm-alfred \
-  --run-command-name status --location eastus \
-  --script @- --async-execution false --timeout-in-seconds 60 <<'EOF'
-Get-Service TeamsMediaBot | Format-List Name, Status, StartType
-Get-NetTCPConnection -State Listen | Where-Object { $_.LocalPort -in @(443,8445) } | Format-Table LocalAddress, LocalPort, OwningProcess
-Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.Subject -like "*qmachina*" } | Format-List Subject, Thumbprint, NotAfter
-EOF
-az vm run-command show -g rg-alfred-poc --vm-name vm-alfred --run-command-name status --instance-view --query "instanceView.output" -o tsv
-az vm run-command delete -g rg-alfred-poc --vm-name vm-alfred --run-command-name status --yes
+SINK=https://<sink-fqdn>
+
+# Start a session
+curl -sS -X POST $SINK/session/start -H "Content-Type: application/json" \
+  -d '{"meeting_url":"https://teams.microsoft.com/test","candidate_name":"Test","instance_id":"alfred"}'
+# → returns session_id
+
+# Trigger inputs:
+#   - DM the bot in Teams (Disney M365 user → bot)  → arrives at /chat
+#   - Or POST a synthetic transcript event:
+curl -sS -X POST $SINK/transcript -H "Content-Type: application/json" \
+  -d '{"session_id":"<id>","event_type":"final","text":"hello world","speaker":"alice","timestamp_utc":"2026-04-30T17:00:00Z"}'
+
+# Watch live (SSE)
+curl -N $SINK/session/events
+
+# Snapshot the current session
+curl -sS $SINK/session/status | jq
+
+# Pull the persisted ledger / dossier / extractions
+curl -sS $SINK/sessions/<id>/ledger      | jq
+curl -sS $SINK/sessions/<id>/dossier     | jq
+curl -sS $SINK/sessions/<id>/extractions | jq
+curl -sS $SINK/sessions/<id>/tool-calls  | jq
 ```
 
-### Recent VM control-plane operations
+For full payload schemas, see `python/transcript_sink.py` and `python/meeting_agent/models.py`.
 
-```bash
-az monitor activity-log list \
-  --resource-id "/subscriptions/70464868-52ea-435d-93a6-8002e83f0b89/resourceGroups/rg-alfred-poc/providers/Microsoft.Compute/virtualMachines/vm-alfred" \
-  --start-time "$(date -u -v-1H '+%Y-%m-%dT%H:%M:%SZ')" \
-  --query "[].{time:eventTimestamp, op:operationName.localizedValue, status:status.localizedValue}" \
-  -o table
-```
+### 3. RTM media allowlist for new bot identities
 
-## Troubleshoot
+Each new bot AppId needs Microsoft to allowlist it for real-time media before `Calls.AccessMedia.Chat` actually attaches to audio. Submit at `https://aka.ms/teams-rtm-onboarding` after the bot registration is in place. Approval typically takes ~2 weeks. Until then: chat I/O works, audio capture doesn't.
 
-| Symptom | Root cause | Fix |
-|---|---|---|
-| `az vm get-instance-view` returns `vmAgent: null` | ARM instance-view cache lag (5–10 min). Agent may already be healthy. | Probe with a synchronous Run Command (`Write-Host alive`). If it returns Succeeded in <60s, agent is fine — ignore the null. |
-| `provisioningState: Updating` indefinitely (>10 min) and probe also fails | Wedged action Run Command extension left orphaned plugin state | RDP to VM (port 3389, password in `/tmp/vm-admin-pass.txt`). `Remove-Item -Recurse -Force 'C:\Packages\Plugins\Microsoft.CPlat.Core.RunCommandWindows*'`; `Remove-Item 'C:\WindowsAzure\Logs\AggregateStatus\aggregatestatus.json'`; `net stop WindowsAzureGuestAgent; net stop RdAgent; net start RdAgent; net start WindowsAzureGuestAgent`. Wait 3 min. |
-| `Conflict: Run command extension execution is in progress` on any `az vm` op | Legacy action Run Command (`invoke`) wedged the extension | Switch caller to **managed** Run Command (`az vm run-command create --run-command-name ...`). Never use `az vm run-command invoke` for anything in this repo. |
-| Bot service Running but health endpoint times out | Bot is in a crashloop. Check `C:\teams-bot-poc\logs\service-error.log`. | Most common: `DllNotFoundException: NativeMedia` — Server-Media-Foundation Windows feature or VC++ Redistributable missing. Re-run `./scripts/deploy-azure-vm.sh` (Phase 1's `Install-MediaPlatformPrereqs` installs both). |
-| `dotnet publish` succeeds but service crashes immediately | Likely missing native dep (`NativeMedia.dll` needs `mfplat.dll`, `mf.dll`, `msvcp140.dll`, `vcruntime140.dll`) | Same as above — `./scripts/deploy-azure-vm.sh` ensures all four. |
-| HTTP-01 cert request fails | Port 80 not reachable from public internet, or DNS not pointing at VM | Verify `dig +short teamsbot.qmachina.com` returns `172.190.7.169`. Verify NSG rule `AllowHTTP` priority 1000 exists. Verify `Get-NetFirewallRule -DisplayGroup "World Wide Web Services (HTTP Traffic-In)"` is enabled on the VM. |
-| nginx `/sink/` proxy returns 502 | Missing SNI when fronting Container Apps HTTPS ingress | `web/nginx.conf.template` already sets `proxy_ssl_server_name on;` and `proxy_set_header Host $proxy_host;`. If you regenerate the template, keep both. |
-| Bot doesn't auto-join meeting after invite | Azure Bot Service registration missing or Graph permissions not consented | Verify `az bot show -g rg-alfred-poc -n alfred-bot-qmachina`. Verify `az ad app permission list --id ff4b0902-5ae8-450b-bf45-7e2338292554` shows admin-consented `Calls.AccessMedia.All` + `Calls.JoinGroupCall.All`. |
+### 4. Replace deprecated multi-tenant Bot Service
 
-For the underlying-incident analysis behind each row, see the memory entries under `~/.claude/projects/-Users-logan-robbins-research-teams-bot-poc/memory/feedback_*.md` (each row's fix maps to one memory).
-
-## Configuration
-
-### Production runtime config
-
-Lives at `C:\teams-bot-poc\src\Config\appsettings.production.json` on the VM. Generated by `bootstrap-production-vm.ps1`. **Do not edit by hand** — re-run the deploy script if a value needs to change.
-
-Key knobs (all set automatically from environment files + Azure resources):
-
-| Section.Key | Source | Purpose |
-|---|---|---|
-| `Bot.AppId` / `Bot.AppSecret` / `Bot.TenantId` | `/tmp/app-secret.json` | Entra app credentials |
-| `Bot.NotificationUrl` | `https://teamsbot.qmachina.com/api/calling` | Where Teams sends incoming-call webhooks |
-| `MediaPlatformSettings.CertificateThumbprint` | Generated by Phase 5 from issued LE cert | TLS for Graph media SDK |
-| `MediaPlatformSettings.ServiceFqdn` | `media.qmachina.com` | Public FQDN for media endpoint |
-| `MediaPlatformSettings.InstancePublicIPAddress` | VM public IP `172.190.7.169` | NAT awareness for media SDK |
-| `Stt.Provider` | `AzureSpeech` (override via `STT_PROVIDER` env to deploy script) | STT backend selector |
-| `Stt.AzureSpeech.Key` / `Stt.AzureSpeech.Region` | `/tmp/speech-key.txt`, `eastus` | Azure Speech credentials |
-| `TranscriptSink.PythonEndpoint` | Auto-resolved from `ca-alfred-api` Container App FQDN + `/transcript` | Bot → sink target |
-| `JoinMode.PreferredMode` | Default `invite_and_graph_join` | See `docs/TEAMS-AUTO-INVITE-SETUP.md` for `policy_auto_invite` |
-
-### Bot HTTP endpoints
-
-```bash
-# Health
-curl https://teamsbot.qmachina.com/api/calling/health
-
-# Explicit join (Graph join after bot is invited)
-curl -X POST https://teamsbot.qmachina.com/api/calling/join \
-  -H "Content-Type: application/json" \
-  -d '{
-    "joinUrl":"<teams-meeting-join-url>",
-    "displayName":"Alfred",
-    "meetingId":"<external-meeting-id>",
-    "organizerTenantId":"2843abed-8970-461e-a260-a59dc1398dbf",
-    "botAttendeePresent":true,
-    "joinMode":"invite_and_graph_join"
-  }'
-```
-
-Response codes: `200` started, `202` deferred (policy mode), `400` `BOT_NOT_INVITED`, `403` permission/tenant issue, `502` `CALL_JOIN_FAILED_7504_OR_7505`.
-
-One-shot operator wrapper:
-
-```bash
-./scripts/join_meeting.sh "<teams-meeting-join-url>" "<candidate-name>"
-JOIN_DRY_RUN=1 ./scripts/join_meeting.sh ...   # prints the curl, doesn't send
-```
-
-## Maintenance Rule
-
-When an entry path, canonical command, deploy step, or troubleshoot fix changes, update this README in the same change set. This file is the operational source of truth.
+Microsoft deprecated multi-tenant Azure Bot Service creation in July 2025. New deploys use SingleTenant (set `MicrosoftAppTenantId` to the Entra app's home tenant). Existing multi-tenant bots still function but should migrate to SingleTenant or User-Assigned Managed Identity at next major change.
