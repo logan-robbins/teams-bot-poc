@@ -1,9 +1,8 @@
 {
   "$schema": "https://developer.microsoft.com/json-schemas/teams/v1.21/MicrosoftTeams.schema.json",
   "manifestVersion": "1.21",
-  "version": "1.0.5",
+  "version": "1.0.9",
   "id": "ff4b0902-5ae8-450b-bf45-7e2338292554",
-  "packageName": "com.qmachina.alfred",
   "developer": {
     "name": "QMachina",
     "websiteUrl": "https://qmachina.com",
@@ -15,8 +14,8 @@
     "full": "Alfred — Meeting Assistant"
   },
   "description": {
-    "short": "Passive meeting assistant: live transcription + chat I/O",
-    "full": "Alfred joins Teams meetings, captures real-time diarized audio, reads and writes the meeting chat, and surfaces live notes and summaries in an external workspace."
+    "short": "Active meeting assistant: live transcription, analysis, and chat I/O",
+    "full": "Alfred joins Teams meetings, captures real-time diarized audio, reads and writes the meeting chat in real time, and surfaces a live AI-generated dossier in an external workspace."
   },
   "icons": {
     "outline": "outline.png",
@@ -26,7 +25,7 @@
   "bots": [
     {
       "botId": "ff4b0902-5ae8-450b-bf45-7e2338292554",
-      "scopes": ["personal", "team", "groupchat"],
+      "scopes": ["personal", "team", "groupChat"],
       "supportsFiles": false,
       "isNotificationOnly": false,
       "supportsCalling": true,
@@ -39,11 +38,15 @@
     "media.qmachina.com",
     "qmachina.com"
   ],
+  "webApplicationInfo": {
+    "id": "ff4b0902-5ae8-450b-bf45-7e2338292554",
+    "resource": "api://teamsbot.qmachina.com/ff4b0902-5ae8-450b-bf45-7e2338292554"
+  },
   "configurableTabs": [
     {
       "configurationUrl": "https://teamsbot.qmachina.com/configure",
       "canUpdateConfiguration": true,
-      "scopes": ["groupchat"],
+      "scopes": ["groupChat"],
       "context": ["meetingChatTab", "meetingDetailsTab", "meetingSidePanel"]
     }
   ],
