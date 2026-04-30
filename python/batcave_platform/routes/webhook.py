@@ -6,7 +6,7 @@ from typing import Any
 
 import httpx
 
-from legionmeet_platform.routes.base import RouteDispatchResult
+from batcave_platform.routes.base import RouteDispatchResult
 
 
 class WebhookRoute:

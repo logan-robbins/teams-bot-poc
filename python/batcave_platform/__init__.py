@@ -1,10 +1,10 @@
-"""LegionMeet product-spec platform package."""
+"""Batcave product-spec platform package."""
 
-from legionmeet_platform.spec_loader import (
+from batcave_platform.spec_loader import (
     PLATFORM_NAME,
     load_product_spec,
 )
-from legionmeet_platform.spec_models import (
+from batcave_platform.spec_models import (
     AgentSpec,
     AgentTool,
     ChecklistItemSpec,

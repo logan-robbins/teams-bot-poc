@@ -24,8 +24,8 @@ APP_SECRET_FILE="${APP_SECRET_FILE:-/tmp/app-secret.json}"
 VM_ADMIN_PASS_FILE="${VM_ADMIN_PASS_FILE:-/tmp/vm-admin-pass.txt}"
 SPEECH_KEY_FILE="${SPEECH_KEY_FILE:-/tmp/speech-key.txt}"
 FASTAPI_APP_NAME="${FASTAPI_APP_NAME:-ca-alfred-api}"
-BOT_HOSTNAME="${BOT_HOSTNAME:-teamsbot.qmachina.com}"
-MEDIA_HOSTNAME="${MEDIA_HOSTNAME:-media.qmachina.com}"
+BOT_HOSTNAME="${BOT_HOSTNAME:-alfred-disney-bot.eastus.cloudapp.azure.com}"
+MEDIA_HOSTNAME="${MEDIA_HOSTNAME:-alfred-disney-bot.eastus.cloudapp.azure.com}"
 STT_PROVIDER="${STT_PROVIDER:-AzureSpeech}"
 AZURE_SPEECH_REGION="${AZURE_SPEECH_REGION:-eastus}"
 AZURE_SPEECH_LANGUAGE="${AZURE_SPEECH_LANGUAGE:-en-US}"
@@ -358,7 +358,7 @@ if [ "$MEDIA_HOSTNAME" != "$BOT_HOSTNAME" ]; then
     CERT_HOSTNAMES="$BOT_HOSTNAME,$MEDIA_HOSTNAME"
 fi
 CERT_FRIENDLY_NAME="${CERT_FRIENDLY_NAME:-alfred-bot-cert}"
-CERT_EMAIL="${CERT_EMAIL:-logan@qmachina.com}"
+CERT_EMAIL="${CERT_EMAIL:-Logan.Robbins@disney.com}"
 
 run_vm_script_file "Phase 4/5: request Let's Encrypt certificate" "alfred-request-letsencrypt-cert" 900 \
     "$SCRIPT_DIR/vm-request-letsencrypt-cert.ps1" \

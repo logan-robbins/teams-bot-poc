@@ -1,21 +1,21 @@
 {
   "$schema": "https://developer.microsoft.com/json-schemas/teams/v1.21/MicrosoftTeams.schema.json",
   "manifestVersion": "1.21",
-  "version": "1.0.9",
-  "id": "ff4b0902-5ae8-450b-bf45-7e2338292554",
+  "version": "1.0.6",
+  "id": "207a38a4-67c5-4ef9-ada8-ea7998734d59",
   "developer": {
-    "name": "QMachina",
-    "websiteUrl": "https://qmachina.com",
-    "privacyUrl": "https://qmachina.com/privacy",
-    "termsOfUseUrl": "https://qmachina.com/terms"
+    "name": "The Walt Disney Company",
+    "websiteUrl": "https://www.disney.com",
+    "privacyUrl": "https://privacy.thewaltdisneycompany.com",
+    "termsOfUseUrl": "https://disneytermsofuse.com"
   },
   "name": {
-    "short": "Alfred",
-    "full": "Alfred — Meeting Assistant"
+    "short": "Alfred Sandbox",
+    "full": "Alfred Sandbox — Meeting Assistant (Disney)"
   },
   "description": {
-    "short": "Active meeting assistant: live transcription, analysis, and chat I/O",
-    "full": "Alfred joins Teams meetings, captures real-time diarized audio, reads and writes the meeting chat in real time, and surfaces a live AI-generated dossier in an external workspace."
+    "short": "Internal sandbox build of the Alfred meeting assistant",
+    "full": "Internal sandbox build of the Alfred meeting assistant. Joins Teams meetings, captures real-time diarized audio, reads and writes meeting chat, and surfaces live notes and summaries in an external workspace. All access is granted per-chat at install time via resource-specific consent (RSC); no tenant-wide Microsoft Graph permissions are required."
   },
   "icons": {
     "outline": "outline.png",
@@ -24,7 +24,7 @@
   "accentColor": "#FFFFFF",
   "bots": [
     {
-      "botId": "ff4b0902-5ae8-450b-bf45-7e2338292554",
+      "botId": "207a38a4-67c5-4ef9-ada8-ea7998734d59",
       "scopes": ["personal", "team", "groupChat"],
       "supportsFiles": false,
       "isNotificationOnly": false,
@@ -34,22 +34,14 @@
   ],
   "permissions": ["identity", "messageTeamMembers"],
   "validDomains": [
-    "teamsbot.qmachina.com",
-    "media.qmachina.com",
-    "qmachina.com"
+    "alfred-disney-bot.eastus.cloudapp.azure.com",
+    "ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io",
+    "ca-alfred-web.gentlewater-5aa74a73.eastus.azurecontainerapps.io"
   ],
   "webApplicationInfo": {
-    "id": "ff4b0902-5ae8-450b-bf45-7e2338292554",
-    "resource": "api://teamsbot.qmachina.com/ff4b0902-5ae8-450b-bf45-7e2338292554"
+    "id": "207a38a4-67c5-4ef9-ada8-ea7998734d59",
+    "resource": "api://botid-207a38a4-67c5-4ef9-ada8-ea7998734d59"
   },
-  "configurableTabs": [
-    {
-      "configurationUrl": "https://teamsbot.qmachina.com/configure",
-      "canUpdateConfiguration": true,
-      "scopes": ["groupChat"],
-      "context": ["meetingChatTab", "meetingDetailsTab", "meetingSidePanel"]
-    }
-  ],
   "authorization": {
     "permissions": {
       "resourceSpecific": [

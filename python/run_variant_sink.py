@@ -14,7 +14,7 @@ import uvicorn
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run a LegionMeet transcript sink instance for a specific product spec.",
+        description="Run a Batcave transcript sink instance for a specific product spec.",
     )
     parser.add_argument(
         "--variant",
@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--product-spec",
         required=True,
-        help="Required path to product spec (JSON or YAML), e.g. ./legionmeet_platform/specs/alfred.yaml.",
+        help="Required path to product spec (JSON or YAML), e.g. ./batcave_platform/specs/alfred.yaml.",
     )
     parser.add_argument("--log-level", default="info", help="Uvicorn log level.")
     return parser.parse_args()
@@ -64,7 +64,7 @@ def main() -> None:
     from transcript_sink import VARIANT, app  # Import after env config
 
     print(
-        f"Starting LegionMeet sink variant={VARIANT.variant_id} instance={args.instance} "
+        f"Starting Batcave sink variant={VARIANT.variant_id} instance={args.instance} "
         f"bind=http://{args.host}:{args.port} output_dir={output_dir} "
         f"product_spec={os.environ['PRODUCT_SPEC_PATH']}"
     )

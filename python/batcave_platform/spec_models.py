@@ -1,4 +1,4 @@
-"""Product specification models for LegionMeet modality parameterization."""
+"""Product specification models for Batcave modality parameterization."""
 
 from __future__ import annotations
 

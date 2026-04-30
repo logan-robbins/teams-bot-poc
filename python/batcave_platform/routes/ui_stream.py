@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from legionmeet_platform.routes.base import RouteDispatchResult
+from batcave_platform.routes.base import RouteDispatchResult
 
 
 class UiStreamRoute:

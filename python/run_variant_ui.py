@@ -13,7 +13,7 @@ from pathlib import Path
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run a LegionMeet Streamlit UI instance for a specific product spec.",
+        description="Run a Batcave Streamlit UI instance for a specific product spec.",
     )
     parser.add_argument(
         "--variant",
@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--product-spec",
         required=True,
-        help="Required path to product spec (JSON or YAML), e.g. ./legionmeet_platform/specs/alfred.yaml.",
+        help="Required path to product spec (JSON or YAML), e.g. ./batcave_platform/specs/alfred.yaml.",
     )
     parser.add_argument("--host", default="0.0.0.0", help="Streamlit bind host.")
     return parser.parse_args()
@@ -66,7 +66,7 @@ def main() -> None:
         args.host,
     ]
     print(
-        f"Starting LegionMeet UI variant={args.variant} instance={args.instance} "
+        f"Starting Batcave UI variant={args.variant} instance={args.instance} "
         f"bind=http://{args.host}:{args.port} sink={args.sink_url} output_dir={output_dir} "
         f"product_spec={env['PRODUCT_SPEC_PATH']}"
     )

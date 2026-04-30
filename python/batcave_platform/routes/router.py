@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from legionmeet_platform.routes.base import OutputRoute, RouteDispatchResult
-from legionmeet_platform.routes.ui_stream import UiStreamRoute
-from legionmeet_platform.routes.webhook import WebhookRoute
-from legionmeet_platform.spec_models import OutputRouteType, ProductSpec
+from batcave_platform.routes.base import OutputRoute, RouteDispatchResult
+from batcave_platform.routes.ui_stream import UiStreamRoute
+from batcave_platform.routes.webhook import WebhookRoute
+from batcave_platform.spec_models import OutputRouteType, ProductSpec
 
 
 class RouteOrchestrator:

@@ -7,14 +7,14 @@ from pathlib import Path
 
 import pytest
 
-from legionmeet_platform import load_product_spec
-from legionmeet_platform.routes import build_route_orchestrator
-from legionmeet_platform.spec_models import ProductSpec
+from batcave_platform import load_product_spec
+from batcave_platform.routes import build_route_orchestrator
+from batcave_platform.spec_models import ProductSpec
 
 
 ALFRED_SPEC = (
     Path(__file__).resolve().parent.parent
-    / "legionmeet_platform"
+    / "batcave_platform"
     / "specs"
     / "alfred.yaml"
 ).resolve()

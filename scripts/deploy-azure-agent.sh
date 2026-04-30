@@ -9,7 +9,7 @@ set -e
 
 echo "========================================"
 echo "Teams Media Bot - Azure Agent Deployment"
-echo "Target: agent.qmachina.com"
+echo "Target: agent.${DOMAIN:-<custom-domain-not-set>}"
 echo "========================================"
 echo ""
 
@@ -23,7 +23,7 @@ FASTAPI_APP_NAME="ca-alfred-api"
 WEB_APP_NAME="ca-alfred-web"
 ACR_NAME="acralfredpoc70464868"
 ACR_LOGIN_SERVER="${ACR_NAME}.azurecr.io"
-DOMAIN="qmachina.com"
+DOMAIN="${DOMAIN:-example.com}"  # Disney env uses *.azurecontainerapps.io directly; only set if you actually have a custom domain.
 SUBDOMAIN="agent"
 FQDN="${SUBDOMAIN}.${DOMAIN}"
 
@@ -36,7 +36,7 @@ WEB_MEMORY="0.5Gi"
 # ALFRED runtime env. Required by transcript_sink.load_runtime_config().
 ALFRED_VARIANT_ID="alfred"
 ALFRED_INSTANCE_ID="alfred"
-ALFRED_PRODUCT_SPEC_PATH="/app/legionmeet_platform/specs/alfred.yaml"
+ALFRED_PRODUCT_SPEC_PATH="/app/batcave_platform/specs/alfred.yaml"
 
 # Optional: URL of the C# bot's /api/send-chat endpoint. Set to enable the
 # send_to_meeting_chat agent tool. Leave empty for dry-run mode (sink logs

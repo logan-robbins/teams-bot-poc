@@ -1,4 +1,4 @@
-# Dockerfile for LegionMeet FastAPI Transcript Sink
+# Dockerfile for Batcave FastAPI Transcript Sink
 # Default target: FastAPI service (transcript_sink.py)
 #
 # Build:  docker build -t talestral-api .
@@ -25,7 +25,7 @@ COPY . .
 # overridden at deploy time.
 ENV VARIANT_ID=alfred \
     INSTANCE_ID=alfred \
-    PRODUCT_SPEC_PATH=/app/legionmeet_platform/specs/alfred.yaml \
+    PRODUCT_SPEC_PATH=/app/batcave_platform/specs/alfred.yaml \
     SINK_HOST=0.0.0.0 \
     SINK_PORT=8765
 

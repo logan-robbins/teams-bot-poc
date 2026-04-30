@@ -1,5 +1,5 @@
 """
-LegionMeet Transcript Service v2
+Batcave Transcript Service v2
 
 Receives real-time transcript events from the C# bot with speaker diarization,
 manages interview sessions, and integrates with the interview analysis agent.
@@ -13,7 +13,7 @@ Endpoints:
     GET  /health           - Health check
     GET  /stats            - Statistics
 
-Target deployment: https://agent.qmachina.com (behind TLS proxy)
+Target deployment: https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io (behind TLS proxy)
 Internal binding: configured by SINK_HOST/SINK_PORT (default 0.0.0.0:8765)
 """
 
@@ -53,12 +53,12 @@ from meeting_agent.output import AnalysisOutputWriter
 from meeting_agent.persistence import SessionStore, build_store
 from meeting_agent.session import InterviewSessionManager
 from meeting_agent.checklist_state import ChecklistDefinition, ChecklistStateManager
-from legionmeet_platform import (
+from batcave_platform import (
     AgentTool,
     PLATFORM_NAME,
     load_product_spec,
 )
-from legionmeet_platform.routes import RouteOrchestrator, build_route_orchestrator
+from batcave_platform.routes import RouteOrchestrator, build_route_orchestrator
 from variants import VariantPlugin, load_variant
 
 # =============================================================================
@@ -175,7 +175,7 @@ TRANSCRIPT_FILE = RUNTIME_CONFIG.transcript_file
 CORS_ORIGINS: list[str] = [
     "http://localhost:8501",  # Streamlit default
     "http://localhost:3000",  # Common React dev port
-    "https://agent.qmachina.com",
+    "https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io",
 ]
 
 # =============================================================================
@@ -1017,7 +1017,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[dict[str, Any]]:
     Yields:
         Dictionary of application state to be attached to requests.
     """
-    logger.info("Starting LegionMeet Transcript Service v2")
+    logger.info("Starting Batcave Transcript Service v2")
     logger.info(
         "Runtime: platform=%s product=%s variant=%s instance=%s host=%s port=%d",
         PLATFORM_NAME,
@@ -1117,9 +1117,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[dict[str, Any]]:
 
 
 app = FastAPI(
-    title=f"LegionMeet Transcript Service ({PRODUCT_SPEC.product_id})",
+    title=f"Batcave Transcript Service ({PRODUCT_SPEC.product_id})",
     version="2.0.0",
-    description="Receives diarized transcripts and integrates with LegionMeet modality analysis pipelines",
+    description="Receives diarized transcripts and integrates with Batcave modality analysis pipelines",
     lifespan=lifespan,
 )
 
@@ -1829,7 +1829,7 @@ async def health(state: AppStateDep) -> HealthResponse:
 
     return HealthResponse(
         status="healthy",
-        service="LegionMeet Transcript Service",
+        service="Batcave Transcript Service",
         version="2.0.0",
         timestamp=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         agent_available=AGENT_AVAILABLE,
@@ -2008,7 +2008,7 @@ async def get_session_tool_calls(
 
 if __name__ == "__main__":
     logger.info("=" * 60)
-    logger.info("LegionMeet Transcript Service v2")
+    logger.info("Batcave Transcript Service v2")
     logger.info("=" * 60)
     logger.info(
         "Binding to: http://%s:%d",

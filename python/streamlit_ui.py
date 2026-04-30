@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Alfred — note-taking UI for the LegionMeet sink.
+Alfred — note-taking UI for the Batcave sink.
 
 Two-column workspace:
   - Left 60%: unified meeting timeline (speech + chat + Alfred sends), ordered
@@ -13,7 +13,7 @@ Polls /session/status every 0.5s; /session/analysis on a slower cadence.
 Compose box posts into the meeting chat on behalf of a human user.
 
 Usage:
-    VARIANT_ID=alfred PRODUCT_SPEC_PATH=legionmeet_platform/specs/alfred.yaml \\
+    VARIANT_ID=alfred PRODUCT_SPEC_PATH=batcave_platform/specs/alfred.yaml \\
         streamlit run streamlit_ui.py
 """
 
@@ -30,7 +30,7 @@ from typing import Any, Final
 import httpx
 import streamlit as st
 
-from legionmeet_platform import load_product_spec
+from batcave_platform import load_product_spec
 
 logger: logging.Logger = logging.getLogger(__name__)
 

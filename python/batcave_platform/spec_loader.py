@@ -1,4 +1,4 @@
-"""Load and validate LegionMeet product specs (JSON or YAML)."""
+"""Load and validate Batcave product specs (JSON or YAML)."""
 
 from __future__ import annotations
 
@@ -8,10 +8,10 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from legionmeet_platform.spec_models import ProductSpec
+from batcave_platform.spec_models import ProductSpec
 
 
-PLATFORM_NAME = "LegionMeet"
+PLATFORM_NAME = "Batcave"
 
 
 def resolve_spec_path(spec_path: str | None = None) -> Path:

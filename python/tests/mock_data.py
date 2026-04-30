@@ -1,5 +1,5 @@
 """
-Mock data generators for LegionMeet testing.
+Mock data generators for Batcave testing.
 
 Generates realistic TranscriptEvent objects matching v2 format with diarization,
 simulating real interview conversations between interviewer and candidate.

@@ -26,7 +26,7 @@ from tests.mock_data import (
 
 TEST_PRODUCT_SPEC_PATH = (
     Path(__file__).resolve().parent.parent
-    / "legionmeet_platform"
+    / "batcave_platform"
     / "specs"
     / "alfred.yaml"
 )
@@ -111,7 +111,7 @@ class TestHealthEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "healthy"
-        assert data["service"] == "LegionMeet Transcript Service"
+        assert data["service"] == "Batcave Transcript Service"
         assert data["version"] == "2.0.0"
         assert "product_id" in data
         assert "timestamp" in data

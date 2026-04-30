@@ -8,8 +8,8 @@ Usage:
 
 Defaults:
   display-name: Alfred
-  bot-endpoint: https://teamsbot.qmachina.com
-  sink-endpoint: https://agent.qmachina.com
+  bot-endpoint: https://alfred-disney-bot.eastus.cloudapp.azure.com
+  sink-endpoint: https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io
 EOF
   exit 1
 fi
@@ -17,8 +17,8 @@ fi
 MEETING_URL="$1"
 CANDIDATE_NAME="$2"
 DISPLAY_NAME="${3:-Alfred}"
-BOT_ENDPOINT="${4:-https://teamsbot.qmachina.com}"
-SINK_ENDPOINT="${5:-https://agent.qmachina.com}"
+BOT_ENDPOINT="${4:-https://alfred-disney-bot.eastus.cloudapp.azure.com}"
+SINK_ENDPOINT="${5:-https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io}"
 EXTRA_ARGS=()
 
 if [[ "${JOIN_DRY_RUN:-0}" == "1" ]]; then

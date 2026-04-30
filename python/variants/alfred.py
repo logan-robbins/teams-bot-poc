@@ -9,7 +9,7 @@ Outbound chat messages are side effects produced by the
 ``send_to_meeting_chat`` tool — silence is simply "did not call the tool".
 
 The persona, prompt, and decision rules are driven by the product spec
-(see legionmeet_platform/specs/alfred.yaml), not hardcoded here.
+(see batcave_platform/specs/alfred.yaml), not hardcoded here.
 """
 
 from __future__ import annotations
