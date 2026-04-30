@@ -3,8 +3,8 @@ param(
     [string]$ConfigPath = "C:\teams-bot-poc\src\Config\appsettings.production.json",
     [string]$RunAsUser = "azureuser",
     [string]$RunAsPassword,
-    [string]$CertSubjectHosts = "teamsbot.qmachina.com,media.qmachina.com",
-    [string]$CertFriendlyNamePattern = "qmachina-teamsbot-media*,alfred-bot-cert*"
+    [string]$CertSubjectHosts = "alfred-disney-bot.eastus.cloudapp.azure.com",
+    [string]$CertFriendlyNamePattern = "alfred-disney-cert*,alfred-bot-cert*"
 )
 
 $ErrorActionPreference = "Stop"
@@ -36,6 +36,29 @@ if (-not $cert) {
 }
 
 $config.MediaPlatformSettings.CertificateThumbprint = $cert.Thumbprint
+
+# Persist a stable FriendlyName prefix so the bot can re-resolve the cert
+# automatically after auto-renewal (LoadCertificateFromStore fallback).
+$friendlyPrefix = $null
+foreach ($pattern in $friendlyPatterns) {
+    $bare = $pattern.TrimEnd('*').Trim()
+    if (-not [string]::IsNullOrWhiteSpace($bare) -and $cert.FriendlyName -like ($bare + '*')) {
+        $friendlyPrefix = $bare
+        break
+    }
+}
+if (-not $friendlyPrefix -and -not [string]::IsNullOrWhiteSpace($cert.FriendlyName)) {
+    $friendlyPrefix = ($cert.FriendlyName -split ' @ ')[0].Trim()
+}
+if ($friendlyPrefix) {
+    if ($config.MediaPlatformSettings.PSObject.Properties.Name -contains 'CertificateFriendlyName') {
+        $config.MediaPlatformSettings.CertificateFriendlyName = $friendlyPrefix
+    }
+    else {
+        $config.MediaPlatformSettings | Add-Member -NotePropertyName CertificateFriendlyName -NotePropertyValue $friendlyPrefix
+    }
+}
+
 $config | ConvertTo-Json -Depth 8 | Set-Content -Path $ConfigPath -Encoding UTF8
 
 $publishDir = Join-Path $ProjectRoot "src\bin\Release\net8.0\publish"

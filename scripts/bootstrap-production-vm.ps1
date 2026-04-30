@@ -290,18 +290,35 @@ function Write-ProductionConfig {
 
     $providerName = if ([string]::IsNullOrWhiteSpace($Provider)) { "Deepgram" } else { $Provider.Trim() }
     $preferredJoinMode = if ($PolicyAutoInviteEnabled) { "policy_auto_invite" } else { "invite_and_graph_join" }
+
+    # Cert thumbprint resolution order:
+    #   1. caller-passed -CertThumbprint
+    #   2. live cert in LocalMachine\My matching CN=$BotServiceFqdn or
+    #      FriendlyName starts with "alfred-disney-cert" / "alfred-bot-cert"
+    #   3. placeholder (the bot resolves the live cert by Subject/FriendlyName
+    #      at runtime, so the placeholder is also tolerated)
     $effectiveCertThumbprint = $CertThumbprint
-    if ([string]::IsNullOrWhiteSpace($effectiveCertThumbprint) -and (Test-Path $Path)) {
+    $effectiveFriendlyPrefix = "alfred-disney-cert"
+    if ([string]::IsNullOrWhiteSpace($effectiveCertThumbprint)) {
         try {
-            $existingConfig = Get-Content -Path $Path -Raw | ConvertFrom-Json
-            $existingThumbprint = $existingConfig.MediaPlatformSettings.CertificateThumbprint
-            if (-not [string]::IsNullOrWhiteSpace($existingThumbprint) -and $existingThumbprint -ne "CHANGE_AFTER_CERT_INSTALL") {
-                $effectiveCertThumbprint = $existingThumbprint
-                Write-Host "Reusing existing certificate thumbprint from production config." -ForegroundColor Yellow
+            $liveCert = Get-ChildItem Cert:\LocalMachine\My -ErrorAction SilentlyContinue |
+                Where-Object {
+                    $_.Subject -match ("CN=" + [regex]::Escape($BotServiceFqdn)) -or
+                    $_.FriendlyName -like "alfred-disney-cert*" -or
+                    $_.FriendlyName -like "alfred-bot-cert*"
+                } |
+                Sort-Object NotAfter -Descending |
+                Select-Object -First 1
+            if ($liveCert) {
+                $effectiveCertThumbprint = $liveCert.Thumbprint
+                if (-not [string]::IsNullOrWhiteSpace($liveCert.FriendlyName)) {
+                    $effectiveFriendlyPrefix = ($liveCert.FriendlyName -split ' @ ')[0].Trim()
+                }
+                Write-Host ("Resolved live cert from store (Thumbprint=" + $liveCert.Thumbprint + ", FriendlyName='" + $liveCert.FriendlyName + "').") -ForegroundColor Yellow
             }
         }
         catch {
-            Write-Warning "Could not read existing certificate thumbprint from '$Path': $($_.Exception.Message)"
+            Write-Warning "Could not enumerate LocalMachine\My cert store: $($_.Exception.Message)"
         }
     }
     if ([string]::IsNullOrWhiteSpace($effectiveCertThumbprint)) {
@@ -336,6 +353,7 @@ function Write-ProductionConfig {
         MediaPlatformSettings = @{
             ApplicationId = $BotAppId
             CertificateThumbprint = $effectiveCertThumbprint
+            CertificateFriendlyName = $effectiveFriendlyPrefix
             InstanceInternalPort = $PublicMediaPort
             InstancePublicPort = $PublicMediaPort
             ServiceFqdn = $BotServiceFqdn

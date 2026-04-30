@@ -56,8 +56,21 @@ public sealed class MediaPlatformConfiguration
     /// <summary>
     /// Gets or sets the thumbprint of the TLS certificate in the LocalMachine store.
     /// </summary>
+    /// <remarks>
+    /// May be empty or a placeholder value such as "CHANGE_AFTER_CERT_INSTALL".
+    /// When the thumbprint cannot be resolved against the cert store, the bot
+    /// falls back to matching by Subject CN against <see cref="ServiceFqdn"/>
+    /// and then by <see cref="CertificateFriendlyName"/> (latest NotAfter wins).
+    /// This makes the bot tolerant to cert auto-renewals.
+    /// </remarks>
     public required string CertificateThumbprint { get; init; }
-    
+
+    /// <summary>
+    /// Optional FriendlyName prefix used to resolve the TLS certificate when
+    /// the thumbprint cannot be found in the cert store (e.g. after renewal).
+    /// </summary>
+    public string? CertificateFriendlyName { get; init; }
+
     /// <summary>
     /// Gets or sets the internal port for media traffic (typically 8445).
     /// </summary>

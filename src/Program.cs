@@ -47,7 +47,7 @@ try
 
     // Load and validate configuration sections
     var botConfig = LoadRequiredConfiguration<BotConfiguration>(builder.Configuration, "Bot");
-    var mediaConfig = LoadRequiredConfiguration<MediaPlatformConfiguration>(builder.Configuration, "MediaPlatformSettings");
+    var mediaConfigRaw = LoadRequiredConfiguration<MediaPlatformConfiguration>(builder.Configuration, "MediaPlatformSettings");
     var sttConfig = LoadSttConfiguration(builder.Configuration);
     var transcriptSinkConfig = LoadRequiredConfiguration<TranscriptSinkConfiguration>(builder.Configuration, "TranscriptSink");
     ValidateTranscriptSinkConfiguration(transcriptSinkConfig);
@@ -56,8 +56,26 @@ try
     var meetingChatConfig = builder.Configuration.GetSection("MeetingChat").Get<MeetingChatConfiguration>()
         ?? new MeetingChatConfiguration();
 
+    // Resolve the TLS cert ONCE at startup. Falls back to Subject-CN/FriendlyName
+    // matching when the configured thumbprint is missing/stale (e.g. after auto
+    // cert renewal). Downstream consumers see the actual resolved thumbprint.
+    var resolvedCert = ResolveCertificate(mediaConfigRaw);
+    Log.Information(
+        "Resolved TLS certificate: Subject={Subject}, Thumbprint={Thumbprint}, NotAfter={NotAfter}",
+        resolvedCert.Subject, resolvedCert.Thumbprint, resolvedCert.NotAfter);
+    var mediaConfig = new MediaPlatformConfiguration
+    {
+        ApplicationId = mediaConfigRaw.ApplicationId,
+        CertificateThumbprint = resolvedCert.Thumbprint,
+        CertificateFriendlyName = mediaConfigRaw.CertificateFriendlyName,
+        InstanceInternalPort = mediaConfigRaw.InstanceInternalPort,
+        InstancePublicPort = mediaConfigRaw.InstancePublicPort,
+        ServiceFqdn = mediaConfigRaw.ServiceFqdn,
+        InstancePublicIPAddress = mediaConfigRaw.InstancePublicIPAddress,
+    };
+
     // Configure Kestrel to listen on the specified URL with TLS if configured
-    ConfigureKestrel(builder, botConfig, mediaConfig);
+    ConfigureKestrel(builder, botConfig, resolvedCert);
 
     // Register configuration as singletons
     builder.Services.AddSingleton(botConfig);
@@ -359,16 +377,15 @@ static SttConfiguration LoadSttConfiguration(IConfiguration configuration)
 }
 
 /// <summary>
-/// Configures Kestrel to listen on the specified URL with optional TLS.
+/// Configures Kestrel to listen on the specified URL, using a pre-resolved cert for TLS.
 /// </summary>
 static void ConfigureKestrel(
-    WebApplicationBuilder builder, 
-    BotConfiguration botConfig, 
-    MediaPlatformConfiguration mediaConfig)
+    WebApplicationBuilder builder,
+    BotConfiguration botConfig,
+    X509Certificate2 tlsCert)
 {
     var listenUri = new Uri(botConfig.LocalHttpListenUrl);
-    
-    // Validate HTTP/HTTPS port configuration
+
     if (string.Equals(listenUri.Scheme, "http", StringComparison.OrdinalIgnoreCase) && listenUri.Port == 443)
     {
         throw new InvalidOperationException(
@@ -381,45 +398,77 @@ static void ConfigureKestrel(
         {
             if (string.Equals(listenUri.Scheme, "https", StringComparison.OrdinalIgnoreCase))
             {
-                var cert = LoadCertificateFromStore(mediaConfig.CertificateThumbprint);
-                listenOptions.UseHttps(cert);
+                listenOptions.UseHttps(tlsCert);
             }
         });
     });
 }
 
 /// <summary>
-/// Loads an X509 certificate from the LocalMachine certificate store by thumbprint.
+/// Resolves the TLS certificate from LocalMachine/My, tolerant to cert auto-renewal.
+/// Resolution order: configured thumbprint → Subject CN matches ServiceFqdn →
+/// FriendlyName starts with the configured prefix. Latest NotAfter wins on
+/// fallback. Throws if no match.
 /// </summary>
-static X509Certificate2 LoadCertificateFromStore(string thumbprint)
+static X509Certificate2 ResolveCertificate(MediaPlatformConfiguration mediaConfig)
 {
-    ArgumentException.ThrowIfNullOrWhiteSpace(thumbprint);
-    
-    if (string.Equals(thumbprint, "CHANGE_AFTER_CERT_INSTALL", StringComparison.OrdinalIgnoreCase))
-    {
-        throw new InvalidOperationException(
-            "CertificateThumbprint is not set. Update Config/appsettings.json with the actual certificate thumbprint.");
-    }
+    ArgumentNullException.ThrowIfNull(mediaConfig);
 
-    var normalizedThumbprint = thumbprint
-        .Replace(" ", string.Empty, StringComparison.Ordinal)
-        .ToUpperInvariant();
-    
     using var store = new X509Store(StoreName.My, StoreLocation.LocalMachine);
     store.Open(OpenFlags.ReadOnly);
 
-    var certificates = store.Certificates.Find(
-        X509FindType.FindByThumbprint,
-        normalizedThumbprint,
-        validOnly: false);
+    var thumbprint = mediaConfig.CertificateThumbprint;
+    var hasUsableThumbprint = !string.IsNullOrWhiteSpace(thumbprint)
+        && !string.Equals(thumbprint, "CHANGE_AFTER_CERT_INSTALL", StringComparison.OrdinalIgnoreCase);
 
-    if (certificates.Count == 0)
+    if (hasUsableThumbprint)
     {
-        throw new InvalidOperationException(
-            $"Certificate with thumbprint '{normalizedThumbprint}' not found in LocalMachine/My store.");
+        var normalized = thumbprint
+            .Replace(" ", string.Empty, StringComparison.Ordinal)
+            .ToUpperInvariant();
+        var byThumb = store.Certificates.Find(X509FindType.FindByThumbprint, normalized, validOnly: false);
+        if (byThumb.Count > 0)
+        {
+            return byThumb[0];
+        }
     }
 
-    return certificates[0];
+    var fqdn = mediaConfig.ServiceFqdn;
+    var friendlyPrefix = mediaConfig.CertificateFriendlyName;
+
+    var candidates = store.Certificates.Cast<X509Certificate2>().ToList();
+
+    if (!string.IsNullOrWhiteSpace(fqdn))
+    {
+        var bySubject = candidates
+            .Where(c =>
+                c.Subject.Contains($"CN={fqdn}", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(c.GetNameInfo(X509NameType.DnsName, false), fqdn, StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(c => c.NotAfter)
+            .ToList();
+        if (bySubject.Count > 0)
+        {
+            return bySubject[0];
+        }
+    }
+
+    if (!string.IsNullOrWhiteSpace(friendlyPrefix))
+    {
+        var byFriendly = candidates
+            .Where(c => !string.IsNullOrWhiteSpace(c.FriendlyName) &&
+                        c.FriendlyName.StartsWith(friendlyPrefix, StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(c => c.NotAfter)
+            .ToList();
+        if (byFriendly.Count > 0)
+        {
+            return byFriendly[0];
+        }
+    }
+
+    throw new InvalidOperationException(
+        $"Could not resolve a TLS certificate from LocalMachine/My. " +
+        $"Tried Thumbprint='{thumbprint}', ServiceFqdn='{fqdn}', FriendlyNamePrefix='{friendlyPrefix}'. " +
+        $"Install a certificate with CN={fqdn} or set MediaPlatformSettings.CertificateThumbprint/CertificateFriendlyName.");
 }
 
 /// <summary>

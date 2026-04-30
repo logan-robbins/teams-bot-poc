@@ -1,8 +1,8 @@
 param(
     [string]$RunAsUser = "azureuser",
-    [string]$Hostnames = "teamsbot.qmachina.com,media.qmachina.com",
-    [string]$EmailAddress = "logan@qmachina.com",
-    [string]$FriendlyName = "alfred-bot-cert"
+    [string]$Hostnames = "alfred-disney-bot.eastus.cloudapp.azure.com",
+    [string]$EmailAddress = "Logan.Robbins@disney.com",
+    [string]$FriendlyName = "alfred-disney-cert"
 )
 
 $ErrorActionPreference = "Stop"

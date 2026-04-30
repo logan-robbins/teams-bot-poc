@@ -2,7 +2,9 @@ param(
     [string]$ProjectRoot = "C:\teams-bot-poc",
     [string]$ConfigPath = "C:\teams-bot-poc\src\Config\appsettings.production.json",
     [string]$RunAsUser = "azureuser",
-    [string]$RunAsPassword
+    [string]$RunAsPassword,
+    [string]$CertSubjectHosts = "alfred-disney-bot.eastus.cloudapp.azure.com",
+    [string]$CertFriendlyNamePattern = "alfred-disney-cert*,alfred-bot-cert*"
 )
 
 $ErrorActionPreference = "Stop"
@@ -17,19 +19,44 @@ if (-not (Test-Path $ConfigPath)) {
 
 $config = Get-Content -Path $ConfigPath -Raw | ConvertFrom-Json
 
+$subjectPatterns = @($CertSubjectHosts -split "," | ForEach-Object { "CN=" + [regex]::Escape($_.Trim()) } | Where-Object { $_ -ne "CN=" })
+$friendlyPatterns = @($CertFriendlyNamePattern -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+
 $cert = Get-ChildItem Cert:\LocalMachine\My |
     Where-Object {
-        $_.Subject -match "CN=teamsbot\.qmachina\.com" -or
-        $_.FriendlyName -like "qmachina-teamsbot-media*"
+        $candidate = $_
+        ($subjectPatterns | Where-Object { $candidate.Subject -match $_ }).Count -gt 0 -or
+        ($friendlyPatterns | Where-Object { $candidate.FriendlyName -like $_ }).Count -gt 0
     } |
     Sort-Object NotAfter -Descending |
     Select-Object -First 1
 
 if (-not $cert) {
-    throw "No bot certificate found in Cert:\LocalMachine\My."
+    throw "No bot certificate found in Cert:\LocalMachine\My (looked for Subject in [$CertSubjectHosts], FriendlyName in [$CertFriendlyNamePattern])."
 }
 
 $config.MediaPlatformSettings.CertificateThumbprint = $cert.Thumbprint
+
+$friendlyPrefix = $null
+foreach ($pattern in $friendlyPatterns) {
+    $bare = $pattern.TrimEnd('*').Trim()
+    if (-not [string]::IsNullOrWhiteSpace($bare) -and $cert.FriendlyName -like ($bare + '*')) {
+        $friendlyPrefix = $bare
+        break
+    }
+}
+if (-not $friendlyPrefix -and -not [string]::IsNullOrWhiteSpace($cert.FriendlyName)) {
+    $friendlyPrefix = ($cert.FriendlyName -split ' @ ')[0].Trim()
+}
+if ($friendlyPrefix) {
+    if ($config.MediaPlatformSettings.PSObject.Properties.Name -contains 'CertificateFriendlyName') {
+        $config.MediaPlatformSettings.CertificateFriendlyName = $friendlyPrefix
+    }
+    else {
+        $config.MediaPlatformSettings | Add-Member -NotePropertyName CertificateFriendlyName -NotePropertyValue $friendlyPrefix
+    }
+}
+
 $config | ConvertTo-Json -Depth 8 | Set-Content -Path $ConfigPath -Encoding UTF8
 
 $publishDir = Join-Path $ProjectRoot "src\bin\Release\net8.0\publish"
