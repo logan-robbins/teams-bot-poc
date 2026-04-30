@@ -176,6 +176,12 @@ curl -sS -m 10 -o /dev/null -w "%{http_code}\n" https://ca-alfred-web.gentlewate
 # Sink stats
 curl -sS https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io/stats | jq
 
+# Verify the Teams channel calling webhook points at the VM. Calling MUST
+# terminate at the C# bot host — Container Apps cannot host /api/calling
+# (no Real-Time Media SDK on Linux).
+az bot msteams show -g rg-alfred-disney -n bot-alfred-disney \
+  --query "properties.properties.{callingWebhook:callingWebhook, enableCalling:enableCalling}" -o json
+
 # UI-to-sink proxy. This must return the same active session state as the
 # direct sink; if it 404s, redeploy the web container with web/nginx.conf.template.
 curl -sS https://ca-alfred-web.gentlewater-5aa74a73.eastus.azurecontainerapps.io/sink/session/status | jq
@@ -303,7 +309,8 @@ gh api repos/logan-robbins/alfred-teams-bot/keys \
 4. Agent contract = `AlfredExtraction` (structured output) + `send_to_meeting_chat` (sole action). **Do not** reintroduce a `SEND/ASK/SILENT` enum.
 5. UI is read-only with respect to the meeting. Only Alfred speaks into the meeting chat, and only through the tool.
 6. All persistent writes go through `meeting_agent.persistence.SessionStore` so live UI and post-meeting replay read the same truth.
-7. Treat this README and `python/batcave_platform/specs/alfred.yaml` as system documents.
+7. The bot self-resolves its TLS cert at startup (thumbprint → Subject CN match on `MediaPlatformSettings.ServiceFqdn` → `CertificateFriendlyName` prefix). Do not re-introduce hard-coded thumbprint dependencies elsewhere — cert auto-renewal must remain transparent.
+8. Treat this README and `python/batcave_platform/specs/alfred.yaml` as system documents.
 
 ---
 
