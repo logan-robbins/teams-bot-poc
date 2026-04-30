@@ -14,16 +14,18 @@ This is the only README. Read it end-to-end before touching code.
 When the Alfred app is installed into a Teams meeting / chat, Teams
 prompts the installer to grant **five chat-scoped, resource-specific
 consent (RSC) permissions**. They are scoped to the single chat the app
-is added to — Alfred has no tenant-wide Graph access. Each is
-load-bearing; remove any one and the corresponding capability fails.
+is added to — Alfred has no tenant-wide Graph access. The live POC uses
+Bot Framework meeting-chat activities for chat ingress; the chat RSC
+permissions remain in the manifest for the Graph notification workstream
+documented in `PROD.md`.
 
 | Permission | What it lets Alfred do | Why it is required |
 |---|---|---|
 | `Calls.JoinGroupCalls.Chat` (Application) | Join the Teams call attached to this chat as a bot. | Without this, Alfred cannot enter the meeting at all. The bot would be installed but never appear as a participant. |
 | `Calls.AccessMedia.Chat` (Application) | Receive the live unmixed audio stream from the meeting (16 kHz / 16-bit / mono PCM). | Audio capture is the entire transcription path. Without it, every transcript event is empty and the dossier never gets built. Microsoft also requires the bot's AppId to be on the **Real-Time Media (RTM) allowlist** before media actually attaches even after consent — request via `https://aka.ms/teams-rtm-onboarding` (~2 weeks turnaround). |
 | `OnlineMeetingParticipant.Read.Chat` (Application) | Read the participant roster of this meeting: AAD object id, display name, MSI (`MediaSourceId`) per audio media stream. | This is the source of truth for **who is speaking**. The Graph Communications SDK exposes `ICall.Participants.MediaStreams[].SourceId` bound to `Info.Identity.User.Id`. Without it, the agent only sees `speaker_0` / `speaker_1` from STT diarization and cannot attribute decisions/actions to a real person. |
-| `ChatMessage.Read.Chat` (Application) | Receive every message posted in the meeting chat as a Microsoft Graph change-notification. | Humans talk to Alfred by chatting in the meeting. Without this, Alfred is deaf to the chat ingress and the only signal is audio. The notification path also gives us the authoritative `from.user.id` (AAD GUID) and `from.user.displayName` for chat senders. |
-| `ChatMessageReadReceipt.Read.Chat` (Application) | Observe read-receipts on chat messages. | Lightweight signal that lets Alfred avoid re-asking questions everyone has already seen and "engaged with". Lower-priority than the four above, but kept in the manifest so the install consent prompt is one-shot and stable. |
+| `ChatMessage.Read.Chat` (Application) | Enables the planned Microsoft Graph change-notification path for meeting chat. | Current live chat ingress is Bot Framework `/api/messages`; this permission is kept so the install consent prompt is stable when the Graph path in `PROD.md` is implemented. |
+| `ChatMessageReadReceipt.Read.Chat` (Application) | Observe read-receipts on chat messages. | Lightweight planned signal that lets Alfred avoid re-asking questions everyone has already seen and "engaged with". Kept in the manifest so the install consent prompt is one-shot and stable. |
 
 The app also requests two **manifest-level Teams app permissions**
 (`identity`, `messageTeamMembers`) — these are the standard set required
@@ -50,8 +52,8 @@ The manifest cannot bypass this.
                     │   (audio + chat + roster)    │
                     └──────────────┬───────────────┘
                                    │
-                  unmixed audio    │   Graph chat notifications
-                  + participants   │   (resource-specific consent)
+                  unmixed audio    │   Bot Framework chat activities
+                  + participants   │   (/api/messages)
                                    ▼
         ┌────────────────────────────────────────────────────┐
         │           C# bot  (src/, runs on Windows VM)       │
@@ -150,6 +152,21 @@ normalized speech + chat + system events).
 
 ## 6. Operate
 
+**Live validation note (2026-04-30):** the Disney sandbox VM is configured
+to POST transcripts to the sink at `/transcript` and chat events to `/chat`.
+The live meeting-chat smoke test validated the current canonical POC flow:
+
+1. Teams meeting chat message reaches the Windows VM through the Bot
+   Framework `/api/messages` endpoint.
+2. `AlfredBot` forwards the message to the Python sink `/chat` endpoint.
+3. The sink writes it into `InterviewSession.meeting_events`.
+4. The React UI reads it through `/sink/session/status` and live SSE.
+
+Microsoft Graph chat-notification subscriptions are not active in the live
+sandbox deployment. Chat ingress is the Bot Framework `/api/messages` path
+(`source="bot_framework"` in the ledger). `TranscriptSink.ChatEndpoint` is
+required; the bot fails fast when it is missing.
+
 ```bash
 # Public health
 curl -sS -m 10 https://alfred-disney-bot.eastus.cloudapp.azure.com/api/calling/health
@@ -158,6 +175,10 @@ curl -sS -m 10 -o /dev/null -w "%{http_code}\n" https://ca-alfred-web.gentlewate
 
 # Sink stats
 curl -sS https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io/stats | jq
+
+# UI-to-sink proxy. This must return the same active session state as the
+# direct sink; if it 404s, redeploy the web container with web/nginx.conf.template.
+curl -sS https://ca-alfred-web.gentlewater-5aa74a73.eastus.azurecontainerapps.io/sink/session/status | jq
 
 # Restart the bot service on the VM
 az vm run-command create -g rg-alfred-disney --vm-name vm-alfred-disney --location eastus \
@@ -276,7 +297,7 @@ gh api repos/logan-robbins/alfred-teams-bot/keys \
 ## 11. Editing rules (do not violate)
 
 1. Single canonical meeting ledger (`InterviewSession.meeting_events`).
-2. One authoritative inbound chat path: Microsoft Graph notifications.
+2. One authoritative inbound chat path for the current POC: Teams Bot Framework activities delivered to `/api/messages`, then forwarded to the Python `/chat` endpoint.
 3. Outbound Alfred chat goes through the `send_to_meeting_chat` agent tool. The old `teams_chat` output route is gone.
 4. Agent contract = `AlfredExtraction` (structured output) + `send_to_meeting_chat` (sole action). **Do not** reintroduce a `SEND/ASK/SILENT` enum.
 5. UI is read-only with respect to the meeting. Only Alfred speaks into the meeting chat, and only through the tool.

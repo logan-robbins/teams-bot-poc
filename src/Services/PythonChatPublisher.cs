@@ -22,7 +22,7 @@ public sealed class PythonChatPublisher
 
     private readonly HttpClient _httpClient;
     private readonly ILogger<PythonChatPublisher> _logger;
-    private readonly TranscriptSinkConfiguration _config;
+    private readonly string _endpoint;
 
     public PythonChatPublisher(
         HttpClient httpClient,
@@ -30,24 +30,23 @@ public sealed class PythonChatPublisher
         ILogger<PythonChatPublisher> logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
-        _config = config ?? throw new ArgumentNullException(nameof(config));
+        ArgumentNullException.ThrowIfNull(config);
+        if (string.IsNullOrWhiteSpace(config.ChatEndpoint))
+        {
+            throw new InvalidOperationException(
+                "TranscriptSink.ChatEndpoint is required because inbound Teams chat is forwarded to the Python /chat endpoint.");
+        }
+
+        _endpoint = config.ChatEndpoint;
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
-    public bool IsConfigured => !string.IsNullOrWhiteSpace(_config.ChatEndpoint);
-
     public async Task PublishAsync(ChatEventPayload payload, CancellationToken cancellationToken = default)
     {
-        if (!IsConfigured)
-        {
-            _logger.LogDebug("PythonChatPublisher disabled (ChatEndpoint not configured); dropping event {MessageId}", payload.MessageId);
-            return;
-        }
-
         try
         {
             using var response = await _httpClient.PostAsJsonAsync(
-                _config.ChatEndpoint,
+                _endpoint,
                 payload,
                 SerializerOptions,
                 cancellationToken);
@@ -64,7 +63,7 @@ public sealed class PythonChatPublisher
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to POST chat event {MessageId} to {Endpoint}",
-                payload.MessageId, _config.ChatEndpoint);
+                payload.MessageId, _endpoint);
         }
     }
 }

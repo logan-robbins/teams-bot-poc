@@ -13,9 +13,8 @@ namespace TeamsMediaBot.Services;
 ///   - Capture a ConversationReference for every meeting chat the bot is
 ///     installed in. This is required for proactive sends via
 ///     CloudAdapter.ContinueConversationAsync.
-///   - Forward every inbound chat message to the Python sink's /chat
-///     endpoint so the unified meeting timeline stays complete even when
-///     the Graph change-notification path is disabled or still rolling out.
+///   - Forward every inbound chat message to the Python sink's /chat endpoint
+///     so the unified meeting timeline stays complete.
 ///
 /// The bot does NOT respond inline to chat messages; all outbound speech is
 /// driven by the Python sink via SendChatController.
@@ -24,21 +23,15 @@ public sealed class AlfredBot : TeamsActivityHandler
 {
     private readonly IConversationReferenceStore _references;
     private readonly PythonChatPublisher _chatPublisher;
-    private readonly bool _forwardInboundChatToPython;
     private readonly ILogger<AlfredBot> _logger;
 
     public AlfredBot(
         IConversationReferenceStore references,
         PythonChatPublisher chatPublisher,
-        MeetingChatConfiguration chatConfig,
         ILogger<AlfredBot> logger)
     {
         _references = references;
         _chatPublisher = chatPublisher;
-        _forwardInboundChatToPython =
-            !chatConfig.Enabled
-            || string.IsNullOrWhiteSpace(chatConfig.GraphNotificationBaseUrl)
-            || string.IsNullOrWhiteSpace(chatConfig.ChatSubscriptionClientStateSecret);
         _logger = logger;
     }
 
@@ -61,11 +54,6 @@ public sealed class AlfredBot : TeamsActivityHandler
         if (string.IsNullOrWhiteSpace(chatThreadId))
         {
             return; // not a meeting chat
-        }
-
-        if (!_forwardInboundChatToPython)
-        {
-            return;
         }
 
         var payload = new ChatEventPayload

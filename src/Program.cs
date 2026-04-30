@@ -50,6 +50,7 @@ try
     var mediaConfig = LoadRequiredConfiguration<MediaPlatformConfiguration>(builder.Configuration, "MediaPlatformSettings");
     var sttConfig = LoadSttConfiguration(builder.Configuration);
     var transcriptSinkConfig = LoadRequiredConfiguration<TranscriptSinkConfiguration>(builder.Configuration, "TranscriptSink");
+    ValidateTranscriptSinkConfiguration(transcriptSinkConfig);
     var joinModeSettings = builder.Configuration.GetSection("JoinMode").Get<JoinModeSettings>()
         ?? new JoinModeSettings();
     var meetingChatConfig = builder.Configuration.GetSection("MeetingChat").Get<MeetingChatConfiguration>()
@@ -171,6 +172,25 @@ static T LoadRequiredConfiguration<T>(IConfiguration configuration, string secti
 {
     return configuration.GetSection(sectionName).Get<T>()
         ?? throw new InvalidOperationException($"Configuration section '{sectionName}' is missing or invalid.");
+}
+
+/// <summary>
+/// Validates endpoints required by the single Teams-chat ingress path.
+/// </summary>
+static void ValidateTranscriptSinkConfiguration(TranscriptSinkConfiguration config)
+{
+    ArgumentNullException.ThrowIfNull(config);
+    if (string.IsNullOrWhiteSpace(config.PythonEndpoint))
+    {
+        throw new InvalidOperationException(
+            "TranscriptSink.PythonEndpoint is required for transcript forwarding.");
+    }
+
+    if (string.IsNullOrWhiteSpace(config.ChatEndpoint))
+    {
+        throw new InvalidOperationException(
+            "TranscriptSink.ChatEndpoint is required for inbound Teams chat forwarding.");
+    }
 }
 
 /// <summary>

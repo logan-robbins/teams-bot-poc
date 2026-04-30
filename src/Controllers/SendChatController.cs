@@ -10,8 +10,9 @@ namespace TeamsMediaBot.Controllers;
 
 /// <summary>
 /// Internal endpoint the Python sink calls when the Alfred agent decides to
-/// SEND or ASK. Looks up the ConversationReference captured for the target
-/// chat thread and posts via CloudAdapter.ContinueConversationAsync.
+/// post through the send_to_meeting_chat tool. Looks up the
+/// ConversationReference captured for the target chat thread and posts via
+/// CloudAdapter.ContinueConversationAsync.
 ///
 /// The sink's teams_chat route already rate-limits client-side; we still
 /// add a server-side per-chat semaphore as belt-and-suspenders to stay
@@ -28,20 +29,17 @@ public sealed class SendChatController : ControllerBase
     private readonly IBotFrameworkHttpAdapter _adapter;
     private readonly IConversationReferenceStore _references;
     private readonly BotConfiguration _botConfig;
-    private readonly MeetingChatConfiguration _chatConfig;
     private readonly ILogger<SendChatController> _logger;
 
     public SendChatController(
         IBotFrameworkHttpAdapter adapter,
         IConversationReferenceStore references,
         BotConfiguration botConfig,
-        MeetingChatConfiguration chatConfig,
         ILogger<SendChatController> logger)
     {
         _adapter = adapter;
         _references = references;
         _botConfig = botConfig;
-        _chatConfig = chatConfig;
         _logger = logger;
     }
 

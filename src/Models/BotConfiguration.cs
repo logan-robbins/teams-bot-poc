@@ -231,14 +231,13 @@ public sealed class TranscriptSinkConfiguration
 /// <summary>
 /// Meeting-chat integration config (Alfred).
 ///
-/// Covers both directions:
-///   - Inbound (Graph change-notification subscription on the meeting chat thread).
-///   - Outbound (Bot Framework proactive messages via ContinueConversationAsync).
+/// Covers optional Graph change-notification subscription management.
+/// The current POC chat ingress path is Bot Framework /api/messages.
 /// </summary>
 public sealed class MeetingChatConfiguration
 {
-    /// <summary>Enables the entire meeting-chat path. Defaults to true on this branch.</summary>
-    public bool Enabled { get; init; } = true;
+    /// <summary>Enables optional Graph chat-notification subscription management.</summary>
+    public bool Enabled { get; init; } = false;
 
     /// <summary>
     /// Public HTTPS base URL the bot exposes for Graph change-notification callbacks.
