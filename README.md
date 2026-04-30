@@ -62,8 +62,10 @@ az vm run-command delete -g <rg> --vm-name <vm> --run-command-name tail-logs --y
 
 ## Push a code change
 
+Code lives in the **private** `logan-robbins/alfred-teams-bot` repo. VMs clone from it via an SSH deploy key (`/tmp/alfred-deploy-key`, ed25519, registered as a read-only deploy key on the repo). If the file is missing on a fresh dev machine, generate a new key, register the public half on the repo, and save the private half there.
+
 ```bash
-git push origin feat/alfred-chat-modality
+git push                            # → private/main
 
 # qMachina
 ./scripts/deploy-azure-vm.sh        # uses defaults
@@ -75,15 +77,18 @@ RG_NAME=rg-alfred-disney VM_NAME=vm-alfred-disney \
   APP_SECRET_FILE=/tmp/alfred-disney-app-secret.json \
   VM_ADMIN_PASS_FILE=/tmp/alfred-disney-vm-admin-pass.txt \
   SPEECH_KEY_FILE=/tmp/alfred-disney-speech-key.txt \
+  DEPLOY_KEY_FILE=/tmp/alfred-deploy-key \
   BOT_HOSTNAME=alfred-disney-bot.eastus.cloudapp.azure.com \
   MEDIA_HOSTNAME=alfred-disney-bot.eastus.cloudapp.azure.com \
   CERT_FRIENDLY_NAME=alfred-disney-cert CERT_EMAIL=Logan.Robbins@disney.com \
   STT_PROVIDER=AzureSpeech AZURE_SPEECH_REGION=eastus \
-  REPO_BRANCH=feat/alfred-chat-modality SKIP_REPO_SYNC=1 \
+  SKIP_REPO_SYNC=0 \
   ./scripts/deploy-azure-vm.sh
 ```
 
 The deploy script stops the bot service before publishing so the running DLL doesn't lock the new build. If you ever see "file in use" during publish, the service wasn't stopped — re-run the script.
+
+For a brand-new VM (or one being migrated from the old public repo), set `SKIP_REPO_SYNC=0` so the bootstrap re-clones / repoints `origin` and normalizes the fetch refspec. Subsequent runs can use `SKIP_REPO_SYNC=1` for a faster path.
 
 ## Debug
 
