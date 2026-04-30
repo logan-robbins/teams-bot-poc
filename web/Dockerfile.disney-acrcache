@@ -1,0 +1,15 @@
+# Disney sandbox build of Alfred React Dossier UI.
+# Same as ../web/Dockerfile but pulls base images from our ACR
+# (avoids Docker Hub rate limits during ACR-task builds).
+FROM acralfreddisneye02c0038.azurecr.io/node:20-alpine AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM acralfreddisneye02c0038.azurecr.io/nginx:alpine
+COPY --from=build /app/dist /usr/share/nginx/html
+COPY nginx.conf.template /etc/nginx/templates/default.conf.template
+ENV NGINX_ENVSUBST_FILTER=^SINK_URL$
+EXPOSE 80

@@ -1,0 +1,56 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/teams/v1.21/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.21",
+  "version": "1.0.6",
+  "id": "207a38a4-67c5-4ef9-ada8-ea7998734d59",
+  "developer": {
+    "name": "The Walt Disney Company",
+    "websiteUrl": "https://www.disney.com",
+    "privacyUrl": "https://privacy.thewaltdisneycompany.com",
+    "termsOfUseUrl": "https://disneytermsofuse.com"
+  },
+  "name": {
+    "short": "Alfred Sandbox",
+    "full": "Alfred Sandbox — Meeting Assistant (Disney)"
+  },
+  "description": {
+    "short": "Internal sandbox build of the Alfred meeting assistant",
+    "full": "Internal sandbox build of the Alfred meeting assistant. Joins Teams meetings, captures real-time diarized audio, reads and writes meeting chat, and surfaces live notes and summaries in an external workspace. All access is granted per-chat at install time via resource-specific consent (RSC); no tenant-wide Microsoft Graph permissions are required."
+  },
+  "icons": {
+    "outline": "outline.png",
+    "color": "color.png"
+  },
+  "accentColor": "#FFFFFF",
+  "bots": [
+    {
+      "botId": "207a38a4-67c5-4ef9-ada8-ea7998734d59",
+      "scopes": ["personal", "team", "groupChat"],
+      "supportsFiles": false,
+      "isNotificationOnly": false,
+      "supportsCalling": true,
+      "supportsVideo": false
+    }
+  ],
+  "permissions": ["identity", "messageTeamMembers"],
+  "validDomains": [
+    "alfred-disney-bot.eastus.cloudapp.azure.com",
+    "ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io",
+    "ca-alfred-web.gentlewater-5aa74a73.eastus.azurecontainerapps.io"
+  ],
+  "webApplicationInfo": {
+    "id": "207a38a4-67c5-4ef9-ada8-ea7998734d59",
+    "resource": "api://botid-207a38a4-67c5-4ef9-ada8-ea7998734d59"
+  },
+  "authorization": {
+    "permissions": {
+      "resourceSpecific": [
+        { "name": "ChatMessage.Read.Chat", "type": "Application" },
+        { "name": "ChatMessageReadReceipt.Read.Chat", "type": "Application" },
+        { "name": "OnlineMeetingParticipant.Read.Chat", "type": "Application" },
+        { "name": "Calls.AccessMedia.Chat", "type": "Application" },
+        { "name": "Calls.JoinGroupCalls.Chat", "type": "Application" }
+      ]
+    }
+  }
+}
