@@ -89,6 +89,52 @@ function Install-PackageIfMissing([string]$CommandName, [string]$PackageName) {
     & $choco install $PackageName -y --no-progress --execution-timeout=600
 }
 
+function Install-DotnetSdkIfMissing {
+    # Get-Command dotnet returning true is not sufficient — Windows Server
+    # ships dotnet runtime/framework binaries that can't run `restore`/`publish`.
+    # Verify a real SDK is present via `dotnet --list-sdks`.
+    $sdksPresent = $false
+    if (Get-Command dotnet -ErrorAction SilentlyContinue) {
+        try {
+            $sdks = & dotnet --list-sdks 2>$null
+            if ($sdks -and ($sdks | Where-Object { $_ -match '^\d' }).Count -gt 0) {
+                $sdksPresent = $true
+            }
+        } catch {
+            $sdksPresent = $false
+        }
+    }
+    if ($sdksPresent) { return }
+
+    Write-Host "Installing .NET 8 SDK via Microsoft's official dotnet-install.ps1..." -ForegroundColor Yellow
+
+    $installerPath = Join-Path $env:TEMP "dotnet-install.ps1"
+    $installRoot = "C:\Program Files\dotnet"
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+
+    Invoke-WebRequest `
+        -Uri "https://dot.net/v1/dotnet-install.ps1" `
+        -OutFile $installerPath `
+        -UseBasicParsing `
+        -TimeoutSec 180
+
+    & $installerPath -Channel 8.0 -Quality GA -InstallDir $installRoot
+
+    # Persist the new dotnet on the machine PATH for the service later.
+    $machinePath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+    if ($machinePath -notlike "*$installRoot*") {
+        [System.Environment]::SetEnvironmentVariable("Path", "$machinePath;$installRoot", "Machine")
+    }
+    # And the current process PATH so the same script can run dotnet right away.
+    $env:Path = "$installRoot;" + $env:Path
+
+    # Verify
+    $sdks = & dotnet --list-sdks 2>$null
+    if (-not $sdks -or ($sdks | Where-Object { $_ -match '^8\.' }).Count -eq 0) {
+        throw ".NET 8 SDK install completed but `dotnet --list-sdks` does not show an 8.x entry."
+    }
+}
+
 function Install-MediaPlatformPrereqs {
     # Required by Microsoft.Graph.Communications.Calls.Media (NativeMedia.dll).
     # Without these the bot crashloops with: DllNotFoundException: Unable to
@@ -200,6 +246,14 @@ function Write-ProductionConfig {
             }
         }
         AllowedHosts = "*"
+        # Bot Framework's ConfigurationBotFrameworkAuthentication (used by
+        # CloudAdapter for /api/messages) reads these root-level keys, distinct
+        # from the Bot.* keys the Graph Communications media SDK consumes below.
+        # Without these, /api/messages returns 401 "Invalid AppId passed on token".
+        MicrosoftAppType = "SingleTenant"
+        MicrosoftAppId = $BotAppId
+        MicrosoftAppPassword = $BotAppSecret
+        MicrosoftAppTenantId = $BotTenantId
         Bot = @{
             TenantId = $BotTenantId
             AppId = $BotAppId
@@ -325,7 +379,7 @@ Write-Host "Preparing Windows VM for production deployment..." -ForegroundColor 
 
 Install-ChocolateyIfMissing
 Install-PackageIfMissing "git" "git"
-Install-PackageIfMissing "dotnet" "dotnet-8.0-sdk"
+Install-DotnetSdkIfMissing
 Install-PackageIfMissing "nssm" "nssm"
 Install-MediaPlatformPrereqs
 Install-OpenSSHServerIfMissing
