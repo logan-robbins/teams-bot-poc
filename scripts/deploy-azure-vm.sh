@@ -15,7 +15,9 @@ RG_NAME="${RG_NAME:-rg-alfred-poc}"
 VM_NAME="${VM_NAME:-vm-alfred}"
 PROJECT_ROOT_WINDOWS="${PROJECT_ROOT_WINDOWS:-C:\\teams-bot-poc}"
 CONFIG_PATH_WINDOWS="${CONFIG_PATH_WINDOWS:-C:\\teams-bot-poc\\src\\Config\\appsettings.production.json}"
-REPO_BRANCH="${REPO_BRANCH:-feat/alfred-chat-modality}"
+REPO_URL="${REPO_URL:-git@github.com:logan-robbins/alfred-teams-bot.git}"
+REPO_BRANCH="${REPO_BRANCH:-main}"
+DEPLOY_KEY_FILE="${DEPLOY_KEY_FILE:-/tmp/alfred-deploy-key}"
 ADMIN_USER="${ADMIN_USER:-azureuser}"
 TENANT_ID="${TENANT_ID:-2843abed-8970-461e-a260-a59dc1398dbf}"
 APP_SECRET_FILE="${APP_SECRET_FILE:-/tmp/app-secret.json}"
@@ -277,6 +279,18 @@ assert_single_line_secret "App secret" "$APP_SECRET"
 assert_single_line_secret "VM admin password" "$RUN_AS_PASSWORD"
 assert_single_line_secret "Azure Speech key" "$AZURE_SPEECH_KEY"
 
+# Read deploy key (required for SSH-based private repo clone). Multi-line, so
+# don't run it through assert_single_line_secret.
+DEPLOY_KEY=""
+if [ -s "$DEPLOY_KEY_FILE" ]; then
+    DEPLOY_KEY="$(< "$DEPLOY_KEY_FILE")"
+fi
+case "$REPO_URL" in
+    git@*|ssh://*)
+        [ -n "$DEPLOY_KEY" ] || fail "REPO_URL='$REPO_URL' is SSH but DEPLOY_KEY_FILE='$DEPLOY_KEY_FILE' is empty or missing. Generate one with ssh-keygen, register the public half as a deploy key on the repo, and save the private half here."
+        ;;
+esac
+
 echo "Checking target Azure resources..."
 az vm show --resource-group "$RG_NAME" --name "$VM_NAME" >/dev/null || fail "VM '$VM_NAME' was not found in resource group '$RG_NAME'."
 
@@ -301,6 +315,7 @@ echo "$VM_NAME is ready for managed Run Command deployment."
 BOOTSTRAP_PARAMETERS=(
     "ProjectRoot=$PROJECT_ROOT_WINDOWS"
     "ConfigPath=$CONFIG_PATH_WINDOWS"
+    "RepoUrl=$REPO_URL"
     "RepoBranch=$REPO_BRANCH"
     "AppId=$APP_ID"
     "TenantId=$TENANT_ID"
@@ -321,6 +336,9 @@ BOOTSTRAP_PARAMETERS=(
     "RunAsPassword=$RUN_AS_PASSWORD"
     "AzureSpeechKey=$AZURE_SPEECH_KEY"
 )
+if [ -n "$DEPLOY_KEY" ]; then
+    BOOTSTRAP_PARAMETERS+=("DeployKey=$DEPLOY_KEY")
+fi
 echo "Managed Run Command phases prepared."
 
 run_vm_script_file \

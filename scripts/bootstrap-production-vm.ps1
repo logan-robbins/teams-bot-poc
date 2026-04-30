@@ -3,8 +3,10 @@
 
 param(
     [string]$ProjectRoot = "C:\teams-bot-poc",
-    [string]$RepoUrl = "https://github.com/logan-robbins/teams-bot-poc.git",
+    [string]$RepoUrl = "git@github.com:logan-robbins/alfred-teams-bot.git",
     [string]$RepoBranch = "main",
+    [string]$DeployKey = "",
+    [string]$DeployKeyPath = "C:\ProgramData\alfred\deploy_key",
     [string]$ConfigPath = "C:\teams-bot-poc\src\Config\appsettings.production.json",
     [string]$AppId,
     [string]$AppSecret,
@@ -183,6 +185,38 @@ function Install-OpenSSHServerIfMissing {
     }
 }
 
+function Setup-DeployKey {
+    param(
+        [string]$KeyContent,
+        [string]$KeyPath,
+        [string]$ServiceUser
+    )
+
+    if ([string]::IsNullOrWhiteSpace($KeyContent)) {
+        return  # No key supplied — caller is using a public repo or pre-configured auth.
+    }
+
+    $parent = Split-Path -Parent $KeyPath
+    if (-not (Test-Path $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+
+    # Normalize CRLF → LF (PowerShell here-strings can introduce CRLF; OpenSSH refuses).
+    $normalized = ($KeyContent -replace "`r`n", "`n").TrimEnd() + "`n"
+    [System.IO.File]::WriteAllText($KeyPath, $normalized, [System.Text.UTF8Encoding]::new($false))
+
+    # Lock the file down so OpenSSH stops complaining about loose permissions.
+    icacls $KeyPath /inheritance:r 2>&1 | Out-Null
+    icacls $KeyPath /grant:r "NT AUTHORITY\SYSTEM:R" 2>&1 | Out-Null
+    if (-not [string]::IsNullOrWhiteSpace($ServiceUser)) {
+        icacls $KeyPath /grant:r "${ServiceUser}:R" 2>&1 | Out-Null
+    }
+
+    # Tell git to use this key + auto-accept github.com's host key on first connect.
+    $env:GIT_SSH_COMMAND = "ssh -i `"$KeyPath`" -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes"
+    Write-Host "Configured GIT_SSH_COMMAND to use deploy key at $KeyPath" -ForegroundColor Yellow
+}
+
 function Ensure-Repository([string]$Root, [string]$Url, [string]$Branch) {
     $gitDir = Join-Path $Root ".git"
     if (-not (Test-Path $gitDir)) {
@@ -199,9 +233,19 @@ function Ensure-Repository([string]$Root, [string]$Url, [string]$Branch) {
     Write-Host "Updating repository in $Root..." -ForegroundColor Yellow
     Push-Location $Root
     try {
+        # Migrate existing checkouts whose origin still points at an older URL
+        # (e.g. when this VM was bootstrapped against the public repo and the
+        # working branch has since moved to a private repo).
+        $currentUrl = (git config --get remote.origin.url 2>$null)
+        if ($currentUrl -and $currentUrl -ne $Url) {
+            Write-Host "Updating remote origin URL: $currentUrl -> $Url" -ForegroundColor Yellow
+            git remote set-url origin $Url
+        }
         git fetch origin $Branch
-        git checkout $Branch
-        git pull --ff-only origin $Branch
+        # Force the checkout to track origin/$Branch even if a local branch of
+        # the same name had been pointing somewhere else (covers branch renames).
+        git checkout -B $Branch "origin/$Branch"
+        git reset --hard "origin/$Branch"
     }
     finally {
         Pop-Location
@@ -386,6 +430,9 @@ Install-OpenSSHServerIfMissing
 
 $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
     [System.Environment]::GetEnvironmentVariable("Path", "User")
+
+# Configure SSH deploy key (if supplied) so private-repo clones work without PAT.
+Setup-DeployKey -KeyContent $DeployKey -KeyPath $DeployKeyPath -ServiceUser $RunAsUser
 
 if ($SkipRepositorySync -ne 1) {
     Ensure-Repository -Root $ProjectRoot -Url $RepoUrl -Branch $RepoBranch
