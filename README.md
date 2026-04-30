@@ -18,6 +18,40 @@ Microsoft Teams meeting assistant. Joins meetings, captures audio, transcribes p
 | Azure OpenAI | `aoai-alfred` (`gpt-5-mini`, GlobalStandard cap 10) | `aoai-alfred-disney` (same) |
 | Manifest zip | `manifest/alfred.zip` | `manifest/disney/alfred-sandbox.zip` |
 
+## Repos and deploy key
+
+| | URL | Visibility | Role |
+|---|---|---|---|
+| Source of truth | `git@github.com:logan-robbins/alfred-teams-bot.git` (`main`) | **PRIVATE** | All Alfred work lives here. Both VMs clone from here. Local `main` tracks `private/main`. |
+| Public reference | `git@github.com:logan-robbins/teams-bot-poc.git` (`main`) | PUBLIC | Original public README + Bicep export. Frozen — no Alfred deploy work goes here. |
+
+`git push` from a fresh checkout pushes to `private/main`. To set this up:
+
+```bash
+git clone git@github.com:logan-robbins/alfred-teams-bot.git
+cd alfred-teams-bot
+# (optional) keep the public repo around for occasional cherry-picks back:
+git remote add origin https://github.com/logan-robbins/teams-bot-poc.git
+git remote rename origin public          # avoid the name collision
+git remote rename origin-name private    # if needed, ensure private is the default `origin`
+```
+
+**Deploy key (`/tmp/alfred-deploy-key`)** — VMs clone the private repo over SSH using a read-only ed25519 deploy key registered on the repo. Both `deploy-azure-vm.sh` runs require it.
+
+```bash
+# Generate (one-time per dev machine — the public half is already registered)
+ssh-keygen -t ed25519 -C "alfred-teams-bot deploy" -f /tmp/alfred-deploy-key -N ""
+chmod 600 /tmp/alfred-deploy-key
+
+# Register the public half on the private repo (read-only)
+gh api repos/logan-robbins/alfred-teams-bot/keys \
+  -f title="$(hostname)-$(date -u +%Y-%m-%d)" \
+  -f key="$(cat /tmp/alfred-deploy-key.pub)" \
+  -F read_only=true
+```
+
+The bootstrap drops the key on each VM at `C:\ProgramData\alfred\deploy_key` with ACL `SYSTEM + azureuser : Read` and points `GIT_SSH_COMMAND` at it. Keys are per-repo, so the same key works for both VMs.
+
 ## Start (install Alfred in a tenant)
 
 1. Upload the manifest zip via **Teams Developer Portal** (`https://dev.teams.microsoft.com/apps`) → **Import app**.
@@ -62,14 +96,12 @@ az vm run-command delete -g <rg> --vm-name <vm> --run-command-name tail-logs --y
 
 ## Push a code change
 
-Code lives in the **private** `logan-robbins/alfred-teams-bot` repo. VMs clone from it via an SSH deploy key (`/tmp/alfred-deploy-key`, ed25519, registered as a read-only deploy key on the repo). If the file is missing on a fresh dev machine, generate a new key, register the public half on the repo, and save the private half there.
-
 ```bash
-git push                            # → private/main
+git push                                  # local main → private/main
 
-# qMachina
-./scripts/deploy-azure-vm.sh        # uses defaults
-./scripts/deploy-azure-agent.sh     # rebuilds + redeploys sink/UI
+# qMachina prod
+./scripts/deploy-azure-vm.sh              # uses defaults; reads /tmp/alfred-deploy-key
+./scripts/deploy-azure-agent.sh           # rebuilds + redeploys sink/UI
 
 # Disney sandbox (env overrides)
 RG_NAME=rg-alfred-disney VM_NAME=vm-alfred-disney \
@@ -82,13 +114,24 @@ RG_NAME=rg-alfred-disney VM_NAME=vm-alfred-disney \
   MEDIA_HOSTNAME=alfred-disney-bot.eastus.cloudapp.azure.com \
   CERT_FRIENDLY_NAME=alfred-disney-cert CERT_EMAIL=Logan.Robbins@disney.com \
   STT_PROVIDER=AzureSpeech AZURE_SPEECH_REGION=eastus \
-  SKIP_REPO_SYNC=0 \
+  SKIP_REPO_SYNC=1 \
   ./scripts/deploy-azure-vm.sh
 ```
 
-The deploy script stops the bot service before publishing so the running DLL doesn't lock the new build. If you ever see "file in use" during publish, the service wasn't stopped — re-run the script.
+`SKIP_REPO_SYNC` controls whether the bootstrap pulls fresh code:
+- **`SKIP_REPO_SYNC=0`** — required the **first** time a VM points at the private repo (clones, sets origin URL, normalizes the fetch refspec, pulls latest). Also use after pushing new commits.
+- **`SKIP_REPO_SYNC=1`** — fast path; uses whatever's already on disk. Use for config-only changes (env vars, secrets) where source code didn't change.
 
-For a brand-new VM (or one being migrated from the old public repo), set `SKIP_REPO_SYNC=0` so the bootstrap re-clones / repoints `origin` and normalizes the fetch refspec. Subsequent runs can use `SKIP_REPO_SYNC=1` for a faster path.
+The script stops the bot service before publishing so the running DLL doesn't lock the new build. If you ever see "file in use" during publish, the service wasn't stopped — re-run.
+
+### Migrating an existing VM from the old public repo
+
+The qMachina `vm-alfred` was originally bootstrapped against the now-empty public branch. The first deploy after this migration must include `DEPLOY_KEY_FILE=/tmp/alfred-deploy-key` and `SKIP_REPO_SYNC=0` — the bootstrap will:
+1. Detect the stale `remote.origin.url` (`https://github.com/logan-robbins/teams-bot-poc.git`) and switch it to the private SSH URL.
+2. Replace the single-branch fetch refspec with `+refs/heads/*:refs/remotes/origin/*` (the old `--single-branch` clone left a refspec that silently swallows new branches).
+3. Install the deploy key, fetch, force-checkout `main`, and rebuild.
+
+Subsequent deploys behave normally.
 
 ## Debug
 
@@ -102,6 +145,8 @@ For a brand-new VM (or one being migrated from the old public repo), set `SKIP_R
 | Sink `events_received` increments but `session_events: 0` and no `[CHAT]` log line | No active session. The sink only persists chat to SQLite when a session is active. `POST /session/start` first. |
 | `az containerapp` op returns 403 + RBAC role-assignment error during create | Use ACR admin credentials inline: `az containerapp registry set --server <acr>.azurecr.io --username <u> --password <p>` after create. |
 | ACR build fails on `nginx:alpine`/`node:20-alpine` with `429 toomanyrequests` | Pre-import into ACR: `az acr import --name <acr> --source docker.io/library/nginx:alpine --image nginx:alpine`. Use `web/Dockerfile.disney-acrcache` which references the local mirror. |
+| `git fetch origin main` on the VM returns exit 0 but `origin/main` doesn't move | Stale single-branch refspec from the original `git clone --branch X --single-branch`. Run `git config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'` inside the repo, then `git fetch --prune origin`. The bootstrap now does this automatically when `remote.origin.url` changes. |
+| Bootstrap aborts with `REPO_URL='git@...' is SSH but DEPLOY_KEY_FILE='...' is empty` | The deploy script needs the SSH deploy key. See **Repos and deploy key** above for how to generate + register one. |
 | `az vm get-instance-view` returns `vmAgent: null` | ARM cache lag. Probe directly with a Run Command (`Write-Host alive`); if it returns Succeeded the agent is fine. |
 | `Conflict: Run command extension execution is in progress` | Legacy `az vm run-command invoke` wedged the extension. RDP in, remove `C:\Packages\Plugins\Microsoft.CPlat.Core.RunCommandWindows*`, restart `WindowsAzureGuestAgent` + `RdAgent`. |
 
