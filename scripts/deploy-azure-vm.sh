@@ -30,6 +30,7 @@ AZURE_SPEECH_LANGUAGE="${AZURE_SPEECH_LANGUAGE:-en-US}"
 BOT_LISTEN_PORT="${BOT_LISTEN_PORT:-443}"
 MEDIA_PORT="${MEDIA_PORT:-8445}"
 VM_READY_TIMEOUT_SECONDS="${VM_READY_TIMEOUT_SECONDS:-900}"
+SKIP_REPO_SYNC="${SKIP_REPO_SYNC:-1}"
 
 fail() {
     echo "ERROR: $*" >&2
@@ -314,7 +315,7 @@ BOOTSTRAP_PARAMETERS=(
     "BotListenPort=$BOT_LISTEN_PORT"
     "MediaPort=$MEDIA_PORT"
     "BootstrapOnly=1"
-    "SkipRepositorySync=1"
+    "SkipRepositorySync=$SKIP_REPO_SYNC"
     "--protected"
     "AppSecret=$APP_SECRET"
     "RunAsPassword=$RUN_AS_PASSWORD"
@@ -331,12 +332,29 @@ run_vm_script_file \
 
 run_vm_script_file "Phase 2/5: open Windows firewall ports" "alfred-open-firewall" 300 "$SCRIPT_DIR/vm-open-firewall.ps1"
 run_vm_script_file "Phase 3/5: install win-acme" "alfred-install-win-acme" 900 "$SCRIPT_DIR/vm-install-win-acme.ps1"
-run_vm_script_file "Phase 4/5: request Let's Encrypt certificate" "alfred-request-letsencrypt-cert" 900 "$SCRIPT_DIR/vm-request-letsencrypt-cert.ps1" "RunAsUser=$ADMIN_USER"
+
+# Build the unique host list for the cert. For deployments where bot and media
+# share a single hostname (e.g. an Azure-managed FQDN), this collapses to one.
+CERT_HOSTNAMES="$BOT_HOSTNAME"
+if [ "$MEDIA_HOSTNAME" != "$BOT_HOSTNAME" ]; then
+    CERT_HOSTNAMES="$BOT_HOSTNAME,$MEDIA_HOSTNAME"
+fi
+CERT_FRIENDLY_NAME="${CERT_FRIENDLY_NAME:-alfred-bot-cert}"
+CERT_EMAIL="${CERT_EMAIL:-logan@qmachina.com}"
+
+run_vm_script_file "Phase 4/5: request Let's Encrypt certificate" "alfred-request-letsencrypt-cert" 900 \
+    "$SCRIPT_DIR/vm-request-letsencrypt-cert.ps1" \
+    "RunAsUser=$ADMIN_USER" \
+    "Hostnames=$CERT_HOSTNAMES" \
+    "EmailAddress=$CERT_EMAIL" \
+    "FriendlyName=$CERT_FRIENDLY_NAME"
 
 FINALIZE_PARAMETERS=(
     "ProjectRoot=$PROJECT_ROOT_WINDOWS"
     "ConfigPath=$CONFIG_PATH_WINDOWS"
     "RunAsUser=$ADMIN_USER"
+    "CertSubjectHosts=$CERT_HOSTNAMES"
+    "CertFriendlyNamePattern=$CERT_FRIENDLY_NAME*"
     "--protected"
     "RunAsPassword=$RUN_AS_PASSWORD"
 )

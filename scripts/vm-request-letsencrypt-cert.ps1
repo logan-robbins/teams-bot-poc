@@ -1,5 +1,8 @@
 param(
-    [string]$RunAsUser = "azureuser"
+    [string]$RunAsUser = "azureuser",
+    [string]$Hostnames = "teamsbot.qmachina.com,media.qmachina.com",
+    [string]$EmailAddress = "logan@qmachina.com",
+    [string]$FriendlyName = "alfred-bot-cert"
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,21 +24,25 @@ if ($null -eq $wacsCommand) {
 
 $wacs = if ($wacsCommand.Source) { $wacsCommand.Source } else { $wacsCommand.FullName }
 
+$uniqueHosts = ($Hostnames -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique) -join ","
+$primaryHost = ($uniqueHosts -split ",")[0]
+
 & $wacs `
     --source manual `
-    --host "teamsbot.qmachina.com,media.qmachina.com" `
+    --host $uniqueHosts `
     --validation selfhosting `
     --validationmode http-01 `
     --store certificatestore `
     --certificatestore My `
     --acl-read $RunAsUser `
-    --friendlyname "qmachina-teamsbot-media" `
-    --emailaddress "logan@qmachina.com" `
+    --friendlyname $FriendlyName `
+    --emailaddress $EmailAddress `
     --accepttos `
     --closeonfinish
 
+$hostPattern = ($uniqueHosts -split "," | ForEach-Object { [regex]::Escape($_) }) -join "|"
 $certs = Get-ChildItem Cert:\LocalMachine\My |
-    Where-Object { $_.Subject -match "teamsbot\.qmachina\.com|media\.qmachina\.com" } |
+    Where-Object { $_.Subject -match $hostPattern } |
     Sort-Object NotAfter -Descending |
     Select-Object -First 5 Subject, Thumbprint, NotAfter
 

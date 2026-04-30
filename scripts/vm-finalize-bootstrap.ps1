@@ -2,7 +2,9 @@ param(
     [string]$ProjectRoot = "C:\teams-bot-poc",
     [string]$ConfigPath = "C:\teams-bot-poc\src\Config\appsettings.production.json",
     [string]$RunAsUser = "azureuser",
-    [string]$RunAsPassword
+    [string]$RunAsPassword,
+    [string]$CertSubjectHosts = "teamsbot.qmachina.com,media.qmachina.com",
+    [string]$CertFriendlyNamePattern = "qmachina-teamsbot-media*,alfred-bot-cert*"
 )
 
 $ErrorActionPreference = "Stop"
@@ -17,11 +19,14 @@ if (-not (Test-Path $ConfigPath)) {
 
 $config = Get-Content -Path $ConfigPath -Raw | ConvertFrom-Json
 
+$subjectPatterns = @($CertSubjectHosts -split "," | ForEach-Object { "CN=" + [regex]::Escape($_.Trim()) } | Where-Object { $_ -ne "CN=" })
+$friendlyPatterns = @($CertFriendlyNamePattern -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+
 $cert = Get-ChildItem Cert:\LocalMachine\My |
     Where-Object {
-        $_.Subject -match "CN=teamsbot\.qmachina\.com" -or
-        $_.Subject -match "CN=media\.qmachina\.com" -or
-        $_.FriendlyName -like "qmachina-teamsbot-media*"
+        $candidate = $_
+        ($subjectPatterns | Where-Object { $candidate.Subject -match $_ }).Count -gt 0 -or
+        ($friendlyPatterns | Where-Object { $candidate.FriendlyName -like $_ }).Count -gt 0
     } |
     Sort-Object NotAfter -Descending |
     Select-Object -First 1
