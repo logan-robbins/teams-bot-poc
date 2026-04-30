@@ -282,3 +282,17 @@ gh api repos/logan-robbins/alfred-teams-bot/keys \
 5. UI is read-only with respect to the meeting. Only Alfred speaks into the meeting chat, and only through the tool.
 6. All persistent writes go through `meeting_agent.persistence.SessionStore` so live UI and post-meeting replay read the same truth.
 7. Treat this README and `python/batcave_platform/specs/alfred.yaml` as system documents.
+
+---
+
+## 12. What's next (productionalization)
+
+`PROD.md` at the repo root is the next-step productionalization plan. It
+covers five technical enhancements layered on the current POC: an
+append-only raw ingest audit store, a split between raw audit and the
+agent's working memory, a Teams-MSI-driven participant identity layer
+(so the agent sees real names instead of `speaker_0`), explicit
+proactivity rules in `alfred.yaml` (without reintroducing a
+`SEND/ASK/SILENT` enum), and per-meeting sink routing so each call can
+target its own Python sink. Read `PROD.md` before starting any of those
+workstreams.
