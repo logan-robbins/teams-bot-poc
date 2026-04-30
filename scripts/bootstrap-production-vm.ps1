@@ -290,6 +290,23 @@ function Write-ProductionConfig {
 
     $providerName = if ([string]::IsNullOrWhiteSpace($Provider)) { "Deepgram" } else { $Provider.Trim() }
     $preferredJoinMode = if ($PolicyAutoInviteEnabled) { "policy_auto_invite" } else { "invite_and_graph_join" }
+    $effectiveCertThumbprint = $CertThumbprint
+    if ([string]::IsNullOrWhiteSpace($effectiveCertThumbprint) -and (Test-Path $Path)) {
+        try {
+            $existingConfig = Get-Content -Path $Path -Raw | ConvertFrom-Json
+            $existingThumbprint = $existingConfig.MediaPlatformSettings.CertificateThumbprint
+            if (-not [string]::IsNullOrWhiteSpace($existingThumbprint) -and $existingThumbprint -ne "CHANGE_AFTER_CERT_INSTALL") {
+                $effectiveCertThumbprint = $existingThumbprint
+                Write-Host "Reusing existing certificate thumbprint from production config." -ForegroundColor Yellow
+            }
+        }
+        catch {
+            Write-Warning "Could not read existing certificate thumbprint from '$Path': $($_.Exception.Message)"
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($effectiveCertThumbprint)) {
+        $effectiveCertThumbprint = "CHANGE_AFTER_CERT_INSTALL"
+    }
 
     $config = [ordered]@{
         Logging = @{
@@ -318,7 +335,7 @@ function Write-ProductionConfig {
         }
         MediaPlatformSettings = @{
             ApplicationId = $BotAppId
-            CertificateThumbprint = $CertThumbprint
+            CertificateThumbprint = $effectiveCertThumbprint
             InstanceInternalPort = $PublicMediaPort
             InstancePublicPort = $PublicMediaPort
             ServiceFqdn = $BotServiceFqdn
@@ -422,10 +439,7 @@ Assert-Required "ServiceFqdn" $ServiceFqdn
 Assert-Required "InstancePublicIPAddress" $InstancePublicIPAddress
 Assert-Required "TranscriptSinkPythonEndpoint" $TranscriptSinkPythonEndpoint
 
-if (($BootstrapOnly -eq 1) -and [string]::IsNullOrWhiteSpace($CertificateThumbprint)) {
-    $CertificateThumbprint = "CHANGE_AFTER_CERT_INSTALL"
-}
-else {
+if (($BootstrapOnly -ne 1) -or -not [string]::IsNullOrWhiteSpace($CertificateThumbprint)) {
     Assert-Required "CertificateThumbprint" $CertificateThumbprint
 }
 
@@ -483,6 +497,15 @@ Write-ProductionConfig `
     -AutoFallbackToInviteGraphJoin ($AutoFallbackToInviteAndGraphJoin -ne 0) `
     -RequireBotInviteJoinAttendee ($RequireBotAttendeeForInviteJoin -ne 0)
 
+$existingService = Get-Service -Name "TeamsMediaBot" -ErrorAction SilentlyContinue
+$wasServiceRunning = $false
+if ($existingService -and $existingService.Status -ne "Stopped") {
+    $wasServiceRunning = $true
+    Write-Host "Stopping TeamsMediaBot before publish so DLLs are not locked..." -ForegroundColor Yellow
+    Stop-Service TeamsMediaBot -Force -ErrorAction Stop
+    $existingService.WaitForStatus("Stopped", "00:00:30")
+}
+
 Push-Location (Join-Path $ProjectRoot "src")
 try {
     dotnet restore
@@ -492,12 +515,23 @@ finally {
     Pop-Location
 }
 
+if (($BootstrapOnly -eq 1) -and $wasServiceRunning) {
+    Write-Host "Restarting TeamsMediaBot after publish." -ForegroundColor Yellow
+    Start-Service TeamsMediaBot
+    Start-Sleep -Seconds 5
+}
+
 $exePath = Join-Path $publishDir "TeamsMediaBot.exe"
 if (-not (Test-Path $exePath)) {
     throw "Published executable not found at '$exePath'."
 }
 
-$serviceStatus = "NotInstalled"
+$serviceStatus = if (Get-Service -Name "TeamsMediaBot" -ErrorAction SilentlyContinue) {
+    [string](Get-Service -Name "TeamsMediaBot").Status
+}
+else {
+    "NotInstalled"
+}
 if ($BootstrapOnly -ne 1) {
     Ensure-Service `
         -ExePath $exePath `
