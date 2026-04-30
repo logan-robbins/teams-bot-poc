@@ -18,6 +18,7 @@ export function Ledger({ history }: Props) {
   const seenRef = useRef<Set<string>>(new Set());
   const [, forceRender] = useState(0);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const lastKeyRef = useRef<string | null>(null);
 
   useEffect(() => {
     const next = new Set(seenRef.current);
@@ -33,15 +34,15 @@ export function Ledger({ history }: Props) {
     if (added) forceRender((n) => n + 1);
   }, [history]);
 
-  // Auto-scroll to bottom when new entries arrive — but only if the user is
-  // already near the bottom. Honors the "butler does not interrupt" principle.
+  // The ledger is a live operational feed; keep the newest meeting turn visible.
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
-    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-    if (distanceFromBottom < 120) {
-      el.scrollTop = el.scrollHeight;
-    }
+    const latest = history.at(-1);
+    const latestKey = latest ? keyFor(latest) : null;
+    if (!latestKey || latestKey === lastKeyRef.current) return;
+    lastKeyRef.current = latestKey;
+    el.scrollTop = el.scrollHeight;
   }, [history]);
 
   return (
@@ -72,7 +73,11 @@ export function Ledger({ history }: Props) {
 }
 
 function keyFor(e: MeetingEvent, idx?: number): string {
-  return e.id ?? `${e.timestamp_utc}::${e.speaker_id ?? ""}::${idx ?? 0}::${e.text.slice(0, 40)}`;
+  return (
+    e.event_id ??
+    e.id ??
+    `${e.timestamp_utc}::${e.speaker_id ?? ""}::${idx ?? 0}::${e.text.slice(0, 40)}`
+  );
 }
 
 function SectionHeader({

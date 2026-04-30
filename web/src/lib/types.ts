@@ -20,6 +20,7 @@ export type EventRole =
   | "unknown";
 
 export interface MeetingEvent {
+  event_id?: string;
   id?: string;
   kind: EventKind;
   role: EventRole;

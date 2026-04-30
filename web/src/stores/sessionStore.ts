@@ -196,6 +196,7 @@ export const useSessionStore = create<State>((set) => ({
 
 function eventKey(event: MeetingEvent): string {
   return (
+    event.event_id ??
     event.id ??
     `${event.timestamp_utc}::${event.kind}::${event.speaker_id ?? ""}::${(event.text ?? "").slice(0, 40)}`
   );
