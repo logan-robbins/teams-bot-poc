@@ -241,7 +241,17 @@ function Ensure-Repository([string]$Root, [string]$Url, [string]$Branch) {
             Write-Host "Updating remote origin URL: $currentUrl -> $Url" -ForegroundColor Yellow
             git remote set-url origin $Url
         }
-        git fetch origin $Branch
+        # Original clone used --single-branch which leaves a refspec like
+        # `+refs/heads/feat/alfred-chat-modality:refs/remotes/origin/feat/...`,
+        # so a later `git fetch origin main` returns 0 but doesn't update
+        # refs/remotes/origin/main. Normalize to the all-branches refspec.
+        $currentFetch = (git config --get remote.origin.fetch 2>$null)
+        $allBranchesRefspec = "+refs/heads/*:refs/remotes/origin/*"
+        if ($currentFetch -ne $allBranchesRefspec) {
+            Write-Host "Normalizing remote.origin.fetch: $currentFetch -> $allBranchesRefspec" -ForegroundColor Yellow
+            git config remote.origin.fetch $allBranchesRefspec
+        }
+        git fetch --prune origin
         # Force the checkout to track origin/$Branch even if a local branch of
         # the same name had been pointing somewhere else (covers branch renames).
         git checkout -B $Branch "origin/$Branch"
