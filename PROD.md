@@ -744,6 +744,304 @@ dotnet test
 
 ---
 
+## Enhancement 6 — Per-meeting UI via URL-routed multi-session sink
+
+### Goal
+One sink + one web deployment hosts N concurrent meetings, each
+addressable at `/m/<chat_thread_id>` with isolated ledger, dossier, and
+SSE stream. Two simultaneous Teams meetings stop merging into one
+ledger; speaker IDs no longer collide; the user opens two browser tabs
+on different `chat_thread_id`s and sees each meeting independently.
+
+Orthogonal to E5: E5 splits meetings across multiple sink **deployments**;
+E6 makes a single sink deployment host multiple concurrent meetings.
+Doing both gives full multi-tenant routing.
+
+### Current state (verified)
+
+- `src/Models/TranscriptEvent.cs:9-39` carries no meeting identifier.
+  Fields are `EventType`, `Text`, `TimestampUtc`, `SpeakerId`, audio
+  offsets, `EventMetadata` (provider/Deepgram session id only),
+  `EventError`. Once a transcript leaves the bot there is no way to tell
+  which Teams meeting it came from.
+- `src/Services/PythonChatPublisher.cs:78` already sends
+  `chat_thread_id` on chat events; transcripts do not.
+- `src/Services/CallHandler.cs:71-90` (constructor) does not receive a
+  thread id. `TeamsCallingBotService.cs:268-308` (`HandleCallAdded`)
+  knows the `threadId` (`call.Resource.ChatInfo?.ThreadId ?? call.Id`)
+  and stores `CallHandlers[threadId] = handler` but never hands it to
+  the handler or to the transcriber.
+- `src/Services/AzureSpeechRealtimeTranscriber.cs:21-58`
+  (`TranscriberFactory.Create()`) returns a transcriber with no
+  per-call binding. `TeamsCallingBotService.cs:660-668`
+  (`GetOrCreateTranscriber(threadId)`) has the threadId at hand but
+  doesn't pass it.
+- `python/transcript_sink.py:223-261` (`TranscriptEventRequest`) has no
+  `chat_thread_id` field. `ChatMessageRequest` at line 288-302 does.
+- `python/transcript_sink.py:552-555` raises `SessionAlreadyActiveError`;
+  line 1431 (`start_session`) raises if any session is active; line
+  1213-1214 appends every inbound transcript to the single active
+  session unconditionally. The sink is singleton-by-design.
+- Sink routes today (verified at lines 1146, 1320, 1404, 1518, 1550,
+  1602, 1640, 1696, 1710, 1953, 1962-1994):
+  `POST /transcript`, `POST /chat`, `POST /session/start`,
+  `POST /session/map-speaker`, `GET /session/status`,
+  `GET /session/analysis`, `GET /session/events` (SSE),
+  `GET /session` (alias), `POST /session/end`, `GET /sessions`,
+  `GET /sessions/{session_id}/{ledger,dossier,extractions,tool-calls}`.
+  The `{session_id}` here is the sink-minted UUID, not the Teams
+  `chat_thread_id`.
+- `web/src/App.tsx` has no router; `web/package.json` does not depend on
+  `react-router`. `web/src/hooks/useSessionStream.ts:34,45` calls
+  `GET /session/status` then opens `EventSource(/session/events)` —
+  one global stream. `web/src/stores/sessionStore.ts:29-30` is a
+  singleton zustand store (`session?: SessionSummary`,
+  `analysis?: AlfredAnalysisBody`).
+
+### Files to modify
+
+#### 1. Bot — plumb `chat_thread_id` end-to-end
+
+- `src/Models/TranscriptEvent.cs:9-39`: add a non-optional field
+  ```csharp
+  string ChatThreadId,
+  ```
+  near the top of the record (after `Text`). Update the JSON property
+  name to `chat_thread_id` to match the sink's snake_case wire shape.
+
+- `src/Services/CallHandler.cs:71-90`: take `string threadId` in the
+  constructor; store on the instance; pass it into every
+  `_transcriber.PublishAsync(...)` and into the heartbeat tick.
+
+- `src/Services/TeamsCallingBotService.cs:295-302`
+  (`HandleCallAdded`): pass `threadId` into both
+  `GetOrCreateTranscriber` *and* `new CallHandler(call, mediaSession,
+  transcriber, threadId, _logger)`.
+
+- `src/Services/AzureSpeechRealtimeTranscriber.cs`,
+  `src/Services/AzureConversationTranscriber.cs`,
+  `src/Services/DeepgramRealtimeTranscriber.cs`: each
+  `PublishAsync(...)` must accept and forward `chatThreadId` (or take
+  it once on construction; either works — construction is simpler since
+  the transcriber lives for one call). Set
+  `TranscriptEvent.ChatThreadId = chatThreadId` on every event.
+
+- `src/Services/TranscriberFactory.cs:60-61`: `Create(string chatThreadId)`.
+  The factory now binds the threadId into the transcriber it returns.
+
+- `src/Services/PythonTranscriptPublisher.cs:87`: no signature change —
+  `chat_thread_id` rides on the `TranscriptEvent` body. (If E5 already
+  changed this signature to take `endpointUrl` + `authToken`, just keep
+  that; this enhancement only adds a body field.)
+
+#### 2. Sink — multi-session keyed by `chat_thread_id`
+
+- `python/transcript_sink.py:223-261` (`TranscriptEventRequest`): add
+  ```python
+  chat_thread_id: str = Field(..., min_length=1)
+  ```
+  Required. Reject inbound transcripts that lack it (current schema
+  has `extra="ignore"`; tighten to `extra="forbid"` only if we want to
+  catch bot/sink drift, otherwise leave as-is).
+
+- Replace the singleton `session_manager` with a
+  `SessionRegistry` keyed by `chat_thread_id`:
+  ```python
+  class SessionRegistry:
+      _sessions: dict[str, SessionState]   # chat_thread_id -> state
+      def get_or_start(self, chat_thread_id: str) -> SessionState: ...
+      def get(self, chat_thread_id: str) -> SessionState | None: ...
+      def end(self, chat_thread_id: str) -> SessionEndResult: ...
+      def active_thread_ids(self) -> list[str]: ...
+  ```
+  Each `SessionState` holds today's `Session` object plus its own
+  `meeting_events`, dossier extraction state, analysis worker handle,
+  and last-event-id cursor.
+
+- `POST /transcript` (line 1146) and `POST /chat` (line 1320): resolve
+  state via `registry.get_or_start(req.chat_thread_id)` instead of
+  reading the global. Auto-start on first event for an unseen
+  `chat_thread_id`. Each session keeps its sink-minted UUID
+  `session_id` for DB joins; the URL key is the `chat_thread_id`.
+
+- Drop `SessionAlreadyActiveError` (line 552) and the `is_active`
+  guard at line 1431. `POST /session/start` becomes idempotent — if a
+  session for that `chat_thread_id` already exists, return it
+  unchanged with `existing=true`. Add `chat_thread_id` to the request
+  body (or derive it from the candidate flow if pre-roll start is
+  still desired).
+
+- `POST /session/end` (line 1710): take an explicit
+  `chat_thread_id` (path or body). Without one, return 400 — no more
+  "end the global session." For symmetry, also accept `session_id` and
+  resolve through the registry.
+
+- New routes (and keep old ones as aliases for backward compat
+  during cutover, returning whichever session was started first):
+  ```
+  GET  /m/{chat_thread_id}/status
+  GET  /m/{chat_thread_id}/events     (SSE — only events for this thread)
+  GET  /m/{chat_thread_id}/ledger
+  GET  /m/{chat_thread_id}/dossier
+  POST /m/{chat_thread_id}/end
+  GET  /m                              (list of active chat_thread_ids
+                                        with snapshot summary per item)
+  ```
+  Implementation: `format_sse` already attaches `session_id` to every
+  bus event (line 873, 1286). Adjust the bus to also tag with
+  `chat_thread_id`, and have the per-thread SSE generator filter on
+  the path param. Cheaper alternative: one `AlfredEventBus` per
+  `SessionState` (cleaner isolation, less filtering).
+
+- `python/batcave_platform/routes/ui_stream.py`: thread the
+  `chat_thread_id` through any session-context payloads it builds.
+
+#### 3. Web — URL-routed UI
+
+- Add `react-router-dom` to `web/package.json` (current `package.json`
+  has no router). Wrap `App.tsx` in a `BrowserRouter` with two routes:
+  ```tsx
+  <Routes>
+    <Route path="/" element={<MeetingList />} />
+    <Route path="/m/:chatThreadId" element={<MeetingDossier />} />
+  </Routes>
+  ```
+
+- `web/src/components/MeetingList.tsx` (new): polls `GET /m` every
+  ~2 s, renders one row per active thread (`chat_thread_id`,
+  `meeting_subject`, started-at, ledger length), clicking a row routes
+  to `/m/<chat_thread_id>`. Read-only, no controls.
+
+- Refactor today's `App.tsx` body into `web/src/components/MeetingDossier.tsx`
+  (the three-column Header / Ledger / Dossier / CompanionRail layout).
+  Pull `chatThreadId` via `useParams()` and pass to
+  `useSessionStream(chatThreadId)`.
+
+- `web/src/hooks/useSessionStream.ts:34,45`: take a `chatThreadId`
+  argument, hit `${SINK_BASE}/m/${chatThreadId}/status` on mount, then
+  `new EventSource(\`${SINK_BASE}/m/${chatThreadId}/events\`)`. No
+  store mutation outside this hook's scope.
+
+- `web/src/stores/sessionStore.ts`: today's singleton store becomes
+  per-thread. Two clean options:
+  - **A (simplest):** keep the store singleton, but the route handler
+    re-mounts the store on `chatThreadId` change (key the
+    `MeetingDossier` element on `chatThreadId` so React unmounts +
+    remounts on navigation; the store re-seeds from the new thread's
+    `/status`).
+  - **B (cleaner):** `sessionStores: Record<chatThreadId, SessionStore>`
+    via a `useSessionStoreFor(chatThreadId)` hook that lazily creates
+    one zustand store per thread. Better for tab-style nav with both
+    meetings open at once; required if we ever want a side-by-side
+    comparison view.
+
+  Pick **A** for the POC unless the user wants two side-by-side
+  meetings in one window — in that case, **B**.
+
+- `web/src/lib/sink.ts:31`: add per-thread variants
+  (`statusFor(threadId)`, `endFor(threadId)`, `listMeetings()`).
+  Keep the existing `/session/*` calls if anything else still uses
+  them; otherwise delete after wire cutover.
+
+- `web/src/components/Header.tsx`: show the current
+  `chat_thread_id` (or the meeting subject if the sink resolves it)
+  and a "← all meetings" link to `/`.
+
+#### 4. Bot-to-sink contract
+
+The bot already has `chatThreadId` in `MeetingChatService` and (after
+step 1) in `CallHandler`. After this change, the bot does not need to
+call `POST /session/start` explicitly — the sink auto-creates the
+session on the first `/transcript` or `/chat` for an unseen
+`chat_thread_id`. The bot still calls `POST /m/<id>/end` (or the
+legacy `/session/end` with `chat_thread_id`) on call termination
+(`CallHandler.OnCallUpdated:136-161`, where `StopTranscriptionAsync`
+already runs). This guarantees the analysis worker for that thread
+finalizes and the session is marked closed.
+
+### Default / single-meeting fallback
+
+Anyone hitting the legacy `GET /session/events`, `GET /session/status`,
+`POST /session/end` (no thread id) gets redirected to whichever
+`chat_thread_id` is the most recently active session. If zero or
+multiple sessions are active, return 409 with a list of active
+`chat_thread_id`s and a hint to use `/m/{id}/...`. This keeps the
+existing UI working pointed at a singleton meeting during cutover and
+fails loudly when ambiguous.
+
+### Verification
+
+```bash
+# 1. Two simultaneous meetings — bot side
+#    Drive two synthetic transcripts with distinct chat_thread_ids:
+curl -sS -X POST $SINK/transcript -H 'Content-Type: application/json' \
+  -d '{"chat_thread_id":"19:meet-A@thread.v2","event_type":"final","text":"meeting A line 1","timestamp_utc":"2026-04-30T17:00:01Z","speaker_id":"speaker_0"}'
+curl -sS -X POST $SINK/transcript -H 'Content-Type: application/json' \
+  -d '{"chat_thread_id":"19:meet-B@thread.v2","event_type":"final","text":"meeting B line 1","timestamp_utc":"2026-04-30T17:00:02Z","speaker_id":"speaker_0"}'
+
+# 2. Sink registry has two distinct sessions
+curl -sS $SINK/m | jq '.[].chat_thread_id'
+# Expect: "19:meet-A@thread.v2", "19:meet-B@thread.v2"
+
+# 3. Per-thread ledger isolation
+curl -sS $SINK/m/19:meet-A@thread.v2/ledger | jq '.events | length'   # 1
+curl -sS $SINK/m/19:meet-B@thread.v2/ledger | jq '.events | length'   # 1
+# A's ledger contains "meeting A line 1" only; B's contains "meeting B line 1" only.
+
+# 4. Per-thread SSE
+#    In two terminals:
+curl -sS -N $SINK/m/19:meet-A@thread.v2/events &
+curl -sS -N $SINK/m/19:meet-B@thread.v2/events &
+#    Drive another final on A; only the A stream emits a ledger_append.
+
+# 5. Idempotent start
+curl -sS -X POST $SINK/m/19:meet-A@thread.v2/end
+curl -sS -X POST $SINK/transcript -H 'Content-Type: application/json' \
+  -d '{"chat_thread_id":"19:meet-A@thread.v2","event_type":"final","text":"reopened","timestamp_utc":"2026-04-30T17:00:10Z","speaker_id":"speaker_0"}'
+curl -sS $SINK/m/19:meet-A@thread.v2/status
+# Expect: a *new* session_id for chat_thread_id A, not the closed one.
+
+# 6. Legacy fallback when ambiguous
+curl -sS -i $SINK/session/status
+# Expect: 409 with body {"active_thread_ids": ["19:meet-A@...","19:meet-B@..."]}.
+# After ending B, the legacy route resolves to A.
+
+# 7. UI smoke
+#    open http://localhost:5173/m/19:meet-A@thread.v2
+#    Confirm header shows the A thread id; ledger shows A's lines only;
+#    Dossier extraction is scoped to A.
+#    Open http://localhost:5173/  → MeetingList shows both rows.
+
+# 8. C# tests
+#    - TranscriptEvent serializes "chat_thread_id" key (snake_case).
+#    - CallHandler forwards chatThreadId on every PublishAsync.
+#    - TeamsCallingBotService.HandleCallAdded passes threadId into
+#      both GetOrCreateTranscriber and the CallHandler ctor.
+
+# 9. Python tests
+#    - SessionRegistry.get_or_start creates one session per thread id.
+#    - POST /transcript with two distinct thread ids creates two sessions.
+#    - AlfredEventBus filtering: SSE on thread A does not emit thread B
+#      events.
+```
+
+### Explicit non-goals (POC scope)
+
+- No auth on `/m/<id>` URLs — anyone with the link sees the meeting.
+  Treat this as internal-only until E6.5 adds bearer-token gating.
+- No cross-meeting analysis, comparison, or merge views.
+- No persistence change for closed sessions; ledger/dossier remain in
+  the existing tables (`meeting_events`, `dossier_items`,
+  `extractions`) keyed by sink-minted `session_id`. The
+  `chat_thread_id` becomes a foreign key column on `sessions`.
+- No retroactive backfill of `chat_thread_id` onto old sessions.
+- No reconnection-with-resume on SSE (the existing native
+  `EventSource` reconnect is sufficient).
+- No bot-side admission control / queue — out of scope; covered
+  separately if scale warrants.
+
+---
+
 ## Critical files (cross-cut)
 
 | File | Role |
