@@ -205,6 +205,19 @@ curl -sS "$SINK/m/$TID/status"  | jq '.session.meeting_history[] | {kind, role, 
 curl -sS "$SINK/m/$TID/ledger"  | jq '.events | length'
 curl -sS "$SINK/m/$TID/dossier" | jq
 curl -sS -X POST "$SINK/m/$TID/end"
+curl -sS -X POST "$SINK/m/$TID/mute" \
+  -H "Content-Type: application/json" -d '{"muted":true}'   # mute Alfred for this meeting
+curl -sS -X POST "$SINK/m/$TID/mute" \
+  -H "Content-Type: application/json" -d '{"muted":false}'  # unmute
+
+# VM audit logs — written by C# bot, indexed by meeting id.
+# Layout: C:\teams-bot-poc\meeting-logs\<sanitized_chat_thread_id>\{transcript|chat}.ndjson
+# Override base dir with MeetingAuditLogDir in appsettings.production.json.
+az vm run-command create -g rg-alfred-disney --vm-name vm-alfred-disney --location eastus \
+  --run-command-name list-audit \
+  --script 'Get-ChildItem "C:\teams-bot-poc\meeting-logs" -Recurse -Filter *.ndjson | Select-Object FullName, Length' \
+  --async-execution false --timeout-in-seconds 30
+az vm run-command delete -g rg-alfred-disney --vm-name vm-alfred-disney --run-command-name list-audit --yes
 
 # Legacy single-session routes (/session/start, /session/status, /session/end,
 # /session/events) still work for dev tooling and the test suite. Their state
@@ -310,6 +323,7 @@ tool dry-runs (logs + appends to the ledger, does not POST).
 | `Conflict: Run command extension execution is in progress` | Legacy `az vm run-command invoke` wedged the extension. RDP in, remove `C:\Packages\Plugins\Microsoft.CPlat.Core.RunCommandWindows*`, restart `WindowsAzureGuestAgent` + `RdAgent`. |
 | `git fetch origin main` on VM exits 0 but `origin/main` doesn't move | Stale single-branch refspec. Run `git config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'` then `git fetch --prune origin`. The bootstrap fixes this automatically when `remote.origin.url` changes. |
 | Bootstrap aborts with `REPO_URL='git@...' is SSH but DEPLOY_KEY_FILE='...' is empty` | The deploy script needs the SSH deploy key. See §10. |
+| Transcripts log to `meet-{meetingId}` audit dir but chat logs to `19:meeting_xxx` dir | Known gap: joining via short URL (`teams.microsoft.com/meet/...`) produces a synthetic `meet-{meetingId}` thread id for audio; Bot Framework chat activities carry the real `19:` thread id. Both paths work independently but audit logs and session state split across two identifiers. Fix requires a Graph API call during join to resolve the real thread id from the meeting id. |
 
 ---
 
@@ -344,7 +358,7 @@ gh api repos/logan-robbins/alfred-teams-bot/keys \
 6. UI is read-only with respect to the meeting. Only Alfred speaks into the meeting chat, and only through the tool.
 7. All persistent writes go through `meeting_agent.persistence.SessionStore` so live UI and post-meeting replay read the same truth.
 8. The bot self-resolves its TLS cert at startup (thumbprint → Subject CN match on `MediaPlatformSettings.ServiceFqdn` → `CertificateFriendlyName` prefix). Do not re-introduce hard-coded thumbprint dependencies elsewhere — cert auto-renewal must remain transparent.
-9. Treat this README and `python/batcave_platform/specs/alfred.yaml` as system documents.
+9. `python/batcave_platform/specs/alfred.yaml` (`agent.prompt_template`) is the **sole source of truth** for Alfred's instructions. `AlfredAnalyzer` raises `ValueError` at construction if `instructions` is not provided — do not add a fallback default in code. Treat both this README and that spec as system documents.
 
 ---
 
