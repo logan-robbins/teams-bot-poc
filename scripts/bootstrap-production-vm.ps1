@@ -203,6 +203,17 @@ function Setup-DeployKey {
 
     # Normalize CRLF → LF (PowerShell here-strings can introduce CRLF; OpenSSH refuses).
     $normalized = ($KeyContent -replace "`r`n", "`n").TrimEnd() + "`n"
+
+    # On re-runs the file was previously locked down to SYSTEM:R + ServiceUser:R
+    # by the icacls block below, which prevents WriteAllText from overwriting it
+    # (UnauthorizedAccessException). Restore SYSTEM full control and clear the
+    # read-only attribute before writing; the strict ACL is reapplied immediately
+    # afterwards.
+    if (Test-Path $KeyPath) {
+        icacls $KeyPath /inheritance:r 2>&1 | Out-Null
+        icacls $KeyPath /grant:r "NT AUTHORITY\SYSTEM:F" "Administrators:F" 2>&1 | Out-Null
+        Set-ItemProperty -Path $KeyPath -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue
+    }
     [System.IO.File]::WriteAllText($KeyPath, $normalized, [System.Text.UTF8Encoding]::new($false))
 
     # Lock the file down so OpenSSH stops complaining about loose permissions.
