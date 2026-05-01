@@ -1,50 +1,18 @@
 # Alfred
 
 Microsoft Teams meeting assistant for The Walt Disney Company. Joins a
-Teams meeting, captures audio, transcribes per-speaker, ingests meeting
-chat, runs an LLM agent that produces a live "dossier" (decisions, open
-questions, action items, risks), and posts back into the meeting chat.
+Teams meeting, captures diarized audio + chat, runs an LLM agent that
+maintains a live dossier (decisions, open questions, action items, risks)
+keyed per-meeting, and posts back into the meeting chat under explicit
+intervention rules.
 
-This is the only README. Read it end-to-end before touching code.
-
----
-
-## 1. Why this app needs the permissions it asks for
-
-When the Alfred app is installed into a Teams meeting / chat, Teams
-prompts the installer to grant **five chat-scoped, resource-specific
-consent (RSC) permissions**. They are scoped to the single chat the app
-is added to — Alfred has no tenant-wide Graph access. The live POC uses
-Bot Framework meeting-chat activities for chat ingress; the chat RSC
-permissions remain in the manifest for the Graph notification workstream
-documented in `PROD.md`.
-
-| Permission | What it lets Alfred do | Why it is required |
-|---|---|---|
-| `Calls.JoinGroupCalls.Chat` (Application) | Join the Teams call attached to this chat as a bot. | Without this, Alfred cannot enter the meeting at all. The bot would be installed but never appear as a participant. |
-| `Calls.AccessMedia.Chat` (Application) | Receive the live unmixed audio stream from the meeting (16 kHz / 16-bit / mono PCM). | Audio capture is the entire transcription path. Without it, every transcript event is empty and the dossier never gets built. Current Microsoft Teams calling bot documentation does not list a separate Real-Time Media allowlist prerequisite; treat media attachment failures as permissions, consent, bot identity, certificate, DNS, or network issues first. |
-| `OnlineMeetingParticipant.Read.Chat` (Application) | Read the participant roster of this meeting: AAD object id, display name, MSI (`MediaSourceId`) per audio media stream. | This is the source of truth for **who is speaking**. The Graph Communications SDK exposes `ICall.Participants.MediaStreams[].SourceId` bound to `Info.Identity.User.Id`. Without it, the agent only sees `speaker_0` / `speaker_1` from STT diarization and cannot attribute decisions/actions to a real person. |
-| `ChatMessage.Read.Chat` (Application) | Enables the planned Microsoft Graph change-notification path for meeting chat. | Current live chat ingress is Bot Framework `/api/messages`; this permission is kept so the install consent prompt is stable when the Graph path in `PROD.md` is implemented. |
-| `ChatMessageReadReceipt.Read.Chat` (Application) | Observe read-receipts on chat messages. | Lightweight planned signal that lets Alfred avoid re-asking questions everyone has already seen and "engaged with". Kept in the manifest so the install consent prompt is one-shot and stable. |
-
-The app also requests two **manifest-level Teams app permissions**
-(`identity`, `messageTeamMembers`) — these are the standard set required
-for any bot that posts into a chat under its own identity. They are not
-Graph permissions.
-
-**Critically: there are zero tenant-wide Graph permissions.** All five
-RSC permissions are granted at install time, scoped to the single chat
-or meeting the installer adds Alfred to. A different chat = a separate
-consent.
-
-If your tenant policy treats the Alfred app as an "unverified publisher"
-and gates user-driven consent, an M365 Global Administrator must grant
-org-wide consent in **Teams Admin Center → Manage apps → Permissions**.
-The manifest cannot bypass this.
+This README is the operational source of truth. Read it end-to-end before
+touching code. `PROD.md` tracks productionalization status and the design
+notes for deferred work.
 
 ---
 
-## 2. System
+## 1. System
 
 ```
                     ┌──────────────────────────────┐
@@ -55,212 +23,257 @@ The manifest cannot bypass this.
                   unmixed audio    │   Bot Framework chat activities
                   + participants   │   (/api/messages)
                                    ▼
-        ┌────────────────────────────────────────────────────┐
-        │           C# bot  (src/, runs on Windows VM)       │
-        │  - Graph Communications SDK joins the call         │
-        │  - Receives audio + per-buffer ActiveSpeakers MSI  │
-        │  - Reads ICall.Participants → MSI ↔ AAD mapping    │
-        │  - Streams PCM to Deepgram / Azure ConversationTr. │
-        │  - Stamps every TranscriptEvent + chat with the    │
-        │    meeting's chat_thread_id                        │
-        │  - Forwards transcript + chat to the Python sink   │
-        │  - Sends Alfred's outbound chat via Bot Framework  │
-        └────────────────────────┬───────────────────────────┘
-                                 │
-              POST /transcript   │   POST /chat
-              { chat_thread_id } │   { chat_thread_id }      ◀── meeting key on every event
-                                 │   POST /api/send-chat     ◀── reverse path
-                                 ▼
-        ┌────────────────────────────────────────────────────┐
-        │      Python sink  (python/, FastAPI on CAE)        │
-        │  - SessionRegistry — one InterviewSessionManager   │
-        │    per chat_thread_id; auto-starts on first event  │
-        │  - Append-only meeting ledger per session          │
-        │  - Debounced AlfredAnalyzer → AlfredExtraction     │
-        │  - send_to_meeting_chat tool (sole action surface) │
-        │  - SQLite: sessions / meeting_events / extractions │
-        │           / tool_calls / dossier_items             │
-        │  - SSE /m/{chat_thread_id}/events drives the UI    │
-        └────────────────────────┬───────────────────────────┘
-                                 │ SSE + JSON, filtered by chat_thread_id
-                                 ▼
-        ┌────────────────────────────────────────────────────┐
-        │          React UI  (web/, Vite + React 19)         │
-        │   URL-routed: /m/<chat_thread_id> is the only      │
-        │   path that renders the dossier. / shows a meeting │
-        │   picker — there is no "current meeting" fallback. │
-        │   3 columns: Ledger | Dossier | Companion Rail     │
-        │   Read-only: only Alfred speaks into chat.         │
-        └────────────────────────────────────────────────────┘
+   ┌──────────────────────────────────────────────────────────────────┐
+   │     C# bot  (src/, Windows VM, Graph Communications SDK)         │
+   │  - Joins the call; streams PCM to AzureConversationTranscriber   │
+   │    (the only sanctioned STT on Disney; emits diarized speaker_N) │
+   │  - Per audio buffer: snapshots ActiveSpeakers + DominantSpeaker  │
+   │    MediaSourceIds; stamped onto every TranscriptEvent (E3)       │
+   │  - Reads ICall.Participants → MSI ↔ AAD ↔ display_name           │
+   │  - Stamps chat_thread_id on every event                          │
+   │  - Per-meeting NDJSON audit log on disk (see §4)                 │
+   │  - Sends Alfred's outbound chat via Bot Framework adapter        │
+   └────────────────────────┬─────────────────────────────────────────┘
+                            │
+       POST /transcript     │   POST /chat
+       POST /session/        │   POST /api/send-chat   ◀── reverse path
+            participants    │
+                            ▼
+   ┌──────────────────────────────────────────────────────────────────┐
+   │     Python sink  (python/, FastAPI on Container Apps)            │
+   │                                                                   │
+   │  Ingest layer (immutable):                                        │
+   │    raw_ingest_events — every inbound event, hashed, BEFORE any   │
+   │      filter (partial drop, session-active, echo suppression)     │
+   │                                                                   │
+   │  Working layer (cleanable):                                       │
+   │    SessionRegistry — one InterviewSessionManager per             │
+   │      chat_thread_id; auto-starts on first event                  │
+   │    meeting_events — normalized ledger; back-links via            │
+   │      source_raw_event_ids to the immutable raw rows              │
+   │    ParticipantResolver — MSI → AAD; manual > teams_msi_unique >  │
+   │      teams_msi_group > sole_human > unresolved (E3)              │
+   │                                                                   │
+   │  Agent layer:                                                     │
+   │    AlfredAnalyzer — debounced, one AlfredExtraction per tick     │
+   │      (rolling summary, topics, decisions, open_questions,        │
+   │       action_items, risks; merged by id)                         │
+   │    Intervention policy — explicit rules in alfred.yaml +         │
+   │      45s cooldown + directly-addressed bypass (E4)               │
+   │    send_to_meeting_chat — sole outbound action surface           │
+   │                                                                   │
+   │  SQLite tables: sessions, meeting_events, raw_ingest_events,     │
+   │    meeting_participants, participant_msi_bindings,               │
+   │    speaker_identity_links, extractions, tool_calls, dossier_items│
+   │                                                                   │
+   │  SSE /m/{chat_thread_id}/events drives the UI                    │
+   └────────────────────────┬─────────────────────────────────────────┘
+                            │ SSE + JSON, filtered by chat_thread_id
+                            ▼
+   ┌──────────────────────────────────────────────────────────────────┐
+   │     React UI  (web/, Vite + React 19 + react-router-dom)         │
+   │   /             → MeetingList (picker, polls /m every 2s)        │
+   │   /m/<id>       → MeetingDossier (3 cols: Ledger / Dossier /     │
+   │                    Companion Rail). Read-only — only Alfred      │
+   │                    speaks into chat, only via the tool.          │
+   └──────────────────────────────────────────────────────────────────┘
 ```
 
 **Meeting key:** `chat_thread_id` (e.g. `19:meeting_xxx@thread.v2`) is the
-canonical 1:1 identifier for a Teams meeting and the only stable id we
-get on both audio and chat paths. The bot stamps it on every
-`TranscriptEvent` and chat activity; the sink keys its `SessionRegistry`
-on it; the UI requires it in the URL. There is no other auth on the UI —
-**knowing the chat_thread_id IS the access boundary**.
+canonical id for a Teams meeting and the only stable identifier present
+on both audio and chat paths. Knowing the `chat_thread_id` IS the access
+boundary for the UI — there is no other auth on `/m/<id>`.
 
-**Agent contract (do not change without reading §6):** the analyzer
-emits one `AlfredExtraction` per tick (rolling summary, topics, notes,
-decisions, open questions, action items, risks — merged by `id`) and
+**Agent contract (do not change without reading §6):** the analyzer emits
+one `AlfredExtraction` per tick (rolling summary + topics + notes +
+decisions + open_questions + action_items + risks, merged by `id`) and
 optionally calls one tool — `send_to_meeting_chat(text, kind, ...)`.
 There is no `SEND/ASK/SILENT` enum. Silence is "did not call the tool".
 
 ---
 
-## 3. Disney environment
+## 2. Disney environment
 
 | Thing | Value |
 |---|---|
-| Azure subscription | `e02c0038-82c8-4655-9647-38083f301099` |
-| Azure tenant | `56b731a8-...` (disney.com) |
+| Azure subscription | `e02c0038-82c8-4655-9647-38083f301099` (WDI R&D) |
 | M365 tenant (Teams + Entra app) | `38387f0b-9a6f-46e2-8373-67422f8c2cb0` (plutosdoghouse.com) |
 | Resource group | `rg-alfred-disney` |
 | Bot VM | `vm-alfred-disney` (`alfred-disney-bot.eastus.cloudapp.azure.com`) |
-| Azure Bot Service | `bot-alfred-disney` (SingleTenant, app tenant = M365 tenant above) |
+| Azure Bot Service | `bot-alfred-disney` (SingleTenant) |
 | Bot AppId | `207a38a4-67c5-4ef9-ada8-ea7998734d59` |
 | Sink (Container App) | `https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io` |
 | UI (Container App) | `https://ca-alfred-web.gentlewater-5aa74a73.eastus.azurecontainerapps.io` |
+| ACR | `acralfreddisneye02c0038.azurecr.io` |
 | Azure OpenAI | `aoai-alfred-disney` (`gpt-5-mini`, GlobalStandard cap 10) |
 | Speech Services | `speech-alfred-disney` (eastus, S0) |
-| Teams app manifest zip | `manifest/alfred-sandbox.zip` |
 
-**Source of truth repo:** `git@github.com:logan-robbins/alfred-teams-bot.git` (`main`). Private. Local `main` tracks `private/main`.
+**Source of truth:** GitHub `private/main` at
+`git@github.com:logan-robbins/alfred-teams-bot.git`. The `disney` remote
+(`gitlab.wdi.disney.com/Michael.Barron.-ND/teams_integration`) hosts the
+active merge-request branch (`alfred-agent-updates`) for Disney review.
+
+---
+
+## 3. Permissions (RSC)
+
+When Alfred is installed into a Teams meeting/chat the installer grants
+**five chat-scoped Resource-Specific Consent permissions**, scoped to that
+single chat. There are zero tenant-wide Graph permissions.
+
+| Permission | Used for |
+|---|---|
+| `Calls.JoinGroupCalls.Chat` | Bot enters the call as a participant. |
+| `Calls.AccessMedia.Chat` | Receive 16 kHz / 16-bit / mono PCM audio. |
+| `OnlineMeetingParticipant.Read.Chat` | MSI ↔ AAD ↔ display-name lookup (E3). |
+| `ChatMessage.Read.Chat` | Reserved for the Graph notification chat path (PROD.md). |
+| `ChatMessageReadReceipt.Read.Chat` | Reserved (planned engagement signal). |
+
+Plus two manifest-level Teams app permissions: `identity`,
+`messageTeamMembers`. The manifest also requests `supportsCalling: true`.
+
+If the tenant treats Alfred as "unverified publisher", an M365 admin must
+grant org-wide consent in **Teams Admin Center → Manage apps →
+Permissions**. The manifest cannot bypass this.
 
 ---
 
 ## 4. Repo layout
 
-```
-src/                         C# Teams bot (Graph Communications SDK)
-python/                      FastAPI sink + Alfred agent
-  transcript_sink.py         all HTTP routes (legacy /session/* + /m/*)
-  meeting_agent/
-    models.py                InterviewSession, MeetingEvent, ...
-    session.py               InterviewSessionManager + SessionRegistry
-    persistence.py, agent.py, tools.py
-  batcave_platform/          product-spec loader, output routes
-    specs/alfred.yaml        Alfred's prompt + intervention policy
-  variants/alfred.py         spec-bound runtime variant
-  tests/                     pytest suite (uv run pytest tests -v)
-web/                         React 19 + Vite + Tailwind v4 dossier UI
-  src/App.tsx                router: / -> MeetingList, /m/* -> MeetingDossier
-  src/components/MeetingList.tsx       picker at root path
-  src/components/MeetingDossier.tsx    dossier (keyed on URL chat_thread_id)
-manifest/                    Teams app manifest (Disney sandbox)
-scripts/                     deploy-azure-vm.sh, deploy-azure-agent.sh, ...
-```
+| Folder | Role |
+|---|---|
+| `src/` | C# Teams bot. Graph Communications SDK + Bot Framework. Builds with `dotnet build`. |
+| `python/` | FastAPI sink + Alfred agent. Run with `uv run python run_variant_sink.py …` from this folder. |
+| `python/meeting_agent/` | Canonical session/agent state. `models.py`, `session.py`, `persistence.py`, `agent.py`, `tools.py`, `identity.py`. |
+| `python/batcave_platform/` | Product spec loader + output routes. `specs/alfred.yaml` is the **sole source of truth** for Alfred's prompt and intervention policy. |
+| `python/tests/` | `uv run pytest tests` baseline: 118 passed, 2 skipped. |
+| `web/` | React 19 + Vite + Tailwind v4 UI. Per-meeting routing via `react-router-dom`. |
+| `manifest/` | Teams app manifest (`manifest.json`, `alfred-sandbox.zip`). Bot AppId, RSC permissions, valid domains. |
+| `scripts/` | Deploy + ops scripts. Canonical entrypoints: `deploy-azure-vm.sh`, `deploy-azure-agent.sh`, `bootstrap-production-vm.ps1`, `join_meeting.sh`. |
 
-Canonical state object: `InterviewSession` in
-`python/meeting_agent/models.py`. Canonical history:
-`InterviewSession.meeting_events` (a single append-only ledger of
-normalized speech + chat + system events). One session per
-`chat_thread_id`, held in `SessionRegistry`.
+**Canonical state object:** `InterviewSession` in
+`python/meeting_agent/models.py`. **Canonical history:**
+`InterviewSession.meeting_events` (single append-only ledger of normalized
+speech + chat + system events). One session per `chat_thread_id`, held in
+`SessionRegistry`. The immutable raw layer is `raw_ingest_events`;
+`MeetingEvent.source_raw_event_ids` back-links every working-ledger row
+to the raw rows that produced it.
 
 ---
 
-## 5. Install in the Disney M365 tenant
+## 5. Install in the M365 tenant
 
-1. Upload `manifest/alfred-sandbox.zip` via the Teams Developer Portal at `https://dev.teams.microsoft.com/apps` → **Import app**.
-2. **Preview in Teams** → **Add to a chat** (or to a meeting). The install grants the five RSC permissions described in §1, scoped to that chat.
-3. Either invite the bot into a meeting from that chat, or trigger an explicit join:
+1. Upload `manifest/alfred-sandbox.zip` via the Teams Developer Portal
+   at `https://dev.teams.microsoft.com/apps` → **Import app**.
+2. **Preview in Teams** → **Add to a chat**. (Do **not** use "Add to a
+   meeting" — that flow opens a modal that renders `developer.websiteUrl`
+   because the manifest is bot-only with no `configurableTabs`.)
+3. From that chat, either invite the bot into a running meeting, or
+   trigger an explicit join:
    ```bash
    ./scripts/join_meeting.sh "<teams-meeting-join-url>" "Alfred"
    ```
-   A `CALL_JOIN_FAILED_7504_OR_7505` response means Microsoft Graph rejected
-   the join with tenant-level authorization constraints, commonly surfaced as
-   `403 Insufficient enterprise tenant permissions`. Re-check the Teams app
-   installation/RSC consent for that meeting chat and the bot app's Graph call
-   permissions/admin consent in the meeting tenant.
-4. If the publisher is "unverified" by tenant policy, see the admin-consent note in §1.
+4. If the publisher is "unverified", see §3.
 
 ---
 
 ## 6. Operate
 
-**Live flow (canonical):** the bot stamps every transcript and chat with
-the meeting's `chat_thread_id` and POSTs them to `/transcript` / `/chat`
-on the sink. The sink's `SessionRegistry` auto-starts a session keyed on
-that id (no `/session/start` round-trip needed) and persists everything
-into `InterviewSession.meeting_events`. The UI loads only through
-`/m/<chat_thread_id>` and reads `/m/<id>/status` + live SSE at
-`/m/<id>/events`. Open `/` to pick from the active meeting list.
-
-Microsoft Graph chat-notification subscriptions are not active in the live
-sandbox deployment. Chat ingress is the Bot Framework `/api/messages` path
-(`source="bot_framework"` in the ledger). `TranscriptSink.ChatEndpoint` is
-required; the bot fails fast when it is missing.
+The bot stamps every transcript and chat with the meeting's
+`chat_thread_id` and POSTs them to `/transcript` / `/chat` on the sink.
+The sink's `SessionRegistry` auto-starts a session keyed on that id and
+persists everything into both the immutable `raw_ingest_events` audit
+table and the working `meeting_events` ledger. The UI reads
+`/m/<chat_thread_id>/status` + live SSE at `/m/<chat_thread_id>/events`.
+Open `/` to pick from the active meeting list.
 
 ```bash
-# Public health
-curl -sS -m 10 https://alfred-disney-bot.eastus.cloudapp.azure.com/api/calling/health
-curl -sS -m 10 https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io/health
-curl -sS -m 10 -o /dev/null -w "%{http_code}\n" https://ca-alfred-web.gentlewater-5aa74a73.eastus.azurecontainerapps.io
+SINK=https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io
+WEB=https://ca-alfred-web.gentlewater-5aa74a73.eastus.azurecontainerapps.io
+BOT=https://alfred-disney-bot.eastus.cloudapp.azure.com
+
+# Health
+curl -sS -m 10 $BOT/api/calling/health
+curl -sS -m 10 $SINK/health
+curl -sS -m 10 -o /dev/null -w "web HTTP=%{http_code}\n" $WEB
 
 # Sink stats
-curl -sS https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io/stats | jq
+curl -sS $SINK/stats | jq
 
-# Per-meeting routes (the UI uses these — chat_thread_id is the URL key).
-SINK=https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io
-TID='19:meeting_xxx@thread.v2'             # URL-encode the colon in the path if needed
+# Per-meeting routes (UI uses these — chat_thread_id is the URL key)
+TID='19:meeting_xxx@thread.v2'   # URL-encode the colon when needed
 
 curl -sS $SINK/m | jq '.meetings[] | {chat_thread_id, active, total_events}'
 curl -sS "$SINK/m/$TID/status"  | jq '.session.meeting_history[] | {kind, role, text}'
 curl -sS "$SINK/m/$TID/ledger"  | jq '.events | length'
 curl -sS "$SINK/m/$TID/dossier" | jq
+
+# Mute / unmute Alfred for one meeting
+curl -sS -X POST "$SINK/m/$TID/mute" -H "Content-Type: application/json" -d '{"muted":true}'
+
+# End a meeting session
 curl -sS -X POST "$SINK/m/$TID/end"
-curl -sS -X POST "$SINK/m/$TID/mute" \
-  -H "Content-Type: application/json" -d '{"muted":true}'   # mute Alfred for this meeting
-curl -sS -X POST "$SINK/m/$TID/mute" \
-  -H "Content-Type: application/json" -d '{"muted":false}'  # unmute
 
-# VM audit logs — written by C# bot, indexed by meeting id.
-# Layout: C:\teams-bot-poc\meeting-logs\<sanitized_chat_thread_id>\{transcript|chat}.ndjson
-# Override base dir with MeetingAuditLogDir in appsettings.production.json.
-az vm run-command create -g rg-alfred-disney --vm-name vm-alfred-disney --location eastus \
-  --run-command-name list-audit \
-  --script 'Get-ChildItem "C:\teams-bot-poc\meeting-logs" -Recurse -Filter *.ndjson | Select-Object FullName, Length' \
-  --async-execution false --timeout-in-seconds 30
-az vm run-command delete -g rg-alfred-disney --vm-name vm-alfred-disney --run-command-name list-audit --yes
+# Raw audit (E1) — every inbound event, including drops
+SID=$(curl -sS "$SINK/m/$TID/status" | jq -r .session.session_id)
+curl -sS "$SINK/sessions/$SID/raw-events" | jq '.events[] | {event_type, dropped_reason}'
+curl -sS "$SINK/sessions/$SID/raw-events/export.ndjson" -o "audit-$SID.ndjson"
 
-# Legacy single-session routes (/session/start, /session/status, /session/end,
-# /session/events) still work for dev tooling and the test suite. Their state
-# lives in the registry's "default" slot. Prefer /m/<id>/* for anything new.
+# Identity (E3) — Teams roster + speaker_id resolutions
+curl -sS "$SINK/sessions/$SID/participants"      | jq
+curl -sS "$SINK/sessions/$SID/speaker-identity"  | jq
+curl -sS -X POST "$SINK/sessions/$SID/speaker-mapping" \
+  -H "Content-Type: application/json" -d '{"speaker_id":"speaker_0","aad_object_id":"<AAD>"}'
+```
 
-# Verify the Teams channel calling webhook points at the VM. Calling MUST
-# terminate at the C# bot host — Container Apps cannot host /api/calling
-# (no Real-Time Media SDK on Linux).
-az bot msteams show -g rg-alfred-disney -n bot-alfred-disney \
-  --query "properties.properties.{callingWebhook:callingWebhook, enableCalling:enableCalling}" -o json
+### VM operations (canonical pattern: `az vm run-command create`)
 
-# UI-to-sink proxy. Should return the same /m index as the direct sink.
-curl -sS https://ca-alfred-web.gentlewater-5aa74a73.eastus.azurecontainerapps.io/sink/m | jq
+`az vm run-command create` is the only sanctioned variant. Never use
+`az vm run-command invoke` — the legacy action variant wedges the
+extension and forces a manual cleanup over RDP.
 
-# Restart the bot service on the VM
-az vm run-command create -g rg-alfred-disney --vm-name vm-alfred-disney --location eastus \
-  --run-command-name restart-bot \
-  --script 'Restart-Service TeamsMediaBot -Force; Start-Sleep -Seconds 8; Get-Service TeamsMediaBot' \
-  --async-execution false --timeout-in-seconds 60
-az vm run-command delete -g rg-alfred-disney --vm-name vm-alfred-disney --run-command-name restart-bot --yes
-
+```bash
 # Tail bot logs
 az vm run-command create -g rg-alfred-disney --vm-name vm-alfred-disney --location eastus \
   --run-command-name tail-logs \
   --script 'Get-Content C:\teams-bot-poc\logs\service-output.log -Tail 80; Write-Host "---STDERR---"; Get-Content C:\teams-bot-poc\logs\service-error.log -Tail 40 -ErrorAction SilentlyContinue' \
-  --async-execution false --timeout-in-seconds 60
-az vm run-command show -g rg-alfred-disney --vm-name vm-alfred-disney --run-command-name tail-logs --instance-view --query "instanceView.output" -o tsv
+  --async-execution false --timeout-in-seconds 60 --output none
+az vm run-command show -g rg-alfred-disney --vm-name vm-alfred-disney --run-command-name tail-logs \
+  --instance-view --query "instanceView.output" -o tsv
 az vm run-command delete -g rg-alfred-disney --vm-name vm-alfred-disney --run-command-name tail-logs --yes
+
+# Restart the bot service
+az vm run-command create -g rg-alfred-disney --vm-name vm-alfred-disney --location eastus \
+  --run-command-name restart-bot \
+  --script 'Restart-Service TeamsMediaBot -Force; Start-Sleep -Seconds 8; Get-Service TeamsMediaBot' \
+  --async-execution false --timeout-in-seconds 60 --output none
+az vm run-command delete -g rg-alfred-disney --vm-name vm-alfred-disney --run-command-name restart-bot --yes
+
+# Per-meeting NDJSON audit logs on disk (written by C# bot)
+# Path: C:\teams-bot-poc\meeting-logs\<sanitized_chat_thread_id>\{transcript|chat}.ndjson
+az vm run-command create -g rg-alfred-disney --vm-name vm-alfred-disney --location eastus \
+  --run-command-name list-audit \
+  --script 'Get-ChildItem "C:\teams-bot-poc\meeting-logs" -Recurse -Filter *.ndjson | Select-Object FullName, Length' \
+  --async-execution false --timeout-in-seconds 30 --output none
+az vm run-command delete -g rg-alfred-disney --vm-name vm-alfred-disney --run-command-name list-audit --yes
 ```
 
-**Always use `az vm run-command create`. Never `az vm run-command invoke`** — the legacy action variant wedges the extension and forces a manual `Microsoft.CPlat.Core.RunCommandWindows*` cleanup over RDP.
+### Verify the Teams calling webhook points at the VM
+
+Calling MUST terminate at the C# bot host — Container Apps cannot host
+`/api/calling` (no Real-Time Media SDK on Linux).
+
+```bash
+az bot msteams show -g rg-alfred-disney -n bot-alfred-disney \
+  --query "properties.properties.{callingWebhook:callingWebhook, enableCalling:enableCalling}" -o json
+```
 
 ---
 
 ## 7. Push a code change
 
 ```bash
-git push                                 # local main → private/main
+git push                                   # local main → private/main
 
 # Bot VM (rebuilds C# bot, redeploys + restarts service)
 RG_NAME=rg-alfred-disney VM_NAME=vm-alfred-disney \
@@ -276,16 +289,23 @@ RG_NAME=rg-alfred-disney VM_NAME=vm-alfred-disney \
   SKIP_REPO_SYNC=0 \
   ./scripts/deploy-azure-vm.sh
 
-# Sink + UI Container Apps (rebuild images via ACR, redeploy)
-./scripts/deploy-azure-agent.sh
+# Sink + UI Container Apps (build via ACR, roll the active revision)
+TAG=disney-sandbox-$(git rev-parse --short HEAD)
+az acr build --registry acralfreddisneye02c0038 --image ca-alfred-api:$TAG --file python/Dockerfile python/
+az acr build --registry acralfreddisneye02c0038 --image ca-alfred-web:$TAG --file web/Dockerfile     web/
+az containerapp update -n ca-alfred-api -g rg-alfred-disney \
+  --image acralfreddisneye02c0038.azurecr.io/ca-alfred-api:$TAG
+az containerapp update -n ca-alfred-web -g rg-alfred-disney \
+  --image acralfreddisneye02c0038.azurecr.io/ca-alfred-web:$TAG
 ```
 
 `SKIP_REPO_SYNC=0` is required after pushing new commits. Use
-`SKIP_REPO_SYNC=1` for config-only redeploys.
+`SKIP_REPO_SYNC=1` for config-only redeploys. The bot service is stopped
+before publishing so the running DLL doesn't lock the build.
 
-The bot service is stopped before publishing so the running DLL doesn't
-lock the build. If you ever see "file in use" during publish, the
-service wasn't stopped — re-run.
+`scripts/deploy-azure-agent.sh` defaults to a non-Disney resource group;
+prefer the explicit `az acr build` + `az containerapp update` flow above
+for Disney.
 
 ---
 
@@ -301,7 +321,7 @@ uv run python run_variant_sink.py --instance dev --port 8765 \
 cd web && npm install && npm run dev      # http://127.0.0.1:5173
 
 # Tests
-cd python && uv run pytest tests -v       # baseline: 97 passed, 2 skipped
+cd python && uv run pytest tests -v       # baseline: 118 passed, 2 skipped
 
 # C# build
 dotnet build
@@ -317,34 +337,33 @@ tool dry-runs (logs + appends to the ledger, does not POST).
 
 | Symptom | Fix |
 |---|---|
-| `/api/calling/health` Healthy but Teams calls don't join | Microsoft RTM media allowlist required for the bot AppId. Submit at `https://aka.ms/teams-rtm-onboarding` (~2 weeks). Until approved, the bot joins but the media SDK fails to attach to audio. |
+| `/api/calling/health` Healthy but Teams calls don't join | Microsoft RTM media allowlist may be required for the bot AppId. Submit at `https://aka.ms/teams-rtm-onboarding`. Until approved, the bot joins but the media SDK fails to attach to audio. |
 | Bot service Running, stderr says `MediaPlatform needs at least 2 cores` | VM has <2 physical cores. Resize: `az vm resize -g rg-alfred-disney -n vm-alfred-disney --size Standard_D4s_v3`, then restart bot service. |
 | Bot service Running, stderr says `DllNotFoundException: NativeMedia` | Server-Media-Foundation feature or VC++ Redistributable missing. Re-run `./scripts/deploy-azure-vm.sh`; Phase 1 reinstalls both. |
 | `POST /api/messages` → 401 `Invalid AppId passed on token` | `appsettings.production.json` is missing `MicrosoftAppId/Password/Type/TenantId` at the **root** (Bot Framework reads these, distinct from `Bot.*`). Re-run `./scripts/deploy-azure-vm.sh`. |
-| Bot crashes on startup with `Certificate with thumbprint '...' not found` | The TLS cert was rotated/renewed but `appsettings.production.json` still has the old thumbprint. The bot now auto-resolves the cert by Subject CN matching `MediaPlatformSettings.ServiceFqdn` (or `CertificateFriendlyName` prefix) when the configured thumbprint is missing — restarting the service is enough. If you do see this error, the cert is missing entirely; run `./scripts/deploy-azure-vm.sh` to re-issue it. |
-| `POST /api/messages` → 500 `CloudAdapter ambiguous constructors` | DI regression. The factory in `src/Program.cs` must explicitly select `CloudAdapter(BotFrameworkAuthentication, ILogger)`. |
-| Sink `events_received` increments but `session_events: 0` and no `[CHAT]` log line | No active session. The sink only persists chat to SQLite when a session is active. `POST /session/start` first. |
-| `az vm get-instance-view` returns `vmAgent: null` | ARM cache lag. Probe directly with a Run Command (`Write-Host alive`); if it returns Succeeded the agent is fine. |
+| Bot crashes on startup with `Certificate with thumbprint '...' not found` | The bot auto-resolves the cert by Subject CN matching `MediaPlatformSettings.ServiceFqdn` (or `CertificateFriendlyName` prefix); restarting is normally enough. If you do see this error, the cert is missing entirely; run `./scripts/deploy-azure-vm.sh`. |
+| Sink container revision crashloops with `Product spec file not found at '/app/legionmeet_platform/...'` | Stale env var from pre-rename era. Fix: `az containerapp update -n ca-alfred-api -g rg-alfred-disney --set-env-vars PRODUCT_SPEC_PATH=/app/batcave_platform/specs/alfred.yaml`. |
+| `az vm run-command create` Phase 1 fails with `Access to the path 'C:\ProgramData\alfred\deploy_key' is denied` | Old ACL locked SYSTEM to Read-only. The current bootstrap script handles this on re-run; if it still fails, relax the ACL in-place (probe via Run Command: `icacls "C:\ProgramData\alfred\deploy_key" /grant:r "NT AUTHORITY\SYSTEM:F"`). |
+| `az vm get-instance-view` returns `vmAgent: null` | ARM cache lag. Probe directly with a Run Command (`Write-Host alive`); if it returns Succeeded, the agent is fine. |
 | `Conflict: Run command extension execution is in progress` | Legacy `az vm run-command invoke` wedged the extension. RDP in, remove `C:\Packages\Plugins\Microsoft.CPlat.Core.RunCommandWindows*`, restart `WindowsAzureGuestAgent` + `RdAgent`. |
-| `git fetch origin main` on VM exits 0 but `origin/main` doesn't move | Stale single-branch refspec. Run `git config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'` then `git fetch --prune origin`. The bootstrap fixes this automatically when `remote.origin.url` changes. |
-| Bootstrap aborts with `REPO_URL='git@...' is SSH but DEPLOY_KEY_FILE='...' is empty` | The deploy script needs the SSH deploy key. See §10. |
-| Transcripts log to `meet-{meetingId}` audit dir but chat logs to `19:meeting_xxx` dir | Known gap: joining via short URL (`teams.microsoft.com/meet/...`) produces a synthetic `meet-{meetingId}` thread id for audio; Bot Framework chat activities carry the real `19:` thread id. Both paths work independently but audit logs and session state split across two identifiers. Fix requires a Graph API call during join to resolve the real thread id from the meeting id. |
+| Sink `events_received` increments but ledger empty | Auto-start requires non-empty `text` on a `final` transcript or a non-deleted chat. Partials and pre-session chats land in `raw_ingest_events` with a `dropped_reason` instead of in the working ledger — verify via `/sessions/{id}/raw-events`. |
+| Ledger shows `speaker_0` instead of real names | C# `Call.Participants.OnUpdated` publisher to `POST /session/participants` is deferred (PROD.md E3). The Python resolver and tables are live; once the C# publisher lands, identities backfill automatically. |
+| Transcripts log to `meet-{meetingId}` audit dir but chat logs to `19:meeting_xxx` dir | Joining via short URL (`teams.microsoft.com/meet/...`) yields a synthetic `meet-{meetingId}` thread id for audio; Bot Framework chat carries the real `19:` thread id. Resolution requires a Graph call during join to look up the real thread id from the meeting id. |
 
 ---
 
 ## 10. Deploy key (private repo)
 
-VMs clone the private repo over SSH using a read-only ed25519 deploy
-key registered on the repo. Bootstrap drops it on the VM at
-`C:\ProgramData\alfred\deploy_key` with ACL `SYSTEM + azureuser : Read`
-and points `GIT_SSH_COMMAND` at it.
+VMs clone the private GitHub repo over SSH using a read-only ed25519
+deploy key. Bootstrap drops it on the VM at
+`C:\ProgramData\alfred\deploy_key` with a strict ACL.
 
 ```bash
-# Generate (one-time per dev machine — public half already registered)
+# Generate (one-time per dev machine — the public half is already on the repo)
 ssh-keygen -t ed25519 -C "alfred-teams-bot deploy" -f /tmp/alfred-deploy-key -N ""
 chmod 600 /tmp/alfred-deploy-key
 
-# Register the public half on the private repo (read-only)
+# Register the public half (read-only)
 gh api repos/logan-robbins/alfred-teams-bot/keys \
   -f title="$(hostname)-$(date -u +%Y-%m-%d)" \
   -f key="$(cat /tmp/alfred-deploy-key.pub)" \
@@ -355,26 +374,53 @@ gh api repos/logan-robbins/alfred-teams-bot/keys \
 
 ## 11. Editing rules (do not violate)
 
-1. Single canonical meeting ledger (`InterviewSession.meeting_events`), one session per `chat_thread_id`.
-2. `chat_thread_id` is the meeting key. Every transcript and chat event must carry it; the UI must require it in the URL (`/m/<chat_thread_id>`); never reintroduce a "current meeting" fallback that lets `/` show a dossier.
-3. One authoritative inbound chat path for the current POC: Teams Bot Framework activities delivered to `/api/messages`, then forwarded to the Python `/chat` endpoint.
-4. Outbound Alfred chat goes through the `send_to_meeting_chat` agent tool. The old `teams_chat` output route is gone.
-5. Agent contract = `AlfredExtraction` (structured output) + `send_to_meeting_chat` (sole action). **Do not** reintroduce a `SEND/ASK/SILENT` enum.
-6. UI is read-only with respect to the meeting. Only Alfred speaks into the meeting chat, and only through the tool.
-7. All persistent writes go through `meeting_agent.persistence.SessionStore` so live UI and post-meeting replay read the same truth.
-8. The bot self-resolves its TLS cert at startup (thumbprint → Subject CN match on `MediaPlatformSettings.ServiceFqdn` → `CertificateFriendlyName` prefix). Do not re-introduce hard-coded thumbprint dependencies elsewhere — cert auto-renewal must remain transparent.
-9. `python/batcave_platform/specs/alfred.yaml` (`agent.prompt_template`) is the **sole source of truth** for Alfred's instructions. `AlfredAnalyzer` raises `ValueError` at construction if `instructions` is not provided — do not add a fallback default in code. Treat both this README and that spec as system documents.
+1. **Single canonical meeting ledger** — `InterviewSession.meeting_events`,
+   one session per `chat_thread_id`. The immutable layer is
+   `raw_ingest_events`; back-link new ledger rows via `source_raw_event_ids`.
+2. **`chat_thread_id` is THE meeting key.** Every transcript and chat must
+   carry it; the UI must require it in the URL (`/m/<chat_thread_id>`);
+   never reintroduce a "current meeting" fallback that lets `/` show a
+   dossier.
+3. **One inbound chat path** — Bot Framework activities to `/api/messages`,
+   then forwarded to the Python `/chat` endpoint.
+4. **Outbound Alfred chat** goes through the `send_to_meeting_chat` agent
+   tool. The old `teams_chat` output route is gone.
+5. **Agent contract** = `AlfredExtraction` (structured output) +
+   `send_to_meeting_chat` (sole action). **Do not** reintroduce a
+   `SEND/ASK/SILENT` enum.
+6. **UI is read-only with respect to the meeting.** Only Alfred speaks
+   into chat, only through the tool.
+7. **All persistent writes** go through `meeting_agent.persistence.SessionStore`
+   so live UI and post-meeting replay read the same truth.
+8. **Bot self-resolves its TLS cert at startup** (thumbprint → Subject CN
+   match on `MediaPlatformSettings.ServiceFqdn` → `CertificateFriendlyName`
+   prefix). Cert auto-renewal must remain transparent.
+9. **`python/batcave_platform/specs/alfred.yaml` (`agent.prompt_template`
+   and `agent.intervention_policy`) is the sole source of truth** for
+   Alfred's instructions and proactivity rules. `AlfredAnalyzer` raises at
+   construction if `instructions` is not provided — do not add a fallback
+   default in code. Treat both this README and that spec as system
+   documents.
+10. **One canonical implementation per concern.** No duplicate files, no
+    parallel code paths, no `v2` copies, no override-with-fallback
+    patterns. If a feature is multi-tenant in spirit, model it as a
+    single canonical lookup with one entry today, not a default-plus-override.
+11. **Fail fast** when prerequisites are unmet — clear, specific errors at
+    system boundaries. Don't add validation or fallbacks for scenarios
+    that can't happen.
 
 ---
 
 ## 12. What's next (productionalization)
 
-`PROD.md` at the repo root is the next-step productionalization plan. It
-covers five technical enhancements layered on the current POC: an
-append-only raw ingest audit store, a split between raw audit and the
-agent's working memory, a Teams-MSI-driven participant identity layer
-(so the agent sees real names instead of `speaker_0`), explicit
-proactivity rules in `alfred.yaml` (without reintroducing a
-`SEND/ASK/SILENT` enum), and per-meeting sink routing so each call can
-target its own Python sink. Read `PROD.md` before starting any of those
-workstreams.
+`PROD.md` at the repo root tracks productionalization status. Current
+state:
+
+- **E1 raw audit store** ✅ live
+- **E2 raw/working ledger split** ✅ live
+- **E3 participant identity layer** ✅ Python live; C# `Call.Participants.OnUpdated` publisher deferred
+- **E4 explicit proactivity policy** ✅ live
+- **E5 multi-sink routing** 🟡 deferred — needs a meeting→sink registration story that survives auto-invite
+- **E6 per-meeting URL-routed UI** ✅ live
+
+Read `PROD.md` before starting any of the deferred workstreams.
