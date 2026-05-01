@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.Bot.Builder;
 using Microsoft.Bot.Builder.Integration.AspNet.Core;
 using Microsoft.Bot.Schema;
+using Newtonsoft.Json;
 using System.Collections.Concurrent;
 using TeamsMediaBot.Models;
 using TeamsMediaBot.Services;
@@ -113,13 +114,30 @@ public sealed class SendChatController : ControllerBase
 
 public sealed record SendChatRequest
 {
+    [JsonProperty("conversation_reference_id")]
     public string? ConversationReferenceId { get; init; }
+
+    [JsonProperty("action")]
     public string? Action { get; init; }
+
+    [JsonProperty("text")]
     public string? Text { get; init; }
+
+    [JsonProperty("mentions")]
     public List<string>? Mentions { get; init; }
+
+    [JsonProperty("reply_to_message_id")]
     public string? ReplyToMessageId { get; init; }
+
+    [JsonProperty("rationale")]
     public string? Rationale { get; init; }
+
+    [JsonProperty("session_id")]
     public string? SessionId { get; init; }
+
+    [JsonProperty("product_id")]
     public string? ProductId { get; init; }
+
+    [JsonProperty("instance_id")]
     public string? InstanceId { get; init; }
 }
