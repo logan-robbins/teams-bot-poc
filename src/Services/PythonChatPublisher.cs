@@ -23,11 +23,13 @@ public sealed class PythonChatPublisher
     private readonly HttpClient _httpClient;
     private readonly ILogger<PythonChatPublisher> _logger;
     private readonly string _endpoint;
+    private readonly MeetingAuditLogger? _auditLogger;
 
     public PythonChatPublisher(
         HttpClient httpClient,
         TranscriptSinkConfiguration config,
-        ILogger<PythonChatPublisher> logger)
+        ILogger<PythonChatPublisher> logger,
+        MeetingAuditLogger? auditLogger = null)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         ArgumentNullException.ThrowIfNull(config);
@@ -39,12 +41,16 @@ public sealed class PythonChatPublisher
 
         _endpoint = config.ChatEndpoint;
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _auditLogger = auditLogger;
     }
 
     public async Task PublishAsync(ChatEventPayload payload, CancellationToken cancellationToken = default)
     {
         try
         {
+            if (_auditLogger is not null && !string.IsNullOrWhiteSpace(payload.ChatThreadId))
+                _auditLogger.Append(payload.ChatThreadId, "chat", payload);
+
             using var response = await _httpClient.PostAsJsonAsync(
                 _endpoint,
                 payload,

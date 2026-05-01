@@ -100,6 +100,11 @@ try
     builder.Services.AddSingleton<IConversationReferenceStore, InMemoryConversationReferenceStore>();
     builder.Services.AddSingleton<IBot, AlfredBot>();
 
+    // Per-meeting raw event audit log (NDJSON files keyed by sanitized chat_thread_id).
+    var auditLogDir = Path.Combine(
+        builder.Configuration["MeetingAuditLogDir"] ?? @"C:\teams-bot-poc\meeting-logs");
+    builder.Services.AddSingleton(new MeetingAuditLogger(auditLogDir));
+
     // Meeting-chat services (inbound chat → Python sink; Graph subscription lifecycle).
     builder.Services.AddSingleton<IMeetingChatService, MeetingChatService>();
     builder.Services.AddHttpClient<PythonChatPublisher>();
@@ -125,10 +130,12 @@ try
     builder.Services.AddSingleton<TranscriberFactory>(sp =>
     {
         var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+        var meetingAuditLogger = sp.GetRequiredService<MeetingAuditLogger>();
         return new TranscriberFactory(
             sttConfig,
             transcriptSinkConfig.PythonEndpoint,
-            loggerFactory);
+            loggerFactory,
+            meetingAuditLogger);
     });
 
     // Register bot service as singleton

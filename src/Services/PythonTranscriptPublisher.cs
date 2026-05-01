@@ -35,6 +35,7 @@ public sealed class PythonTranscriptPublisher : IDisposable
     private readonly ILogger<PythonTranscriptPublisher> _logger;
     private readonly HttpClient _httpClient;
     private readonly JsonSerializerOptions _jsonOptions;
+    private readonly MeetingAuditLogger? _auditLogger;
     private bool _isDisposed;
 
     /// <summary>
@@ -42,15 +43,20 @@ public sealed class PythonTranscriptPublisher : IDisposable
     /// </summary>
     /// <param name="endpoint">The Python FastAPI endpoint URL.</param>
     /// <param name="logger">The logger instance.</param>
+    /// <param name="auditLogger">Optional audit logger; when provided every event is appended to disk.</param>
     /// <exception cref="ArgumentNullException">Thrown when required parameters are null.</exception>
-    public PythonTranscriptPublisher(string endpoint, ILogger<PythonTranscriptPublisher> logger)
+    public PythonTranscriptPublisher(
+        string endpoint,
+        ILogger<PythonTranscriptPublisher> logger,
+        MeetingAuditLogger? auditLogger = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(endpoint);
         ArgumentNullException.ThrowIfNull(logger);
         
         _endpoint = endpoint;
         _logger = logger;
-        
+        _auditLogger = auditLogger;
+
         // Configure HttpClient with appropriate settings
         // Note: Using SocketsHttpHandler for better connection pooling
         var handler = new SocketsHttpHandler
@@ -91,6 +97,9 @@ public sealed class PythonTranscriptPublisher : IDisposable
         
         try
         {
+            if (_auditLogger is not null && !string.IsNullOrWhiteSpace(transcriptEvent.ChatThreadId))
+                _auditLogger.Append(transcriptEvent.ChatThreadId, "transcript", transcriptEvent);
+
             using var response = await _httpClient
                 .PostAsJsonAsync(_endpoint, transcriptEvent, _jsonOptions, cancellationToken)
                 .ConfigureAwait(false);

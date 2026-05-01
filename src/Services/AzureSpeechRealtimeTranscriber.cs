@@ -23,6 +23,7 @@ public sealed class TranscriberFactory
     private readonly SttConfiguration _sttConfig;
     private readonly string _pythonEndpoint;
     private readonly ILoggerFactory _loggerFactory;
+    private readonly MeetingAuditLogger? _auditLogger;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="TranscriberFactory"/> class.
@@ -30,19 +31,22 @@ public sealed class TranscriberFactory
     /// <param name="sttConfig">The STT configuration.</param>
     /// <param name="pythonEndpoint">The Python endpoint for transcript events.</param>
     /// <param name="loggerFactory">The logger factory.</param>
+    /// <param name="auditLogger">Optional audit logger passed through to each publisher.</param>
     /// <exception cref="ArgumentNullException">Thrown when required parameters are null.</exception>
     public TranscriberFactory(
         SttConfiguration sttConfig,
         string pythonEndpoint,
-        ILoggerFactory loggerFactory)
+        ILoggerFactory loggerFactory,
+        MeetingAuditLogger? auditLogger = null)
     {
         ArgumentNullException.ThrowIfNull(sttConfig);
         ArgumentException.ThrowIfNullOrWhiteSpace(pythonEndpoint);
         ArgumentNullException.ThrowIfNull(loggerFactory);
-        
+
         _sttConfig = sttConfig;
         _pythonEndpoint = pythonEndpoint;
         _loggerFactory = loggerFactory;
+        _auditLogger = auditLogger;
     }
 
     /// <summary>
@@ -58,7 +62,7 @@ public sealed class TranscriberFactory
     public IRealtimeTranscriber Create()
     {
         var publisherLogger = _loggerFactory.CreateLogger<PythonTranscriptPublisher>();
-        var publisher = new PythonTranscriptPublisher(_pythonEndpoint, publisherLogger);
+        var publisher = new PythonTranscriptPublisher(_pythonEndpoint, publisherLogger, _auditLogger);
         
         var provider = (_sttConfig.Provider ?? "Deepgram").Trim();
 
