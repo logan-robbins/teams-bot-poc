@@ -4,6 +4,7 @@ using Microsoft.Graph.Communications.Resources;
 using Microsoft.Graph.Models;
 using Microsoft.Skype.Bots.Media;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Timers;
 
 namespace TeamsMediaBot.Services;
@@ -44,6 +45,13 @@ public class CallHandler : HeartbeatHandler
     private long _audioFramesReceived;
     private bool _isShuttingDown;
     private uint _lastDominantSpeaker = DominantSpeakerChangedEventArgs.None;
+    /// <summary>
+    /// E3: Snapshot of the most recent <c>AudioMediaBuffer.ActiveSpeakers</c>
+    /// MediaSourceIds. Volatile-read pattern: written from the media worker
+    /// thread inside <see cref="OnAudioMediaReceived"/>, read from the
+    /// transcriber's publish thread via <see cref="GetMediaSourceIdHint"/>.
+    /// </summary>
+    private uint[]? _lastActiveSpeakers;
 
     /// <summary>
     /// Gets the call being handled.
@@ -170,6 +178,19 @@ public class CallHandler : HeartbeatHandler
     }
 
     /// <summary>
+    /// E3: Returns the current Teams MediaSourceId hint (dominant + active set)
+    /// for stamping onto the next published TranscriptEvent. Returns
+    /// <c>(null, null)</c> when no dominant speaker has been observed yet.
+    /// </summary>
+    public (uint? Dominant, uint[]? Active) GetMediaSourceIdHint()
+    {
+        var dominant = _lastDominantSpeaker;
+        return (
+            dominant == DominantSpeakerChangedEventArgs.None ? null : dominant,
+            Volatile.Read(ref _lastActiveSpeakers));
+    }
+
+    /// <summary>
     /// Handles incoming audio frames from Teams Media SDK.
     /// </summary>
     /// <remarks>
@@ -199,17 +220,24 @@ public class CallHandler : HeartbeatHandler
 
             _audioFramesReceived++;
 
+            // E3: snapshot the most recent active-speakers set so the
+            // transcriber can stamp it on each published event.
+            var activeSpeakersForHint = buffer.ActiveSpeakers;
+            if (activeSpeakersForHint is not null && activeSpeakersForHint.Length > 0)
+            {
+                Volatile.Write(ref _lastActiveSpeakers, activeSpeakersForHint);
+            }
+
             // Log stats periodically (~1 second intervals)
             if (_audioFramesReceived % StatsLogInterval == 0)
             {
-                var activeSpeakers = buffer.ActiveSpeakers;
                 var unmixedCount = buffer.UnmixedAudioBuffers?.Length ?? 0;
                 _logger.LogDebug(
                     "Call {CallId}: Received {FrameCount} audio frames ({DurationSeconds:F1}s of audio), ActiveSpeakers={ActiveSpeakerCount}, UnmixedBuffers={UnmixedBufferCount}, DominantSpeaker={DominantSpeaker}",
                     Call.Id,
                     _audioFramesReceived,
                     _audioFramesReceived * 0.02,
-                    activeSpeakers?.Length ?? 0,
+                    activeSpeakersForHint?.Length ?? 0,
                     unmixedCount,
                     _lastDominantSpeaker);
             }

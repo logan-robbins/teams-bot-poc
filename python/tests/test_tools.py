@@ -77,3 +77,61 @@ async def test_question_kind_auto_appends_question_mark() -> None:
     last = session.meeting_events[-1]
     assert last.text.endswith("?")
     assert last.from_bot is True
+
+
+# =============================================================================
+# E4: cooldown enforcement + directly-addressed bypass
+# =============================================================================
+
+
+def _make_context_with_cooldown(
+    *,
+    cooldown_seconds: float,
+    trigger_text: str | None = None,
+    bypass: bool = True,
+    mention_strings: list[str] | None = None,
+) -> AlfredAgentContext:
+    sm = InterviewSessionManager()
+    session = sm.start_session("Standup", "https://teams.com/x")
+    session.conversation_reference_id = "conv-ref-1"
+    return AlfredAgentContext(
+        session_manager=sm,
+        send_chat_url=None,
+        cooldown_seconds=cooldown_seconds,
+        directly_addressed_bypass=bypass,
+        mention_strings=mention_strings or ["alfred"],
+        trigger_text=trigger_text,
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_refuses_when_cooldown_active() -> None:
+    ctx = _make_context_with_cooldown(cooldown_seconds=45)
+    first = await send_to_meeting_chat_impl(ctx, text="Initial post.")
+    assert first.ok is True
+    second = await send_to_meeting_chat_impl(ctx, text="Trying again immediately.")
+    assert second.ok is False
+    assert second.reason == "cooldown_active"
+
+
+@pytest.mark.asyncio
+async def test_tool_allows_when_directly_addressed_bypasses_cooldown() -> None:
+    ctx = _make_context_with_cooldown(
+        cooldown_seconds=45,
+        trigger_text="Hey Alfred, who is owning the rollout doc?",
+    )
+    first = await send_to_meeting_chat_impl(ctx, text="Initial post.")
+    assert first.ok is True
+
+    # Direct address should bypass the cooldown.
+    second = await send_to_meeting_chat_impl(ctx, text="Bee will own it.")
+    assert second.ok is True
+    assert second.reason is None
+
+
+@pytest.mark.asyncio
+async def test_zero_cooldown_does_not_block() -> None:
+    ctx = _make_context_with_cooldown(cooldown_seconds=0)
+    first = await send_to_meeting_chat_impl(ctx, text="One.")
+    second = await send_to_meeting_chat_impl(ctx, text="Two.")
+    assert first.ok is True and second.ok is True

@@ -43,12 +43,31 @@ agent:
       `send_to_meeting_chat(kind='statement')`.
 
     Guiding principles:
-      1. Strong bias toward silence by default.
+      1. Strong bias toward silence by default, EXCEPT when one of the
+         intervention rules below fires.
       2. Never interrupt flow. Never narrate what was just said.
       3. Intent-alignment: commit → decision; unresolved → open_question;
          someone agrees to do → action_item (with owner if stated);
          risk spotted → risk (with severity).
       4. If `alfred_muted` is true, never call `send_to_meeting_chat`.
+
+  intervention_policy:
+    cooldown_seconds: 45
+    directly_addressed_bypass: true
+    mention_strings: ["alfred"]
+    rules:
+      - id: missing_owner
+        when: "action_item.owner is null"
+        ask: "Who's owning this one?"
+      - id: missing_due
+        when: "action_item.due is null and action_item.status == 'owned'"
+        ask: "When do we need this by?"
+      - id: implied_decision
+        when: "decision.status == 'tentative' and last_seen_age_seconds > 60"
+        ask: "Are we calling that decided?"
+      - id: unresolved_disagreement
+        when: "two participants disagreed on a decision and the topic moved on"
+        ask: "Did we settle <topic>?"
 
 checklist:
   items:

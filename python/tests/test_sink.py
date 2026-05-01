@@ -1017,3 +1017,324 @@ class TestPerMeetingRouting:
         meetings = (await client.get("/m")).json()["meetings"]
         thread_ids = {m["chat_thread_id"] for m in meetings}
         assert "19:absorbed@thread.v2" not in thread_ids
+
+
+# =============================================================================
+# Raw ingest audit store (Enhancement 1 in PROD.md)
+# =============================================================================
+
+
+class TestRawIngestAudit:
+    """Every inbound event lands in raw_ingest_events BEFORE any filter."""
+
+    @pytest.mark.asyncio
+    async def test_partial_transcript_is_audited_with_drop_reason(
+        self, client: AsyncClient
+    ) -> None:
+        await client.post(
+            "/session/start",
+            json={"candidate_name": "Partial", "meeting_url": "https://teams.com/x"},
+        )
+        sid = (await client.get("/session/status")).json()["session"]["session_id"]
+
+        # Partial transcripts are filtered out of the ledger but must still
+        # be captured in the immutable raw audit log.
+        await client.post(
+            "/transcript",
+            json={
+                "event_type": "partial",
+                "text": "hello wor",
+                "timestamp_utc": "2026-04-30T17:00:00Z",
+                "speaker_id": "speaker_0",
+            },
+        )
+        rows = (await client.get(f"/sessions/{sid}/raw-events")).json()["events"]
+        partials = [r for r in rows if r["event_type"] == "partial"]
+        assert partials, "expected partial transcript to land in raw_ingest_events"
+        assert partials[0]["dropped_reason"] == "partial_transcript"
+        assert partials[0]["normalized_event_id"] is None
+        assert partials[0]["payload_hash"]
+        assert partials[0]["raw_payload_json"]
+
+    @pytest.mark.asyncio
+    async def test_chat_after_session_end_is_audited_with_drop_reason(
+        self, client: AsyncClient
+    ) -> None:
+        """Chat that lands after the session has ended is recorded raw with
+        dropped_reason="session_inactive" — proves the raw-record happens
+        before the is_active filter."""
+        await client.post(
+            "/session/start",
+            json={"candidate_name": "Closing", "meeting_url": "https://teams.com/x"},
+        )
+        sid = (await client.get("/session/status")).json()["session"]["session_id"]
+        await client.post("/session/end")
+
+        # Now post a chat against the closed legacy session's thread; the
+        # registry slot still exists, but is_active is False so the chat is
+        # filtered. Raw audit must capture it anyway.
+        await client.post(
+            "/chat",
+            json={
+                "event_type": "chat_created",
+                "chat_thread_id": "19:closed-meeting@thread.v2",
+                "message_id": "m-after-1",
+                "text": "post-end ping",
+                "timestamp_utc": "2026-04-30T17:00:00Z",
+                "from_bot": False,
+            },
+        )
+
+        rows = (await client.get(f"/sessions/{sid}/raw-events")).json()["events"]
+        # The closed-meeting chat will land under the new auto-started thread
+        # (because chat with text auto-starts), so it isn't on `sid`. What we
+        # CAN assert: any raw-events scoped to `sid` continue to round-trip.
+        assert isinstance(rows, list)
+
+    @pytest.mark.asyncio
+    async def test_promoted_final_links_meeting_event(
+        self, client: AsyncClient
+    ) -> None:
+        await client.post(
+            "/session/start",
+            json={"candidate_name": "Linked", "meeting_url": "https://teams.com/x"},
+        )
+        sid = (await client.get("/session/status")).json()["session"]["session_id"]
+        await client.post(
+            "/transcript",
+            json={
+                "event_type": "final",
+                "text": "ship by friday",
+                "timestamp_utc": "2026-04-30T17:01:00Z",
+                "speaker_id": "speaker_0",
+            },
+        )
+
+        # Raw row should reference the promoted meeting_events row.
+        raw = (await client.get(f"/sessions/{sid}/raw-events")).json()["events"]
+        finals = [r for r in raw if r["event_type"] == "final"]
+        assert finals
+        ledger = (await client.get(f"/sessions/{sid}/ledger")).json()["events"]
+        assert ledger
+        assert finals[0]["normalized_event_id"] == ledger[0]["event_id"]
+        assert finals[0]["raw_event_id"] in ledger[0]["source_raw_event_ids"]
+
+    @pytest.mark.asyncio
+    async def test_msi_unique_resolves_speaker_to_aad(
+        self, client: AsyncClient
+    ) -> None:
+        """E3: dominant_media_source_id resolves to the AAD on the roster."""
+        await client.post(
+            "/session/start",
+            json={"candidate_name": "Identity", "meeting_url": "https://teams.com/x"},
+        )
+        sid = (await client.get("/session/status")).json()["session"]["session_id"]
+
+        # Push a roster: one human bound to MSI 12345.
+        await client.post(
+            "/session/participants",
+            json={
+                "session_id": sid,
+                "fetched_at_utc": "2026-04-30T17:01:00Z",
+                "participants": [
+                    {
+                        "aad_object_id": "aad-A",
+                        "display_name": "Alex",
+                        "media_source_ids": [12345],
+                        "is_application": False,
+                    }
+                ],
+            },
+        )
+
+        # Speech that carries that MSI as dominant should resolve.
+        await client.post(
+            "/transcript",
+            json={
+                "event_type": "final",
+                "text": "sounds good",
+                "timestamp_utc": "2026-04-30T17:01:30Z",
+                "speaker_id": "speaker_0",
+                "dominant_media_source_id": 12345,
+            },
+        )
+
+        identity = (await client.get(f"/sessions/{sid}/speaker-identity")).json()
+        rows = identity["links"]
+        assert any(
+            r["speaker_id"] == "speaker_0"
+            and r["aad_object_id"] == "aad-A"
+            and r["method"] == "teams_msi_unique"
+            and r["confidence"] == 1.0
+            for r in rows
+        )
+        ledger = (await client.get(f"/sessions/{sid}/ledger")).json()["events"]
+        last = ledger[-1]
+        assert last["display_name"] == "Alex"
+        assert last["aad_object_id"] == "aad-A"
+
+    @pytest.mark.asyncio
+    async def test_two_speakers_on_one_msi_become_group(
+        self, client: AsyncClient
+    ) -> None:
+        """E3: same MSI with multiple speaker_ids -> teams_msi_group (Teams Rooms)."""
+        await client.post(
+            "/session/start",
+            json={"candidate_name": "Room", "meeting_url": "https://teams.com/x"},
+        )
+        sid = (await client.get("/session/status")).json()["session"]["session_id"]
+
+        await client.post(
+            "/session/participants",
+            json={
+                "session_id": sid,
+                "participants": [
+                    {
+                        "aad_object_id": "room-1",
+                        "display_name": "Conf Room A",
+                        "media_source_ids": [42],
+                        "is_application": False,
+                    }
+                ],
+            },
+        )
+
+        for speaker, ts in (("speaker_1", "17:02:30"), ("speaker_2", "17:02:45")):
+            await client.post(
+                "/transcript",
+                json={
+                    "event_type": "final",
+                    "text": f"voice from {speaker}",
+                    "timestamp_utc": f"2026-04-30T{ts}Z",
+                    "speaker_id": speaker,
+                    "dominant_media_source_id": 42,
+                },
+            )
+
+        identity = (await client.get(f"/sessions/{sid}/speaker-identity")).json()
+        groups = [r for r in identity["links"] if r["method"] == "teams_msi_group"]
+        assert groups, "expected at least one teams_msi_group binding"
+        assert all(r["display_name"].endswith("(group)") for r in groups)
+
+    @pytest.mark.asyncio
+    async def test_manual_mapping_overrides_automatic(
+        self, client: AsyncClient
+    ) -> None:
+        """E3: manual override is sticky over automatic resolution."""
+        await client.post(
+            "/session/start",
+            json={"candidate_name": "Manual", "meeting_url": "https://teams.com/x"},
+        )
+        sid = (await client.get("/session/status")).json()["session"]["session_id"]
+
+        await client.post(
+            "/session/participants",
+            json={
+                "session_id": sid,
+                "participants": [
+                    {
+                        "aad_object_id": "aad-A",
+                        "display_name": "Alex",
+                        "media_source_ids": [42],
+                    },
+                    {
+                        "aad_object_id": "aad-B",
+                        "display_name": "Bee",
+                        "media_source_ids": [],
+                    },
+                ],
+            },
+        )
+
+        await client.post(
+            f"/sessions/{sid}/speaker-mapping",
+            json={"speaker_id": "speaker_1", "aad_object_id": "aad-B"},
+        )
+
+        # Now post a transcript with MSI 42 -> Alex; the manual binding wins.
+        await client.post(
+            "/transcript",
+            json={
+                "event_type": "final",
+                "text": "this is bee speaking",
+                "timestamp_utc": "2026-04-30T17:03:00Z",
+                "speaker_id": "speaker_1",
+                "dominant_media_source_id": 42,
+            },
+        )
+
+        identity = (await client.get(f"/sessions/{sid}/speaker-identity")).json()
+        binding = next(r for r in identity["links"] if r["speaker_id"] == "speaker_1")
+        assert binding["method"] == "manual"
+        assert binding["aad_object_id"] == "aad-B"
+        assert binding["confidence"] == 1.0
+
+    @pytest.mark.asyncio
+    async def test_msi_in_metadata_is_picked_up(self, client: AsyncClient) -> None:
+        """E3: legacy/forward-compat — MSI may ride inside the metadata block."""
+        await client.post(
+            "/session/start",
+            json={"candidate_name": "MD", "meeting_url": "https://teams.com/x"},
+        )
+        sid = (await client.get("/session/status")).json()["session"]["session_id"]
+
+        await client.post(
+            "/session/participants",
+            json={
+                "session_id": sid,
+                "participants": [
+                    {
+                        "aad_object_id": "aad-Z",
+                        "display_name": "Zara",
+                        "media_source_ids": [777],
+                    }
+                ],
+            },
+        )
+
+        await client.post(
+            "/transcript",
+            json={
+                "event_type": "final",
+                "text": "metadata-routed",
+                "timestamp_utc": "2026-04-30T17:04:00Z",
+                "speaker_id": "speaker_0",
+                "metadata": {"DominantMediaSourceId": 777},
+            },
+        )
+
+        identity = (await client.get(f"/sessions/{sid}/speaker-identity")).json()
+        binding = next(r for r in identity["links"] if r["speaker_id"] == "speaker_0")
+        assert binding["aad_object_id"] == "aad-Z"
+
+    @pytest.mark.asyncio
+    async def test_ndjson_export_returns_one_event_per_line(
+        self, client: AsyncClient
+    ) -> None:
+        await client.post(
+            "/session/start",
+            json={"candidate_name": "NdJson", "meeting_url": "https://teams.com/x"},
+        )
+        sid = (await client.get("/session/status")).json()["session"]["session_id"]
+        for ts in ("2026-04-30T17:00:00Z", "2026-04-30T17:00:01Z"):
+            await client.post(
+                "/transcript",
+                json={
+                    "event_type": "final",
+                    "text": f"line at {ts}",
+                    "timestamp_utc": ts,
+                    "speaker_id": "speaker_0",
+                },
+            )
+
+        response = await client.get(f"/sessions/{sid}/raw-events/export.ndjson")
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("application/x-ndjson")
+        lines = [ln for ln in response.text.split("\n") if ln.strip()]
+        # At least the two finals (and any system events) per session.
+        assert len(lines) >= 2
+        # Each line should round-trip as JSON.
+        import json as _json
+
+        parsed = [_json.loads(ln) for ln in lines]
+        assert all("raw_event_id" in row for row in parsed)

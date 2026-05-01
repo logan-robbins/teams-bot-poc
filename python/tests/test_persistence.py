@@ -121,6 +121,49 @@ def test_store_writes_extraction_and_dossier(tmp_path: Path) -> None:
     assert tool_calls[0]["ok"] is True
 
 
+def test_store_meeting_event_round_trips_raw_backlinks(tmp_path: Path) -> None:
+    """E2: meeting_events stores source_raw_event_ids + superseded_by columns."""
+    store = build_store(tmp_path / "alfred.sqlite3")
+    session = _session()
+    store.upsert_session(session)
+
+    event = MeetingEvent(
+        event_id="speech:2026-04-30T17:00:00Z:s0",
+        kind="speech",
+        source="teams_media",
+        timestamp_utc="2026-04-30T17:00:00Z",
+        text="Ship it.",
+        speaker_id="speaker_0",
+        source_raw_event_ids=["raw-1", "raw-2"],
+        superseded_by=None,
+    )
+    store.append_meeting_event(session.session_id, event)
+
+    rows = store.get_ledger(session.session_id)
+    assert rows[0]["source_raw_event_ids"] == ["raw-1", "raw-2"]
+    assert rows[0]["superseded_by"] is None
+
+    # Promote a superseded_by link (E2: working ledger may mark a row
+    # superseded without losing audit fidelity in the raw layer).
+    superseder = MeetingEvent(
+        event_id="speech:2026-04-30T17:00:01Z:s0",
+        kind="speech",
+        source="teams_media",
+        timestamp_utc="2026-04-30T17:00:01Z",
+        text="Ship it now.",
+        speaker_id="speaker_0",
+        source_raw_event_ids=["raw-3"],
+    )
+    store.append_meeting_event(session.session_id, superseder)
+    event.superseded_by = superseder.event_id
+    store.append_meeting_event(session.session_id, event)
+
+    rows = store.get_ledger(session.session_id)
+    by_id = {r["event_id"]: r for r in rows}
+    assert by_id[event.event_id]["superseded_by"] == superseder.event_id
+    assert by_id[superseder.event_id]["source_raw_event_ids"] == ["raw-3"]
+
+
 def test_store_dossier_upsert_by_id(tmp_path: Path) -> None:
     store = build_store(tmp_path / "alfred.sqlite3")
     session = _session()

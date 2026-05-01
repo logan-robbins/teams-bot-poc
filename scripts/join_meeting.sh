@@ -37,4 +37,4 @@ exec uv run python ../scripts/auto_join.py \
   --bot-endpoint "${BOT_ENDPOINT}" \
   --sink-endpoint "${SINK_ENDPOINT}" \
   --join-mode invite_and_graph_join \
-  "${EXTRA_ARGS[@]}"
+  ${EXTRA_ARGS+"${EXTRA_ARGS[@]}"}

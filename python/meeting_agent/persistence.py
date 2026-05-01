@@ -37,7 +37,10 @@ from .models import (
     InterviewSession,
     MeetingEvent,
     OpenQuestion,
+    Participant,
+    RawIngestEvent,
     Risk,
+    SpeakerIdentityLink,
     ToolCallRecord,
 )
 
@@ -67,17 +70,74 @@ CREATE TABLE IF NOT EXISTS meeting_events (
     text TEXT DEFAULT '',
     role TEXT DEFAULT 'unknown',
     speaker_id TEXT,
+    participant_id TEXT,
+    aad_object_id TEXT,
+    media_source_id TEXT,
     display_name TEXT,
     message_id TEXT,
     reply_to_message_id TEXT,
     from_bot INTEGER DEFAULT 0,
     confidence REAL,
     raw_json TEXT,
+    source_raw_event_ids_json TEXT DEFAULT '[]',
+    superseded_by TEXT,
     PRIMARY KEY (session_id, event_id),
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
 CREATE INDEX IF NOT EXISTS idx_meeting_events_session_ts
     ON meeting_events(session_id, timestamp_utc);
+
+CREATE TABLE IF NOT EXISTS raw_ingest_events (
+    raw_event_id           TEXT PRIMARY KEY,
+    session_id             TEXT,
+    received_at_utc        TEXT NOT NULL,
+    provider_timestamp_utc TEXT,
+    source                 TEXT NOT NULL,
+    event_type             TEXT NOT NULL,
+    speaker_or_sender_id   TEXT,
+    payload_hash           TEXT NOT NULL,
+    raw_payload_json       TEXT NOT NULL,
+    normalized_payload_json TEXT,
+    normalized_event_id    TEXT,
+    dropped_reason         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_raw_ingest_session_received
+    ON raw_ingest_events(session_id, received_at_utc);
+CREATE INDEX IF NOT EXISTS idx_raw_ingest_payload_hash
+    ON raw_ingest_events(payload_hash);
+
+CREATE TABLE IF NOT EXISTS meeting_participants (
+    session_id        TEXT NOT NULL,
+    aad_object_id     TEXT NOT NULL,
+    display_name      TEXT,
+    upn               TEXT,
+    is_application    INTEGER NOT NULL DEFAULT 0,
+    role              TEXT,
+    first_seen_at_utc TEXT,
+    last_seen_at_utc  TEXT,
+    PRIMARY KEY (session_id, aad_object_id)
+);
+
+CREATE TABLE IF NOT EXISTS participant_msi_bindings (
+    session_id        TEXT NOT NULL,
+    media_source_id   INTEGER NOT NULL,
+    aad_object_id     TEXT NOT NULL,
+    first_seen_at_utc TEXT,
+    last_seen_at_utc  TEXT,
+    PRIMARY KEY (session_id, media_source_id)
+);
+
+CREATE TABLE IF NOT EXISTS speaker_identity_links (
+    session_id        TEXT NOT NULL,
+    speaker_id        TEXT NOT NULL,
+    aad_object_id     TEXT,
+    display_name      TEXT,
+    confidence        REAL,
+    method            TEXT,
+    last_dominant_msi INTEGER,
+    updated_at_utc    TEXT,
+    PRIMARY KEY (session_id, speaker_id)
+);
 
 CREATE TABLE IF NOT EXISTS extractions (
     session_id TEXT NOT NULL,
@@ -153,7 +213,23 @@ class SessionStore:
         self._lock = threading.Lock()
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
             conn.commit()
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """Best-effort additive column migrations for previously-deployed DBs."""
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(meeting_events)")}
+        additive: list[tuple[str, str]] = [
+            ("participant_id", "TEXT"),
+            ("aad_object_id", "TEXT"),
+            ("media_source_id", "TEXT"),
+            ("source_raw_event_ids_json", "TEXT DEFAULT '[]'"),
+            ("superseded_by", "TEXT"),
+        ]
+        for column, decl in additive:
+            if column in existing:
+                continue
+            conn.execute(f"ALTER TABLE meeting_events ADD COLUMN {column} {decl}")
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(
@@ -211,9 +287,11 @@ class SessionStore:
                 """
                 INSERT OR REPLACE INTO meeting_events (
                     session_id, event_id, kind, source, timestamp_utc,
-                    text, role, speaker_id, display_name, message_id,
-                    reply_to_message_id, from_bot, confidence, raw_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    text, role, speaker_id, participant_id, aad_object_id,
+                    media_source_id, display_name, message_id,
+                    reply_to_message_id, from_bot, confidence, raw_json,
+                    source_raw_event_ids_json, superseded_by
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
@@ -224,13 +302,288 @@ class SessionStore:
                     event.text or "",
                     event.role or "unknown",
                     event.speaker_id,
+                    event.participant_id,
+                    event.aad_object_id,
+                    event.media_source_id,
                     event.display_name,
                     event.message_id,
                     event.reply_to_message_id,
                     1 if event.from_bot else 0,
                     event.confidence,
                     _json(event.raw) if event.raw is not None else None,
+                    _json(event.source_raw_event_ids or []),
+                    event.superseded_by,
                 ),
+            )
+
+    def record_raw_ingest_event(self, raw: RawIngestEvent) -> None:
+        """Insert (or replace) an immutable raw audit row.
+
+        See ``RawIngestEvent`` for field meanings. INSERT OR REPLACE means
+        idempotent re-ingest is safe: the same payload hash + raw_event_id
+        round-trip yields the same row.
+        """
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO raw_ingest_events (
+                    raw_event_id, session_id, received_at_utc,
+                    provider_timestamp_utc, source, event_type,
+                    speaker_or_sender_id, payload_hash, raw_payload_json,
+                    normalized_payload_json, normalized_event_id, dropped_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    raw.raw_event_id,
+                    raw.session_id,
+                    raw.received_at_utc,
+                    raw.provider_timestamp_utc,
+                    raw.source,
+                    raw.event_type,
+                    raw.speaker_or_sender_id,
+                    raw.payload_hash,
+                    raw.raw_payload_json,
+                    raw.normalized_payload_json,
+                    raw.normalized_event_id,
+                    raw.dropped_reason,
+                ),
+            )
+
+    # -- Participant identity (E3) ---------------------------------------
+
+    def upsert_participant(
+        self, session_id: str, participant: Participant
+    ) -> None:
+        """Idempotent upsert of one participant row plus its MSI bindings."""
+        now = _iso_now()
+        first_seen = participant.first_seen_at_utc or now
+        last_seen = participant.last_seen_at_utc or now
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO meeting_participants (
+                    session_id, aad_object_id, display_name, upn,
+                    is_application, role, first_seen_at_utc, last_seen_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id, aad_object_id) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    upn = excluded.upn,
+                    is_application = excluded.is_application,
+                    role = excluded.role,
+                    last_seen_at_utc = excluded.last_seen_at_utc
+                """,
+                (
+                    session_id,
+                    participant.aad_object_id,
+                    participant.display_name,
+                    participant.user_principal_name,
+                    1 if participant.is_application else 0,
+                    participant.role,
+                    first_seen,
+                    last_seen,
+                ),
+            )
+            for msi in participant.media_source_ids:
+                conn.execute(
+                    """
+                    INSERT INTO participant_msi_bindings (
+                        session_id, media_source_id, aad_object_id,
+                        first_seen_at_utc, last_seen_at_utc
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(session_id, media_source_id) DO UPDATE SET
+                        aad_object_id = excluded.aad_object_id,
+                        last_seen_at_utc = excluded.last_seen_at_utc
+                    """,
+                    (
+                        session_id,
+                        int(msi),
+                        participant.aad_object_id,
+                        first_seen,
+                        last_seen,
+                    ),
+                )
+
+    def get_participants(self, session_id: str) -> list[dict[str, Any]]:
+        """Return participants joined with their bound MediaSourceIds."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT aad_object_id, display_name, upn, is_application, role,"
+                " first_seen_at_utc, last_seen_at_utc"
+                " FROM meeting_participants WHERE session_id = ?"
+                " ORDER BY first_seen_at_utc ASC",
+                (session_id,),
+            ).fetchall()
+            participants: list[dict[str, Any]] = []
+            for row in rows:
+                aad = row["aad_object_id"]
+                msis = [
+                    int(r["media_source_id"])
+                    for r in conn.execute(
+                        "SELECT media_source_id FROM participant_msi_bindings"
+                        " WHERE session_id = ? AND aad_object_id = ?"
+                        " ORDER BY first_seen_at_utc ASC",
+                        (session_id, aad),
+                    )
+                ]
+                participants.append(
+                    {
+                        "aad_object_id": aad,
+                        "display_name": row["display_name"],
+                        "upn": row["upn"],
+                        "is_application": bool(row["is_application"]),
+                        "role": row["role"],
+                        "first_seen_at_utc": row["first_seen_at_utc"],
+                        "last_seen_at_utc": row["last_seen_at_utc"],
+                        "media_source_ids": msis,
+                    }
+                )
+        return participants
+
+    def get_participant_for_msi(
+        self, session_id: str, media_source_id: int
+    ) -> dict[str, Any] | None:
+        """Lookup the participant currently bound to a MediaSourceId."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT b.aad_object_id, p.display_name, p.is_application"
+                " FROM participant_msi_bindings b"
+                " LEFT JOIN meeting_participants p"
+                " ON p.session_id = b.session_id"
+                " AND p.aad_object_id = b.aad_object_id"
+                " WHERE b.session_id = ? AND b.media_source_id = ?",
+                (session_id, int(media_source_id)),
+            ).fetchone()
+            if row is None:
+                return None
+            return {
+                "aad_object_id": row["aad_object_id"],
+                "display_name": row["display_name"],
+                "is_application": bool(row["is_application"]),
+            }
+
+    def upsert_speaker_identity_link(
+        self, session_id: str, link: SpeakerIdentityLink
+    ) -> None:
+        """Idempotent upsert of a (speaker_id) ↔ AAD binding."""
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO speaker_identity_links (
+                    session_id, speaker_id, aad_object_id, display_name,
+                    confidence, method, last_dominant_msi, updated_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id, speaker_id) DO UPDATE SET
+                    aad_object_id = excluded.aad_object_id,
+                    display_name = excluded.display_name,
+                    confidence = excluded.confidence,
+                    method = excluded.method,
+                    last_dominant_msi = excluded.last_dominant_msi,
+                    updated_at_utc = excluded.updated_at_utc
+                """,
+                (
+                    session_id,
+                    link.speaker_id,
+                    link.aad_object_id,
+                    link.display_name,
+                    link.confidence,
+                    link.method,
+                    link.last_dominant_msi,
+                    link.updated_at_utc,
+                ),
+            )
+
+    def get_speaker_identity_link(
+        self, session_id: str, speaker_id: str
+    ) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT speaker_id, aad_object_id, display_name, confidence,"
+                " method, last_dominant_msi, updated_at_utc"
+                " FROM speaker_identity_links"
+                " WHERE session_id = ? AND speaker_id = ?",
+                (session_id, speaker_id),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_speaker_identity_links(self, session_id: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT speaker_id, aad_object_id, display_name, confidence,"
+                " method, last_dominant_msi, updated_at_utc"
+                " FROM speaker_identity_links WHERE session_id = ?"
+                " ORDER BY speaker_id ASC",
+                (session_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def backfill_meeting_event_identity(
+        self,
+        session_id: str,
+        speaker_id: str,
+        *,
+        aad_object_id: str | None,
+        display_name: str | None,
+        media_source_id: int | None,
+    ) -> int:
+        """Rewrite identity columns on prior speech rows for this speaker.
+
+        Allowed by E2: the working ledger may be retroactively updated as
+        long as raw_ingest_events stays immutable underneath.
+        """
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE meeting_events
+                   SET aad_object_id = ?,
+                       display_name = ?,
+                       media_source_id = ?,
+                       participant_id = ?
+                 WHERE session_id = ?
+                   AND kind = 'speech'
+                   AND speaker_id = ?
+                """,
+                (
+                    aad_object_id,
+                    display_name,
+                    str(media_source_id) if media_source_id is not None else None,
+                    aad_object_id,
+                    session_id,
+                    speaker_id,
+                ),
+            )
+            return cur.rowcount or 0
+
+    def update_raw_ingest_promotion(
+        self,
+        raw_event_id: str,
+        *,
+        session_id: str | None = None,
+        normalized_payload_json: str | None = None,
+        normalized_event_id: str | None = None,
+        dropped_reason: str | None = None,
+    ) -> None:
+        """Patch a raw row after promotion / drop. Only non-None fields are written."""
+        sets: list[str] = []
+        params: list[Any] = []
+        if session_id is not None:
+            sets.append("session_id = ?")
+            params.append(session_id)
+        if normalized_payload_json is not None:
+            sets.append("normalized_payload_json = ?")
+            params.append(normalized_payload_json)
+        if normalized_event_id is not None:
+            sets.append("normalized_event_id = ?")
+            params.append(normalized_event_id)
+        if dropped_reason is not None:
+            sets.append("dropped_reason = ?")
+            params.append(dropped_reason)
+        if not sets:
+            return
+        params.append(raw_event_id)
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                f"UPDATE raw_ingest_events SET {', '.join(sets)} WHERE raw_event_id = ?",
+                params,
             )
 
     def append_extraction(self, session_id: str, item: AnalysisItem) -> None:
@@ -369,7 +722,9 @@ class SessionStore:
     def get_ledger(self, session_id: str, limit: int | None = None) -> list[dict[str, Any]]:
         query = (
             "SELECT event_id, kind, source, timestamp_utc, text, role, speaker_id,"
-            " display_name, message_id, reply_to_message_id, from_bot, confidence"
+            " participant_id, aad_object_id, media_source_id, display_name,"
+            " message_id, reply_to_message_id, from_bot, confidence,"
+            " source_raw_event_ids_json, superseded_by"
             " FROM meeting_events WHERE session_id = ? ORDER BY timestamp_utc ASC"
         )
         params: list[Any] = [session_id]
@@ -381,7 +736,48 @@ class SessionStore:
             rows = [dict(row) for row in cur.fetchall()]
         for row in rows:
             row["from_bot"] = bool(row["from_bot"])
+            row["source_raw_event_ids"] = json.loads(
+                row.pop("source_raw_event_ids_json") or "[]"
+            )
         return rows
+
+    def get_raw_events(
+        self,
+        session_id: str,
+        since: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return raw_ingest_events rows for a session (oldest first)."""
+        query = (
+            "SELECT raw_event_id, session_id, received_at_utc, provider_timestamp_utc,"
+            " source, event_type, speaker_or_sender_id, payload_hash, raw_payload_json,"
+            " normalized_payload_json, normalized_event_id, dropped_reason"
+            " FROM raw_ingest_events WHERE session_id = ?"
+        )
+        params: list[Any] = [session_id]
+        if since:
+            query += " AND received_at_utc > ?"
+            params.append(since)
+        query += " ORDER BY received_at_utc ASC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(int(limit))
+        with self._connect() as conn:
+            cur = conn.execute(query, params)
+            return [dict(row) for row in cur.fetchall()]
+
+    def iter_raw_events(self, session_id: str) -> Iterable[dict[str, Any]]:
+        """Generator over raw_ingest_events for streaming NDJSON export."""
+        query = (
+            "SELECT raw_event_id, session_id, received_at_utc, provider_timestamp_utc,"
+            " source, event_type, speaker_or_sender_id, payload_hash, raw_payload_json,"
+            " normalized_payload_json, normalized_event_id, dropped_reason"
+            " FROM raw_ingest_events WHERE session_id = ? ORDER BY received_at_utc ASC"
+        )
+        with self._connect() as conn:
+            cur = conn.execute(query, [session_id])
+            for row in cur:
+                yield dict(row)
 
     def get_extractions(
         self,

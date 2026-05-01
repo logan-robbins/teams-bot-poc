@@ -117,6 +117,7 @@ class AlfredAnalyzer:
         reasoning_effort: Optional[str] = None,
         instructions: Optional[str] = None,
         send_chat_url: Optional[str] = None,
+        intervention_policy: Optional[dict[str, Any]] = None,
     ) -> None:
         if not instructions:
             raise ValueError(
@@ -125,7 +126,8 @@ class AlfredAnalyzer:
             )
         self.model = model or DEFAULT_MODEL
         self.reasoning_effort = reasoning_effort or DEFAULT_REASONING_EFFORT
-        self.instructions = instructions
+        self.intervention_policy = intervention_policy or {}
+        self.instructions = self._compose_instructions(instructions, self.intervention_policy)
         self.session_manager = session_manager
         self.output_writer = output_writer
         self.publish_thoughts = publish_thoughts
@@ -148,6 +150,46 @@ class AlfredAnalyzer:
             model_settings=model_settings,
         )
         logger.info("AlfredAnalyzer initialized model=%s reasoning=%s", self.model, self.reasoning_effort)
+
+    @staticmethod
+    def _compose_instructions(
+        base_instructions: str,
+        policy: dict[str, Any] | None,
+    ) -> str:
+        """Append the explicit Intervention Rules block to the system prompt.
+
+        Lives in the **stable** prefix so it's prompt-cacheable. Crucially
+        keeps the existing 'strong bias toward silence' line — the rules are
+        **exceptions**, not a green light to chat.
+        """
+        rules = list((policy or {}).get("rules") or [])
+        if not rules:
+            return base_instructions
+
+        lines: list[str] = ["", "## When to break silence (call send_to_meeting_chat)"]
+        lines.append("You SHOULD ask when:")
+        for rule in rules:
+            ask = str(rule.get("ask") or "").strip()
+            rid = str(rule.get("id") or "").strip()
+            when = str(rule.get("when") or "").strip()
+            if not ask:
+                continue
+            lines.append(f"  - [{rid}] {ask}  ⟵ {when}" if rid and when else f"  - {ask}")
+
+        cooldown = float((policy or {}).get("cooldown_seconds") or 0)
+        directly_addressed = bool((policy or {}).get("directly_addressed_bypass", True))
+        if cooldown > 0:
+            lines.append("")
+            lines.append(
+                f"Cooldown: do not call the tool more than once every {cooldown:g} seconds"
+                + (
+                    " unless a human directly addresses you (mentions \"Alfred\")."
+                    if directly_addressed
+                    else "."
+                )
+            )
+
+        return base_instructions + "\n" + "\n".join(lines)
 
     @staticmethod
     def _format_dossier_block(label: str, items: list[dict[str, Any]]) -> str:
@@ -315,9 +357,15 @@ class AlfredAnalyzer:
         )
         prompt = self._build_prompt(response_text, context, chaining=bool(previous_response_id))
 
+        policy = self.intervention_policy or {}
+        mention_strings = list(policy.get("mention_strings") or ["alfred"])
         run_ctx = AlfredAgentContext(
             session_manager=self.session_manager,
             send_chat_url=self.send_chat_url,
+            cooldown_seconds=float(policy.get("cooldown_seconds") or 0.0),
+            directly_addressed_bypass=bool(policy.get("directly_addressed_bypass", True)),
+            mention_strings=mention_strings,
+            trigger_text=response_text,
         )
 
         async def _run(prev_id: str | None, input_prompt: str):

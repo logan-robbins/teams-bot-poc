@@ -32,6 +32,14 @@ public sealed partial class AzureConversationTranscriber : IRealtimeTranscriber
     private readonly string? _endpointId;
     private readonly PythonTranscriptPublisher _publisher;
     private readonly ILogger<AzureConversationTranscriber> _logger;
+    /// <summary>
+    /// E3: Resolves the contemporaneous Teams MediaSourceId hint
+    /// (dominant + active set) at transcript publish time. Set by
+    /// <see cref="TranscriberFactory"/> from <see cref="CallHandler"/>'s
+    /// per-buffer trackers; null when participant-identity plumbing is
+    /// not wired in.
+    /// </summary>
+    private Func<(uint? Dominant, uint[]? Active)>? _msiHintProvider;
 
     private PushAudioInputStream? _audioInputStream;
     private ConversationTranscriber? _transcriber;
@@ -80,6 +88,16 @@ public sealed partial class AzureConversationTranscriber : IRealtimeTranscriber
         _endpointId = string.IsNullOrWhiteSpace(endpointId) ? null : endpointId.Trim();
         _publisher = publisher;
         _logger = logger;
+    }
+
+    /// <summary>
+    /// E3: Wire a callback that returns the most-recent dominant + active
+    /// MediaSourceIds from <see cref="CallHandler.OnAudioMediaReceived"/>.
+    /// Called by <see cref="TranscriberFactory"/> right after construction.
+    /// </summary>
+    public void SetMediaSourceIdHintProvider(Func<(uint? Dominant, uint[]? Active)> provider)
+    {
+        _msiHintProvider = provider;
     }
 
     /// <inheritdoc/>
@@ -302,6 +320,23 @@ public sealed partial class AzureConversationTranscriber : IRealtimeTranscriber
     /// </summary>
     private void PublishEventAsync(string eventType, string? text, string? speakerId, EventError? error = null)
     {
+        // E3: stamp the contemporaneous Teams MediaSourceId hint (if any).
+        uint? dominantMsi = null;
+        uint[]? activeMsis = null;
+        if (_msiHintProvider is not null)
+        {
+            try
+            {
+                var (d, a) = _msiHintProvider();
+                dominantMsi = d;
+                activeMsis = a;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "MSI hint provider threw — publishing without identity hint");
+            }
+        }
+
         var transcriptEvent = new TranscriptEvent(
             EventType: eventType,
             Text: text,
@@ -309,7 +344,9 @@ public sealed partial class AzureConversationTranscriber : IRealtimeTranscriber
             ChatThreadId: ChatThreadId,
             SpeakerId: speakerId,
             Metadata: new EventMetadata(Provider: "azure_speech", Model: null, SessionId: _sessionId),
-            Error: error
+            Error: error,
+            DominantMediaSourceId: dominantMsi,
+            ActiveMediaSourceIds: activeMsis
         );
 
         // Fire-and-forget: don't block the caller (typically audio processing thread)

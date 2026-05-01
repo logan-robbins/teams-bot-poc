@@ -524,36 +524,38 @@ class InterviewSessionManager:
             return True
         return False
     
-    def add_transcript(self, event: TranscriptEvent) -> None:
+    def add_transcript(
+        self,
+        event: TranscriptEvent,
+        raw_event_ids: list[str] | None = None,
+    ) -> Optional[MeetingEvent]:
         """
         Add a transcript event to the session.
-        
+
         All events are stored, but typically only "final" events
         are used for analysis.
-        
+
         Args:
             event: The transcript event to add.
-            
+            raw_event_ids: Optional list of ``raw_ingest_events.raw_event_id``
+                values to back-link onto the promoted ``MeetingEvent``.
+
+        Returns:
+            The promoted ``MeetingEvent`` (post light-consolidation merge), or
+            ``None`` when no ledger row was produced (e.g. partial / session
+            lifecycle events).
+
         Raises:
             ValueError: If no session is active.
-            
-        Example:
-            >>> event = TranscriptEvent(
-            ...     event_type="final",
-            ...     text="I have 5 years of Python experience.",
-            ...     timestamp_utc="2026-01-31T10:32:00.000Z",
-            ...     speaker_id="speaker_1"
-            ... )
-            >>> manager.add_transcript(event)
         """
         if self._session is None:
             raise ValueError("No active session. Call start_session() first.")
-        
+
         self._session.transcript_events.append(event)
 
         if event.event_type == "final" and event.text and event.text.strip():
             metadata = event.metadata
-            self._append_meeting_event(
+            promoted = self._append_meeting_event(
                 MeetingEvent(
                     event_id=f"speech:{event.timestamp_utc}:{event.speaker_id or 'unknown'}",
                     kind="speech",
@@ -569,14 +571,24 @@ class InterviewSessionManager:
                     transcript_provider=metadata.provider if metadata else None,
                     confidence=event.confidence,
                     raw=metadata.raw_response if metadata else None,
+                    source_raw_event_ids=list(raw_event_ids or []),
                 )
             )
+            if raw_event_ids:
+                # When _append_meeting_event merged into an earlier turn, extend
+                # the existing backlinks rather than overwriting.
+                merged = set(promoted.source_raw_event_ids or [])
+                merged.update(raw_event_ids)
+                promoted.source_raw_event_ids = sorted(merged)
 
             logger.debug(
                 "Added final transcript: speaker=%s, len=%d",
                 event.speaker_id,
                 len(event.text) if event.text else 0,
             )
+            return promoted
+
+        return None
     
     def get_recent_transcripts(
         self,
@@ -843,8 +855,16 @@ class InterviewSessionManager:
     # Meeting chat (Alfred)
     # ------------------------------------------------------------------
 
-    def add_chat_message(self, message: ChatMessage) -> None:
-        """Append a meeting chat message to the session and capture the conversation ref."""
+    def add_chat_message(
+        self,
+        message: ChatMessage,
+        raw_event_ids: list[str] | None = None,
+    ) -> Optional[MeetingEvent]:
+        """Append a meeting chat message to the session and capture the conversation ref.
+
+        Returns the promoted ``MeetingEvent`` for new messages, or ``None`` when
+        the message was a duplicate / chat_deleted / empty body.
+        """
         if self._session is None:
             raise ValueError("No active session. Call start_session() first.")
 
@@ -864,7 +884,7 @@ class InterviewSessionManager:
                     existing.html = message.html
                 if message.text and not existing.text:
                     existing.text = message.text
-                return
+                return None
 
         self._session.chat_messages.append(message)
 
@@ -883,7 +903,7 @@ class InterviewSessionManager:
             )
 
         if message.event_type != "chat_deleted" and (message.text or "").strip():
-            self._append_meeting_event(
+            promoted = self._append_meeting_event(
                 MeetingEvent(
                     event_id=f"chat:{message.message_id}",
                     kind="chat",
@@ -898,8 +918,16 @@ class InterviewSessionManager:
                     reply_to_message_id=message.reply_to_message_id,
                     from_bot=message.from_bot,
                     raw=message.raw,
+                    source_raw_event_ids=list(raw_event_ids or []),
                 )
             )
+            if raw_event_ids:
+                merged = set(promoted.source_raw_event_ids or [])
+                merged.update(raw_event_ids)
+                promoted.source_raw_event_ids = sorted(merged)
+            return promoted
+
+        return None
 
     def get_unified_timeline(self, count: Optional[int] = None) -> list[dict[str, object]]:
         """

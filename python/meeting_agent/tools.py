@@ -33,6 +33,22 @@ __all__ = [
 ]
 
 
+def _parse_iso_utc(timestamp: str | None) -> datetime | None:
+    if not timestamp:
+        return None
+    try:
+        return datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+
+
+def _is_directly_addressed(text: str | None, mention_strings: list[str]) -> bool:
+    if not text or not mention_strings:
+        return False
+    haystack = text.lower()
+    return any(token.lower() in haystack for token in mention_strings if token)
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -55,6 +71,23 @@ class AlfredAgentContext(BaseModel):
     session_manager: InterviewSessionManager
     send_chat_url: str | None = None
     tool_records: list = Field(default_factory=list)
+    # E4: explicit proactivity policy carried per-run from the product spec.
+    cooldown_seconds: float = Field(
+        default=0.0,
+        description="Min seconds between consecutive Alfred posts (E4). Bypassed when directly addressed.",
+    )
+    directly_addressed_bypass: bool = Field(
+        default=True,
+        description="If True, a human directly addressing Alfred bypasses the cooldown.",
+    )
+    mention_strings: list[str] = Field(
+        default_factory=lambda: ["alfred"],
+        description="Substrings that count as 'directly addressed' for cooldown bypass.",
+    )
+    trigger_text: str | None = Field(
+        default=None,
+        description="Text of the event that triggered this analysis tick (used to detect direct address).",
+    )
 
     @property
     def conversation_reference_id(self) -> str | None:
@@ -146,6 +179,36 @@ async def send_to_meeting_chat_impl(
             "send_to_meeting_chat", arguments, result.model_dump(), ok=False, error="muted"
         )
         return result
+
+    # E4: cooldown enforcement. Skip when the trigger event was a direct
+    # address ("Alfred, …" / "@alfred") and `directly_addressed_bypass` is on.
+    bypass_cooldown = (
+        context.directly_addressed_bypass
+        and _is_directly_addressed(context.trigger_text, context.mention_strings)
+    )
+    cooldown = max(float(context.cooldown_seconds or 0.0), 0.0)
+    if cooldown > 0 and not bypass_cooldown and session.outbound_chat_intents:
+        last_intent = session.outbound_chat_intents[-1]
+        last_ts = _parse_iso_utc(last_intent.timestamp_utc)
+        now_ts = datetime.now(timezone.utc)
+        if last_ts is not None:
+            gap = (now_ts - last_ts).total_seconds()
+            if gap < cooldown:
+                logger.info(
+                    "send_to_meeting_chat blocked by cooldown: gap=%.1fs < %.1fs (session=%s)",
+                    gap,
+                    cooldown,
+                    session.session_id,
+                )
+                result = SendResult(ok=False, reason="cooldown_active")
+                context.record(
+                    "send_to_meeting_chat",
+                    arguments,
+                    result.model_dump(),
+                    ok=False,
+                    error="cooldown_active",
+                )
+                return result
 
     if kind == "question" and not body.rstrip().endswith("?"):
         body = f"{body.rstrip()}?"

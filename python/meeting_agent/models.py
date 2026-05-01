@@ -123,6 +123,69 @@ class MeetingEvent(BaseModel):
     transcript_provider: Optional[str] = None
     confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     raw: Optional[dict] = None
+    source_raw_event_ids: list[str] = Field(
+        default_factory=list,
+        description="Backlinks to raw_ingest_events.raw_event_id rows that produced this ledger row",
+    )
+    superseded_by: Optional[str] = Field(
+        default=None,
+        description="When non-null, points at the event_id that supersedes this row (E2)",
+    )
+
+
+class RawIngestEvent(BaseModel):
+    """One inbound event captured to the immutable raw-audit table.
+
+    Recorded BEFORE any normalization, dedup, partial-drop, or echo-suppression
+    filter, so the raw layer is a faithful record of "exactly what we received
+    from Teams / STT / Graph / Bot Framework." See PROD.md Enhancement 1.
+    """
+
+    raw_event_id: str = Field(..., description="UUIDv4 generated server-side at ingest")
+    session_id: Optional[str] = Field(
+        default=None,
+        description="Resolved session id; null for events that arrived before any session existed",
+    )
+    received_at_utc: str = Field(..., description="Server receipt time")
+    provider_timestamp_utc: Optional[str] = Field(
+        default=None,
+        description="Payload's own ts (event.timestamp_utc / Graph createdDateTime)",
+    )
+    source: Literal[
+        "teams_media",
+        "stt",
+        "graph_notification",
+        "bot_framework",
+        "system",
+    ]
+    event_type: str = Field(
+        ...,
+        description=(
+            "partial | final | session_started | session_stopped | "
+            "chat_created | chat_updated | chat_deleted | "
+            "participants_updated | manual_speaker_mapping | error"
+        ),
+    )
+    speaker_or_sender_id: Optional[str] = None
+    payload_hash: str = Field(..., description="SHA256 of raw_payload_json")
+    raw_payload_json: str = Field(..., description="Exact body received, JSON-encoded")
+    normalized_payload_json: Optional[str] = Field(
+        default=None,
+        description="Post-normalization payload (null when dropped before normalization)",
+    )
+    normalized_event_id: Optional[str] = Field(
+        default=None,
+        description="meeting_events.event_id when promoted; null when dropped or non-ledger",
+    )
+    dropped_reason: Optional[
+        Literal[
+            "partial_transcript",
+            "session_inactive",
+            "echo_suppressed",
+            "duplicate_message_id",
+            "malformed",
+        ]
+    ] = None
 
 
 class OutboundChatIntent(BaseModel):
@@ -132,6 +195,62 @@ class OutboundChatIntent(BaseModel):
     normalized_text: str
     timestamp_utc: str = Field(default_factory=utc_now_iso)
     reply_to_message_id: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Participant identity (Enhancement 3)
+# ---------------------------------------------------------------------------
+
+
+class Participant(BaseModel):
+    """One row in the per-session Teams participant roster.
+
+    Sourced from the live ``ICall.Participants`` collection via the C# bot.
+    """
+
+    aad_object_id: str = Field(..., description="Azure AD object id (GUID) of the user")
+    display_name: Optional[str] = None
+    user_principal_name: Optional[str] = None
+    media_source_ids: list[int] = Field(
+        default_factory=list,
+        description="Audio MediaSourceIds bound to this participant in the call",
+    )
+    is_in_lobby: bool = False
+    role: Optional[str] = None
+    is_application: bool = Field(
+        default=False,
+        description="True for bot/app participants — excluded from human-only counts",
+    )
+    first_seen_at_utc: Optional[str] = None
+    last_seen_at_utc: Optional[str] = None
+
+
+SpeakerResolutionMethod = Literal[
+    "manual",
+    "teams_msi_unique",
+    "teams_msi_group",
+    "sole_human",
+    "chat_aad",
+    "unresolved",
+]
+
+
+class SpeakerIdentityLink(BaseModel):
+    """Resolved (speaker_id) ↔ AAD binding for one session.
+
+    Persisted to ``speaker_identity_links``; produced by
+    :class:`meeting_agent.identity.ParticipantResolver`. Higher-method
+    answers replace lower ones (priority order:
+    ``manual > teams_msi_unique > teams_msi_group > sole_human > unresolved``).
+    """
+
+    speaker_id: str
+    aad_object_id: Optional[str] = None
+    display_name: Optional[str] = None
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    method: SpeakerResolutionMethod = "unresolved"
+    last_dominant_msi: Optional[int] = None
+    updated_at_utc: str = Field(default_factory=utc_now_iso)
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +416,10 @@ class InterviewSession(BaseModel):
     started_at: str
     ended_at: Optional[str] = None
     speaker_mappings: list[SpeakerMapping] = Field(default_factory=list)
+    participants: list[Participant] = Field(
+        default_factory=list,
+        description="Live Teams participant roster (E3); sourced from ICall.Participants",
+    )
     transcript_events: list[TranscriptEvent] = Field(default_factory=list)
     chat_messages: list[ChatMessage] = Field(default_factory=list)
     meeting_events: list[MeetingEvent] = Field(default_factory=list)

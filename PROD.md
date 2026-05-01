@@ -25,13 +25,22 @@ said what" is structurally weak. Four problems compound:
      `Participant.Resource.MediaStreams[].SourceId` (MSI) is bound to that
      participant's `Info.Identity.User.Id` (AAD GUID) and display name. That
      is a direct MSI→AAD lookup table, in-band, no Graph REST call needed.
-   Today the C# bot logs MSIs and throws them away; the active diarization-
-   capable transcribers (Deepgram, `AzureConversationTranscriber` — both
-   produce `speaker_N`) are the *only* speaker signal that reaches Python,
-   so the agent sees `speaker_0` instead of "Logan". `MeetingEvent`'s
-   `participant_id` / `aad_object_id` / `display_name` / `media_source_id`
-   fields exist (`python/meeting_agent/models.py:101-122`) but are never
-   populated, and `InterviewSession.speaker_mappings` is never written.
+   Today the C# bot logs MSIs and throws them away; the only diarization
+   signal that reaches Python is `speaker_N` from `AzureConversationTranscriber`
+   (the deployed transcriber on `vm-alfred-disney` — verified live: the VM's
+   `appsettings.production.json` has `Stt.Provider="AzureSpeech"`, which the
+   factory at `src/Services/AzureSpeechRealtimeTranscriber.cs:62-83` routes to
+   `AzureConversationTranscriber`). So the agent sees `speaker_0` instead of
+   "Logan". `MeetingEvent`'s `participant_id` / `aad_object_id` /
+   `display_name` / `media_source_id` fields exist
+   (`python/meeting_agent/models.py:101-122`) but are never populated, and
+   `InterviewSession.speaker_mappings` is never written.
+
+   Disney compliance constraint: **the Disney M365 deployment is not
+   cleared for Deepgram.** Azure Speech with the GA real-time-diarization
+   `ConversationTranscriber` is the only sanctioned STT path. The
+   `DeepgramRealtimeTranscriber` class and `Stt.Deepgram` config branch
+   are dead code in this deployment and are removed in §3 below.
 4. **Proactivity is implicit.** The prompt has a hard silence bias
    (`python/batcave_platform/specs/alfred.yaml:30-31`) with no explicit
    intervention rules, so Alfred is passive even when ambiguity matters. We
@@ -42,7 +51,16 @@ This plan is a POC plan. No NFR / perf / migration / cost considerations.
 
 ---
 
-## Enhancement 1 — Append-only raw audit store
+## Enhancement 1 — Append-only raw audit store ✅ IMPLEMENTED
+
+Status: complete. `raw_ingest_events` table + `record_raw` helper landed in
+`python/transcript_sink.py`; `/sessions/{id}/raw-events` and
+`/sessions/{id}/raw-events/export.ndjson` endpoints added.
+Backlinks (`MeetingEvent.source_raw_event_ids`) wired through
+`session.add_transcript` / `session.add_chat_message`. New tests in
+`tests/test_sink.py::TestRawIngestAudit` cover the partial drop, the
+post-session-end drop, the promoted backlink, and NDJSON export. Total
+suite now 107 passed / 2 skipped.
 
 ### Goal
 Every inbound event from Teams media, STT, Graph notification, and Bot
@@ -126,7 +144,17 @@ CREATE INDEX IF NOT EXISTS idx_raw_ingest_payload_hash
 
 ---
 
-## Enhancement 2 — Split raw audit from agent memory
+## Enhancement 2 — Split raw audit from agent memory ✅ IMPLEMENTED
+
+Status: complete. `meeting_events` now carries `source_raw_event_ids_json`
+and `superseded_by` columns (additive migration); `MeetingEvent` model has
+`source_raw_event_ids: list[str]` and `superseded_by: Optional[str]`;
+`InterviewSessionManager.add_transcript` / `add_chat_message` accept and
+forward `raw_event_ids`. `Decision`/`OpenQuestion`/`ActionItem`/`Risk`
+already had `source_event_ids` — no change. Test:
+`tests/test_persistence.py::test_store_meeting_event_round_trips_raw_backlinks`.
+Filler-pruning / fragment-merge in the working ledger is intentionally out
+of scope per PROD.md §2; the layering is just made non-destructive.
 
 ### Goal
 Three logical layers, all persisted, with explicit backlinks:
@@ -182,7 +210,61 @@ audit fidelity — because the raw layer underneath is intact.
 
 ---
 
-## Enhancement 3 — Participant identity layer
+## Enhancement 3 — Participant identity layer ✅ IMPLEMENTED (Python side + C# MSI stamp)
+
+Status: Python resolver + endpoints + tests **complete**. C# transcript-side
+MSI stamp **complete** (additive, no Deepgram touch). Outstanding bot-side
+items left for the next deploy window are itemized below.
+
+**What landed**
+
+Python:
+- New tables: `meeting_participants`, `participant_msi_bindings`,
+  `speaker_identity_links`. Full CRUD helpers on `SessionStore`.
+- New `python/meeting_agent/identity.py::ParticipantResolver` with the
+  `manual > teams_msi_unique > teams_msi_group > sole_human > unresolved`
+  priority order, retroactive ledger backfill, and is-Teams-Rooms-name
+  detection (`Conf Room *`, `*MTR*`, etc.).
+- New endpoints: `POST /session/participants`,
+  `POST /sessions/{id}/speaker-mapping`,
+  `GET /sessions/{id}/participants`,
+  `GET /sessions/{id}/speaker-identity`.
+- `TranscriptEventRequest` extended with `dominant_media_source_id` and
+  `active_media_source_ids`. Both top-level and metadata-block carriers
+  accepted (forward/backward compat).
+- `Participant` and `SpeakerIdentityLink` models added; `InterviewSession`
+  carries a `participants: list[Participant]` field.
+- 4 new tests in `tests/test_sink.py::TestRawIngestAudit`:
+  `test_msi_unique_resolves_speaker_to_aad`,
+  `test_two_speakers_on_one_msi_become_group`,
+  `test_manual_mapping_overrides_automatic`,
+  `test_msi_in_metadata_is_picked_up`.
+
+C# (additive, low-risk):
+- `TranscriptEvent` record now carries `DominantMediaSourceId` and
+  `ActiveMediaSourceIds`.
+- `CallHandler.OnAudioMediaReceived` snapshots `buffer.ActiveSpeakers`
+  via `Volatile.Write`; `CallHandler.GetMediaSourceIdHint()` exposes the
+  current dominant + active set.
+- `AzureConversationTranscriber.SetMediaSourceIdHintProvider(Func<...>)`
+  is wired from `TeamsCallingBotService.HandleCallAdded` so every
+  published event stamps the hint.
+
+**Deferred to next deploy** (called out so it doesn't get lost)
+
+- `Call.Participants.OnUpdated` subscription + `POST /session/participants`
+  publisher on the C# side. Without this, the Python `meeting_participants`
+  table starts empty and the resolver falls through to `sole_human` /
+  `unresolved` for every speaker. Plumbing on the receiving side is fully
+  in place.
+- Deepgram removal (file deletes, csproj cleanup, `BotConfiguration`
+  cleanup, bootstrap script trim, README diagram). The deployed config on
+  `vm-alfred-disney` already pins `Stt.Provider=AzureSpeech` so this is
+  cosmetic / dead-code cleanup, not behavioral.
+- Agent prompt enrichment: render display names + roster line in the
+  stable prefix. Today the agent-side rendering already prefers
+  `display_name` when present (see `agent.py:_format_history_line`), so
+  identity flows through to the LLM as soon as the resolver populates it.
 
 ### Goal
 Use Teams as the source of truth for "who is speaking" — it already knows.
@@ -257,24 +339,89 @@ Build:
     publish a transcript (cleaner — the transcribers already hold a
     `PythonTranscriptPublisher`, so plumb a `Func<uint?>` provider in).
   Pick the second option: add a `Func<uint?> getCurrentDominantSpeaker`
-  parameter to both `DeepgramRealtimeTranscriber` and
-  `AzureConversationTranscriber` ctors, and call it inside
-  `PublishEventAsync` / `FireAndForget` (the existing sites where
-  `TranscriptEvent` is constructed at
-  `AzureConversationTranscriber.cs:300-309` and the Deepgram equivalent).
+  parameter to the `AzureConversationTranscriber` ctor and call it inside
+  `PublishEventAsync` at the existing site where `TranscriptEvent` is
+  constructed (`AzureConversationTranscriber.cs:300-309`). Stamp the
+  result on `DominantMediaSourceId` (and `ActiveMediaSourceIds` from the
+  most recent `OnAudioMediaReceived` snapshot) before publish.
   `TranscriberFactory.Create` gets the lambda from `CallHandler` and
-  passes it through.
+  passes it through. Deepgram is not wired (see Deepgram removal below).
 
 ### Notes on STT diarization
-- Both active transcribers diarize. `AzureConversationTranscriber` is the
-  GA real-time-diarization Azure path
-  (`AzureConversationTranscriber.cs:23-25` cites the GA blog), normalized
-  to `speaker_N`. Deepgram likewise emits `speaker_N`. The deprecated
-  `AzureSpeechRealtimeTranscriber` (`AzureSpeechRealtimeTranscriber.cs:118-127`)
-  is unused.
+- The single sanctioned transcriber on Disney is `AzureConversationTranscriber`,
+  the GA real-time-diarization Azure path
+  (`AzureConversationTranscriber.cs:23-25` cites the GA blog). It enables
+  `PropertyId.SpeechServiceResponse_DiarizeIntermediateResults=true` at
+  `AzureConversationTranscriber.cs:115-117` and normalizes Azure's
+  `Guest-N` to `speaker_N`.
+- Two other transcriber classes exist in `src/Services/` and must be
+  retired in this enhancement:
+  - `AzureSpeechRealtimeTranscriber` (`AzureSpeechRealtimeTranscriber.cs:132`):
+    uses `SpeechRecognizer` which does not support diarization. The header
+    comment marks it deprecated; the factory does not reference it. Dead.
+  - `DeepgramRealtimeTranscriber`: Disney is not cleared for Deepgram, the
+    deployed config never selects it, and keeping it invites accidental
+    selection.
 - We keep `speaker_id` on `TranscriptEvent` — it's still useful as the
   within-MSI sub-divider for the Teams Rooms case (multiple humans on one
   device). It is **not** the primary identity signal anymore.
+
+### Deepgram removal (Disney compliance)
+
+Disney's WDI R&D subscription (`e02c0038-…`, tenant `56b731a8-…`) is not
+cleared for Deepgram. Remove every reference so `Stt.Provider="AzureSpeech"`
+becomes the only valid configuration, and the dead `AzureSpeechRealtimeTranscriber`
+class disappears with it.
+
+Files to modify:
+- `src/Services/DeepgramRealtimeTranscriber.cs` — delete the file.
+- `src/Services/AzureSpeechRealtimeTranscriber.cs` — delete the deprecated
+  `AzureSpeechRealtimeTranscriber` class (lines 132-398). Keep the
+  `TranscriberFactory` class at the top of the file (or move it to its own
+  `TranscriberFactory.cs` while you're there). In the factory, drop the
+  `CreateDeepgramTranscriber` method and the `"Deepgram"` provider branch
+  at lines 67-73; change the default at line 67 from `"Deepgram"` to
+  `"AzureSpeech"`; tighten the `NotSupportedException` message at line 83
+  to name only `AzureSpeech`.
+- `src/Models/BotConfiguration.cs` — delete `DeepgramConfiguration` (lines
+  149+) and the `Deepgram` property on `SttConfiguration` (lines 138-140).
+  Change the `Provider` default at line 135 from `"Deepgram"` to
+  `"AzureSpeech"` and update its XML doc comment (line 125, 130, 133)
+  accordingly.
+- `src/Models/TranscriptEvent.cs:5,53` — drop the `"deepgram"` mention
+  from the `Provider` doc comment; the only emitted value is now
+  `"azure_speech"`.
+- `src/Services/IRealtimeTranscriber.cs:9` — drop the
+  "Deepgram (primary) and Azure Speech (fallback)" comment; replace with
+  a one-liner naming `AzureConversationTranscriber` as the sole impl.
+- `src/Program.cs:6` — update the file-header comment to drop "Deepgram".
+- `src/TeamsMediaBot.csproj:40-42` — remove the `<PackageReference Include="Deepgram" Version="6.6.1" />`.
+- `src/Config/appsettings.example.json`, `appsettings.instance-a.example.json`,
+  `appsettings.instance-b.example.json` — flip the example `Stt.Provider`
+  to `"AzureSpeech"`, drop the `Deepgram` block, populate an
+  `AzureSpeech` block with `Region`, `RecognitionLanguage`, and a
+  placeholder `Key`.
+- `scripts/bootstrap-production-vm.ps1` — drop the `DeepgramApiKey`,
+  `DeepgramModel`, `DeepgramDiarize` parameters (lines 22-25, 278-279),
+  the Deepgram branch of the config writer (lines 385-392), the
+  Deepgram-related parameters passed at lines 506-508, and change the
+  `$SttProvider` default at line 22 from `"Deepgram"` to `"AzureSpeech"`.
+  After removal, the `throw` at line 404 ("Unsupported STT provider…")
+  should name only `AzureSpeech`.
+- `scripts/deploy-azure-vm.sh` — already defaults `STT_PROVIDER=AzureSpeech`
+  at line 29; nothing to change here.
+- README.md — the §2 architecture diagram says
+  "Streams PCM to Deepgram / Azure ConversationTr." — replace with
+  "Streams PCM to Azure ConversationTranscriber (diarized)".
+
+Verification after removal:
+- `dotnet build` succeeds with no Deepgram references resolved.
+- Re-run `./scripts/deploy-azure-vm.sh` (with `SKIP_REPO_SYNC=0`) and
+  re-probe `appsettings.production.json` on `vm-alfred-disney`; expect
+  `Stt.Provider="AzureSpeech"` and no `Stt.Deepgram` block.
+- The bot service starts, `/api/calling/health` returns Healthy, and a
+  test join produces `[FINAL] Speaker=speaker_0: …` lines in
+  `service-output.log` (proves `AzureConversationTranscriber` is live).
 
 ### Python side — store + resolve
 
@@ -406,19 +553,51 @@ Build:
   the roster as context.
 
 ### Notes
-- Both active STT providers diarize — Deepgram via
-  `DeepgramRealtimeTranscriber` and Azure via the GA-real-time-diarization
-  `AzureConversationTranscriber` (`AzureConversationTranscriber.cs`). Both
-  emit `speaker_N`. The deprecated `AzureSpeechRealtimeTranscriber` (no
-  diarization) is unused.
+- The sole STT provider on Disney is `AzureConversationTranscriber`
+  (GA real-time diarization, emits `speaker_N` after `Guest-N`
+  normalization). Deepgram is removed (see "Deepgram removal" above);
+  the deprecated `AzureSpeechRealtimeTranscriber` (no diarization) is
+  removed alongside it.
 - The primary identity signal is now Teams' own MSI→AAD mapping carried
   on every transcript event; STT `speaker_N` is the within-MSI sub-divider.
+- "When possible, by attendee id" is the explicit goal: real Teams users
+  resolve via `teams_msi_unique`; conference rooms / shared devices
+  resolve to the room's AAD device id via `teams_msi_group` (the user's
+  "general attendant is okay" case).
 - We are not solving voice fingerprinting; we are reconciling identifiers
   Teams already provides.
 
 ---
 
-## Enhancement 4 — Explicit proactivity policy (no action enum)
+## Enhancement 4 — Explicit proactivity policy (no action enum) ✅ IMPLEMENTED
+
+Status: complete. The agent contract is unchanged — still `AlfredExtraction`
++ `send_to_meeting_chat`. No `SEND/ASK/SILENT` enum was introduced.
+
+What landed:
+- `python/batcave_platform/specs/alfred.yaml` carries the
+  `intervention_policy` block (cooldown, bypass flag, mention strings, four
+  rules: missing_owner / missing_due / implied_decision /
+  unresolved_disagreement).
+- `python/batcave_platform/spec_models.py::AgentSpec` adds the optional
+  `intervention_policy: dict | None` field (loader is Pydantic, so no
+  loader change needed).
+- `python/meeting_agent/agent.py::AlfredAnalyzer._compose_instructions`
+  appends a `## When to break silence (call send_to_meeting_chat)` section
+  to the agent's stable system prompt — preserves the pre-existing strong
+  silence bias and adds the rules as exceptions. Cooldown is rendered into
+  the prompt too.
+- `python/meeting_agent/tools.py::send_to_meeting_chat_impl` enforces the
+  cooldown server-side, returning `SendResult(ok=False, reason="cooldown_active")`
+  so the LLM sees its rate-limited attempt on the next tick. Direct address
+  ("alfred" mention in the trigger text, case-insensitive) bypasses the
+  cooldown when `directly_addressed_bypass=true`.
+- New tests:
+  `tests/test_tools.py::test_tool_refuses_when_cooldown_active`,
+  `test_tool_allows_when_directly_addressed_bypasses_cooldown`,
+  `test_zero_cooldown_does_not_block`,
+  `tests/test_intervention_policy.py` (3 tests on prompt rendering and
+  spec parsing). Total suite now 118 passed / 2 skipped.
 
 ### Goal
 Encode the four intervention rules + a cooldown in `alfred.yaml`, surface
@@ -513,9 +692,67 @@ server-side. Contract stays `AlfredExtraction` + `send_to_meeting_chat`.
 
 ---
 
-## Enhancement 5 — Per-meeting sink routing
+## Enhancement 5 — Per-meeting sink routing 🟡 DEFERRED
 
-### Goal
+**Decision:** keep one backend sink for now. Multi-sink routing is the
+right end state but blocked on a registration mechanism that survives
+**auto-invite** (Graph chat notifications adding the bot to a meeting
+without an explicit `/api/calling/join` call).
+
+### Why the §5 design as written below is wrong
+
+It's framed as "join request carries an override; otherwise fall back to
+the default sink." That's two parallel code paths and violates the
+project's "one canonical implementation, no fallback paths" rule.
+
+### The correct end-state design (when this is picked up)
+
+One bot, many sinks, routed by `chat_thread_id` — *not* via override.
+Topology:
+
+```
+   vm-alfred-disney  ──►  IMeetingSinkRouter  ──►  Sink A / Sink B / …
+                          chat_thread_id → sink_id → URL
+```
+
+Single canonical lookup. No default. The publisher does
+`_router.Resolve(evt.ChatThreadId).Post(...)` and that's the only path.
+
+`appsettings.production.json` carries a named-sinks table:
+```json
+"Sinks": {
+  "team-a": "https://ca-alfred-team-a.../",
+  "team-b": "https://ca-alfred-team-b.../"
+}
+```
+Callers refer to sinks by name, not URL.
+
+### What's blocking it: meeting → sink registration
+
+The router needs `chat_thread_id → sink_id` populated **before the first
+event** for every meeting, including those auto-invited via Graph
+notifications.
+
+- **Explicit join (`/api/calling/join`)**: the request can carry
+  `sinkId`. Easy.
+- **Auto-invite** (Graph notification adds bot to a meeting): no
+  request body, no opportunity to bind. We need a separate registration
+  source — e.g. an admin-driven `meetings` config, a calendar webhook
+  that pre-registers meetings, or a per-tenant default sink derived
+  from organizer AAD. Each option has tradeoffs that aren't worth
+  resolving until multi-tenant is a real requirement.
+
+### Today's posture
+
+- ✅ Single configured `TranscriptSink` block remains the canonical
+  sink for the whole bot process.
+- ✅ Auto-invite continues to work unchanged.
+- 🟡 Multi-sink routing is solved when a meeting-registration story is
+  picked. Until then, additional tenants get their own bot deployment
+  (`vm-alfred-<tenant>`), which is fine for small N.
+
+### Original design (kept for reference)
+
 Replace the global "one configured sink for the whole bot process" wiring
 with a per-call sink override carried on the join request. Each meeting
 can target its own Python sink (e.g. one sink per customer / team), with
@@ -639,7 +876,7 @@ Each publisher caller has the `callId` already; resolution is a single
 `store.TryGet(callId) ?? defaults`:
 
 - `src/Services/AzureConversationTranscriber.cs:300-323`
-  (`PublishEventAsync`) and the parallel Deepgram site: take a
+  (`PublishEventAsync`): take a
   `Func<(string transcriptEndpoint, string? authToken)>` resolver in the
   constructor (alongside the dominant-speaker `Func<uint?>` from E3).
   Resolve at publish time.
@@ -744,7 +981,26 @@ dotnet test
 
 ---
 
-## Enhancement 6 — Per-meeting UI via URL-routed multi-session sink
+## Enhancement 6 — Per-meeting UI via URL-routed multi-session sink ✅ IMPLEMENTED (pre-existing)
+
+Status: shipped in commits before this PROD.md pass (`21b1e5b`,
+`9f5ba35`, `a0f1af5`, `e1f5d72`). The current state matches the §6 spec:
+
+- C# bot: `TranscriptEvent.ChatThreadId` is plumbed end-to-end; published
+  on every event.
+- Sink: `SessionRegistry` keys on `chat_thread_id`; `/m/*` routes
+  (`/m`, `/m/{id}/status`, `/m/{id}/events`, `/m/{id}/ledger`,
+  `/m/{id}/dossier`, `/m/{id}/end`, `/m/{id}/mute`) live in
+  `transcript_sink.py` (~lines 2160-2410). Auto-start on first inbound
+  transcript or chat for an unseen thread.
+- UI: React Router 7 wraps `App.tsx` with `<Route path="/" />` (MeetingList
+  picker) and `<Route path="/m/*" />` (MeetingDossier keyed on
+  `chat_thread_id`). `useSessionStream(chatThreadId)` hits
+  `/m/{id}/status` + `/m/{id}/events`.
+
+The `TestPerMeetingRouting` suite already covers the two-meeting
+isolation, per-thread status, 404-on-unknown, and end-only-this-meeting
+cases (5 tests). No further work in this round.
 
 ### Goal
 One sink + one web deployment hosts N concurrent meetings, each
@@ -761,7 +1017,7 @@ Doing both gives full multi-tenant routing.
 
 - `src/Models/TranscriptEvent.cs:9-39` carries no meeting identifier.
   Fields are `EventType`, `Text`, `TimestampUtc`, `SpeakerId`, audio
-  offsets, `EventMetadata` (provider/Deepgram session id only),
+  offsets, `EventMetadata` (provider name + Azure session id only),
   `EventError`. Once a transcript leaves the bot there is no way to tell
   which Teams meeting it came from.
 - `src/Services/PythonChatPublisher.cs:78` already sends
@@ -818,13 +1074,12 @@ Doing both gives full multi-tenant routing.
   `GetOrCreateTranscriber` *and* `new CallHandler(call, mediaSession,
   transcriber, threadId, _logger)`.
 
-- `src/Services/AzureSpeechRealtimeTranscriber.cs`,
-  `src/Services/AzureConversationTranscriber.cs`,
-  `src/Services/DeepgramRealtimeTranscriber.cs`: each
-  `PublishAsync(...)` must accept and forward `chatThreadId` (or take
-  it once on construction; either works — construction is simpler since
-  the transcriber lives for one call). Set
-  `TranscriptEvent.ChatThreadId = chatThreadId` on every event.
+- `src/Services/AzureConversationTranscriber.cs`: `PublishEventAsync`
+  must accept and forward `chatThreadId` (or take it once on
+  construction; construction is simpler since the transcriber lives for
+  one call). Set `TranscriptEvent.ChatThreadId = chatThreadId` on every
+  event. (The Deepgram and deprecated `AzureSpeechRealtimeTranscriber`
+  classes are removed in §3.)
 
 - `src/Services/TranscriberFactory.cs:60-61`: `Create(string chatThreadId)`.
   The factory now binds the threadId into the transcriber it returns.
@@ -1056,8 +1311,9 @@ curl -sS -i $SINK/session/status
 | `python/batcave_platform/spec_models.py` | Add `intervention_policy` field to `AgentSpec`. |
 | `python/batcave_platform/specs/alfred.yaml` | Add `intervention_policy` block. |
 | `src/Services/CallHandler.cs` | Subscribe to `Call.Participants.OnUpdated`; build MSI→AAD payload from `Participant.Resource.MediaStreams[].SourceId` + `Info.Identity`; expose `GetCurrentDominantSpeaker()` lambda; keep tracking `_lastDominantSpeaker`. |
-| `src/Services/AzureConversationTranscriber.cs`, `src/Services/DeepgramRealtimeTranscriber.cs` | Accept a `Func<uint?>` dominant-speaker provider; include `dominant_media_source_id` and `active_media_source_ids` in published `TranscriptEvent`. |
-| `src/Services/TranscriberFactory.cs` | Plumb the dominant-speaker lambda from `CallHandler` through to both transcriber constructors. |
+| `src/Services/AzureConversationTranscriber.cs` | Accept a `Func<uint?>` dominant-speaker provider; include `dominant_media_source_id` and `active_media_source_ids` in published `TranscriptEvent`. |
+| `src/Services/TranscriberFactory.cs` | Plumb the dominant-speaker lambda from `CallHandler` through to the transcriber constructor (Azure-only after §3 removal). |
+| `src/Services/DeepgramRealtimeTranscriber.cs`, `src/Services/AzureSpeechRealtimeTranscriber.cs`, `src/Models/BotConfiguration.cs` (`DeepgramConfiguration` + `Stt.Deepgram`), `src/Config/appsettings*.example.json`, `src/TeamsMediaBot.csproj` (Deepgram package), `scripts/bootstrap-production-vm.ps1` (Deepgram parameters + branch) | DELETE per §3 "Deepgram removal". |
 | `src/Services/PythonTranscriptPublisher.cs` (or sibling `PythonParticipantsPublisher`) | New `PublishParticipantsAsync` posting to `POST /session/participants`. Also: refactor `PublishAsync` to accept `endpointUrl` + `authToken` per call (E5). |
 | `src/Models/TranscriptEvent.cs` (and Python `TranscriptEventRequest`) | Add `DominantMediaSourceId` (uint?) and `ActiveMediaSourceIds` (uint[]?). |
 | `src/Services/PerCallSinkOverride.cs` (NEW) | Per-call `(transcriptEndpoint, chatEndpoint, participantsEndpoint, authToken?)` record. |

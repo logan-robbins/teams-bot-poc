@@ -22,7 +22,7 @@ documented in `PROD.md`.
 | Permission | What it lets Alfred do | Why it is required |
 |---|---|---|
 | `Calls.JoinGroupCalls.Chat` (Application) | Join the Teams call attached to this chat as a bot. | Without this, Alfred cannot enter the meeting at all. The bot would be installed but never appear as a participant. |
-| `Calls.AccessMedia.Chat` (Application) | Receive the live unmixed audio stream from the meeting (16 kHz / 16-bit / mono PCM). | Audio capture is the entire transcription path. Without it, every transcript event is empty and the dossier never gets built. Microsoft also requires the bot's AppId to be on the **Real-Time Media (RTM) allowlist** before media actually attaches even after consent — request via `https://aka.ms/teams-rtm-onboarding` (~2 weeks turnaround). |
+| `Calls.AccessMedia.Chat` (Application) | Receive the live unmixed audio stream from the meeting (16 kHz / 16-bit / mono PCM). | Audio capture is the entire transcription path. Without it, every transcript event is empty and the dossier never gets built. Current Microsoft Teams calling bot documentation does not list a separate Real-Time Media allowlist prerequisite; treat media attachment failures as permissions, consent, bot identity, certificate, DNS, or network issues first. |
 | `OnlineMeetingParticipant.Read.Chat` (Application) | Read the participant roster of this meeting: AAD object id, display name, MSI (`MediaSourceId`) per audio media stream. | This is the source of truth for **who is speaking**. The Graph Communications SDK exposes `ICall.Participants.MediaStreams[].SourceId` bound to `Info.Identity.User.Id`. Without it, the agent only sees `speaker_0` / `speaker_1` from STT diarization and cannot attribute decisions/actions to a real person. |
 | `ChatMessage.Read.Chat` (Application) | Enables the planned Microsoft Graph change-notification path for meeting chat. | Current live chat ingress is Bot Framework `/api/messages`; this permission is kept so the install consent prompt is stable when the Graph path in `PROD.md` is implemented. |
 | `ChatMessageReadReceipt.Read.Chat` (Application) | Observe read-receipts on chat messages. | Lightweight planned signal that lets Alfred avoid re-asking questions everyone has already seen and "engaged with". Kept in the manifest so the install consent prompt is one-shot and stable. |
@@ -168,6 +168,11 @@ normalized speech + chat + system events). One session per
    ```bash
    ./scripts/join_meeting.sh "<teams-meeting-join-url>" "Alfred"
    ```
+   A `CALL_JOIN_FAILED_7504_OR_7505` response means Microsoft Graph rejected
+   the join with tenant-level authorization constraints, commonly surfaced as
+   `403 Insufficient enterprise tenant permissions`. Re-check the Teams app
+   installation/RSC consent for that meeting chat and the bot app's Graph call
+   permissions/admin consent in the meeting tenant.
 4. If the publisher is "unverified" by tenant policy, see the admin-consent note in §1.
 
 ---

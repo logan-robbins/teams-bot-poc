@@ -20,8 +20,11 @@ Internal binding: configured by SINK_HOST/SINK_PORT (default 0.0.0.0:8765)
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json as _json_mod
 import logging
 import os
+import uuid as _uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -42,10 +45,13 @@ from meeting_agent.debounce import (
     drain_with_debounce,
 )
 from meeting_agent.events import AlfredEventBus, detect_direct_address, format_sse
+from meeting_agent.identity import ParticipantResolver
 from meeting_agent.models import (
     AnalysisItem,
     ChatMessage,
     MeetingEvent,
+    Participant,
+    RawIngestEvent,
     SessionAnalysis,
     TranscriptEvent,
 )
@@ -255,6 +261,20 @@ class TranscriptEventRequest(BaseModel):
     metadata: dict[str, Any] | None = Field(
         default=None, description="Additional metadata"
     )
+    dominant_media_source_id: int | None = Field(
+        default=None,
+        description=(
+            "Teams MediaSourceId most recently flagged dominant by the "
+            "Graph Communications Media SDK at publish time (E3)."
+        ),
+    )
+    active_media_source_ids: list[int] | None = Field(
+        default=None,
+        description=(
+            "Snapshot of active MediaSourceIds at publish time, from "
+            "AudioMediaBuffer.ActiveSpeakers (E3)."
+        ),
+    )
 
     # v1 fields (legacy aliases)
     Kind: str | None = Field(default=None, description="Legacy v1 event kind")
@@ -293,6 +313,43 @@ class MuteRequest(BaseModel):
     """Body for POST /m/{chat_thread_id}/mute."""
 
     muted: bool
+
+
+class ParticipantRosterEntry(BaseModel):
+    """One participant pushed by the C# bot from ICall.Participants (E3)."""
+
+    aad_object_id: str = Field(..., min_length=1)
+    display_name: str | None = None
+    user_principal_name: str | None = None
+    media_source_ids: list[int] = Field(default_factory=list)
+    is_in_lobby: bool = False
+    role: str | None = None
+    is_application: bool = False
+    first_seen_at_utc: str | None = None
+    last_seen_at_utc: str | None = None
+
+    model_config = {"extra": "ignore"}
+
+
+class ParticipantsUpdateRequest(BaseModel):
+    """Body of POST /session/participants from the C# bot (E3)."""
+
+    session_id: str | None = Field(
+        default=None,
+        description="Optional explicit session_id; if omitted, chat_thread_id is required",
+    )
+    chat_thread_id: str | None = None
+    fetched_at_utc: str | None = None
+    participants: list[ParticipantRosterEntry] = Field(default_factory=list)
+
+    model_config = {"extra": "ignore"}
+
+
+class SpeakerMappingOverride(BaseModel):
+    """Body of POST /sessions/{id}/speaker-mapping (manual override, E3)."""
+
+    speaker_id: str = Field(..., min_length=1)
+    aad_object_id: str = Field(..., min_length=1)
 
 
 class ChatMessageRequest(BaseModel):
@@ -511,6 +568,7 @@ class AppState(TypedDict):
     route_orchestrator: RouteOrchestrator
     checklist_agent: ChecklistAgent | None
     last_enqueued_event_ids: dict[str, str]
+    participant_resolver: ParticipantResolver
 
 
 def get_initial_stats() -> AppStats:
@@ -611,6 +669,7 @@ def get_app_state(request: Request) -> AppState:
         route_orchestrator=state.route_orchestrator,
         checklist_agent=state.checklist_agent,
         last_enqueued_event_ids=state.last_enqueued_event_ids,
+        participant_resolver=state.participant_resolver,
     )
 
 
@@ -679,6 +738,34 @@ def normalize_v1_to_v2(request: TranscriptEventRequest, stats: AppStats) -> dict
         "confidence": request.confidence,
         "metadata": request.metadata,
     }
+
+
+def _extract_msi_hints(
+    request: TranscriptEventRequest,
+) -> tuple[int | None, list[int] | None]:
+    """Pull MSI hints from the wire payload (top-level or metadata)."""
+    dominant = request.dominant_media_source_id
+    active = request.active_media_source_ids
+
+    md = request.metadata or {}
+    if dominant is None:
+        candidate = md.get("dominant_media_source_id") or md.get(
+            "DominantMediaSourceId"
+        )
+        if isinstance(candidate, (int, float)):
+            dominant = int(candidate)
+        elif isinstance(candidate, str) and candidate.strip().isdigit():
+            dominant = int(candidate.strip())
+    if active is None:
+        candidate_list = md.get("active_media_source_ids") or md.get(
+            "ActiveMediaSourceIds"
+        )
+        if isinstance(candidate_list, list):
+            active = [int(x) for x in candidate_list if isinstance(x, (int, float, str))
+                      and (isinstance(x, (int, float)) or str(x).strip().isdigit())]
+            if not active:
+                active = None
+    return dominant, active
 
 
 # =============================================================================
@@ -809,6 +896,83 @@ def resolve_manager_for_inbound(
     return manager, thread_id
 
 
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _stable_json(payload: Any) -> str:
+    """Deterministic JSON for hashing (sorted keys, no extraneous whitespace)."""
+    if isinstance(payload, BaseModel):
+        payload = payload.model_dump()
+    return _json_mod.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def record_raw(
+    store: SessionStore,
+    *,
+    source: str,
+    event_type: str,
+    payload: Any,
+    session_id: str | None = None,
+    provider_timestamp_utc: str | None = None,
+    speaker_or_sender_id: str | None = None,
+    dropped_reason: str | None = None,
+    normalized_payload: Any | None = None,
+    normalized_event_id: str | None = None,
+) -> str:
+    """Record an inbound payload to the raw audit store and return its raw_event_id.
+
+    Called from every ingress route BEFORE any filter (partial drop,
+    session-active drop, echo suppression). The returned id is back-linked
+    onto the promoted ``MeetingEvent.source_raw_event_ids`` when the event
+    becomes a ledger row, or left dangling with ``dropped_reason`` set when
+    the event was filtered out.
+    """
+    raw_payload_json = _stable_json(payload)
+    raw_event = RawIngestEvent(
+        raw_event_id=_uuid.uuid4().hex,
+        session_id=session_id,
+        received_at_utc=_now_utc_iso(),
+        provider_timestamp_utc=provider_timestamp_utc,
+        source=source,  # type: ignore[arg-type]
+        event_type=event_type,
+        speaker_or_sender_id=speaker_or_sender_id,
+        payload_hash=hashlib.sha256(raw_payload_json.encode("utf-8")).hexdigest(),
+        raw_payload_json=raw_payload_json,
+        normalized_payload_json=(
+            _stable_json(normalized_payload) if normalized_payload is not None else None
+        ),
+        normalized_event_id=normalized_event_id,
+        dropped_reason=dropped_reason,  # type: ignore[arg-type]
+    )
+    try:
+        store.record_raw_ingest_event(raw_event)
+    except Exception as exc:  # noqa: BLE001 - audit failures must not break ingest
+        logger.warning("raw_ingest_events insert failed: %s", exc)
+    return raw_event.raw_event_id
+
+
+def _patch_raw_promotion(
+    store: SessionStore,
+    raw_event_id: str | None,
+    *,
+    session_id: str | None = None,
+    normalized_event_id: str | None = None,
+    dropped_reason: str | None = None,
+) -> None:
+    if not raw_event_id:
+        return
+    try:
+        store.update_raw_ingest_promotion(
+            raw_event_id,
+            session_id=session_id,
+            normalized_event_id=normalized_event_id,
+            dropped_reason=dropped_reason,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("raw_ingest_events update failed: %s", exc)
+
+
 async def enqueue_analysis_event(
     state: AppState,
     chat_thread_id: str,
@@ -884,6 +1048,7 @@ async def agent_processing_loop(
                 reasoning_effort=PRODUCT_SPEC.agent.reasoning_effort,
                 instructions=PRODUCT_SPEC.agent.prompt_template,
                 send_chat_url=os.environ.get("BOT_SEND_CHAT_URL") or None,
+                intervention_policy=PRODUCT_SPEC.agent.intervention_policy,
             )
             analyzers[key] = analyzer
             logger.info("Alfred analyzer initialized for thread=%s", thread_id)
@@ -1179,6 +1344,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[dict[str, Any]]:
         )
     )
 
+    participant_resolver = ParticipantResolver(store)
+
     # Yield state to be attached to app.state
     state = {
         "session_manager": session_manager,
@@ -1195,6 +1362,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[dict[str, Any]]:
         "route_orchestrator": route_orchestrator,
         "checklist_agent": checklist_agent,
         "last_enqueued_event_ids": last_enqueued_event_ids,
+        "participant_resolver": participant_resolver,
     }
 
     yield state
@@ -1304,12 +1472,35 @@ async def receive_transcript(
         auto_start=auto_start,
     )
 
+    # Capture an immutable raw-audit row BEFORE any filter (partial drop,
+    # session-active drop, normalization mutation). Promoted ledger rows
+    # back-link via MeetingEvent.source_raw_event_ids.
+    resolved_session_id = (
+        session_manager.session.session_id if session_manager.session else None
+    )
+    raw_event_id = record_raw(
+        store,
+        source="stt",
+        event_type=event.event_type or "unknown",
+        payload=request.model_dump(),
+        session_id=resolved_session_id,
+        provider_timestamp_utc=event.timestamp_utc,
+        speaker_or_sender_id=event.speaker_id,
+        normalized_payload=normalized,
+    )
+
     # Update stats
     stats["events_received"] += 1
 
     if event.event_type == "partial":
         stats["partial_transcripts"] += 1
         logger.debug("[PARTIAL] [%s] %s", event.speaker_id, event.text)
+        _patch_raw_promotion(
+            store,
+            raw_event_id,
+            session_id=resolved_session_id,
+            dropped_reason="partial_transcript",
+        )
 
     elif event.event_type == "final":
         stats["final_transcripts"] += 1
@@ -1320,7 +1511,33 @@ async def receive_transcript(
 
         # Add to session if active
         if session_manager.is_active:
-            session_manager.add_transcript(event)
+            session_manager.add_transcript(event, raw_event_ids=[raw_event_id])
+
+            # E3: resolve speech to a Teams participant. Pull MSI hints from
+            # the wire payload (top-level fields or metadata block).
+            resolver = state["participant_resolver"]
+            dominant_msi, active_msis = _extract_msi_hints(request)
+            sid_for_resolve = (
+                session_manager.session.session_id if session_manager.session else None
+            )
+            if sid_for_resolve and event.speaker_id:
+                link = resolver.resolve_speech(
+                    sid_for_resolve,
+                    event.speaker_id,
+                    dominant_msi,
+                    active_msis,
+                )
+                latest_for_patch = session_manager.get_latest_meeting_event()
+                if (
+                    latest_for_patch is not None
+                    and latest_for_patch.speaker_id == event.speaker_id
+                    and link.aad_object_id
+                ):
+                    latest_for_patch.aad_object_id = link.aad_object_id
+                    latest_for_patch.display_name = link.display_name
+                    latest_for_patch.participant_id = link.aad_object_id
+                    if link.last_dominant_msi is not None:
+                        latest_for_patch.media_source_id = str(link.last_dominant_msi)
 
             speaker_role = (
                 session_manager.get_speaker_role(event.speaker_id) if event.speaker_id else None
@@ -1391,8 +1608,22 @@ async def receive_transcript(
                     store.append_meeting_event(sid, latest_event)
                 except Exception as persist_exc:  # noqa: BLE001
                     logger.warning("Persistence write failed for transcript event: %s", persist_exc)
+                _patch_raw_promotion(
+                    store,
+                    raw_event_id,
+                    session_id=sid,
+                    normalized_event_id=latest_event.event_id,
+                )
                 await event_bus.publish("ledger_append", latest_event, session_id=sid)
             await enqueue_analysis_event(state, chat_thread_id, latest_event)
+        else:
+            # Final transcript landed before any session existed; record the
+            # drop reason so audit shows it was received-but-not-promoted.
+            _patch_raw_promotion(
+                store,
+                raw_event_id,
+                dropped_reason="session_inactive",
+            )
 
     elif event.event_type == "session_started":
         stats["session_events"] += 1
@@ -1475,9 +1706,48 @@ async def receive_chat_message(
         auto_start=auto_start,
     )
 
+    # Raw audit BEFORE the is_active filter (so pre-session chats are still
+    # captured) and BEFORE echo-suppression (so bot echoes are still audited).
+    raw_source = "graph_notification" if chat.raw is not None else "bot_framework"
+    resolved_session_id = (
+        session_manager.session.session_id if session_manager.session else None
+    )
+    raw_event_id = record_raw(
+        store,
+        source=raw_source,
+        event_type=chat.event_type,
+        payload=request.model_dump(),
+        session_id=resolved_session_id,
+        provider_timestamp_utc=chat.timestamp_utc,
+        speaker_or_sender_id=chat.sender_id,
+    )
+
     if session_manager.is_active:
-        session_manager.add_chat_message(chat)
-        should_analyze = not session_manager.is_expected_bot_echo(chat)
+        promoted_event = session_manager.add_chat_message(
+            chat, raw_event_ids=[raw_event_id]
+        )
+        is_echo = session_manager.is_expected_bot_echo(chat)
+        should_analyze = not is_echo
+        if is_echo:
+            _patch_raw_promotion(
+                store,
+                raw_event_id,
+                session_id=resolved_session_id,
+                dropped_reason="echo_suppressed",
+            )
+
+        # E3: resolve chat sender by AAD when possible (Graph notification
+        # path carries a real AAD; bot-framework path may not).
+        if promoted_event is not None and session_manager.session is not None:
+            resolver = state["participant_resolver"]
+            resolved = resolver.resolve_chat_sender(
+                session_manager.session.session_id, chat
+            )
+            if resolved is not None:
+                promoted_event.aad_object_id = resolved["aad_object_id"]
+                promoted_event.participant_id = resolved["aad_object_id"]
+                if resolved.get("display_name"):
+                    promoted_event.display_name = resolved["display_name"]
 
         if session_manager.session:
             await dispatch_route_payload(
@@ -1509,10 +1779,36 @@ async def receive_chat_message(
                 store.append_meeting_event(sid, latest_event)
             except Exception as persist_exc:  # noqa: BLE001
                 logger.warning("Persistence write failed for chat event: %s", persist_exc)
+            if promoted_event is latest_event or (
+                promoted_event is not None
+                and promoted_event.event_id == latest_event.event_id
+            ):
+                _patch_raw_promotion(
+                    store,
+                    raw_event_id,
+                    session_id=sid,
+                    normalized_event_id=latest_event.event_id,
+                )
             await event_bus.publish("ledger_append", latest_event, session_id=sid)
+        elif promoted_event is None and chat.event_type != "chat_deleted":
+            # Duplicate message_id — already in the ledger from a prior call.
+            _patch_raw_promotion(
+                store,
+                raw_event_id,
+                session_id=resolved_session_id,
+                dropped_reason="duplicate_message_id",
+            )
 
         if should_analyze:
             await enqueue_analysis_event(state, chat_thread_id, latest_event)
+    else:
+        # No active session — record the drop reason on the raw row so audit
+        # shows the inbound chat was received but not promoted.
+        _patch_raw_promotion(
+            store,
+            raw_event_id,
+            dropped_reason="session_inactive",
+        )
 
     await variant_plugin.on_chat_message(chat, session_manager.get_session_context())
 
@@ -2446,6 +2742,171 @@ async def get_session_tool_calls(
     """Return the audit log of agent tool calls for a session."""
     rows = await asyncio.to_thread(state["store"].get_tool_calls, session_id, limit)
     return ToolCallsResponse(session_id=session_id, tool_calls=rows)
+
+
+class ParticipantsResponse(BaseModel):
+    session_id: str
+    participants: list[dict[str, Any]]
+
+
+class SpeakerIdentityResponse(BaseModel):
+    session_id: str
+    links: list[dict[str, Any]]
+
+
+@app.post("/session/participants")
+async def upsert_session_participants(
+    request: ParticipantsUpdateRequest,
+    state: AppStateDep,
+) -> dict[str, Any]:
+    """Receive a Teams participant roster snapshot from the C# bot (E3).
+
+    Either ``session_id`` or ``chat_thread_id`` is required to bind the
+    payload to a session. Each call is recorded raw, then upserted into
+    ``meeting_participants`` + ``participant_msi_bindings``.
+    """
+    store = state["store"]
+    registry = state["session_registry"]
+
+    session_id = request.session_id
+    if session_id is None and request.chat_thread_id:
+        manager = registry.get(request.chat_thread_id) or registry.get_or_start(
+            request.chat_thread_id
+        )
+        if manager.session is not None:
+            session_id = manager.session.session_id
+    if session_id is None:
+        raise TranscriptServiceError(
+            message="Either session_id or chat_thread_id must be provided",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            error_code="MISSING_SESSION_BINDING",
+        )
+
+    raw_event_id = record_raw(
+        store,
+        source="teams_media",
+        event_type="participants_updated",
+        payload=request.model_dump(),
+        session_id=session_id,
+        provider_timestamp_utc=request.fetched_at_utc,
+    )
+
+    resolver = state["participant_resolver"]
+    participants = [
+        Participant(
+            aad_object_id=entry.aad_object_id,
+            display_name=entry.display_name,
+            user_principal_name=entry.user_principal_name,
+            media_source_ids=list(entry.media_source_ids),
+            is_in_lobby=entry.is_in_lobby,
+            role=entry.role,
+            is_application=entry.is_application,
+            first_seen_at_utc=entry.first_seen_at_utc,
+            last_seen_at_utc=entry.last_seen_at_utc,
+        )
+        for entry in request.participants
+    ]
+    resolver.upsert_participants(session_id, participants)
+    logger.info(
+        "Upserted %d participant(s) for session=%s (raw=%s)",
+        len(participants),
+        session_id,
+        raw_event_id,
+    )
+    return {"ok": True, "session_id": session_id, "count": len(participants)}
+
+
+@app.post("/sessions/{session_id}/speaker-mapping")
+async def post_speaker_mapping(
+    session_id: str,
+    body: SpeakerMappingOverride,
+    state: AppStateDep,
+) -> dict[str, Any]:
+    """Manually bind a speaker_id to an AAD; sticky over automatic resolution."""
+    store = state["store"]
+    raw_event_id = record_raw(
+        store,
+        source="system",
+        event_type="manual_speaker_mapping",
+        payload=body.model_dump(),
+        session_id=session_id,
+    )
+    link = state["participant_resolver"].set_manual_mapping(
+        session_id, body.speaker_id, body.aad_object_id
+    )
+    logger.info(
+        "Manual speaker mapping: session=%s speaker=%s -> aad=%s (raw=%s)",
+        session_id,
+        body.speaker_id,
+        body.aad_object_id,
+        raw_event_id,
+    )
+    return {"ok": True, "link": link.model_dump()}
+
+
+@app.get("/sessions/{session_id}/participants", response_model=ParticipantsResponse)
+async def get_session_participants(
+    session_id: str,
+    state: AppStateDep,
+) -> ParticipantsResponse:
+    rows = await asyncio.to_thread(state["store"].get_participants, session_id)
+    return ParticipantsResponse(session_id=session_id, participants=rows)
+
+
+@app.get(
+    "/sessions/{session_id}/speaker-identity",
+    response_model=SpeakerIdentityResponse,
+)
+async def get_session_speaker_identity(
+    session_id: str,
+    state: AppStateDep,
+) -> SpeakerIdentityResponse:
+    rows = await asyncio.to_thread(state["store"].get_speaker_identity_links, session_id)
+    return SpeakerIdentityResponse(session_id=session_id, links=rows)
+
+
+class RawEventsResponse(BaseModel):
+    session_id: str
+    events: list[dict[str, Any]]
+
+
+@app.get("/sessions/{session_id}/raw-events", response_model=RawEventsResponse)
+async def get_session_raw_events(
+    session_id: str,
+    state: AppStateDep,
+    since: str | None = None,
+    limit: int | None = None,
+) -> RawEventsResponse:
+    """Return the immutable raw-audit rows ingested for a session."""
+    rows = await asyncio.to_thread(
+        state["store"].get_raw_events, session_id, since, limit
+    )
+    return RawEventsResponse(session_id=session_id, events=rows)
+
+
+@app.get("/sessions/{session_id}/raw-events/export.ndjson")
+async def export_session_raw_events_ndjson(
+    session_id: str,
+    state: AppStateDep,
+) -> StreamingResponse:
+    """Stream the session's raw audit log as one-event-per-line NDJSON."""
+    store = state["store"]
+
+    def _producer() -> AsyncIterator[bytes]:
+        async def _gen() -> AsyncIterator[bytes]:
+            for row in store.iter_raw_events(session_id):
+                yield (_json_mod.dumps(row, default=str) + "\n").encode("utf-8")
+
+        return _gen()
+
+    return StreamingResponse(
+        _producer(),
+        media_type="application/x-ndjson",
+        headers={
+            "Content-Disposition": f'attachment; filename="raw-events-{session_id}.ndjson"',
+            "Cache-Control": "no-cache",
+        },
+    )
 
 
 # =============================================================================

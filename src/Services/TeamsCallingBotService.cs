@@ -304,6 +304,15 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
         var handler = new CallHandler(call, mediaSession, transcriber, _logger);
         CallHandlers[threadId] = handler;
 
+        // E3: Wire the MediaSourceId hint provider so each published
+        // TranscriptEvent carries the contemporaneous dominant + active
+        // MediaSourceIds. The Python sink uses these to map speech to
+        // a Teams participant via meeting_participants / participant_msi_bindings.
+        if (transcriber is AzureConversationTranscriber azureTranscriber)
+        {
+            azureTranscriber.SetMediaSourceIdHintProvider(handler.GetMediaSourceIdHint);
+        }
+
         _ = _meetingChatService.AttachToCallAsync(call);
         
         _logger.LogInformation(

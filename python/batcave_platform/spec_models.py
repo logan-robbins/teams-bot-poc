@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -58,6 +59,14 @@ class AgentSpec(BaseModel):
     tools: tuple[AgentTool, ...] = Field(default_factory=lambda: (AgentTool.NONE,))
     model: str | None = None
     reasoning_effort: str | None = None
+    intervention_policy: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Explicit proactivity policy (E4). Recognized keys: "
+            "cooldown_seconds, directly_addressed_bypass, mention_strings, rules. "
+            "rules is a list of {id, when, ask} entries rendered into the prompt."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_tools(self) -> "AgentSpec":
