@@ -54,10 +54,10 @@ export function MeetingDossier({ chatThreadId }: Props) {
             "minmax(320px, 1fr) minmax(420px, 1.25fr) minmax(280px, 0.75fr)",
         }}
       >
-        <div className="min-w-0 border-r border-ink-800">
+        <div className="min-h-0 min-w-0 overflow-hidden border-r border-ink-800">
           <Ledger history={history} />
         </div>
-        <div className="min-w-0 border-r border-ink-800">
+        <div className="min-h-0 min-w-0 overflow-hidden border-r border-ink-800">
           <Dossier analysis={analysis} />
         </div>
         <CompanionRail
