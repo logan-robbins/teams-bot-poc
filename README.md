@@ -61,30 +61,45 @@ The manifest cannot bypass this.
         │  - Receives audio + per-buffer ActiveSpeakers MSI  │
         │  - Reads ICall.Participants → MSI ↔ AAD mapping    │
         │  - Streams PCM to Deepgram / Azure ConversationTr. │
+        │  - Stamps every TranscriptEvent + chat with the    │
+        │    meeting's chat_thread_id                        │
         │  - Forwards transcript + chat to the Python sink   │
         │  - Sends Alfred's outbound chat via Bot Framework  │
         └────────────────────────┬───────────────────────────┘
                                  │
               POST /transcript   │   POST /chat
-              POST /session/...  │   POST /api/send-chat ◀── reverse path
+              { chat_thread_id } │   { chat_thread_id }      ◀── meeting key on every event
+                                 │   POST /api/send-chat     ◀── reverse path
                                  ▼
         ┌────────────────────────────────────────────────────┐
         │      Python sink  (python/, FastAPI on CAE)        │
-        │  - Append-only meeting ledger (MeetingEvent)       │
+        │  - SessionRegistry — one InterviewSessionManager   │
+        │    per chat_thread_id; auto-starts on first event  │
+        │  - Append-only meeting ledger per session          │
         │  - Debounced AlfredAnalyzer → AlfredExtraction     │
         │  - send_to_meeting_chat tool (sole action surface) │
         │  - SQLite: sessions / meeting_events / extractions │
         │           / tool_calls / dossier_items             │
-        │  - SSE /session/events drives the UI               │
+        │  - SSE /m/{chat_thread_id}/events drives the UI    │
         └────────────────────────┬───────────────────────────┘
-                                 │ SSE + JSON
+                                 │ SSE + JSON, filtered by chat_thread_id
                                  ▼
         ┌────────────────────────────────────────────────────┐
         │          React UI  (web/, Vite + React 19)         │
+        │   URL-routed: /m/<chat_thread_id> is the only      │
+        │   path that renders the dossier. / shows a meeting │
+        │   picker — there is no "current meeting" fallback. │
         │   3 columns: Ledger | Dossier | Companion Rail     │
         │   Read-only: only Alfred speaks into chat.         │
         └────────────────────────────────────────────────────┘
 ```
+
+**Meeting key:** `chat_thread_id` (e.g. `19:meeting_xxx@thread.v2`) is the
+canonical 1:1 identifier for a Teams meeting and the only stable id we
+get on both audio and chat paths. The bot stamps it on every
+`TranscriptEvent` and chat activity; the sink keys its `SessionRegistry`
+on it; the UI requires it in the URL. There is no other auth on the UI —
+**knowing the chat_thread_id IS the access boundary**.
 
 **Agent contract (do not change without reading §6):** the analyzer
 emits one `AlfredExtraction` per tick (rolling summary, topics, notes,
@@ -120,13 +135,19 @@ There is no `SEND/ASK/SILENT` enum. Silence is "did not call the tool".
 ```
 src/                         C# Teams bot (Graph Communications SDK)
 python/                      FastAPI sink + Alfred agent
-  transcript_sink.py         all HTTP routes
-  meeting_agent/             models, session, agent, tools, persistence
+  transcript_sink.py         all HTTP routes (legacy /session/* + /m/*)
+  meeting_agent/
+    models.py                InterviewSession, MeetingEvent, ...
+    session.py               InterviewSessionManager + SessionRegistry
+    persistence.py, agent.py, tools.py
   batcave_platform/          product-spec loader, output routes
     specs/alfred.yaml        Alfred's prompt + intervention policy
   variants/alfred.py         spec-bound runtime variant
   tests/                     pytest suite (uv run pytest tests -v)
 web/                         React 19 + Vite + Tailwind v4 dossier UI
+  src/App.tsx                router: / -> MeetingList, /m/* -> MeetingDossier
+  src/components/MeetingList.tsx       picker at root path
+  src/components/MeetingDossier.tsx    dossier (keyed on URL chat_thread_id)
 manifest/                    Teams app manifest (Disney sandbox)
 scripts/                     deploy-azure-vm.sh, deploy-azure-agent.sh, ...
 ```
@@ -134,7 +155,8 @@ scripts/                     deploy-azure-vm.sh, deploy-azure-agent.sh, ...
 Canonical state object: `InterviewSession` in
 `python/meeting_agent/models.py`. Canonical history:
 `InterviewSession.meeting_events` (a single append-only ledger of
-normalized speech + chat + system events).
+normalized speech + chat + system events). One session per
+`chat_thread_id`, held in `SessionRegistry`.
 
 ---
 
@@ -152,15 +174,13 @@ normalized speech + chat + system events).
 
 ## 6. Operate
 
-**Live validation note (2026-04-30):** the Disney sandbox VM is configured
-to POST transcripts to the sink at `/transcript` and chat events to `/chat`.
-The live meeting-chat smoke test validated the current canonical POC flow:
-
-1. Teams meeting chat message reaches the Windows VM through the Bot
-   Framework `/api/messages` endpoint.
-2. `AlfredBot` forwards the message to the Python sink `/chat` endpoint.
-3. The sink writes it into `InterviewSession.meeting_events`.
-4. The React UI reads it through `/sink/session/status` and live SSE.
+**Live flow (canonical):** the bot stamps every transcript and chat with
+the meeting's `chat_thread_id` and POSTs them to `/transcript` / `/chat`
+on the sink. The sink's `SessionRegistry` auto-starts a session keyed on
+that id (no `/session/start` round-trip needed) and persists everything
+into `InterviewSession.meeting_events`. The UI loads only through
+`/m/<chat_thread_id>` and reads `/m/<id>/status` + live SSE at
+`/m/<id>/events`. Open `/` to pick from the active meeting list.
 
 Microsoft Graph chat-notification subscriptions are not active in the live
 sandbox deployment. Chat ingress is the Bot Framework `/api/messages` path
@@ -176,15 +196,28 @@ curl -sS -m 10 -o /dev/null -w "%{http_code}\n" https://ca-alfred-web.gentlewate
 # Sink stats
 curl -sS https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io/stats | jq
 
+# Per-meeting routes (the UI uses these — chat_thread_id is the URL key).
+SINK=https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io
+TID='19:meeting_xxx@thread.v2'             # URL-encode the colon in the path if needed
+
+curl -sS $SINK/m | jq '.meetings[] | {chat_thread_id, active, total_events}'
+curl -sS "$SINK/m/$TID/status"  | jq '.session.meeting_history[] | {kind, role, text}'
+curl -sS "$SINK/m/$TID/ledger"  | jq '.events | length'
+curl -sS "$SINK/m/$TID/dossier" | jq
+curl -sS -X POST "$SINK/m/$TID/end"
+
+# Legacy single-session routes (/session/start, /session/status, /session/end,
+# /session/events) still work for dev tooling and the test suite. Their state
+# lives in the registry's "default" slot. Prefer /m/<id>/* for anything new.
+
 # Verify the Teams channel calling webhook points at the VM. Calling MUST
 # terminate at the C# bot host — Container Apps cannot host /api/calling
 # (no Real-Time Media SDK on Linux).
 az bot msteams show -g rg-alfred-disney -n bot-alfred-disney \
   --query "properties.properties.{callingWebhook:callingWebhook, enableCalling:enableCalling}" -o json
 
-# UI-to-sink proxy. This must return the same active session state as the
-# direct sink; if it 404s, redeploy the web container with web/nginx.conf.template.
-curl -sS https://ca-alfred-web.gentlewater-5aa74a73.eastus.azurecontainerapps.io/sink/session/status | jq
+# UI-to-sink proxy. Should return the same /m index as the direct sink.
+curl -sS https://ca-alfred-web.gentlewater-5aa74a73.eastus.azurecontainerapps.io/sink/m | jq
 
 # Restart the bot service on the VM
 az vm run-command create -g rg-alfred-disney --vm-name vm-alfred-disney --location eastus \
@@ -303,14 +336,15 @@ gh api repos/logan-robbins/alfred-teams-bot/keys \
 
 ## 11. Editing rules (do not violate)
 
-1. Single canonical meeting ledger (`InterviewSession.meeting_events`).
-2. One authoritative inbound chat path for the current POC: Teams Bot Framework activities delivered to `/api/messages`, then forwarded to the Python `/chat` endpoint.
-3. Outbound Alfred chat goes through the `send_to_meeting_chat` agent tool. The old `teams_chat` output route is gone.
-4. Agent contract = `AlfredExtraction` (structured output) + `send_to_meeting_chat` (sole action). **Do not** reintroduce a `SEND/ASK/SILENT` enum.
-5. UI is read-only with respect to the meeting. Only Alfred speaks into the meeting chat, and only through the tool.
-6. All persistent writes go through `meeting_agent.persistence.SessionStore` so live UI and post-meeting replay read the same truth.
-7. The bot self-resolves its TLS cert at startup (thumbprint → Subject CN match on `MediaPlatformSettings.ServiceFqdn` → `CertificateFriendlyName` prefix). Do not re-introduce hard-coded thumbprint dependencies elsewhere — cert auto-renewal must remain transparent.
-8. Treat this README and `python/batcave_platform/specs/alfred.yaml` as system documents.
+1. Single canonical meeting ledger (`InterviewSession.meeting_events`), one session per `chat_thread_id`.
+2. `chat_thread_id` is the meeting key. Every transcript and chat event must carry it; the UI must require it in the URL (`/m/<chat_thread_id>`); never reintroduce a "current meeting" fallback that lets `/` show a dossier.
+3. One authoritative inbound chat path for the current POC: Teams Bot Framework activities delivered to `/api/messages`, then forwarded to the Python `/chat` endpoint.
+4. Outbound Alfred chat goes through the `send_to_meeting_chat` agent tool. The old `teams_chat` output route is gone.
+5. Agent contract = `AlfredExtraction` (structured output) + `send_to_meeting_chat` (sole action). **Do not** reintroduce a `SEND/ASK/SILENT` enum.
+6. UI is read-only with respect to the meeting. Only Alfred speaks into the meeting chat, and only through the tool.
+7. All persistent writes go through `meeting_agent.persistence.SessionStore` so live UI and post-meeting replay read the same truth.
+8. The bot self-resolves its TLS cert at startup (thumbprint → Subject CN match on `MediaPlatformSettings.ServiceFqdn` → `CertificateFriendlyName` prefix). Do not re-introduce hard-coded thumbprint dependencies elsewhere — cert auto-renewal must remain transparent.
+9. Treat this README and `python/batcave_platform/specs/alfred.yaml` as system documents.
 
 ---
 
