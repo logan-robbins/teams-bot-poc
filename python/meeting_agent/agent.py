@@ -27,7 +27,7 @@ from typing import Any, Optional
 
 from agents import Agent, ModelSettings, Runner, set_default_openai_client
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, BadRequestError
 from openai.types.shared import Reasoning
 from pydantic import BaseModel
 
@@ -88,38 +88,6 @@ class RunningAssessment(BaseModel):
 InterviewAnalysisOutput = AlfredExtraction
 
 
-DEFAULT_ALFRED_INSTRUCTIONS = """You are Alfred, a quiet meeting assistant joining a Teams meeting.
-
-You can hear everything said (diarized transcript) and see every chat
-message. On each tick you receive the full meeting context.
-
-Two things happen per tick, independently:
-
-1. You ALWAYS return a structured ``AlfredExtraction`` describing your
-   current thinking: updated running_summary, topics, new notes, and
-   — most importantly — any new or updated decisions, open_questions,
-   action_items, and risks you can identify from the conversation.
-
-2. You MAY call the ``send_to_meeting_chat`` tool to post into the meeting
-   chat. Silence is the default. Only call the tool when you have
-   concrete value to add (a decision, a missing link, a clarifying
-   question that is genuinely blocking progress). Never call to recap
-   or narrate. If you would post, prefer one or two sentences.
-
-Rules:
-- Strong bias toward silence. Not calling the tool is the right answer
-  most of the time.
-- Never interrupt flow just to acknowledge.
-- If the meeting is muted (`context.alfred_muted == true`), never call
-  the tool.
-- Intent-alignment matters: when participants commit to something,
-  record it as a decision. When they leave something unresolved,
-  record it as an open_question. When someone agrees to do something,
-  record it as an action_item with an owner if stated.
-- Keep notes terse. Lists are deltas, not full history.
-"""
-
-
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -150,9 +118,14 @@ class AlfredAnalyzer:
         instructions: Optional[str] = None,
         send_chat_url: Optional[str] = None,
     ) -> None:
+        if not instructions:
+            raise ValueError(
+                "AlfredAnalyzer requires instructions — pass the prompt_template "
+                "from alfred.yaml (or equivalent product spec)."
+            )
         self.model = model or DEFAULT_MODEL
         self.reasoning_effort = reasoning_effort or DEFAULT_REASONING_EFFORT
-        self.instructions = instructions or DEFAULT_ALFRED_INSTRUCTIONS
+        self.instructions = instructions
         self.session_manager = session_manager
         self.output_writer = output_writer
         self.publish_thoughts = publish_thoughts
@@ -211,58 +184,72 @@ class AlfredAnalyzer:
             return prefix
         return f"{prefix}: {text}"
 
-    def _build_prompt(self, response_text: str, context: Optional[dict[str, Any]]) -> str:
+    def _build_prompt(
+        self,
+        response_text: str,
+        context: Optional[dict[str, Any]],
+        *,
+        chaining: bool,
+    ) -> str:
+        """Build the per-turn input for Runner.run.
+
+        When ``chaining=True`` the Responses API chain already holds full
+        history and Alfred's prior state, so we send only the delta + flags.
+        When ``chaining=False`` (Tick 1 or after chain recovery) we include
+        the canonical session snapshot so the model has full context.
+        """
         ctx = context or {}
         stable_prefix = dict(ctx.get("stable_prefix") or {})
-        meeting_history = list(ctx.get("meeting_history") or [])
         dynamic_tail = list(ctx.get("dynamic_tail") or [])
         trigger_event = dict(ctx.get("trigger_event") or {})
+        alfred_muted = bool(stable_prefix.get("alfred_muted") or ctx.get("alfred_muted"))
+        direct_address = bool(ctx.get("direct_address"))
 
-        parts: list[str] = [
-            "# Alfred Meeting Context",
-            "## Stable Prefix",
-            f"- session_id: {stable_prefix.get('session_id') or ctx.get('session_id') or 'unknown'}",
-            f"- candidate_name: {stable_prefix.get('candidate_name') or ctx.get('candidate_name') or 'unknown'}",
-            f"- meeting_url: {stable_prefix.get('meeting_url') or ctx.get('meeting_url') or 'unknown'}",
-            f"- started_at: {stable_prefix.get('started_at') or ctx.get('started_at') or 'unknown'}",
-            f"- prompt_cache_key: {stable_prefix.get('prompt_cache_key') or ctx.get('prompt_cache_key') or ''}",
-            f"- latest_response_id: {stable_prefix.get('latest_response_id') or ctx.get('latest_response_id') or ''}",
-            f"- alfred_muted: {bool(stable_prefix.get('alfred_muted') or ctx.get('alfred_muted'))}",
-            "",
-            "## Current Alfred State",
-            f"running_summary:\n{stable_prefix.get('running_summary') or ctx.get('running_summary') or '(empty)'}",
-            "",
-            f"topics: {', '.join(stable_prefix.get('topics') or ctx.get('topics') or []) or '(none)'}",
-            f"notes: {' | '.join(stable_prefix.get('notes') or ctx.get('notes') or []) or '(none)'}",
-            "",
-            "### Current Dossier (what Alfred already believes)",
-            "Revise these by emitting the same `id` with updated fields.",
-            "Only emit NEW items or CHANGED items in the extraction below.",
-            "",
-            self._format_dossier_block(
-                "decisions", stable_prefix.get("decisions") or ctx.get("decisions") or []
-            ),
-            self._format_dossier_block(
-                "open_questions",
-                stable_prefix.get("open_questions") or ctx.get("open_questions") or [],
-            ),
-            self._format_dossier_block(
-                "action_items",
-                stable_prefix.get("action_items") or ctx.get("action_items") or [],
-            ),
-            self._format_dossier_block(
-                "risks", stable_prefix.get("risks") or ctx.get("risks") or []
-            ),
-            "",
-            "## Full Meeting History",
-        ]
-        if meeting_history:
-            parts.extend(
-                self._format_history_line(index, event)
-                for index, event in enumerate(meeting_history, start=1)
-            )
+        if chaining:
+            parts: list[str] = ["# Alfred — New Events This Tick"]
+            if alfred_muted:
+                parts.append("alfred_muted: true  ← do NOT call send_to_meeting_chat")
+            if direct_address:
+                parts.append("direct_address: true  ← silence-default is overridden; act on the trigger")
         else:
-            parts.append("(no meeting history yet)")
+            parts = [
+                "# Alfred Meeting Context",
+                "## Session",
+                f"- session_id: {stable_prefix.get('session_id') or ctx.get('session_id') or 'unknown'}",
+                f"- started_at: {stable_prefix.get('started_at') or ctx.get('started_at') or 'unknown'}",
+                f"- alfred_muted: {alfred_muted}",
+            ]
+            if direct_address:
+                parts.append("- direct_address: true  ← silence-default is overridden")
+            parts.extend(
+                [
+                    "",
+                    "## Current Alfred State",
+                    f"running_summary:\n{stable_prefix.get('running_summary') or ctx.get('running_summary') or '(empty)'}",
+                    "",
+                    f"topics: {', '.join(stable_prefix.get('topics') or ctx.get('topics') or []) or '(none)'}",
+                    f"notes: {' | '.join(stable_prefix.get('notes') or ctx.get('notes') or []) or '(none)'}",
+                    "",
+                    "### Current Dossier",
+                    "Revise these by emitting the same `id` with updated fields.",
+                    "Only emit NEW items or CHANGED items in the extraction below.",
+                    "",
+                    self._format_dossier_block(
+                        "decisions", stable_prefix.get("decisions") or ctx.get("decisions") or []
+                    ),
+                    self._format_dossier_block(
+                        "open_questions",
+                        stable_prefix.get("open_questions") or ctx.get("open_questions") or [],
+                    ),
+                    self._format_dossier_block(
+                        "action_items",
+                        stable_prefix.get("action_items") or ctx.get("action_items") or [],
+                    ),
+                    self._format_dossier_block(
+                        "risks", stable_prefix.get("risks") or ctx.get("risks") or []
+                    ),
+                ]
+            )
 
         parts.extend(["", "## Newly Appended Events"])
         if dynamic_tail:
@@ -321,17 +308,44 @@ class AlfredAnalyzer:
                 speaker_id=speaker_id,
             )
 
-        prompt = self._build_prompt(response_text, context)
+        ctx = context or {}
+        stable_prefix = dict(ctx.get("stable_prefix") or {})
+        previous_response_id: str | None = (
+            stable_prefix.get("latest_response_id") or ctx.get("latest_response_id") or None
+        )
+        prompt = self._build_prompt(response_text, context, chaining=bool(previous_response_id))
 
         run_ctx = AlfredAgentContext(
             session_manager=self.session_manager,
             send_chat_url=self.send_chat_url,
         )
 
+        async def _run(prev_id: str | None, input_prompt: str):
+            return await Runner.run(
+                self._agent,
+                input_prompt,
+                context=run_ctx,
+                previous_response_id=prev_id,
+            )
+
         try:
-            result = await Runner.run(self._agent, prompt, context=run_ctx)
+            try:
+                result = await _run(previous_response_id, prompt)
+            except BadRequestError as exc:
+                if "previous_response" not in str(exc).lower():
+                    raise
+                # Stale chain: clear the id, send a full-context prompt once.
+                logger.warning(
+                    "Stale previous_response_id=%s; reseeding chain. Error: %s",
+                    previous_response_id,
+                    exc,
+                )
+                if self.session_manager and self.session_manager.session:
+                    self.session_manager.session.latest_response_id = None
+                result = await _run(None, self._build_prompt(response_text, context, chaining=False))
+
             extraction = result.final_output_as(AlfredExtraction)
-            latest_response_id = _extract_response_id(result)
+            latest_response_id = result.last_response_id or _extract_response_id(result)
 
             analysis_item = AnalysisItem(
                 response_id=response_id or f"resp_{uuid.uuid4().hex[:8]}",

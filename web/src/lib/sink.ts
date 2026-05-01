@@ -57,6 +57,12 @@ export const sink = {
       body: "{}",
     }),
 
+  setMuted: (chatThreadId: string, muted: boolean) =>
+    json<{ alfred_muted: boolean }>(`/m/${encodeURIComponent(chatThreadId)}/mute`, {
+      method: "POST",
+      body: JSON.stringify({ muted }),
+    }),
+
   listMeetings: () => json<MeetingListResponse>("/m"),
 
   // -- Legacy (single-session) endpoints kept for diagnostics + tooling ------

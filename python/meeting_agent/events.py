@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -24,10 +25,24 @@ __all__ = [
     "AlfredEvent",
     "AlfredEventBus",
     "AlfredEventType",
+    "detect_direct_address",
     "format_sse",
 ]
 
 logger = logging.getLogger(__name__)
+
+_DIRECT_ADDRESS_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"^\s*alfred[\s,:!?]", re.IGNORECASE),
+    re.compile(r"@alfred\b", re.IGNORECASE),
+    re.compile(r"\bhey alfred\b", re.IGNORECASE),
+    re.compile(r"\bok alfred\b", re.IGNORECASE),
+    re.compile(r"\bexcuse me alfred\b", re.IGNORECASE),
+]
+
+
+def detect_direct_address(text: str) -> bool:
+    """Return True if ``text`` is directly addressing Alfred by name."""
+    return any(p.search(text) for p in _DIRECT_ADDRESS_PATTERNS)
 
 
 AlfredEventType = Literal[

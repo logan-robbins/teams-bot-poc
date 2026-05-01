@@ -41,7 +41,7 @@ from meeting_agent.debounce import (
     DEFAULT_QUIET_WINDOW_SECONDS,
     drain_with_debounce,
 )
-from meeting_agent.events import AlfredEventBus, format_sse
+from meeting_agent.events import AlfredEventBus, detect_direct_address, format_sse
 from meeting_agent.models import (
     AnalysisItem,
     ChatMessage,
@@ -287,6 +287,12 @@ class SpeakerMapRequest(BaseModel):
         ..., min_length=1, description="Speaker identifier: speaker_0, speaker_1, etc."
     )
     role: SpeakerRole = Field(..., description="Role: candidate or interviewer")
+
+
+class MuteRequest(BaseModel):
+    """Body for POST /m/{chat_thread_id}/mute."""
+
+    muted: bool
 
 
 class ChatMessageRequest(BaseModel):
@@ -923,6 +929,7 @@ async def agent_processing_loop(
                         analysis_context,
                         event,
                     )
+                    analysis_context["direct_address"] = detect_direct_address(event.text)
 
                     analysis_item: AnalysisItem = await analyzer.analyze_async(
                         response_text=event.text,
@@ -2370,6 +2377,32 @@ async def end_meeting_session(
         message=f"Session ended for chat_thread_id='{chat_thread_id}'",
         summary=summary,
     )
+
+
+@app.post("/m/{chat_thread_id:path}/mute")
+async def set_meeting_mute(
+    chat_thread_id: str,
+    body: MuteRequest,
+    state: AppStateDep,
+) -> dict[str, bool]:
+    """Toggle Alfred's mute state for this meeting."""
+    manager = _resolve_meeting_or_404(state, chat_thread_id)
+    if manager.session is None:
+        raise SessionNotActiveError(f"No active session for chat_thread_id='{chat_thread_id}'.")
+    manager.session.alfred_muted = body.muted
+    await asyncio.to_thread(state["store"].upsert_session, manager.session)
+    sid = manager.session.session_id
+    await state["event_bus"].publish(
+        "session_state",
+        {
+            "session_id": sid,
+            "running_summary": manager.session.running_summary,
+            "topics": list(manager.session.topics),
+            "alfred_muted": manager.session.alfred_muted,
+        },
+        session_id=sid,
+    )
+    return {"alfred_muted": manager.session.alfred_muted}
 
 
 @app.get("/sessions/{session_id}/ledger", response_model=LedgerResponse)

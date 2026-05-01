@@ -1,4 +1,3 @@
-import { useState } from "react";
 import { Link } from "react-router-dom";
 import { Header } from "./Header";
 import { Ledger } from "./Ledger";
@@ -26,11 +25,15 @@ export function MeetingDossier({ chatThreadId }: Props) {
   const session = useSessionStore((s) => s.session);
   const analysis = useSessionStore((s) => s.analysis);
   const connection = useSessionStore((s) => s.connection);
-  const [muted, setMuted] = useState(false);
+  const muted = session?.alfred_muted ?? false;
 
   async function endSession() {
     if (!chatThreadId) return;
     await sink.endMeeting(chatThreadId);
+  }
+
+  function handleSetMuted(m: boolean) {
+    sink.setMuted(chatThreadId, m).catch(() => {});
   }
 
   const history = session?.meeting_history ?? [];
@@ -61,7 +64,7 @@ export function MeetingDossier({ chatThreadId }: Props) {
           session={session}
           analysis={analysis}
           muted={muted}
-          setMuted={setMuted}
+          setMuted={handleSetMuted}
           onAfterMutation={noop}
         />
       </main>

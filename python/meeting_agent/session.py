@@ -242,6 +242,11 @@ class InterviewSessionManager:
             prompt_cache_key=_build_prompt_cache_key(session_id),
             graph_chat_thread_id=chat_thread_id,
         )
+        # Seed conversation_reference_id from chat_thread_id so voice-only
+        # or early-transcript sessions can post chat via the C# bot before
+        # any chat activity arrives to carry the reference.
+        if chat_thread_id:
+            self._session.conversation_reference_id = chat_thread_id
         self._speaker_roles = {}
 
         logger.info(
