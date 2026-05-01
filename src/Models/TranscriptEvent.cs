@@ -9,13 +9,16 @@ namespace TeamsMediaBot.Models;
 public record TranscriptEvent(
     /// <summary>"partial" | "final" | "session_started" | "session_stopped" | "error"</summary>
     string EventType,
-    
+
     /// <summary>Transcribed text (null for non-text events)</summary>
     string? Text,
-    
+
     /// <summary>ISO 8601 UTC timestamp</summary>
     string TimestampUtc,
-    
+
+    /// <summary>Teams chat thread id (meeting id). Required so the sink can route per-meeting.</summary>
+    string? ChatThreadId = null,
+
     /// <summary>Normalized speaker ID: "speaker_0", "speaker_1", etc. Null if diarization disabled.</summary>
     string? SpeakerId = null,
     

@@ -40,6 +40,9 @@ public sealed partial class AzureConversationTranscriber : IRealtimeTranscriber
     private long _bytesReceived;
     private bool _isDisposed;
 
+    /// <inheritdoc/>
+    public string? ChatThreadId { get; set; }
+
     /// <summary>
     /// Source-generated regex to extract speaker number from "Guest-1", "Guest-2", etc.
     /// Using source generation for better startup performance and AOT compatibility.
@@ -303,6 +306,7 @@ public sealed partial class AzureConversationTranscriber : IRealtimeTranscriber
             EventType: eventType,
             Text: text,
             TimestampUtc: DateTime.UtcNow.ToString("O"),
+            ChatThreadId: ChatThreadId,
             SpeakerId: speakerId,
             Metadata: new EventMetadata(Provider: "azure_speech", Model: null, SessionId: _sessionId),
             Error: error

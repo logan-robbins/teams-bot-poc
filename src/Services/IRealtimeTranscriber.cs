@@ -15,6 +15,14 @@ namespace TeamsMediaBot.Services;
 public interface IRealtimeTranscriber : IAsyncDisposable
 {
     /// <summary>
+    /// Teams chat thread id of the meeting this transcriber is bound to.
+    /// Set after construction by the join workflow once the threadId is known.
+    /// Stamped on every <see cref="TeamsMediaBot.Models.TranscriptEvent"/> so
+    /// the Python sink can route transcripts to the correct meeting session.
+    /// </summary>
+    string? ChatThreadId { get; set; }
+
+    /// <summary>
     /// Starts the transcription session.
     /// </summary>
     /// <param name="ct">Optional cancellation token.</param>

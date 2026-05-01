@@ -34,6 +34,9 @@ public sealed class DeepgramRealtimeTranscriber : IRealtimeTranscriber
     private long _bytesReceived;
     private bool _isDisposed;
 
+    /// <inheritdoc/>
+    public string? ChatThreadId { get; set; }
+
     /// <summary>
     /// Initializes a new instance of the <see cref="DeepgramRealtimeTranscriber"/> class.
     /// </summary>
@@ -217,6 +220,7 @@ public sealed class DeepgramRealtimeTranscriber : IRealtimeTranscriber
             EventType: eventType,
             Text: alternative.Transcript,
             TimestampUtc: DateTime.UtcNow.ToString("O"),
+            ChatThreadId: ChatThreadId,
             SpeakerId: speakerId,
             AudioStartMs: audioStartMs,
             AudioEndMs: audioEndMs,
@@ -301,6 +305,7 @@ public sealed class DeepgramRealtimeTranscriber : IRealtimeTranscriber
             EventType: eventType,
             Text: text,
             TimestampUtc: DateTime.UtcNow.ToString("O"),
+            ChatThreadId: ChatThreadId,
             Metadata: new EventMetadata(Provider: "deepgram", Model: _model, SessionId: _sessionId),
             Error: error
         );

@@ -52,6 +52,10 @@ class TranscriptEvent(BaseModel):
     )
     text: Optional[str] = None
     timestamp_utc: str = Field(..., description="ISO 8601 UTC timestamp when event occurred")
+    chat_thread_id: Optional[str] = Field(
+        default=None,
+        description="Teams chat thread id (meeting id) the event belongs to",
+    )
     speaker_id: Optional[str] = None
     audio_start_ms: Optional[float] = None
     audio_end_ms: Optional[float] = None

@@ -3,10 +3,15 @@ import { normalizeDossierKind, useSessionStore } from "../stores/sessionStore";
 import type { AlfredAnalysisBody, MeetingEvent } from "../lib/types";
 
 /**
- * Live session stream.
+ * Live session stream for a single meeting.
  *
- *  1. Seeds the store from GET /session/status (one-shot snapshot)
- *  2. Opens EventSource at GET /session/events for push updates
+ * Required: ``chatThreadId`` — the URL-routed meeting key. The hook hits
+ * ``/m/<chatThreadId>/status`` for the seed snapshot, then opens an
+ * ``EventSource`` at ``/m/<chatThreadId>/events`` so the browser only ever
+ * sees events for the meeting in the current URL.
+ *
+ *  1. Seeds the store from GET /m/{id}/status (one-shot snapshot)
+ *  2. Opens EventSource at GET /m/{id}/events for push updates
  *  3. Reconnects automatically via the native EventSource
  *  4. Updates connection state so the UI can show a connection chip
  *
@@ -16,7 +21,7 @@ import type { AlfredAnalysisBody, MeetingEvent } from "../lib/types";
 
 const SINK_BASE = "/sink";
 
-export function useSessionStream(): void {
+export function useSessionStream(chatThreadId: string): void {
   const seedFromStatus = useSessionStore((s) => s.seedFromStatus);
   const setConnection = useSessionStore((s) => s.setConnection);
   const appendLedger = useSessionStore((s) => s.appendLedger);
@@ -27,11 +32,13 @@ export function useSessionStream(): void {
   const markSessionEnded = useSessionStore((s) => s.markSessionEnded);
 
   useEffect(() => {
+    if (!chatThreadId) return;
     let cancelled = false;
+    const encoded = encodeURIComponent(chatThreadId);
 
     (async () => {
       try {
-        const res = await fetch(`${SINK_BASE}/session/status`);
+        const res = await fetch(`${SINK_BASE}/m/${encoded}/status`);
         if (!cancelled && res.ok) {
           const body = await res.json();
           seedFromStatus(body);
@@ -42,7 +49,7 @@ export function useSessionStream(): void {
     })();
 
     setConnection({ mode: "connecting" });
-    const source = new EventSource(`${SINK_BASE}/session/events`);
+    const source = new EventSource(`${SINK_BASE}/m/${encoded}/events`);
 
     source.addEventListener("open", () => setConnection({ mode: "open" }));
     source.addEventListener("error", () =>
@@ -95,6 +102,7 @@ export function useSessionStream(): void {
       setConnection({ mode: "closed" });
     };
   }, [
+    chatThreadId,
     seedFromStatus,
     setConnection,
     appendLedger,

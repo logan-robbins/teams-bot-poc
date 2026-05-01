@@ -51,7 +51,7 @@ from meeting_agent.models import (
 )
 from meeting_agent.output import AnalysisOutputWriter
 from meeting_agent.persistence import SessionStore, build_store
-from meeting_agent.session import InterviewSessionManager
+from meeting_agent.session import InterviewSessionManager, SessionRegistry
 from meeting_agent.checklist_state import ChecklistDefinition, ChecklistStateManager
 from batcave_platform import (
     AgentTool,
@@ -235,6 +235,10 @@ class TranscriptEventRequest(BaseModel):
     text: str | None = Field(default=None, description="Transcript text content")
     timestamp_utc: str | None = Field(
         default=None, description="UTC timestamp in ISO format"
+    )
+    chat_thread_id: str | None = Field(
+        default=None,
+        description="Teams chat thread id (meeting id) the event belongs to",
     )
     speaker_id: str | None = Field(
         default=None, description="Speaker identifier (e.g., speaker_0)"
@@ -481,15 +485,19 @@ class AppStats(TypedDict):
     started_at: str
 
 
+AgentQueueItem = tuple[str, MeetingEvent]
+
+
 class AppState(TypedDict):
     """Type-safe application state managed by lifespan."""
 
     session_manager: InterviewSessionManager
+    session_registry: SessionRegistry
     output_writer: AnalysisOutputWriter
     store: SessionStore
     event_bus: AlfredEventBus
     transcript_queue: asyncio.Queue[TranscriptEvent]
-    agent_queue: asyncio.Queue[MeetingEvent]
+    agent_queue: asyncio.Queue[AgentQueueItem]
     stats: AppStats
     agent_task: asyncio.Task[None] | None
     variant_plugin: VariantPlugin
@@ -584,6 +592,7 @@ def get_app_state(request: Request) -> AppState:
         raise RuntimeError("Application state not initialized")
     return AppState(
         session_manager=state.session_manager,
+        session_registry=state.session_registry,
         output_writer=state.output_writer,
         store=state.store,
         event_bus=state.event_bus,
@@ -657,6 +666,7 @@ def normalize_v1_to_v2(request: TranscriptEventRequest, stats: AppStats) -> dict
             request.timestamp_utc
             or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         ),
+        "chat_thread_id": request.chat_thread_id,
         "speaker_id": request.speaker_id,
         "audio_start_ms": request.audio_start_ms,
         "audio_end_ms": request.audio_end_ms,
@@ -752,13 +762,58 @@ def maybe_auto_map_candidate(session_manager: InterviewSessionManager) -> str | 
     return session_manager.get_candidate_speaker_id() or inferred_candidate
 
 
-async def enqueue_analysis_event(state: AppState, event: MeetingEvent | None) -> None:
+def resolve_manager_for_inbound(
+    registry: SessionRegistry,
+    chat_thread_id: str | None,
+    *,
+    auto_start: bool,
+) -> tuple[InterviewSessionManager, str]:
+    """Pick the per-meeting session manager for an inbound transcript/chat.
+
+    Returns ``(manager, resolved_chat_thread_id)``. The resolved id is what
+    keys the agent queue and SSE filter for this event.
+
+    Routing rules:
+
+    * If ``chat_thread_id`` is empty, route to the legacy default slot.
+    * If the default slot has an active legacy session (started via
+      ``POST /session/start`` without a thread id), prefer it when the
+      inbound thread id matches or is unset — keeps single-meeting tooling
+      and tests working unchanged.
+    * Otherwise, look up (and optionally auto-start) the per-thread slot.
+    """
+    thread_id = (chat_thread_id or "").strip()
+    if not thread_id:
+        thread_id = SessionRegistry.DEFAULT_THREAD_ID
+
+    default_mgr = registry.get(SessionRegistry.DEFAULT_THREAD_ID)
+    if default_mgr is not None and default_mgr.is_active and default_mgr.session is not None:
+        bound = (default_mgr.session.graph_chat_thread_id or "").strip()
+        if (
+            thread_id == SessionRegistry.DEFAULT_THREAD_ID
+            or not bound
+            or bound == thread_id
+        ):
+            return default_mgr, SessionRegistry.DEFAULT_THREAD_ID
+
+    if auto_start:
+        manager = registry.get_or_start(thread_id, candidate_name="Meeting", meeting_url="")
+    else:
+        manager = registry.get_or_create(thread_id)
+    return manager, thread_id
+
+
+async def enqueue_analysis_event(
+    state: AppState,
+    chat_thread_id: str,
+    event: MeetingEvent | None,
+) -> None:
     """Queue a normalized meeting event for Alfred live-turn analysis."""
     if event is None:
         return
 
-    session = state["session_manager"].session
-    if session is None:
+    manager = state["session_registry"].get(chat_thread_id)
+    if manager is None or manager.session is None:
         return
 
     if event.kind == "speech" and not event.text.strip():
@@ -766,13 +821,18 @@ async def enqueue_analysis_event(state: AppState, event: MeetingEvent | None) ->
     if event.kind == "chat" and (event.from_bot or not event.text.strip()):
         return
 
-    last_event_id = state["last_enqueued_event_ids"].get(session.session_id)
+    last_event_id = state["last_enqueued_event_ids"].get(manager.session.session_id)
     if last_event_id == event.event_id:
         return
 
-    await state["agent_queue"].put(event)
-    state["last_enqueued_event_ids"][session.session_id] = event.event_id
-    logger.info("Queued Alfred analysis event kind=%s event_id=%s", event.kind, event.event_id)
+    await state["agent_queue"].put((chat_thread_id, event))
+    state["last_enqueued_event_ids"][manager.session.session_id] = event.event_id
+    logger.info(
+        "Queued Alfred analysis event kind=%s event_id=%s thread=%s",
+        event.kind,
+        event.event_id,
+        chat_thread_id,
+    )
 
 
 # =============================================================================
@@ -781,8 +841,8 @@ async def enqueue_analysis_event(state: AppState, event: MeetingEvent | None) ->
 
 
 async def agent_processing_loop(
-    agent_queue: asyncio.Queue[MeetingEvent],
-    session_manager: InterviewSessionManager,
+    agent_queue: asyncio.Queue[AgentQueueItem],
+    session_registry: SessionRegistry,
     output_writer: AnalysisOutputWriter,
     store: SessionStore,
     event_bus: AlfredEventBus,
@@ -791,43 +851,69 @@ async def agent_processing_loop(
     checklist_manager: ChecklistStateManager,
     route_orchestrator: RouteOrchestrator,
 ) -> None:
-    """Background task that processes unified meeting events through Alfred."""
+    """Background task that processes unified meeting events through Alfred.
+
+    With multi-session routing, the queue carries ``(chat_thread_id, event)``
+    tuples. The analyzer is constructed lazily per-thread so each Alfred
+    instance binds to that meeting's ``InterviewSessionManager``.
+    """
     logger.info("Agent processing loop started")
 
-    analyzer = None
-    publisher = None
+    publisher = get_publisher() if (AGENT_AVAILABLE and get_publisher) else None
+    analyzers: dict[str, Any] = {}
 
-    if AGENT_AVAILABLE and InterviewAnalyzer:
+    def _resolve_analyzer(manager: InterviewSessionManager):
+        if not (AGENT_AVAILABLE and InterviewAnalyzer):
+            return None
+        thread_id = manager.session.graph_chat_thread_id if manager.session else None
+        key = thread_id or id(manager)
+        analyzer = analyzers.get(key)
+        if analyzer is not None:
+            return analyzer
         try:
             analyzer = InterviewAnalyzer(
                 model=PRODUCT_SPEC.agent.model,
-                session_manager=session_manager,
+                session_manager=manager,
                 publish_thoughts=True,
                 reasoning_effort=PRODUCT_SPEC.agent.reasoning_effort,
                 instructions=PRODUCT_SPEC.agent.prompt_template,
                 send_chat_url=os.environ.get("BOT_SEND_CHAT_URL") or None,
             )
-            publisher = get_publisher() if get_publisher else None
-            logger.info("Alfred analyzer initialized with real-time publishing")
+            analyzers[key] = analyzer
+            logger.info("Alfred analyzer initialized for thread=%s", thread_id)
+            return analyzer
         except Exception as e:
             logger.error("Failed to initialize Alfred analyzer: %s", e)
+            return None
 
     response_counter = 0
 
     while True:
         try:
-            event, batch_size = await drain_with_debounce(
+            queue_item, batch_size = await drain_with_debounce(
                 agent_queue,
                 quiet_window_seconds=DEFAULT_QUIET_WINDOW_SECONDS,
                 max_batch=DEFAULT_MAX_BATCH,
             )
             del batch_size  # logged inside the helper
+            chat_thread_id, event = queue_item
+
+            session_manager = session_registry.get(chat_thread_id)
+            if session_manager is None:
+                continue
 
             if not event.text:
                 continue
 
-            logger.info("AGENT_INPUT [%s/%s]: %s...", event.kind, event.speaker_id, event.text[:100])
+            logger.info(
+                "AGENT_INPUT [%s/%s/thread=%s]: %s...",
+                event.kind,
+                event.speaker_id,
+                chat_thread_id,
+                event.text[:100],
+            )
 
+            analyzer = _resolve_analyzer(session_manager)
             if analyzer and session_manager.is_active:
                 try:
                     analysis_context = session_manager.get_agent_context_snapshot(
@@ -1039,10 +1125,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[dict[str, Any]]:
     logger.info("Event bus initialized")
 
     # Initialize state components
-    session_manager = InterviewSessionManager()
+    session_registry = SessionRegistry()
+    # Legacy singleton manager — registered under DEFAULT_THREAD_ID so the
+    # existing /session/* routes (used by tests + tooling) keep returning the
+    # same manager instance they always have.
+    session_manager = session_registry.get_or_create(SessionRegistry.DEFAULT_THREAD_ID)
     checklist_manager = build_checklist_manager()
     transcript_queue: asyncio.Queue[TranscriptEvent] = asyncio.Queue()
-    agent_queue: asyncio.Queue[MeetingEvent] = asyncio.Queue()
+    agent_queue: asyncio.Queue[AgentQueueItem] = asyncio.Queue()
     last_enqueued_event_ids: dict[str, str] = {}
     stats = get_initial_stats()
     route_orchestrator = ROUTES
@@ -1071,7 +1161,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[dict[str, Any]]:
     agent_task = asyncio.create_task(
         agent_processing_loop(
             agent_queue,
-            session_manager,
+            session_registry,
             output_writer,
             store,
             event_bus,
@@ -1085,6 +1175,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[dict[str, Any]]:
     # Yield state to be attached to app.state
     state = {
         "session_manager": session_manager,
+        "session_registry": session_registry,
         "output_writer": output_writer,
         "store": store,
         "event_bus": event_bus,
@@ -1179,12 +1270,11 @@ async def receive_transcript(
         TranscriptResponse confirming receipt.
     """
     stats = state["stats"]
-    session_manager = state["session_manager"]
+    session_registry = state["session_registry"]
     output_writer = state["output_writer"]
     store = state["store"]
     event_bus = state["event_bus"]
     transcript_queue = state["transcript_queue"]
-    agent_queue = state["agent_queue"]
     variant_plugin = state["variant_plugin"]
     checklist_manager = state["checklist_manager"]
     route_orchestrator = state["route_orchestrator"]
@@ -1195,6 +1285,17 @@ async def receive_transcript(
 
     # Parse into TranscriptEvent model
     event = TranscriptEvent(**normalized)
+
+    # Resolve the per-meeting session manager by chat_thread_id. Auto-start
+    # the meeting session on first inbound final transcript so the bot does
+    # not need an explicit /session/start round-trip. Partial transcripts and
+    # session_started events do not auto-create.
+    auto_start = event.event_type == "final" and bool((event.text or "").strip())
+    session_manager, chat_thread_id = resolve_manager_for_inbound(
+        session_registry,
+        event.chat_thread_id,
+        auto_start=auto_start,
+    )
 
     # Update stats
     stats["events_received"] += 1
@@ -1284,7 +1385,7 @@ async def receive_transcript(
                 except Exception as persist_exc:  # noqa: BLE001
                     logger.warning("Persistence write failed for transcript event: %s", persist_exc)
                 await event_bus.publish("ledger_append", latest_event, session_id=sid)
-            await enqueue_analysis_event(state, latest_event)
+            await enqueue_analysis_event(state, chat_thread_id, latest_event)
 
     elif event.event_type == "session_started":
         stats["session_events"] += 1
@@ -1329,7 +1430,7 @@ async def receive_chat_message(
     and becomes a first-class event in the unified meeting timeline.
     """
     stats = state["stats"]
-    session_manager = state["session_manager"]
+    session_registry = state["session_registry"]
     variant_plugin = state["variant_plugin"]
     route_orchestrator = state["route_orchestrator"]
     store = state["store"]
@@ -1352,6 +1453,19 @@ async def receive_chat_message(
         reply_to_message_id=request.reply_to_message_id,
         from_bot=request.from_bot,
         raw=request.raw,
+    )
+
+    # Auto-start the meeting session on first non-deleted chat for an unseen
+    # thread so the UI gets a session immediately, without needing an explicit
+    # /session/start call.
+    auto_start = (
+        chat.event_type != "chat_deleted"
+        and bool((chat.text or "").strip())
+    )
+    session_manager, chat_thread_id = resolve_manager_for_inbound(
+        session_registry,
+        chat.chat_thread_id,
+        auto_start=auto_start,
     )
 
     if session_manager.is_active:
@@ -1391,7 +1505,7 @@ async def receive_chat_message(
             await event_bus.publish("ledger_append", latest_event, session_id=sid)
 
         if should_analyze:
-            await enqueue_analysis_event(state, latest_event)
+            await enqueue_analysis_event(state, chat_thread_id, latest_event)
 
     await variant_plugin.on_chat_message(chat, session_manager.get_session_context())
 
@@ -1956,6 +2070,305 @@ async def list_sessions(state: AppStateDep, limit: int = 100) -> SessionListResp
     rows = await asyncio.to_thread(state["store"].list_sessions, limit)
     return SessionListResponse(
         sessions=[SessionSummaryRow(**row) for row in rows],
+    )
+
+
+# =============================================================================
+# Per-meeting routes (URL-keyed by chat_thread_id)
+# =============================================================================
+#
+# The UI requires a chat_thread_id in its URL (`/m/<chat_thread_id>`) so
+# anyone hitting the dossier only ever sees the single meeting they were
+# in. There is intentionally no other auth on these routes — the
+# chat_thread_id IS the access boundary. All audio + chat events are
+# tagged with chat_thread_id at ingestion (via TranscriptEvent /
+# ChatMessage) and routed to the matching session manager so the data is
+# tracked by meeting.
+
+
+class MeetingListEntry(BaseModel):
+    """Public summary of one meeting in the registry."""
+
+    chat_thread_id: str
+    session_id: str | None = None
+    candidate_name: str | None = None
+    meeting_url: str | None = None
+    started_at: str | None = None
+    ended_at: str | None = None
+    active: bool = False
+    total_events: int = 0
+
+
+class MeetingListResponse(BaseModel):
+    meetings: list[MeetingListEntry]
+
+
+def _build_meeting_entry(thread_id: str, manager: InterviewSessionManager) -> MeetingListEntry:
+    session = manager.session
+    return MeetingListEntry(
+        chat_thread_id=thread_id,
+        session_id=session.session_id if session else None,
+        candidate_name=session.candidate_name if session else None,
+        meeting_url=session.meeting_url if session else None,
+        started_at=session.started_at if session else None,
+        ended_at=session.ended_at if session else None,
+        active=manager.is_active,
+        total_events=len(session.meeting_events) if session else 0,
+    )
+
+
+def _resolve_meeting_or_404(
+    state: AppState,
+    chat_thread_id: str,
+) -> InterviewSessionManager:
+    manager = state["session_registry"].get(chat_thread_id)
+    if manager is None:
+        raise TranscriptServiceError(
+            message=f"No meeting registered for chat_thread_id='{chat_thread_id}'.",
+            status_code=status.HTTP_404_NOT_FOUND,
+            error_code="MEETING_NOT_FOUND",
+        )
+    return manager
+
+
+@app.get("/m", response_model=MeetingListResponse)
+async def list_meetings(state: AppStateDep) -> MeetingListResponse:
+    """List meetings (active + recently ended) currently in the registry."""
+    registry = state["session_registry"]
+    entries: list[MeetingListEntry] = []
+    for thread_id in registry.thread_ids:
+        if thread_id == SessionRegistry.DEFAULT_THREAD_ID:
+            # Hide the legacy compatibility slot from the per-meeting list —
+            # it has no real chat_thread_id anyone could hit in a URL.
+            continue
+        manager = registry.get(thread_id)
+        if manager is None:
+            continue
+        entries.append(_build_meeting_entry(thread_id, manager))
+    # Most recently started first.
+    entries.sort(key=lambda e: e.started_at or "", reverse=True)
+    return MeetingListResponse(meetings=entries)
+
+
+@app.get("/m/{chat_thread_id:path}/status", response_model=SessionStatusWrapper)
+async def get_meeting_status(
+    chat_thread_id: str,
+    state: AppStateDep,
+) -> SessionStatusWrapper:
+    """Snapshot for the UI to seed the dossier on mount."""
+    manager = _resolve_meeting_or_404(state, chat_thread_id)
+    checklist_manager = state["checklist_manager"]
+    stats = state["stats"]
+    context = manager.get_session_context()
+
+    session_status = SessionStatusResponse(
+        active=context["session_active"],
+        session_id=context.get("session_id"),
+        candidate_name=context.get("candidate_name"),
+        meeting_url=context.get("meeting_url"),
+        started_at=context.get("started_at"),
+        speaker_mappings=context.get("speaker_mappings", {}),
+        recent_conversation=context.get("recent_conversation", []),
+        meeting_history=context.get("meeting_history", []),
+        chat_messages_count=context.get("chat_messages_count", 0),
+        conversation_reference_id=context.get("conversation_reference_id"),
+        graph_chat_thread_id=context.get("graph_chat_thread_id") or chat_thread_id,
+        prompt_cache_key=context.get("prompt_cache_key"),
+        latest_response_id=context.get("latest_response_id"),
+        running_summary=context.get("running_summary", ""),
+        topics=context.get("topics", []),
+        notes=context.get("notes", []),
+        decisions=context.get("decisions", []),
+        open_questions=context.get("open_questions", []),
+        action_items=context.get("action_items", []),
+        risks=context.get("risks", []),
+        total_events=context.get("total_events", 0),
+        final_events=context.get("final_events", 0),
+        analysis_count=stats["agent_analyses"],
+        checklist=checklist_manager.snapshot(),
+        product_id=PRODUCT_SPEC.product_id,
+    )
+
+    return SessionStatusWrapper(
+        session=session_status,
+        agent_available=AGENT_AVAILABLE,
+        product_id=PRODUCT_SPEC.product_id,
+    )
+
+
+@app.get("/m/{chat_thread_id:path}/events")
+async def stream_meeting_events(
+    chat_thread_id: str,
+    state: AppStateDep,
+    request: Request,
+) -> StreamingResponse:
+    """Server-Sent Events stream filtered to one meeting's session_id."""
+    manager = _resolve_meeting_or_404(state, chat_thread_id)
+    event_bus = state["event_bus"]
+    session_filter = (
+        manager.session.session_id if manager.session is not None else None
+    )
+
+    async def generator() -> AsyncIterator[bytes]:
+        heartbeat_seconds = 15.0
+        yield b": alfred-sse-stream\n\n"
+
+        subscription = event_bus.subscribe(session_filter=session_filter)
+        iterator = subscription.__aiter__()
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    event = await asyncio.wait_for(
+                        iterator.__anext__(), timeout=heartbeat_seconds
+                    )
+                except asyncio.TimeoutError:
+                    yield b": keep-alive\n\n"
+                    continue
+                except StopAsyncIteration:
+                    break
+                yield format_sse(event)
+        finally:
+            aclose = getattr(subscription, "aclose", None)
+            if aclose is not None:
+                try:
+                    await aclose()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    return StreamingResponse(
+        generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/m/{chat_thread_id:path}/ledger", response_model=LedgerResponse)
+async def get_meeting_ledger(
+    chat_thread_id: str,
+    state: AppStateDep,
+    limit: int | None = None,
+) -> LedgerResponse:
+    """Persisted ledger for a meeting."""
+    manager = _resolve_meeting_or_404(state, chat_thread_id)
+    if manager.session is None:
+        return LedgerResponse(session_id="", events=[])
+    sid = manager.session.session_id
+    events = await asyncio.to_thread(state["store"].get_ledger, sid, limit)
+    return LedgerResponse(session_id=sid, events=events)
+
+
+@app.get("/m/{chat_thread_id:path}/dossier", response_model=DossierResponse)
+async def get_meeting_dossier(
+    chat_thread_id: str,
+    state: AppStateDep,
+) -> DossierResponse:
+    """Latest intent-alignment state for a meeting."""
+    manager = _resolve_meeting_or_404(state, chat_thread_id)
+    if manager.session is None:
+        return DossierResponse(
+            session_id="",
+            decisions=[],
+            open_questions=[],
+            action_items=[],
+            risks=[],
+        )
+    sid = manager.session.session_id
+    bundle = await asyncio.to_thread(state["store"].get_dossier, sid)
+    return DossierResponse(session_id=sid, **bundle)
+
+
+@app.post("/m/{chat_thread_id:path}/end", response_model=SessionEndResponse)
+async def end_meeting_session(
+    chat_thread_id: str,
+    state: AppStateDep,
+) -> SessionEndResponse:
+    """End the meeting's session. Bot calls this on call termination."""
+    manager = _resolve_meeting_or_404(state, chat_thread_id)
+    if not manager.is_active:
+        raise SessionNotActiveError(
+            f"No active session for chat_thread_id='{chat_thread_id}'."
+        )
+
+    output_writer = state["output_writer"]
+    checklist_manager = state["checklist_manager"]
+    stats = state["stats"]
+    variant_plugin = state["variant_plugin"]
+    store = state["store"]
+    event_bus = state["event_bus"]
+    route_orchestrator = state["route_orchestrator"]
+
+    session = manager.session
+    assert session is not None
+    session_id = session.session_id
+    candidate_name = session.candidate_name
+    started_at = session.started_at
+
+    ended_session = manager.end_session()
+
+    if ended_session:
+        try:
+            analysis = output_writer.load_analysis(session_id)
+            if analysis:
+                analysis.ended_at = ended_session.ended_at
+                analysis.checklist_state = checklist_manager.snapshot()
+                analysis.running_summary = ended_session.running_summary
+                analysis.topics = list(ended_session.topics)
+                analysis.notes = list(ended_session.notes)
+                analysis.decisions = list(ended_session.decisions)
+                analysis.open_questions = list(ended_session.open_questions)
+                analysis.action_items = list(ended_session.action_items)
+                analysis.risks = list(ended_session.risks)
+                analysis.compute_overall_scores()
+                output_writer.write_analysis(session_id, analysis)
+            try:
+                store.upsert_session(ended_session)
+            except Exception as persist_exc:  # noqa: BLE001
+                logger.warning("Persistence write failed on session end: %s", persist_exc)
+        except Exception as e:
+            logger.error("Failed to finalize analysis: %s", e)
+
+    summary = {
+        "session_id": session_id,
+        "chat_thread_id": chat_thread_id,
+        "candidate_name": candidate_name,
+        "started_at": started_at,
+        "ended_at": (
+            ended_session.ended_at
+            if ended_session
+            else datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        ),
+        "total_events": len(ended_session.meeting_events) if ended_session else 0,
+        "analyses_generated": stats["agent_analyses"],
+    }
+
+    state["last_enqueued_event_ids"].pop(session_id, None)
+
+    await event_bus.publish("session_ended", summary, session_id=session_id)
+    await variant_plugin.on_session_end(summary)
+    await dispatch_route_payload(
+        route_orchestrator=route_orchestrator,
+        stats=stats,
+        payload={
+            "event_type": "session_ended",
+            "product_id": PRODUCT_SPEC.product_id,
+            "instance_id": RUNTIME_CONFIG.instance_id,
+            "session_id": session_id,
+            "chat_thread_id": chat_thread_id,
+            "summary": summary,
+            "checklist": checklist_manager.snapshot(),
+        },
+    )
+
+    return SessionEndResponse(
+        ok=True,
+        message=f"Session ended for chat_thread_id='{chat_thread_id}'",
+        summary=summary,
     )
 
 

@@ -56,22 +56,23 @@ async def client() -> AsyncIterator[AsyncClient]:
             yield ac
 
 
-@pytest_asyncio.fixture(autouse=True)
-async def reset_state(client: AsyncClient) -> AsyncIterator[None]:
-    """
-    Reset application state before each test.
+def _reset_app_state(app) -> None:
+    """Wipe per-test mutable state on app.state so tests don't leak."""
+    from meeting_agent.session import SessionRegistry
 
-    Ensures test isolation by clearing session state and stats.
-    """
-    from transcript_sink import app
-
-    # Access state through lifespan-initialized app.state
     if hasattr(app.state, "session_manager"):
         session_manager = app.state.session_manager
         if session_manager.is_active:
             session_manager.end_session()
         session_manager._session = None
         session_manager._speaker_roles = {}
+
+    if hasattr(app.state, "session_registry"):
+        registry = app.state.session_registry
+        for thread_id in list(registry.thread_ids):
+            if thread_id == SessionRegistry.DEFAULT_THREAD_ID:
+                continue
+            registry.discard(thread_id)
 
     if hasattr(app.state, "stats"):
         stats = app.state.stats
@@ -84,15 +85,19 @@ async def reset_state(client: AsyncClient) -> AsyncIterator[None]:
         stats["v2_events"] = 0
         stats["agent_analyses"] = 0
 
-    yield
 
-    # Cleanup after test
-    if hasattr(app.state, "session_manager"):
-        session_manager = app.state.session_manager
-        if session_manager.is_active:
-            session_manager.end_session()
-        session_manager._session = None
-        session_manager._speaker_roles = {}
+@pytest_asyncio.fixture(autouse=True)
+async def reset_state(client: AsyncClient) -> AsyncIterator[None]:
+    """
+    Reset application state before each test.
+
+    Ensures test isolation by clearing session state and stats.
+    """
+    from transcript_sink import app
+
+    _reset_app_state(app)
+    yield
+    _reset_app_state(app)
 
 
 # =============================================================================
@@ -830,6 +835,24 @@ class TestChatEndpoint:
         ]
 
     @pytest.mark.asyncio
+    async def test_chat_routes_to_per_thread_when_no_legacy_session(
+        self, client: AsyncClient
+    ) -> None:
+        """A chat with chat_thread_id auto-starts a per-thread session."""
+        await client.post(
+            "/chat",
+            json={
+                "chat_thread_id": "19:thread-only-A@thread.v2",
+                "message_id": "m-A",
+                "text": "hello A",
+                "timestamp_utc": "2026-04-22T16:00:00Z",
+            },
+        )
+        meetings = (await client.get("/m")).json()["meetings"]
+        thread_ids = [m["chat_thread_id"] for m in meetings]
+        assert "19:thread-only-A@thread.v2" in thread_ids
+
+    @pytest.mark.asyncio
     async def test_deleted_chat_is_dropped_from_timeline(
         self, client: AsyncClient
     ) -> None:
@@ -852,3 +875,145 @@ class TestChatEndpoint:
             "meeting_history"
         ]
         assert history == []
+
+
+# =============================================================================
+# Per-meeting URL routing (Section 6 of PROD.md)
+# =============================================================================
+
+
+class TestPerMeetingRouting:
+    """The UI requires a chat_thread_id in its URL; the sink must isolate
+    each meeting's transcripts, chat, and dossier behind ``/m/<thread_id>``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_two_threads_get_distinct_sessions(self, client: AsyncClient) -> None:
+        """Two distinct chat_thread_ids produce two distinct session managers."""
+        await client.post(
+            "/transcript",
+            json={
+                "event_type": "final",
+                "text": "meeting A line 1",
+                "timestamp_utc": "2026-04-30T17:00:01Z",
+                "chat_thread_id": "19:meet-A@thread.v2",
+                "speaker_id": "speaker_0",
+            },
+        )
+        await client.post(
+            "/transcript",
+            json={
+                "event_type": "final",
+                "text": "meeting B line 1",
+                "timestamp_utc": "2026-04-30T17:00:02Z",
+                "chat_thread_id": "19:meet-B@thread.v2",
+                "speaker_id": "speaker_0",
+            },
+        )
+
+        meetings = (await client.get("/m")).json()["meetings"]
+        thread_ids = {m["chat_thread_id"] for m in meetings}
+        assert thread_ids >= {"19:meet-A@thread.v2", "19:meet-B@thread.v2"}
+
+        a = (await client.get("/m/19:meet-A@thread.v2/status")).json()["session"]
+        b = (await client.get("/m/19:meet-B@thread.v2/status")).json()["session"]
+        assert a["session_id"] != b["session_id"]
+        assert a["graph_chat_thread_id"] == "19:meet-A@thread.v2"
+        assert b["graph_chat_thread_id"] == "19:meet-B@thread.v2"
+
+    @pytest.mark.asyncio
+    async def test_per_meeting_status_shows_only_its_events(
+        self, client: AsyncClient
+    ) -> None:
+        """A meeting's /status only contains events with that chat_thread_id."""
+        await client.post(
+            "/transcript",
+            json={
+                "event_type": "final",
+                "text": "alpha line",
+                "timestamp_utc": "2026-04-30T17:00:01Z",
+                "chat_thread_id": "19:alpha@thread.v2",
+                "speaker_id": "speaker_0",
+            },
+        )
+        await client.post(
+            "/chat",
+            json={
+                "chat_thread_id": "19:beta@thread.v2",
+                "message_id": "m-beta-1",
+                "text": "beta chat",
+                "timestamp_utc": "2026-04-30T17:00:05Z",
+            },
+        )
+
+        alpha = (await client.get("/m/19:alpha@thread.v2/status")).json()["session"]
+        beta = (await client.get("/m/19:beta@thread.v2/status")).json()["session"]
+
+        alpha_texts = [e["text"] for e in alpha["meeting_history"]]
+        beta_texts = [e["text"] for e in beta["meeting_history"]]
+        assert "alpha line" in alpha_texts
+        assert "beta chat" not in alpha_texts
+        assert "beta chat" in beta_texts
+        assert "alpha line" not in beta_texts
+
+    @pytest.mark.asyncio
+    async def test_status_for_unknown_meeting_returns_404(
+        self, client: AsyncClient
+    ) -> None:
+        """Hitting /m/<unknown> returns 404 — no leak of other sessions."""
+        response = await client.get("/m/19:never-seen@thread.v2/status")
+        assert response.status_code == 404
+        body = response.json()
+        assert body["error_code"] == "MEETING_NOT_FOUND"
+
+    @pytest.mark.asyncio
+    async def test_meeting_end_marks_session_inactive(
+        self, client: AsyncClient
+    ) -> None:
+        """POST /m/<id>/end ends only that meeting's session."""
+        await client.post(
+            "/transcript",
+            json={
+                "event_type": "final",
+                "text": "ending soon",
+                "timestamp_utc": "2026-04-30T17:00:00Z",
+                "chat_thread_id": "19:ender@thread.v2",
+                "speaker_id": "speaker_0",
+            },
+        )
+        end = await client.post("/m/19:ender@thread.v2/end")
+        assert end.status_code == 200
+        body = end.json()
+        assert body["ok"] is True
+        assert body["summary"]["chat_thread_id"] == "19:ender@thread.v2"
+
+        status = (await client.get("/m/19:ender@thread.v2/status")).json()["session"]
+        assert status["active"] is False
+
+    @pytest.mark.asyncio
+    async def test_legacy_session_absorbs_unbound_threads(
+        self, client: AsyncClient
+    ) -> None:
+        """When a legacy /session/start is active without a thread id, inbound
+        events keep flowing into that session — preserves single-meeting
+        tooling."""
+        await client.post(
+            "/session/start",
+            json={"candidate_name": "Legacy", "meeting_url": "https://teams.com/x"},
+        )
+        await client.post(
+            "/transcript",
+            json={
+                "event_type": "final",
+                "text": "routes to legacy default slot",
+                "timestamp_utc": "2026-04-30T17:00:00Z",
+                "chat_thread_id": "19:absorbed@thread.v2",
+                "speaker_id": "speaker_0",
+            },
+        )
+        legacy = (await client.get("/session/status")).json()["session"]
+        assert legacy["total_events"] == 1
+        # No per-thread slot was created.
+        meetings = (await client.get("/m")).json()["meetings"]
+        thread_ids = {m["chat_thread_id"] for m in meetings}
+        assert "19:absorbed@thread.v2" not in thread_ids

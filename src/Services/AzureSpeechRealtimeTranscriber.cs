@@ -138,6 +138,9 @@ public sealed class AzureSpeechRealtimeTranscriber : IRealtimeTranscriber
     private SpeechRecognizer? _recognizer;
     private long _framesReceived;
     private long _bytesReceived;
+
+    /// <inheritdoc/>
+    public string? ChatThreadId { get; set; }
     
     // Transcript file path - save to Desktop for easy viewing
     private static readonly string TranscriptFilePath = Path.Combine(
@@ -331,6 +334,7 @@ public sealed class AzureSpeechRealtimeTranscriber : IRealtimeTranscriber
             EventType: eventType,
             Text: text,
             TimestampUtc: timestamp,
+            ChatThreadId: ChatThreadId,
             Metadata: new EventMetadata(Provider: "azure_speech", Model: null, SessionId: null),
             Error: error
         );

@@ -293,10 +293,13 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
         
         // Get or create transcriber (may have been pre-registered by JoinMeetingAsync)
         var transcriber = GetOrCreateTranscriber(threadId);
-        
+        // Bind transcriber to this meeting's chat thread id so every published
+        // TranscriptEvent carries chat_thread_id for sink-side per-meeting routing.
+        transcriber.ChatThreadId ??= threadId;
+
         // Get media session from call
         var mediaSession = call.GetLocalMediaSession();
-        
+
         // Create handler with heartbeat keepalive
         var handler = new CallHandler(call, mediaSession, transcriber, _logger);
         CallHandlers[threadId] = handler;
@@ -574,6 +577,9 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
             throw new InvalidOperationException($"Bot is already in this meeting: {meetingId}");
         }
 
+        // Bind transcriber to this thread so any pre-Established events carry it.
+        transcriber.ChatThreadId = threadId;
+
         // Store transcriber for when CallHandler is created
         _pendingTranscribers[threadId] = transcriber;
 
@@ -624,6 +630,9 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
             _logger.LogWarning("Call handler already exists for thread: {ThreadId}", threadId);
             throw new InvalidOperationException($"Bot is already in a call for thread: {threadId}");
         }
+
+        // Bind transcriber to this thread so any pre-Established events carry it.
+        transcriber.ChatThreadId = threadId;
 
         // Store transcriber for when CallHandler is created
         _pendingTranscribers[threadId] = transcriber;

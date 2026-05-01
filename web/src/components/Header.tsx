@@ -5,12 +5,16 @@ import type { SessionSummary } from "../lib/types";
 interface Props {
   session?: SessionSummary;
   muted: boolean;
+  chatThreadId?: string;
   onEnd: () => void;
 }
 
-export function Header({ session, muted, onEnd }: Props) {
+export function Header({ session, muted, chatThreadId, onEnd }: Props) {
   const active = !!session?.active;
   const label = session?.candidate_name || "Awaiting instruction";
+  // Show the URL-bound chat_thread_id so operators can confirm at a
+  // glance which meeting the dossier is wired to.
+  const threadLabel = chatThreadId || session?.meeting_url || "";
 
   return (
     <header className="flex items-center justify-between border-b border-ink-800 bg-ink-950/80 px-6 py-3 backdrop-blur">
@@ -27,9 +31,12 @@ export function Header({ session, muted, onEnd }: Props) {
         <div className="mx-4 h-8 w-px bg-ink-700" />
         <div className="flex flex-col leading-tight">
           <span className="text-sm font-medium text-ink-100">{label}</span>
-          {session?.meeting_url ? (
-            <span className="font-mono text-[10px] text-ink-400 truncate max-w-[360px]">
-              {session.meeting_url}
+          {threadLabel ? (
+            <span
+              className="font-mono text-[10px] text-ink-400 truncate max-w-[360px]"
+              title={threadLabel}
+            >
+              {threadLabel}
             </span>
           ) : (
             <span className="text-[11px] italic text-ink-300">

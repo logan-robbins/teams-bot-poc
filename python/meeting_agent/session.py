@@ -32,7 +32,7 @@ from .models import (
 )
 
 
-__all__ = ["InterviewSessionManager"]
+__all__ = ["InterviewSessionManager", "SessionRegistry"]
 
 
 logger = logging.getLogger(__name__)
@@ -198,20 +198,28 @@ class InterviewSessionManager:
         """Check if there is an active session."""
         return self._session is not None and self._session.ended_at is None
     
-    def start_session(self, candidate_name: str, meeting_url: str) -> InterviewSession:
+    def start_session(
+        self,
+        candidate_name: str,
+        meeting_url: str,
+        chat_thread_id: str | None = None,
+    ) -> InterviewSession:
         """
         Initialize a new interview session.
-        
+
         Creates a new session with a unique ID and stores candidate information.
         Any existing session is implicitly ended.
-        
+
         Args:
             candidate_name: Name of the candidate being interviewed.
             meeting_url: Teams meeting join URL.
-            
+            chat_thread_id: Teams chat thread id of the meeting (becomes the
+                URL key the UI routes on, and is persisted as
+                ``graph_chat_thread_id``).
+
         Returns:
             The newly created InterviewSession.
-            
+
         Example:
             >>> session = manager.start_session("Jane Doe", "https://teams.microsoft.com/l/meetup-join/...")
             >>> print(session.session_id)
@@ -221,24 +229,26 @@ class InterviewSessionManager:
         if self._session is not None:
             logger.info("Ending existing session before starting new one")
             self.end_session()
-        
+
         # Generate session ID with timestamp and random suffix
         timestamp = datetime.now(timezone.utc)
         session_id = f"int_{timestamp.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-        
+
         self._session = InterviewSession(
             session_id=session_id,
             candidate_name=candidate_name,
             meeting_url=meeting_url,
             started_at=_format_utc_timestamp(timestamp),
             prompt_cache_key=_build_prompt_cache_key(session_id),
+            graph_chat_thread_id=chat_thread_id,
         )
         self._speaker_roles = {}
-        
+
         logger.info(
-            "Started session %s for candidate '%s'",
+            "Started session %s for candidate '%s' (chat_thread_id=%s)",
             session_id,
             candidate_name,
+            chat_thread_id,
         )
         return self._session
     
@@ -895,3 +905,112 @@ class InterviewSessionManager:
 
         entries = [event.model_dump() for event in self._session.meeting_events]
         return entries[-count:] if count is not None and len(entries) > count else entries
+
+
+# ---------------------------------------------------------------------------
+# Multi-session registry
+# ---------------------------------------------------------------------------
+
+
+_DEFAULT_THREAD_ID = "default"
+
+
+class SessionRegistry:
+    """
+    Registry of concurrent meeting sessions keyed by Teams chat_thread_id.
+
+    The sink hosts one ``InterviewSessionManager`` per active meeting. New
+    threads are auto-created on first ingress so the bot does not need to
+    call ``/session/start`` explicitly. Closed sessions are kept in the
+    registry so the UI can still poll their status until garbage collected.
+
+    The registry also exposes a ``DEFAULT`` legacy slot used by the original
+    singleton routes (``/session/start``, ``/session/status`` etc.) so the
+    existing test suite and tooling keep working unchanged.
+    """
+
+    DEFAULT_THREAD_ID = _DEFAULT_THREAD_ID
+
+    def __init__(self) -> None:
+        self._managers: dict[str, InterviewSessionManager] = {}
+
+    @property
+    def thread_ids(self) -> list[str]:
+        """All chat_thread_ids currently tracked (active or closed)."""
+        return list(self._managers.keys())
+
+    def active_thread_ids(self) -> list[str]:
+        """chat_thread_ids that have an active session right now."""
+        return [tid for tid, mgr in self._managers.items() if mgr.is_active]
+
+    def get(self, chat_thread_id: str) -> Optional[InterviewSessionManager]:
+        return self._managers.get(chat_thread_id)
+
+    def get_or_create(self, chat_thread_id: str) -> InterviewSessionManager:
+        manager = self._managers.get(chat_thread_id)
+        if manager is None:
+            manager = InterviewSessionManager()
+            self._managers[chat_thread_id] = manager
+            logger.info("Registered new session manager for chat_thread_id=%s", chat_thread_id)
+        return manager
+
+    def get_or_start(
+        self,
+        chat_thread_id: str,
+        candidate_name: str = "Meeting",
+        meeting_url: str = "",
+    ) -> InterviewSessionManager:
+        """Resolve manager and ensure it has an active session."""
+        manager = self.get_or_create(chat_thread_id)
+        if not manager.is_active:
+            manager.start_session(
+                candidate_name=candidate_name,
+                meeting_url=meeting_url,
+                chat_thread_id=chat_thread_id,
+            )
+        return manager
+
+    def end(self, chat_thread_id: str) -> Optional[InterviewSession]:
+        manager = self._managers.get(chat_thread_id)
+        if manager is None or not manager.is_active:
+            return None
+        return manager.end_session()
+
+    def discard(self, chat_thread_id: str) -> None:
+        """Remove a manager entirely (used by tests for isolation)."""
+        self._managers.pop(chat_thread_id, None)
+
+    def clear(self) -> None:
+        self._managers.clear()
+
+    def resolve_default(self) -> Optional[InterviewSessionManager]:
+        """
+        Pick the singleton-compatible session for legacy callers.
+
+        Used by ``/session/*`` routes that were written before per-meeting
+        URL routing existed. If exactly one session is active, return it;
+        otherwise prefer the explicit ``DEFAULT`` slot. Returns ``None`` if
+        no manager has ever been registered.
+        """
+        if _DEFAULT_THREAD_ID in self._managers:
+            return self._managers[_DEFAULT_THREAD_ID]
+        active = [mgr for mgr in self._managers.values() if mgr.is_active]
+        if len(active) == 1:
+            return active[0]
+        if not self._managers:
+            return None
+        # Fall back to most recently registered manager so legacy
+        # ``/session/status`` keeps returning *something* in the singleton case.
+        return next(reversed(list(self._managers.values())))
+
+    def manager_for_session_id(self, session_id: str) -> Optional[InterviewSessionManager]:
+        for manager in self._managers.values():
+            if manager.session is not None and manager.session.session_id == session_id:
+                return manager
+        return None
+
+    def thread_id_for_session_id(self, session_id: str) -> Optional[str]:
+        for thread_id, manager in self._managers.items():
+            if manager.session is not None and manager.session.session_id == session_id:
+                return thread_id
+        return None
