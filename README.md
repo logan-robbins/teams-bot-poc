@@ -268,6 +268,44 @@ az bot msteams show -g rg-alfred-disney -n bot-alfred-disney \
   --query "properties.properties.{callingWebhook:callingWebhook, enableCalling:enableCalling}" -o json
 ```
 
+### Live call-join diagnostic
+
+Use a real, currently running Teams meeting URL. The first response only
+proves that the bot API and Graph call-create path accepted or rejected
+the request; the actual join/audio path completes asynchronously through
+the `/api/calling` webhook and must be confirmed in VM logs.
+
+```bash
+BOT=https://alfred-disney-bot.eastus.cloudapp.azure.com
+JOIN_URL='<live Teams meeting join URL>'
+
+curl -sS -D - -X POST "$BOT/api/calling/join" \
+  -H "Content-Type: application/json" \
+  -d "$(jq -n --arg joinUrl "$JOIN_URL" \
+        '{joinUrl:$joinUrl, displayName:"Alfred", joinMode:"invite_and_graph_join", botAttendeePresent:true}')"
+
+curl -sS "$BOT/api/calling/health" | jq
+```
+
+Interpretation:
+
+- `200` with `callId` means `communications/calls` accepted the join.
+  Immediately tail VM logs and look for `Call added`, `state changed:
+  ... -> Established`, `CallHandler created ... audio socket wired`,
+  `Transcription started`, and audio frame counters.
+- `202` with `deferred:true` means policy auto-invite mode was selected;
+  no explicit Graph join was attempted, so Teams must invite the bot via
+  the calling webhook.
+- `400` with `BOT_NOT_INVITED` means invite mode failed fast because the
+  request asserted the bot/service account was not on the meeting invite.
+- `403` with `GRAPH_PERMISSION_MISSING` or `TENANT_NOT_ENABLED_FOR_MODE`
+  points at RSC/admin-consent or tenant join-mode configuration.
+- `502` with `CALL_JOIN_FAILED_7504_OR_7505` points at tenant-level Graph
+  calling authorization constraints.
+- If the request returns `200` but no async call log lines appear, verify
+  the Azure Bot `callingWebhook` still points at the VM and that the VM
+  accepts HTTPS traffic for `/api/calling`.
+
 ---
 
 ## 7. Push a code change

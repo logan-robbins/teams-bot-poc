@@ -3,6 +3,7 @@ using Microsoft.Graph.Communications.Calls.Media;
 using Microsoft.Graph.Communications.Resources;
 using Microsoft.Graph.Models;
 using Microsoft.Skype.Bots.Media;
+using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Timers;
@@ -44,6 +45,8 @@ public class CallHandler : HeartbeatHandler
     private bool _isTranscriberStarted;
     private long _audioFramesReceived;
     private bool _isShuttingDown;
+    private bool _loggedFirstUnmixedAudio;
+    private bool _loggedMissingUnmixedAudio;
     private uint _lastDominantSpeaker = DominantSpeakerChangedEventArgs.None;
     /// <summary>
     /// E3: Snapshot of the most recent <c>AudioMediaBuffer.ActiveSpeakers</c>
@@ -204,16 +207,29 @@ public class CallHandler : HeartbeatHandler
         try
         {
             buffer = e.Buffer;
-            if (buffer is null || buffer.Data == IntPtr.Zero || buffer.Length <= 0)
+            if (buffer is null)
             {
                 return;
             }
 
-            // Extract PCM bytes from unmanaged buffer
-            // Note: Using stackalloc would be better for small buffers, but buffer.Length 
-            // can vary and we need to pass to transcriber which expects heap allocation
-            var pcmData = new byte[buffer.Length];
-            Marshal.Copy(buffer.Data, pcmData, 0, (int)buffer.Length);
+            var unmixedBuffers = buffer.UnmixedAudioBuffers;
+            if (unmixedBuffers is null || unmixedBuffers.Length == 0)
+            {
+                if (!_loggedMissingUnmixedAudio)
+                {
+                    _loggedMissingUnmixedAudio = true;
+                    _logger.LogWarning(
+                        "Call {CallId}: received media frame without unmixed audio buffers; transcription is configured for unmixed Teams audio.",
+                        Call.Id);
+                }
+                return;
+            }
+
+            var pcmData = MixUnmixedPcm16k16bitMono(unmixedBuffers);
+            if (pcmData.Length == 0)
+            {
+                return;
+            }
 
             // Push to transcriber (non-blocking call)
             _transcriber.PushPcm16k16bitMono(pcmData);
@@ -222,23 +238,32 @@ public class CallHandler : HeartbeatHandler
 
             // E3: snapshot the most recent active-speakers set so the
             // transcriber can stamp it on each published event.
-            var activeSpeakersForHint = buffer.ActiveSpeakers;
+            var activeSpeakersForHint = GetActiveSpeakerIds(buffer, unmixedBuffers);
             if (activeSpeakersForHint is not null && activeSpeakersForHint.Length > 0)
             {
                 Volatile.Write(ref _lastActiveSpeakers, activeSpeakersForHint);
             }
 
+            if (!_loggedFirstUnmixedAudio)
+            {
+                _loggedFirstUnmixedAudio = true;
+                _logger.LogInformation(
+                    "Call {CallId}: receiving unmixed Teams audio buffers for transcription. ActiveSpeakers={ActiveSpeakerCount}, UnmixedBuffers={UnmixedBufferCount}",
+                    Call.Id,
+                    activeSpeakersForHint?.Length ?? 0,
+                    unmixedBuffers.Length);
+            }
+
             // Log stats periodically (~1 second intervals)
             if (_audioFramesReceived % StatsLogInterval == 0)
             {
-                var unmixedCount = buffer.UnmixedAudioBuffers?.Length ?? 0;
                 _logger.LogDebug(
                     "Call {CallId}: Received {FrameCount} audio frames ({DurationSeconds:F1}s of audio), ActiveSpeakers={ActiveSpeakerCount}, UnmixedBuffers={UnmixedBufferCount}, DominantSpeaker={DominantSpeaker}",
                     Call.Id,
                     _audioFramesReceived,
                     _audioFramesReceived * 0.02,
                     activeSpeakersForHint?.Length ?? 0,
-                    unmixedCount,
+                    unmixedBuffers.Length,
                     _lastDominantSpeaker);
             }
         }
@@ -251,6 +276,76 @@ public class CallHandler : HeartbeatHandler
             // CRITICAL: Must dispose buffer per SDK requirements to release unmanaged memory
             buffer?.Dispose();
         }
+    }
+
+    private static uint[]? GetActiveSpeakerIds(AudioMediaBuffer buffer, UnmixedAudioBuffer[] unmixedBuffers)
+    {
+        var activeSpeakers = buffer.ActiveSpeakers;
+        if (activeSpeakers is not null && activeSpeakers.Length > 0)
+        {
+            return activeSpeakers;
+        }
+
+        return unmixedBuffers
+            .Select(unmixed => unmixed.ActiveSpeakerId)
+            .Where(activeSpeakerId => activeSpeakerId != 0)
+            .Distinct()
+            .ToArray();
+    }
+
+    private static byte[] MixUnmixedPcm16k16bitMono(UnmixedAudioBuffer[] unmixedBuffers)
+    {
+        var maxLength = 0;
+        foreach (var unmixedBuffer in unmixedBuffers)
+        {
+            if (unmixedBuffer.Data != IntPtr.Zero && unmixedBuffer.Length > maxLength)
+            {
+                maxLength = checked((int)unmixedBuffer.Length);
+            }
+        }
+
+        if (maxLength < 2)
+        {
+            return Array.Empty<byte>();
+        }
+
+        // 16-bit PCM samples must be whole little-endian Int16 values.
+        maxLength -= maxLength % 2;
+        var sampleCount = maxLength / 2;
+        var mixedSamples = new int[sampleCount];
+
+        foreach (var unmixedBuffer in unmixedBuffers)
+        {
+            if (unmixedBuffer.Data == IntPtr.Zero || unmixedBuffer.Length < 2)
+            {
+                continue;
+            }
+
+            var copyLength = Math.Min(checked((int)unmixedBuffer.Length), maxLength);
+            copyLength -= copyLength % 2;
+            var sourceBytes = new byte[copyLength];
+            Marshal.Copy(unmixedBuffer.Data, sourceBytes, 0, copyLength);
+
+            for (var byteIndex = 0; byteIndex < copyLength; byteIndex += 2)
+            {
+                mixedSamples[byteIndex / 2] += BinaryPrimitives.ReadInt16LittleEndian(
+                    sourceBytes.AsSpan(byteIndex, 2));
+            }
+        }
+
+        var mixedBytes = new byte[maxLength];
+        for (var sampleIndex = 0; sampleIndex < sampleCount; sampleIndex++)
+        {
+            var clampedSample = Math.Clamp(
+                mixedSamples[sampleIndex],
+                short.MinValue,
+                short.MaxValue);
+            BinaryPrimitives.WriteInt16LittleEndian(
+                mixedBytes.AsSpan(sampleIndex * 2, 2),
+                (short)clampedSample);
+        }
+
+        return mixedBytes;
     }
 
     /// <summary>
