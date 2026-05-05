@@ -46,8 +46,11 @@ public class CallHandler : HeartbeatHandler
     private long _mediaFramesReceived;
     private long _audioFramesReceived;
     private long _missingUnmixedFrames;
+    private long _primaryAudioFramesReceived;
+    private long _emptyAudioPayloadFrames;
     private bool _isShuttingDown;
     private bool _loggedFirstUnmixedAudio;
+    private bool _loggedFirstPrimaryAudio;
     private bool _loggedMissingUnmixedAudio;
     private uint _lastDominantSpeaker = DominantSpeakerChangedEventArgs.None;
     /// <summary>
@@ -216,29 +219,67 @@ public class CallHandler : HeartbeatHandler
 
             _mediaFramesReceived++;
             var unmixedBuffers = buffer.UnmixedAudioBuffers;
-            if (unmixedBuffers is null || unmixedBuffers.Length == 0)
+            var pcmData = Array.Empty<byte>();
+            uint[]? activeSpeakersForHint = null;
+            var unmixedBufferCount = unmixedBuffers?.Length ?? 0;
+
+            if (unmixedBufferCount > 0)
+            {
+                pcmData = MixUnmixedPcm16k16bitMono(unmixedBuffers!);
+                activeSpeakersForHint = GetActiveSpeakerIds(buffer, unmixedBuffers!);
+
+                if (!_loggedFirstUnmixedAudio)
+                {
+                    _loggedFirstUnmixedAudio = true;
+                    _logger.LogInformation(
+                        "Call {CallId}: receiving unmixed Teams audio buffers for transcription. ActiveSpeakers={ActiveSpeakerCount}, UnmixedBuffers={UnmixedBufferCount}",
+                        Call.Id,
+                        activeSpeakersForHint?.Length ?? 0,
+                        unmixedBufferCount);
+                }
+            }
+            else
             {
                 _missingUnmixedFrames++;
-                if (!_loggedMissingUnmixedAudio)
-                {
-                    _loggedMissingUnmixedAudio = true;
-                    _logger.LogWarning(
-                        "Call {CallId}: received media frame without unmixed audio buffers; transcription is configured for unmixed Teams audio.",
-                        Call.Id);
-                }
+                pcmData = CopyPrimaryPcm16k16bitMono(buffer);
+                activeSpeakersForHint = buffer.ActiveSpeakers;
 
-                if (_missingUnmixedFrames % StatsLogInterval == 0)
+                if (pcmData.Length > 0)
                 {
-                    _logger.LogInformation(
-                        "Call {CallId}: received {MediaFrameCount} media frames, but {MissingUnmixedFrameCount} had no unmixed Teams audio buffers.",
-                        Call.Id,
-                        _mediaFramesReceived,
-                        _missingUnmixedFrames);
+                    _primaryAudioFramesReceived++;
+
+                    if (!_loggedFirstPrimaryAudio)
+                    {
+                        _loggedFirstPrimaryAudio = true;
+                        _logger.LogInformation(
+                            "Call {CallId}: receiving primary mixed Teams audio buffers for transcription because unmixed buffers are absent. FrameBytes={FrameBytes}, ActiveSpeakers={ActiveSpeakerCount}",
+                            Call.Id,
+                            pcmData.Length,
+                            activeSpeakersForHint?.Length ?? 0);
+                    }
                 }
-                return;
+                else
+                {
+                    _emptyAudioPayloadFrames++;
+                    if (!_loggedMissingUnmixedAudio)
+                    {
+                        _loggedMissingUnmixedAudio = true;
+                        _logger.LogWarning(
+                            "Call {CallId}: received media frame without unmixed audio buffers or primary PCM audio data.",
+                            Call.Id);
+                    }
+
+                    if (_emptyAudioPayloadFrames % StatsLogInterval == 0)
+                    {
+                        _logger.LogInformation(
+                            "Call {CallId}: received {MediaFrameCount} media frames, but {EmptyAudioPayloadFrameCount} had no Teams audio payload.",
+                            Call.Id,
+                            _mediaFramesReceived,
+                            _emptyAudioPayloadFrames);
+                    }
+                }
             }
 
-            var pcmData = MixUnmixedPcm16k16bitMono(unmixedBuffers);
             if (pcmData.Length == 0)
             {
                 return;
@@ -251,20 +292,9 @@ public class CallHandler : HeartbeatHandler
 
             // E3: snapshot the most recent active-speakers set so the
             // transcriber can stamp it on each published event.
-            var activeSpeakersForHint = GetActiveSpeakerIds(buffer, unmixedBuffers);
             if (activeSpeakersForHint is not null && activeSpeakersForHint.Length > 0)
             {
                 Volatile.Write(ref _lastActiveSpeakers, activeSpeakersForHint);
-            }
-
-            if (!_loggedFirstUnmixedAudio)
-            {
-                _loggedFirstUnmixedAudio = true;
-                _logger.LogInformation(
-                    "Call {CallId}: receiving unmixed Teams audio buffers for transcription. ActiveSpeakers={ActiveSpeakerCount}, UnmixedBuffers={UnmixedBufferCount}",
-                    Call.Id,
-                    activeSpeakersForHint?.Length ?? 0,
-                    unmixedBuffers.Length);
             }
 
             // Log stats periodically (~1 second intervals)
@@ -276,7 +306,7 @@ public class CallHandler : HeartbeatHandler
                     _audioFramesReceived,
                     _audioFramesReceived * 0.02,
                     activeSpeakersForHint?.Length ?? 0,
-                    unmixedBuffers.Length,
+                    unmixedBufferCount,
                     _lastDominantSpeaker);
             }
         }
@@ -361,6 +391,25 @@ public class CallHandler : HeartbeatHandler
         return mixedBytes;
     }
 
+    private static byte[] CopyPrimaryPcm16k16bitMono(AudioMediaBuffer buffer)
+    {
+        if (buffer.Data == IntPtr.Zero || buffer.Length < 2)
+        {
+            return Array.Empty<byte>();
+        }
+
+        var copyLength = checked((int)buffer.Length);
+        copyLength -= copyLength % 2;
+        if (copyLength == 0)
+        {
+            return Array.Empty<byte>();
+        }
+
+        var pcmData = new byte[copyLength];
+        Marshal.Copy(buffer.Data, pcmData, 0, copyLength);
+        return pcmData;
+    }
+
     /// <summary>
     /// Starts the transcriber for this call.
     /// </summary>
@@ -398,11 +447,13 @@ public class CallHandler : HeartbeatHandler
             await _transcriber.StopAsync().ConfigureAwait(false);
             _isTranscriberStarted = false;
             _logger.LogInformation(
-                "Transcription stopped for call {CallId}. Total media frames: {MediaFrameCount}, transcribed audio frames: {AudioFrameCount}, missing unmixed frames: {MissingUnmixedFrameCount}",
+                "Transcription stopped for call {CallId}. Total media frames: {MediaFrameCount}, transcribed audio frames: {AudioFrameCount}, primary mixed audio frames: {PrimaryAudioFrameCount}, frames without unmixed buffers: {MissingUnmixedFrameCount}, empty audio payload frames: {EmptyAudioPayloadFrameCount}",
                 Call.Id,
                 _mediaFramesReceived,
                 _audioFramesReceived,
-                _missingUnmixedFrames);
+                _primaryAudioFramesReceived,
+                _missingUnmixedFrames,
+                _emptyAudioPayloadFrames);
         }
         catch (Exception ex)
         {

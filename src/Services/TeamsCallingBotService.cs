@@ -384,7 +384,7 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
             {
                 StreamDirections = StreamDirection.Recvonly,  // We only need to receive audio
                 SupportedAudioFormat = AudioFormat.Pcm16K,    // 16 kHz PCM
-                ReceiveUnmixedMeetingAudio = true             // Receive per-speaker Teams audio buffers for transcription + MSI hints
+                ReceiveUnmixedMeetingAudio = true             // Request per-speaker buffers; CallHandler also accepts primary mixed PCM frames.
             },
             new VideoSocketSettings
             {
