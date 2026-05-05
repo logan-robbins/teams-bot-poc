@@ -20,13 +20,15 @@ notes for deferred work.
                     │   (audio + chat + roster)    │
                     └──────────────┬───────────────┘
                                    │
-                  unmixed audio    │   Bot Framework chat activities
+                  audio PCM        │   Bot Framework chat activities
                   + participants   │   (/api/messages)
                                    ▼
    ┌──────────────────────────────────────────────────────────────────┐
    │     C# bot  (src/, Windows VM, Graph Communications SDK)         │
    │  - Joins the call; streams PCM to AzureConversationTranscriber   │
    │    (the only sanctioned STT on Disney; emits diarized speaker_N) │
+   │  - Reads unmixed per-speaker buffers when Teams sends them;      │
+   │    otherwise reads the primary mixed PCM buffer                  │
    │  - Per audio buffer: snapshots ActiveSpeakers + DominantSpeaker  │
    │    MediaSourceIds; stamped onto every TranscriptEvent (E3)       │
    │  - Reads ICall.Participants → MSI ↔ AAD ↔ display_name           │
@@ -293,6 +295,20 @@ Interpretation:
   Immediately tail VM logs and look for `Call added`, `state changed:
   ... -> Established`, `CallHandler created ... audio socket wired`,
   `Transcription started`, and audio frame counters.
+- Audio can arrive in two SDK shapes. `receiving unmixed Teams audio
+  buffers` means Teams provided per-speaker buffers and MSI hints.
+  `receiving primary mixed Teams audio buffers ... FrameBytes=640`
+  means Teams provided the mixed 16 kHz PCM frame instead; this is still
+  valid audio input for STT, but it has no per-speaker Teams MSI hint.
+- `audio level stats ... PeakSample=0, AverageAbsSample=0.0` means the
+  bot is joined and media callbacks are firing, but Teams is sending
+  silence to the bot. This is not an Azure Speech or sink failure; verify
+  Alfred is present in the call roster, the speaker is unmuted in Teams,
+  meeting options are not suppressing app/bot audio, and try removing +
+  re-adding Alfred or starting a fresh meeting.
+- Non-zero `PeakSample` with no `[FINAL]` or `[PARTIAL]` points at the STT
+  path after the media socket: check `Azure session started`, transcription
+  cancellation logs, and sink `/m/<chat_thread_id>/status`.
 - `202` with `deferred:true` means policy auto-invite mode was selected;
   no explicit Graph join was attempted, so Teams must invite the bot via
   the calling webhook.
@@ -385,6 +401,7 @@ tool dry-runs (logs + appends to the ledger, does not POST).
 | `az vm get-instance-view` returns `vmAgent: null` | ARM cache lag. Probe directly with a Run Command (`Write-Host alive`); if it returns Succeeded, the agent is fine. |
 | `Conflict: Run command extension execution is in progress` | Legacy `az vm run-command invoke` wedged the extension. RDP in, remove `C:\Packages\Plugins\Microsoft.CPlat.Core.RunCommandWindows*`, restart `WindowsAzureGuestAgent` + `RdAgent`. |
 | Sink `events_received` increments but ledger empty | Auto-start requires non-empty `text` on a `final` transcript or a non-deleted chat. Partials and pre-session chats land in `raw_ingest_events` with a `dropped_reason` instead of in the working ledger — verify via `/sessions/{id}/raw-events`. |
+| Call is active, media frames arrive, but transcript stays empty | Tail VM logs for `audio level stats`. `PeakSample=0` and `AverageAbsSample=0.0` means Teams is sending silence to the bot even though the media socket is alive. `PeakSample>0` with no transcript means debug Azure Speech/session cancellation and sink publishing. |
 | Ledger shows `speaker_0` instead of real names | C# `Call.Participants.OnUpdated` publisher to `POST /session/participants` is deferred (PROD.md E3). The Python resolver and tables are live; once the C# publisher lands, identities backfill automatically. |
 | Transcripts log to `meet-{meetingId}` audit dir but chat logs to `19:meeting_xxx` dir | Joining via short URL (`teams.microsoft.com/meet/...`) yields a synthetic `meet-{meetingId}` thread id for audio; Bot Framework chat carries the real `19:` thread id. Resolution requires a Graph call during join to look up the real thread id from the meeting id. |
 
