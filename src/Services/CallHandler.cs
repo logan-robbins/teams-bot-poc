@@ -43,7 +43,9 @@ public class CallHandler : HeartbeatHandler
     private readonly ILogger _logger;
     private readonly IRealtimeTranscriber _transcriber;
     private bool _isTranscriberStarted;
+    private long _mediaFramesReceived;
     private long _audioFramesReceived;
+    private long _missingUnmixedFrames;
     private bool _isShuttingDown;
     private bool _loggedFirstUnmixedAudio;
     private bool _loggedMissingUnmixedAudio;
@@ -212,15 +214,26 @@ public class CallHandler : HeartbeatHandler
                 return;
             }
 
+            _mediaFramesReceived++;
             var unmixedBuffers = buffer.UnmixedAudioBuffers;
             if (unmixedBuffers is null || unmixedBuffers.Length == 0)
             {
+                _missingUnmixedFrames++;
                 if (!_loggedMissingUnmixedAudio)
                 {
                     _loggedMissingUnmixedAudio = true;
                     _logger.LogWarning(
                         "Call {CallId}: received media frame without unmixed audio buffers; transcription is configured for unmixed Teams audio.",
                         Call.Id);
+                }
+
+                if (_missingUnmixedFrames % StatsLogInterval == 0)
+                {
+                    _logger.LogInformation(
+                        "Call {CallId}: received {MediaFrameCount} media frames, but {MissingUnmixedFrameCount} had no unmixed Teams audio buffers.",
+                        Call.Id,
+                        _mediaFramesReceived,
+                        _missingUnmixedFrames);
                 }
                 return;
             }
@@ -385,9 +398,11 @@ public class CallHandler : HeartbeatHandler
             await _transcriber.StopAsync().ConfigureAwait(false);
             _isTranscriberStarted = false;
             _logger.LogInformation(
-                "Transcription stopped for call {CallId}. Total audio frames: {FrameCount}",
+                "Transcription stopped for call {CallId}. Total media frames: {MediaFrameCount}, transcribed audio frames: {AudioFrameCount}, missing unmixed frames: {MissingUnmixedFrameCount}",
                 Call.Id,
-                _audioFramesReceived);
+                _mediaFramesReceived,
+                _audioFramesReceived,
+                _missingUnmixedFrames);
         }
         catch (Exception ex)
         {
