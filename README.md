@@ -295,6 +295,15 @@ Interpretation:
   Immediately tail VM logs and look for `Call added`, `state changed:
   ... -> Established`, `CallHandler created ... audio socket wired`,
   `Transcription started`, and audio frame counters.
+- `/api/calling/health` includes `calls[]` with per-call media readiness:
+  `readiness`, `readiness_reason`, `unmixed_audio_frames`,
+  `primary_mixed_audio_frames`, `recent_peak_sample`, and
+  `recent_average_abs_sample`. For Alfred's current speaker-identity path,
+  the expected live value is `readiness:"ready"` with
+  `unmixed_audio_frames > 0` and `recent_peak_sample > 0`.
+- `readiness:"unmixed_audio_missing"` means the bot joined and media frames
+  are arriving, but Teams has not supplied `UnmixedAudioBuffers`; treat this
+  as a bot/media negotiation failure for the current product path.
 - Audio can arrive in two SDK shapes. `receiving unmixed Teams audio
   buffers` means Teams provided per-speaker buffers and MSI hints.
   `receiving primary mixed Teams audio buffers ... FrameBytes=640`

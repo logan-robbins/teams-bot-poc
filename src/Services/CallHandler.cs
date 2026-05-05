@@ -7,6 +7,7 @@ using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Timers;
+using TeamsMediaBot.Models;
 
 namespace TeamsMediaBot.Services;
 
@@ -40,10 +41,14 @@ public class CallHandler : HeartbeatHandler
     /// </summary>
     private const int StatsLogInterval = 50;
     private const int AudioLevelStatsLogInterval = StatsLogInterval * 5;
+    private const int UnmixedReadinessGraceSeconds = 10;
+    private const int AudioReadinessGraceSeconds = 15;
     
     private readonly ILogger _logger;
     private readonly IRealtimeTranscriber _transcriber;
+    private readonly bool _hasAudioSocket;
     private bool _isTranscriberStarted;
+    private string _callState;
     private long _mediaFramesReceived;
     private long _audioFramesReceived;
     private long _unmixedAudioFramesReceived;
@@ -53,6 +58,14 @@ public class CallHandler : HeartbeatHandler
     private long _audioLevelSampleCount;
     private long _audioLevelAbsSampleSum;
     private int _audioLevelPeak;
+    private int _recentPeakSample;
+    private double _recentAverageAbsSample;
+    private long _establishedAtUtcTicks;
+    private long _transcriptionStartedAtUtcTicks;
+    private long _lastMediaFrameAtUtcTicks;
+    private long _lastUnmixedAudioAtUtcTicks;
+    private long _lastPrimaryMixedAudioAtUtcTicks;
+    private long _lastNonSilentAudioAtUtcTicks;
     private bool _isShuttingDown;
     private bool _loggedFirstUnmixedAudio;
     private bool _loggedFirstPrimaryAudio;
@@ -107,14 +120,20 @@ public class CallHandler : HeartbeatHandler
         _transcriber = transcriber;
         _logger = logger;
         JoinedAtUtc = DateTime.UtcNow;
+        _callState = call.Resource.State?.ToString() ?? "Unknown";
+        _hasAudioSocket = MediaSession.AudioSocket is not null;
+        if (call.Resource.State == CallState.Established)
+        {
+            _establishedAtUtcTicks = JoinedAtUtc.Ticks;
+        }
 
         // Subscribe to call state changes
         Call.OnUpdated += OnCallUpdated;
 
         // Subscribe to audio events
-        if (MediaSession.AudioSocket is not null)
+        if (_hasAudioSocket)
         {
-            MediaSession.AudioSocket.AudioMediaReceived += OnAudioMediaReceived;
+            MediaSession.AudioSocket!.AudioMediaReceived += OnAudioMediaReceived;
             MediaSession.AudioSocket.DominantSpeakerChanged += OnDominantSpeakerChanged;
             _logger.LogInformation("CallHandler created for call {CallId} - audio socket wired", call.Id);
         }
@@ -158,6 +177,7 @@ public class CallHandler : HeartbeatHandler
     {
         var newState = args.NewResource.State;
         var oldState = args.OldResource.State;
+        _callState = newState?.ToString() ?? "Unknown";
 
         _logger.LogInformation(
             "Call {CallId} state changed: {OldState} -> {NewState} (ResultInfo: {ResultInfo})",
@@ -169,6 +189,7 @@ public class CallHandler : HeartbeatHandler
         // Start transcription when call is established
         if (oldState != newState && newState == CallState.Established)
         {
+            Interlocked.Exchange(ref _establishedAtUtcTicks, DateTime.UtcNow.Ticks);
             _logger.LogInformation("Call {CallId} established - starting transcription", Call.Id);
             await StartTranscriptionAsync().ConfigureAwait(false);
         }
@@ -203,6 +224,104 @@ public class CallHandler : HeartbeatHandler
             Volatile.Read(ref _lastActiveSpeakers));
     }
 
+    public CallMediaReadinessSnapshot GetMediaReadinessSnapshot(string threadId)
+    {
+        var now = DateTime.UtcNow;
+        var establishedAtUtc = ReadUtc(_establishedAtUtcTicks);
+        var transcriptionStartedAtUtc = ReadUtc(_transcriptionStartedAtUtcTicks);
+        var lastMediaFrameAtUtc = ReadUtc(_lastMediaFrameAtUtcTicks);
+        var lastUnmixedAudioAtUtc = ReadUtc(_lastUnmixedAudioAtUtcTicks);
+        var lastPrimaryMixedAudioAtUtc = ReadUtc(_lastPrimaryMixedAudioAtUtcTicks);
+        var lastNonSilentAudioAtUtc = ReadUtc(_lastNonSilentAudioAtUtcTicks);
+        var (dominant, active) = GetMediaSourceIdHint();
+        var readinessAge = establishedAtUtc.HasValue
+            ? now - establishedAtUtc.Value
+            : now - JoinedAtUtc;
+
+        var (readiness, reason) = ResolveMediaReadiness(
+            readinessAge,
+            establishedAtUtc.HasValue,
+            lastMediaFrameAtUtc,
+            lastNonSilentAudioAtUtc);
+
+        return new CallMediaReadinessSnapshot(
+            ThreadId: threadId,
+            CallId: Call.Id,
+            State: _callState,
+            JoinedAtUtc: JoinedAtUtc,
+            EstablishedAtUtc: establishedAtUtc,
+            TranscriptionStartedAtUtc: transcriptionStartedAtUtc,
+            HasAudioSocket: _hasAudioSocket,
+            TranscriberStarted: _isTranscriberStarted,
+            RequiresUnmixedAudio: true,
+            Readiness: readiness,
+            ReadinessReason: reason,
+            MediaFramesReceived: _mediaFramesReceived,
+            TranscribedAudioFrames: _audioFramesReceived,
+            UnmixedAudioFrames: _unmixedAudioFramesReceived,
+            PrimaryMixedAudioFrames: _primaryAudioFramesReceived,
+            FramesWithoutUnmixedBuffers: _missingUnmixedFrames,
+            EmptyAudioPayloadFrames: _emptyAudioPayloadFrames,
+            LastMediaFrameAtUtc: lastMediaFrameAtUtc,
+            LastUnmixedAudioAtUtc: lastUnmixedAudioAtUtc,
+            LastPrimaryMixedAudioAtUtc: lastPrimaryMixedAudioAtUtc,
+            LastNonSilentAudioAtUtc: lastNonSilentAudioAtUtc,
+            RecentPeakSample: _recentPeakSample,
+            RecentAverageAbsSample: _recentAverageAbsSample,
+            DominantMediaSourceId: dominant,
+            ActiveMediaSourceIds: active);
+    }
+
+    private (string Readiness, string? Reason) ResolveMediaReadiness(
+        TimeSpan readinessAge,
+        bool isEstablished,
+        DateTime? lastMediaFrameAtUtc,
+        DateTime? lastNonSilentAudioAtUtc)
+    {
+        if (!_hasAudioSocket)
+        {
+            return ("no_audio_socket", "Call established without a local audio socket.");
+        }
+
+        if (!isEstablished)
+        {
+            return ("waiting_for_established", "Graph call has not reached Established state.");
+        }
+
+        if (!_isTranscriberStarted)
+        {
+            return ("waiting_for_transcriber", "Call is established but the STT transcriber is not started.");
+        }
+
+        if (lastMediaFrameAtUtc is null)
+        {
+            return readinessAge.TotalSeconds >= UnmixedReadinessGraceSeconds
+                ? ("media_not_flowing", "Call is established but no media frames have arrived.")
+                : ("waiting_for_media", "Call is established; waiting for first media frame.");
+        }
+
+        if (_unmixedAudioFramesReceived == 0)
+        {
+            return readinessAge.TotalSeconds >= UnmixedReadinessGraceSeconds
+                ? ("unmixed_audio_missing", "Media frames are arriving, but Teams has not provided UnmixedAudioBuffers.")
+                : ("waiting_for_unmixed_audio", "Media frames are arriving; waiting for Teams unmixed speaker buffers.");
+        }
+
+        if (lastNonSilentAudioAtUtc is null)
+        {
+            return readinessAge.TotalSeconds >= AudioReadinessGraceSeconds
+                ? ("silent_audio", "Unmixed audio buffers are arriving, but all observed PCM samples are zero.")
+                : ("waiting_for_non_silent_audio", "Unmixed audio buffers are arriving; waiting for non-silent PCM samples.");
+        }
+
+        return ("ready", null);
+    }
+
+    private static DateTime? ReadUtc(long ticks)
+    {
+        return ticks <= 0 ? null : new DateTime(ticks, DateTimeKind.Utc);
+    }
+
     /// <summary>
     /// Handles incoming audio frames from Teams Media SDK.
     /// </summary>
@@ -223,6 +342,7 @@ public class CallHandler : HeartbeatHandler
             }
 
             _mediaFramesReceived++;
+            Interlocked.Exchange(ref _lastMediaFrameAtUtcTicks, DateTime.UtcNow.Ticks);
             var unmixedBuffers = buffer.UnmixedAudioBuffers;
             var pcmData = Array.Empty<byte>();
             uint[]? activeSpeakersForHint = null;
@@ -233,6 +353,7 @@ public class CallHandler : HeartbeatHandler
                 pcmData = MixUnmixedPcm16k16bitMono(unmixedBuffers!);
                 activeSpeakersForHint = GetActiveSpeakerIds(buffer, unmixedBuffers!);
                 _unmixedAudioFramesReceived++;
+                Interlocked.Exchange(ref _lastUnmixedAudioAtUtcTicks, DateTime.UtcNow.Ticks);
 
                 if (!_loggedFirstUnmixedAudio)
                 {
@@ -253,6 +374,7 @@ public class CallHandler : HeartbeatHandler
                 if (pcmData.Length > 0)
                 {
                     _primaryAudioFramesReceived++;
+                    Interlocked.Exchange(ref _lastPrimaryMixedAudioAtUtcTicks, DateTime.UtcNow.Ticks);
 
                     if (!_loggedFirstPrimaryAudio)
                     {
@@ -322,6 +444,8 @@ public class CallHandler : HeartbeatHandler
                 var averageAbsSample = _audioLevelSampleCount == 0
                     ? 0
                     : (double)_audioLevelAbsSampleSum / _audioLevelSampleCount;
+                _recentPeakSample = _audioLevelPeak;
+                _recentAverageAbsSample = averageAbsSample;
 
                 _logger.LogInformation(
                     "Call {CallId}: audio level stats Frames={FrameCount}, DurationSeconds={DurationSeconds:F1}, UnmixedFrames={UnmixedFrameCount}, PrimaryMixedFrames={PrimaryAudioFrameCount}, PeakSample={PeakSample}, AverageAbsSample={AverageAbsSample:F1}, ActiveSpeakers={ActiveSpeakerCount}, DominantSpeaker={DominantSpeaker}",
@@ -448,6 +572,10 @@ public class CallHandler : HeartbeatHandler
             var absSample = Math.Abs((int)sample);
             _audioLevelAbsSampleSum += absSample;
             _audioLevelSampleCount++;
+            if (absSample > 0)
+            {
+                Interlocked.Exchange(ref _lastNonSilentAudioAtUtcTicks, DateTime.UtcNow.Ticks);
+            }
             if (absSample > _audioLevelPeak)
             {
                 _audioLevelPeak = absSample;
@@ -469,6 +597,7 @@ public class CallHandler : HeartbeatHandler
         {
             await _transcriber.StartAsync().ConfigureAwait(false);
             _isTranscriberStarted = true;
+            Interlocked.Exchange(ref _transcriptionStartedAtUtcTicks, DateTime.UtcNow.Ticks);
             _logger.LogInformation("Transcription started for call {CallId}", Call.Id);
         }
         catch (Exception ex)

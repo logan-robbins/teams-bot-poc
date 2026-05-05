@@ -247,12 +247,23 @@ public class CallingController : ControllerBase
     [ProducesResponseType(StatusCodes.Status200OK)]
     public IActionResult GetHealth()
     {
+        var calls = _botService.CallHandlers
+            .Select(kvp => kvp.Value.GetMediaReadinessSnapshot(kvp.Key))
+            .OrderBy(snapshot => snapshot.JoinedAtUtc)
+            .ToList();
+        var isDegraded = calls.Any(snapshot => snapshot.Readiness is
+            "no_audio_socket" or
+            "media_not_flowing" or
+            "unmixed_audio_missing" or
+            "silent_audio");
+
         return Ok(new HealthCheckResponse
         {
-            Status = "Healthy",
+            Status = isDegraded ? "Degraded" : "Healthy",
             TimestampUtc = DateTime.UtcNow,
             Service = "Alfred",
-            ActiveCalls = _botService.CallHandlers.Count
+            ActiveCalls = calls.Count,
+            Calls = calls
         });
     }
 }
@@ -436,6 +447,11 @@ public sealed class HealthCheckResponse
     /// Gets or sets the number of active calls.
     /// </summary>
     public int ActiveCalls { get; init; }
+
+    /// <summary>
+    /// Gets per-call media readiness snapshots.
+    /// </summary>
+    public IReadOnlyList<CallMediaReadinessSnapshot> Calls { get; init; } = Array.Empty<CallMediaReadinessSnapshot>();
 }
 
 /// <summary>

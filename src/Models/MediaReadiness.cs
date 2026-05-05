@@ -1,0 +1,28 @@
+namespace TeamsMediaBot.Models;
+
+public sealed record CallMediaReadinessSnapshot(
+    string ThreadId,
+    string CallId,
+    string State,
+    DateTime JoinedAtUtc,
+    DateTime? EstablishedAtUtc,
+    DateTime? TranscriptionStartedAtUtc,
+    bool HasAudioSocket,
+    bool TranscriberStarted,
+    bool RequiresUnmixedAudio,
+    string Readiness,
+    string? ReadinessReason,
+    long MediaFramesReceived,
+    long TranscribedAudioFrames,
+    long UnmixedAudioFrames,
+    long PrimaryMixedAudioFrames,
+    long FramesWithoutUnmixedBuffers,
+    long EmptyAudioPayloadFrames,
+    DateTime? LastMediaFrameAtUtc,
+    DateTime? LastUnmixedAudioAtUtc,
+    DateTime? LastPrimaryMixedAudioAtUtc,
+    DateTime? LastNonSilentAudioAtUtc,
+    int RecentPeakSample,
+    double RecentAverageAbsSample,
+    uint? DominantMediaSourceId,
+    uint[]? ActiveMediaSourceIds);
