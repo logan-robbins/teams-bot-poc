@@ -39,15 +39,20 @@ public class CallHandler : HeartbeatHandler
     /// Number of frames between statistics logging (50 frames = ~1 second at 20ms/frame).
     /// </summary>
     private const int StatsLogInterval = 50;
+    private const int AudioLevelStatsLogInterval = StatsLogInterval * 5;
     
     private readonly ILogger _logger;
     private readonly IRealtimeTranscriber _transcriber;
     private bool _isTranscriberStarted;
     private long _mediaFramesReceived;
     private long _audioFramesReceived;
+    private long _unmixedAudioFramesReceived;
     private long _missingUnmixedFrames;
     private long _primaryAudioFramesReceived;
     private long _emptyAudioPayloadFrames;
+    private long _audioLevelSampleCount;
+    private long _audioLevelAbsSampleSum;
+    private int _audioLevelPeak;
     private bool _isShuttingDown;
     private bool _loggedFirstUnmixedAudio;
     private bool _loggedFirstPrimaryAudio;
@@ -227,6 +232,7 @@ public class CallHandler : HeartbeatHandler
             {
                 pcmData = MixUnmixedPcm16k16bitMono(unmixedBuffers!);
                 activeSpeakersForHint = GetActiveSpeakerIds(buffer, unmixedBuffers!);
+                _unmixedAudioFramesReceived++;
 
                 if (!_loggedFirstUnmixedAudio)
                 {
@@ -287,6 +293,7 @@ public class CallHandler : HeartbeatHandler
 
             // Push to transcriber (non-blocking call)
             _transcriber.PushPcm16k16bitMono(pcmData);
+            RecordAudioLevel(pcmData);
 
             _audioFramesReceived++;
 
@@ -308,6 +315,29 @@ public class CallHandler : HeartbeatHandler
                     activeSpeakersForHint?.Length ?? 0,
                     unmixedBufferCount,
                     _lastDominantSpeaker);
+            }
+
+            if (_audioFramesReceived % AudioLevelStatsLogInterval == 0)
+            {
+                var averageAbsSample = _audioLevelSampleCount == 0
+                    ? 0
+                    : (double)_audioLevelAbsSampleSum / _audioLevelSampleCount;
+
+                _logger.LogInformation(
+                    "Call {CallId}: audio level stats Frames={FrameCount}, DurationSeconds={DurationSeconds:F1}, UnmixedFrames={UnmixedFrameCount}, PrimaryMixedFrames={PrimaryAudioFrameCount}, PeakSample={PeakSample}, AverageAbsSample={AverageAbsSample:F1}, ActiveSpeakers={ActiveSpeakerCount}, DominantSpeaker={DominantSpeaker}",
+                    Call.Id,
+                    _audioFramesReceived,
+                    _audioFramesReceived * 0.02,
+                    _unmixedAudioFramesReceived,
+                    _primaryAudioFramesReceived,
+                    _audioLevelPeak,
+                    averageAbsSample,
+                    activeSpeakersForHint?.Length ?? 0,
+                    _lastDominantSpeaker);
+
+                _audioLevelSampleCount = 0;
+                _audioLevelAbsSampleSum = 0;
+                _audioLevelPeak = 0;
             }
         }
         catch (Exception ex)
@@ -410,6 +440,21 @@ public class CallHandler : HeartbeatHandler
         return pcmData;
     }
 
+    private void RecordAudioLevel(ReadOnlySpan<byte> pcmData)
+    {
+        for (var byteIndex = 0; byteIndex + 1 < pcmData.Length; byteIndex += 2)
+        {
+            var sample = BinaryPrimitives.ReadInt16LittleEndian(pcmData[byteIndex..(byteIndex + 2)]);
+            var absSample = Math.Abs((int)sample);
+            _audioLevelAbsSampleSum += absSample;
+            _audioLevelSampleCount++;
+            if (absSample > _audioLevelPeak)
+            {
+                _audioLevelPeak = absSample;
+            }
+        }
+    }
+
     /// <summary>
     /// Starts the transcriber for this call.
     /// </summary>
@@ -447,10 +492,11 @@ public class CallHandler : HeartbeatHandler
             await _transcriber.StopAsync().ConfigureAwait(false);
             _isTranscriberStarted = false;
             _logger.LogInformation(
-                "Transcription stopped for call {CallId}. Total media frames: {MediaFrameCount}, transcribed audio frames: {AudioFrameCount}, primary mixed audio frames: {PrimaryAudioFrameCount}, frames without unmixed buffers: {MissingUnmixedFrameCount}, empty audio payload frames: {EmptyAudioPayloadFrameCount}",
+                "Transcription stopped for call {CallId}. Total media frames: {MediaFrameCount}, transcribed audio frames: {AudioFrameCount}, unmixed audio frames: {UnmixedFrameCount}, primary mixed audio frames: {PrimaryAudioFrameCount}, frames without unmixed buffers: {MissingUnmixedFrameCount}, empty audio payload frames: {EmptyAudioPayloadFrameCount}",
                 Call.Id,
                 _mediaFramesReceived,
                 _audioFramesReceived,
+                _unmixedAudioFramesReceived,
                 _primaryAudioFramesReceived,
                 _missingUnmixedFrames,
                 _emptyAudioPayloadFrames);
