@@ -2,104 +2,132 @@
 
 Microsoft Teams meeting assistant for The Walt Disney Company. Joins a
 Teams meeting, captures diarized audio + chat, runs an LLM agent that
-maintains a live dossier (decisions, open questions, action items, risks)
-keyed per-meeting, and posts back into the meeting chat under explicit
-intervention rules.
+maintains a live dossier (decisions, open questions, action items,
+risks) keyed per-meeting, and posts back into the meeting chat under
+explicit intervention rules. Also persistently attaches to a Teams
+**channel** to listen to all posts and roll up every meeting that
+happens in it (§5b).
 
-This README is the operational source of truth. Read it end-to-end before
-touching code. `PROD.md` tracks productionalization status and the design
-notes for deferred work.
+> **AI coding agents:** read [`AGENTS.md`](AGENTS.md) first — it has
+> the operational layer (build, deploy, debug, gotchas) underneath
+> this product overview.
+
+This README is the **what + why**. `AGENTS.md` is the **how**.
+`PROD.md` tracks productionalization status and deferred work.
+
+## TL;DR
+
+- **Three deployables:** C# bot on a Windows VM (audio + Teams APIs),
+  Python FastAPI sink on Container Apps (sessions + agent + SQLite),
+  React UI on Container Apps (read-only).
+- **Single key:** `chat_thread_id` routes every transcript and chat
+  to its session. The UI URL is `/m/<chat_thread_id>`.
+- **Channel rollup:** every event is also stamped with optional
+  `team_id` / `channel_id` / `channel_thread_id`, so analytics can
+  query an entire channel's history (chat + every meeting +
+  every transcript) by `channel_id` alone.
+- **Agent contract:** one `AlfredExtraction` per debounced tick;
+  optionally one tool call (`send_to_meeting_chat`). No `SEND/ASK/SILENT`
+  enum. Silence is "did not call the tool".
+- **Source of truth for agent behavior:** `python/batcave_platform/specs/alfred.yaml`.
 
 ---
 
 ## 1. System
 
 ```
-                    ┌──────────────────────────────┐
-                    │    Microsoft Teams meeting   │
-                    │   (audio + chat + roster)    │
-                    └──────────────┬───────────────┘
-                                   │
-                  audio PCM        │   Bot Framework chat activities
-                  + participants   │   (/api/messages)
-                                   ▼
-   ┌──────────────────────────────────────────────────────────────────┐
-   │     C# bot  (src/, Windows VM, Graph Communications SDK)         │
-   │  - Joins the call; streams PCM to AzureConversationTranscriber   │
-   │    (the only sanctioned STT on Disney; emits diarized speaker_N) │
-   │  - Reads unmixed per-speaker buffers when Teams sends them;      │
-   │    otherwise reads the primary mixed PCM buffer                  │
-   │  - Per audio buffer: snapshots ActiveSpeakers + DominantSpeaker  │
-   │    MediaSourceIds; stamped onto every TranscriptEvent (E3)       │
-   │  - Reads ICall.Participants → MSI ↔ AAD ↔ display_name           │
-   │  - Stamps chat_thread_id on every event                          │
-   │  - Per-meeting NDJSON audit log on disk (see §4)                 │
-   │  - Sends Alfred's outbound chat via Bot Framework adapter        │
-   └────────────────────────┬─────────────────────────────────────────┘
-                            │
-       POST /transcript     │   POST /chat
-       POST /session/        │   POST /api/send-chat   ◀── reverse path
-            participants    │
-                            ▼
-   ┌──────────────────────────────────────────────────────────────────┐
-   │     Python sink  (python/, FastAPI on Container Apps)            │
-   │                                                                   │
-   │  Ingest layer (immutable):                                        │
-   │    raw_ingest_events — every inbound event, hashed, BEFORE any   │
-   │      filter (partial drop, session-active, echo suppression)     │
-   │                                                                   │
-   │  Working layer (cleanable):                                       │
-   │    SessionRegistry — one InterviewSessionManager per             │
-   │      chat_thread_id; auto-starts on first event                  │
-   │    meeting_events — normalized ledger; back-links via            │
-   │      source_raw_event_ids to the immutable raw rows              │
-   │    ParticipantResolver — MSI → AAD; manual > teams_msi_unique >  │
-   │      teams_msi_group > sole_human > unresolved (E3)              │
-   │                                                                   │
-   │  Agent layer:                                                     │
-   │    AlfredAnalyzer — debounced, one AlfredExtraction per tick     │
-   │      (rolling summary, topics, decisions, open_questions,        │
-   │       action_items, risks; merged by id)                         │
-   │    Intervention policy — explicit rules in alfred.yaml +         │
-   │      45s cooldown + directly-addressed bypass (E4)               │
-   │    send_to_meeting_chat — sole outbound action surface           │
-   │                                                                   │
-   │  SQLite tables: sessions, meeting_events, raw_ingest_events,     │
-   │    meeting_participants, participant_msi_bindings,               │
-   │    speaker_identity_links, extractions, tool_calls, dossier_items│
-   │                                                                   │
-   │  SSE /m/{chat_thread_id}/events drives the UI                    │
-   └────────────────────────┬─────────────────────────────────────────┘
-                            │ SSE + JSON, filtered by chat_thread_id
-                            ▼
-   ┌──────────────────────────────────────────────────────────────────┐
-   │     React UI  (web/, Vite + React 19 + react-router-dom)         │
-   │   /             → MeetingList (picker, polls /m every 2s)        │
-   │   /m/<id>       → MeetingDossier (3 cols: Ledger / Dossier /     │
-   │                    Companion Rail). Read-only — only Alfred      │
-   │                    speaks into chat, only via the tool.          │
-   └──────────────────────────────────────────────────────────────────┘
+       Microsoft Teams (meeting OR persistent channel)
+                        │
+       audio PCM        │  Bot Framework chat activities (/api/messages)
+       + roster         │  Graph change-notifications (/api/graph-notifications)
+                        ▼
+  ┌────────────────────────────────────────────────────────────────────┐
+  │  C# bot  src/  ·  Windows VM  ·  Graph Communications + Bot SDK    │
+  │                                                                    │
+  │  Audio path:  Join call → stream PCM → diarized TranscriptEvents   │
+  │               (Azure Speech, the only sanctioned Disney provider)  │
+  │  Chat path:   Bot Framework + Graph subscriptions                  │
+  │  Channel:     Persistent attach → ChannelMessage subscription      │
+  │               + auto-attach on team-install (§5b)                  │
+  │  Identity:    MSI ↔ AAD ↔ display_name from ICall.Participants     │
+  │  Audit:       Per-meeting NDJSON log on disk (§4)                  │
+  │  Outbound:    send_to_meeting_chat via Bot Framework adapter       │
+  │                                                                    │
+  │  Stamps every published event with chat_thread_id (always) and     │
+  │  team_id / channel_id / channel_thread_id (when known) so the      │
+  │  sink can later roll meetings up under their parent channel.       │
+  └──────────────────┬─────────────────────────────────────────────────┘
+                     │
+                     │  POST /transcript    POST /chat    POST /session/link
+                     │  POST /session/participants     POST /api/send-chat ◀── reverse
+                     ▼
+  ┌────────────────────────────────────────────────────────────────────┐
+  │  Python sink  python/  ·  FastAPI on Container Apps                │
+  │                                                                    │
+  │  E1 raw layer  (immutable):                                        │
+  │      raw_ingest_events — every inbound event hashed, BEFORE any    │
+  │        filter (partial drop, session-active, echo suppression)     │
+  │                                                                    │
+  │  E2 working layer  (cleanable):                                    │
+  │      SessionRegistry — one InterviewSessionManager per             │
+  │        chat_thread_id; auto-starts on first non-empty final/chat   │
+  │      meeting_events — normalized ledger; back-links to raw via     │
+  │        source_raw_event_ids; team_id/channel_id stamped at write   │
+  │        time and backfilled by /session/link                        │
+  │                                                                    │
+  │  E3 identity:  ParticipantResolver  manual > teams_msi_unique >    │
+  │                teams_msi_group > sole_human > unresolved           │
+  │                                                                    │
+  │  Agent:    AlfredAnalyzer — debounced, one AlfredExtraction per    │
+  │            tick (rolling summary + topics + notes + decisions +    │
+  │            open_questions + action_items + risks, merged by id)    │
+  │  E4 policy:  alfred.yaml interventions + 45 s cooldown +           │
+  │              directly-addressed bypass                             │
+  │  Outbound:  send_to_meeting_chat (sole tool)                       │
+  │                                                                    │
+  │  Channel rollup:                                                   │
+  │      session_channel_links binds chat_thread_id → channel context  │
+  │      /c/{teamId}/{channelId}/events returns chat + every meeting   │
+  │        + every transcript under one channel, ordered by ts         │
+  │                                                                    │
+  │  SSE /m/{chat_thread_id}/events drives the UI                      │
+  └──────────────────┬─────────────────────────────────────────────────┘
+                     │  SSE + JSON, filtered by chat_thread_id
+                     ▼
+  ┌────────────────────────────────────────────────────────────────────┐
+  │  React UI  web/  ·  Vite + React 19                                │
+  │     /           → MeetingList (polls /m every 2 s)                 │
+  │     /m/<id>     → MeetingDossier (Ledger / Dossier / Companion).   │
+  │                   Read-only — only Alfred speaks via the tool.     │
+  └────────────────────────────────────────────────────────────────────┘
 ```
 
-**Meeting key:** `chat_thread_id` (e.g. `19:meeting_xxx@thread.v2`) is the
-canonical id for a Teams meeting and the only stable identifier present
-on both audio and chat paths. Knowing the `chat_thread_id` IS the access
-boundary for the UI — there is no other auth on `/m/<id>`.
+### Key contracts
 
-**Agent contract (do not change without reading §6):** the analyzer emits
-one `AlfredExtraction` per tick (rolling summary + topics + notes +
-decisions + open_questions + action_items + risks, merged by `id`) and
-optionally calls one tool — `send_to_meeting_chat(text, kind, ...)`.
-There is no `SEND/ASK/SILENT` enum. Silence is "did not call the tool".
+**Meeting key.** `chat_thread_id` is the canonical id —
+`19:meeting_xxx@thread.v2` for a meeting, `19:{channelId}@thread.tacv2`
+for a channel. Every transcript and chat carries it. The UI URL
+*requires* it (`/m/<chat_thread_id>`); knowing the id IS the access
+boundary, there is no other auth on the per-meeting routes.
 
-**Chunking / debouncing contract:** C# does not debounce Alfred. C# forwards
-Teams audio into STT, then POSTs every STT event to Python `/transcript`;
-it also POSTs every meeting-chat event to Python `/chat`. Python owns the
-working ledger and Alfred batching. `partial` transcripts are raw-audited
-but not promoted to the working ledger; `final` transcripts and chat
-messages can trigger Alfred. The agent loop debounces in
-`python/meeting_agent/debounce.py` with `DEFAULT_QUIET_WINDOW_SECONDS=1.5`
-and `DEFAULT_MAX_BATCH=8`, used by `python/transcript_sink.py`.
+**Channel rollup key.** For a channel meeting, `channel_thread_id` is
+the *parent channel's* id, distinct from this meeting's
+`chat_thread_id`. Stamped on events when the bot sees `channelData`
+on a meeting-chat activity, plus retroactively backfilled via
+`POST /session/link`. Once linked, `GET /c/{teamId}/{channelId}/events`
+returns every event under one ordered timeline.
+
+**Agent contract.** One `AlfredExtraction` per tick, optionally one
+`send_to_meeting_chat` tool call. Do not introduce a `SEND/ASK/SILENT`
+enum. Do not introduce a parallel outbound path.
+
+**Debouncing contract.** C# does not debounce Alfred; it forwards
+*every* STT event to `/transcript` and *every* chat to `/chat`. Python
+owns the ledger and the agent's batching:
+`python/meeting_agent/debounce.py` (`DEFAULT_QUIET_WINDOW_SECONDS=1.5`,
+`DEFAULT_MAX_BATCH=8`) used by `python/transcript_sink.py`.
+`partial` transcripts are raw-audited but not promoted to the working
+ledger; `final` transcripts and chat messages can trigger Alfred.
 
 ---
 
@@ -128,23 +156,37 @@ active merge-request branch (`alfred-agent-updates`) for Disney review.
 
 ## 3. Permissions (RSC)
 
-When Alfred is installed into a Teams meeting/chat the installer grants
-**five chat-scoped Resource-Specific Consent permissions**, scoped to that
-single chat. There are zero tenant-wide Graph permissions.
+The manifest declares 11 Resource-Specific Consent permissions split
+across the two operational shapes — meeting and channel. There are
+zero tenant-wide Graph permissions.
+
+**Chat-scoped (per-meeting / per-chat install):**
 
 | Permission | Used for |
 |---|---|
 | `Calls.JoinGroupCalls.Chat` | Bot enters the call as a participant. |
 | `Calls.AccessMedia.Chat` | Receive 16 kHz / 16-bit / mono PCM audio. |
 | `OnlineMeetingParticipant.Read.Chat` | MSI ↔ AAD ↔ display-name lookup (E3). |
-| `ChatMessage.Read.Chat` | Reserved for the Graph notification chat path (PROD.md). |
+| `ChatMessage.Read.Chat` | Graph subscription on the meeting chat. |
 | `ChatMessageReadReceipt.Read.Chat` | Reserved (planned engagement signal). |
 
-Plus two manifest-level Teams app permissions: `identity`,
-`messageTeamMembers`. The manifest also requests `supportsCalling: true`.
+**Team-scoped (persistent channel attachment, §5b):**
 
-If the tenant treats Alfred as "unverified publisher", an M365 admin must
-grant org-wide consent in **Teams Admin Center → Manage apps →
+| Permission | Used for |
+|---|---|
+| `ChannelMessage.Read.Group` | Graph subscription on `teams/{teamId}/channels/{channelId}/messages`. |
+| `ChannelMessage.Send.Group` | Optional Graph-based outbound (Bot Framework adapter is the default). |
+| `ChannelMeeting.ReadBasic.Group` | Discover channel meetings spawned in attached channels. |
+| `ChannelMeetingParticipant.Read.Group` | Roster lookups for channel meetings. |
+| `TeamsAppInstallation.Read.Group` | Verify the bot is still installed at the team level. |
+| `TeamSettings.Read.Group` | Read team display name / settings for operator UI. |
+
+Plus two manifest-level Teams app permissions: `identity`,
+`messageTeamMembers`. The manifest also requests
+`supportsCalling: true`.
+
+If the tenant treats Alfred as "unverified publisher", an M365 admin
+must grant org-wide consent in **Teams Admin Center → Manage apps →
 Permissions**. The manifest cannot bypass this.
 
 ---
@@ -153,22 +195,28 @@ Permissions**. The manifest cannot bypass this.
 
 | Folder | Role |
 |---|---|
-| `src/` | C# Teams bot. Graph Communications SDK + Bot Framework. Builds with `dotnet build`. |
+| `src/` | C# Teams bot. Graph Communications SDK + Bot Framework. Builds with `dotnet publish` (Windows-x64; verify locally with the Docker SDK image — see `AGENTS.md` §3.3). |
 | `python/` | FastAPI sink + Alfred agent. Run with `uv run python run_variant_sink.py …` from this folder. |
 | `python/meeting_agent/` | Canonical session/agent state. `models.py`, `session.py`, `persistence.py`, `agent.py`, `tools.py`, `identity.py`. |
 | `python/batcave_platform/` | Product spec loader + output routes. `specs/alfred.yaml` is the **sole source of truth** for Alfred's prompt and intervention policy. |
-| `python/tests/` | `uv run pytest tests` baseline: 118 passed, 2 skipped. |
+| `python/tests/` | `uv run pytest tests` baseline: **121 passed, 2 skipped**. |
 | `web/` | React 19 + Vite + Tailwind v4 UI. Per-meeting routing via `react-router-dom`. |
-| `manifest/` | Teams app manifest (`manifest.json`, `alfred-sandbox.zip`). Bot AppId, RSC permissions, valid domains. |
+| `manifest/` | Teams app manifest (`manifest.json`, `alfred-sandbox.zip`). Bot AppId, 11 RSC permissions, valid domains. Currently at version `1.0.7`. |
 | `scripts/` | Deploy + ops scripts. Canonical entrypoints: `deploy-azure-vm.sh`, `deploy-azure-agent.sh`, `bootstrap-production-vm.ps1`, `join_meeting.sh`. |
+| `AGENTS.md` | **Operator manual for AI coding agents** — build, deploy, debug. Read this before changing anything in this tree. |
 
 **Canonical state object:** `InterviewSession` in
 `python/meeting_agent/models.py`. **Canonical history:**
-`InterviewSession.meeting_events` (single append-only ledger of normalized
-speech + chat + system events). One session per `chat_thread_id`, held in
-`SessionRegistry`. The immutable raw layer is `raw_ingest_events`;
-`MeetingEvent.source_raw_event_ids` back-links every working-ledger row
-to the raw rows that produced it.
+`InterviewSession.meeting_events` (single append-only ledger of
+normalized speech + chat + system events). One session per
+`chat_thread_id`, held in `SessionRegistry`. The immutable raw layer
+is `raw_ingest_events`; `MeetingEvent.source_raw_event_ids` back-links
+every working-ledger row to the raw rows that produced it.
+
+**Canonical channel link:** `session_channel_links` (chat_thread_id PK
+→ team_id, channel_id, channel_thread_id). Populated either by C#
+stamping at write time or by `POST /session/link`, which also
+backfills prior `meeting_events` and `raw_ingest_events` rows.
 
 ---
 
@@ -296,6 +344,19 @@ curl -sS "$SINK/sessions/$SID/participants"      | jq
 curl -sS "$SINK/sessions/$SID/speaker-identity"  | jq
 curl -sS -X POST "$SINK/sessions/$SID/speaker-mapping" \
   -H "Content-Type: application/json" -d '{"speaker_id":"speaker_0","aad_object_id":"<AAD>"}'
+
+# Channel rollup — every event (chat / speech / system) under a channel,
+# from the channel itself AND every meeting spawned from it, ordered by ts.
+TEAM=<aad group id>
+CHAN='19:<channel guid>@thread.tacv2'
+ENC=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=''))" "$CHAN")
+curl -sS "$SINK/c/$TEAM/$ENC/events?since=2026-05-01T00:00:00Z&kinds=speech,chat" | jq
+
+# Manually link a meeting thread to a channel (also retroactively backfills
+# all prior meeting_events / raw_ingest_events for that meeting):
+curl -sS -X POST "$SINK/session/link" -H "Content-Type: application/json" \
+  -d "$(jq -n --arg tid "19:meeting_xxx@thread.v2" --arg team "$TEAM" --arg chan "$CHAN" \
+        '{chat_thread_id:$tid, team_id:$team, channel_id:$chan, channel_thread_id:$chan, source:"manual"}')"
 ```
 
 ### VM operations (canonical pattern: `az vm run-command create`)
@@ -454,10 +515,15 @@ uv run python run_variant_sink.py --instance dev --port 8765 \
 cd web && npm install && npm run dev      # http://127.0.0.1:5173
 
 # Tests
-cd python && uv run pytest tests -v       # baseline: 118 passed, 2 skipped
+cd python && uv run pytest tests -v       # baseline: 121 passed, 2 skipped
 
-# C# build
-dotnet build
+# C# build — Docker SDK image with a named NuGet volume so restore is
+# fast across runs (~12 min cold, seconds warm). See AGENTS.md §3.3.
+docker volume create alfred-nuget-cache
+docker run --rm -v "$(pwd):/work" \
+  -v alfred-nuget-cache:/root/.nuget/packages \
+  -w /work/src mcr.microsoft.com/dotnet/sdk:8.0 \
+  dotnet build --configuration Release --nologo /v:m
 ```
 
 Set `BOT_SEND_CHAT_URL=http://127.0.0.1:3978/api/send-chat` in the sink
@@ -467,6 +533,11 @@ tool dry-runs (logs + appends to the ledger, does not POST).
 ---
 
 ## 9. Debug
+
+> Deeper diagnosis playbook (auto-join tiers, PowerShell-via-az gotchas,
+> `dotnet publish` stale-binary trap, run-command name caching, etc.)
+> lives in [`AGENTS.md`](AGENTS.md) §7. The table below is the
+> short-form symptom→fix index.
 
 | Symptom | Fix |
 |---|---|
@@ -483,6 +554,9 @@ tool dry-runs (logs + appends to the ledger, does not POST).
 | Call is active, media frames arrive, but transcript stays empty | Tail VM logs for `audio level stats`. `PeakSample=0` and `AverageAbsSample=0.0` means Teams is sending silence to the bot even though the media socket is alive. `PeakSample>0` with no transcript means debug Azure Speech/session cancellation and sink publishing. |
 | Ledger shows `speaker_0` instead of real names | C# `Call.Participants.OnUpdated` publisher to `POST /session/participants` is deferred (PROD.md E3). The Python resolver and tables are live; once the C# publisher lands, identities backfill automatically. |
 | Transcripts log to `meet-{meetingId}` audit dir but chat logs to `19:meeting_xxx` dir | Joining via short URL (`teams.microsoft.com/meet/...`) yields a synthetic `meet-{meetingId}` thread id for audio; Bot Framework chat carries the real `19:` thread id. Resolution requires a Graph call during join to look up the real thread id from the meeting id. |
+| Newly-pushed C# code "deploys" but the running bot still has old behavior | `dotnet publish` is incremental — stale `bin/`+`obj/` from a previous build can produce a fresh-timestamped DLL with old content. Any deploy that touches code must `rm -rf src/bin src/obj` before `dotnet publish`. See `AGENTS.md` §7.4. |
+| `az vm run-command create` succeeded but its output is the *previous* attempt's error | Run-command resources are cached by name. Use a unique `--run-command-name` per attempt or `az vm run-command delete` first. See `AGENTS.md` §7.3. |
+| Channel rollup `/c/{tid}/{cid}/events` returns nothing for a real meeting | The bot only stamps `channel_id` once it sees a meeting-chat activity carrying `channelData`. If the meeting started but no chat activity has happened yet, post anything in the meeting chat to trigger `/session/link`. Or call `/session/link` manually with the meeting's `chat_thread_id`. |
 
 ---
 
@@ -542,6 +616,20 @@ gh api repos/logan-robbins/alfred-teams-bot/keys \
 11. **Fail fast** when prerequisites are unmet — clear, specific errors at
     system boundaries. Don't add validation or fallbacks for scenarios
     that can't happen.
+12. **Channel link integrity.** Stamp `team_id` / `channel_id` /
+    `channel_thread_id` at write time when known; backfill prior rows
+    via `POST /session/link`. Don't introduce a parallel "channel
+    session" model — channel sessions and meeting sessions are both
+    `chat_thread_id`-keyed; the link is a side table.
+13. **`dotnet publish` always after `rm -rf src/bin src/obj`** in any
+    deploy script that touches code. MSBuild's incremental cache will
+    happily ship a new-timestamped DLL with old content otherwise. See
+    [`AGENTS.md`](AGENTS.md) §7.4.
+14. **Manifest changes** require: bump `version` in `manifest.json`,
+    regenerate `alfred-sandbox.zip` (`cd manifest && rm
+    alfred-sandbox.zip && zip -j alfred-sandbox.zip manifest.json
+    color.png outline.png`), re-import in Teams Developer Portal,
+    re-grant admin consent if RSCs changed.
 
 ---
 
@@ -556,5 +644,7 @@ state:
 - **E4 explicit proactivity policy** ✅ live
 - **E5 multi-sink routing** 🟡 deferred — needs a meeting→sink registration story that survives auto-invite
 - **E6 per-meeting URL-routed UI** ✅ live
+- **E7 persistent channel attachment** ✅ live — auto-attach on team install + `POST /api/channels/attach`; Graph subscription on `teams/{teamId}/channels/{channelId}/messages` with renewal loop and on-startup restore
+- **E8 channel-id metadata + rollup** ✅ live — every event carries `team_id` / `channel_id` / `channel_thread_id`; `POST /session/link` backfills prior rows; `GET /c/{teamId}/{channelId}/events` returns the unified channel timeline
 
 Read `PROD.md` before starting any of the deferred workstreams.
