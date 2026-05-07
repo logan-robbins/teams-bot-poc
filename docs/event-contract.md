@@ -162,8 +162,8 @@ only `transcript.partial` and `transcript.final`.
 
 ```jsonc
 {
-  // "partial" | "final" — duplicates the envelope event_type but
-  // present here for back-compat with the legacy /transcript shape.
+  // "partial" | "final" — duplicates the envelope event_type for
+  // ergonomic consumer code that operates on the payload alone.
   "event_type": "final",
   "text":       "the actual transcribed text",
   "timestamp_utc":   "2026-05-07T16:34:12.184Z",

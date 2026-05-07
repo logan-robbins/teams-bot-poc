@@ -74,7 +74,7 @@ public sealed record ChannelAttachmentRequest
 /// </summary>
 public sealed class ChannelAttachmentService : IChannelAttachmentService, IHostedService
 {
-    private const string LegacyDefaultConsumerName = "legacy-default";
+    private const string BootstrapDefaultConsumerName = "bootstrap-default";
 
     private readonly ChannelAttachmentStore _store;
     private readonly IMeetingChatService _meetingChatService;
@@ -111,15 +111,15 @@ public sealed class ChannelAttachmentService : IChannelAttachmentService, IHoste
                     SubscriptionExpiresAtUtc = subscription.ExpiresAtUtc,
                 };
 
-                if (ShouldApplyLegacySeed(refreshed))
+                if (ShouldApplyBootstrapSeed(refreshed))
                 {
                     refreshed = refreshed with
                     {
-                        Consumers = new[] { BuildLegacyDefaultConsumer(_dispatchConfig.BootstrapConsumerUrl!) },
-                        LegacySeeded = true,
+                        Consumers = new[] { BuildBootstrapDefaultConsumer(_dispatchConfig.BootstrapConsumerUrl!) },
+                        BootstrapSeeded = true,
                     };
                     _logger.LogInformation(
-                        "Seeded legacy-default consumer on existing attachment TeamId={TeamId} ChannelId={ChannelId} Url={Url}",
+                        "Seeded bootstrap-default consumer on existing attachment TeamId={TeamId} ChannelId={ChannelId} Url={Url}",
                         refreshed.TeamId, refreshed.ChannelId, _dispatchConfig.BootstrapConsumerUrl);
                 }
 
@@ -142,15 +142,15 @@ public sealed class ChannelAttachmentService : IChannelAttachmentService, IHoste
         }
     }
 
-    private bool ShouldApplyLegacySeed(ChannelAttachmentRecord record) =>
-        !record.LegacySeeded
+    private bool ShouldApplyBootstrapSeed(ChannelAttachmentRecord record) =>
+        !record.BootstrapSeeded
         && record.Consumers.Count == 0
         && !string.IsNullOrWhiteSpace(_dispatchConfig.BootstrapConsumerUrl);
 
-    private static ConsumerConfig BuildLegacyDefaultConsumer(string url) =>
+    private static ConsumerConfig BuildBootstrapDefaultConsumer(string url) =>
         new()
         {
-            Name = LegacyDefaultConsumerName,
+            Name = BootstrapDefaultConsumerName,
             Url = url,
             EventKinds = new[] { "*" },
             Enabled = true,
@@ -173,16 +173,16 @@ public sealed class ChannelAttachmentService : IChannelAttachmentService, IHoste
             cancellationToken);
 
         var consumers = existing?.Consumers ?? Array.Empty<ConsumerConfig>();
-        var legacySeeded = existing?.LegacySeeded ?? false;
+        var bootstrapSeeded = existing?.BootstrapSeeded ?? false;
 
         if (existing is null
             && consumers.Count == 0
             && !string.IsNullOrWhiteSpace(_dispatchConfig.BootstrapConsumerUrl))
         {
-            consumers = new[] { BuildLegacyDefaultConsumer(_dispatchConfig.BootstrapConsumerUrl!) };
-            legacySeeded = true;
+            consumers = new[] { BuildBootstrapDefaultConsumer(_dispatchConfig.BootstrapConsumerUrl!) };
+            bootstrapSeeded = true;
             _logger.LogInformation(
-                "Seeded legacy-default consumer on new attachment TeamId={TeamId} ChannelId={ChannelId} Url={Url}",
+                "Seeded bootstrap-default consumer on new attachment TeamId={TeamId} ChannelId={ChannelId} Url={Url}",
                 request.TeamId, request.ChannelId, _dispatchConfig.BootstrapConsumerUrl);
         }
 
@@ -202,7 +202,7 @@ public sealed class ChannelAttachmentService : IChannelAttachmentService, IHoste
             SubscriptionResource = subscription.Resource,
             SubscriptionExpiresAtUtc = subscription.ExpiresAtUtc,
             Consumers = consumers,
-            LegacySeeded = legacySeeded,
+            BootstrapSeeded = bootstrapSeeded,
         };
 
         await _store.UpsertAsync(record, cancellationToken);

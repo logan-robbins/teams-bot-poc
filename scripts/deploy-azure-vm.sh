@@ -304,7 +304,7 @@ ensure_recovery_nsg_rules
 
 FASTAPI_FQDN="$(az containerapp show --name "$FASTAPI_APP_NAME" --resource-group "$RG_NAME" --query properties.configuration.ingress.fqdn -o tsv)"
 [ -n "$FASTAPI_FQDN" ] || fail "Could not resolve Container App FQDN for $FASTAPI_APP_NAME."
-TRANSCRIPT_ENDPOINT="https://$FASTAPI_FQDN/transcript"
+BOOTSTRAP_CONSUMER_URL="https://$FASTAPI_FQDN/events"
 
 require_dns_points_to_vm "$BOT_HOSTNAME" "$PUBLIC_IP"
 require_dns_points_to_vm "$MEDIA_HOSTNAME" "$PUBLIC_IP"
@@ -322,7 +322,7 @@ BOOTSTRAP_PARAMETERS=(
     "NotificationUrl=https://$BOT_HOSTNAME/api/calling"
     "ServiceFqdn=$MEDIA_HOSTNAME"
     "InstancePublicIPAddress=$PUBLIC_IP"
-    "TranscriptSinkPythonEndpoint=$TRANSCRIPT_ENDPOINT"
+    "BootstrapConsumerUrl=$BOOTSTRAP_CONSUMER_URL"
     "RunAsUser=$ADMIN_USER"
     "SttProvider=$STT_PROVIDER"
     "AzureSpeechRegion=$AZURE_SPEECH_REGION"
@@ -390,4 +390,4 @@ curl --fail --show-error --silent --max-time 30 "https://$BOT_HOSTNAME/api/calli
 echo ""
 echo "VM deployment complete."
 echo "Bot health URL: https://$BOT_HOSTNAME/api/calling/health"
-echo "Transcript endpoint: $TRANSCRIPT_ENDPOINT"
+echo "Bootstrap consumer URL: $BOOTSTRAP_CONSUMER_URL"

@@ -51,23 +51,6 @@ try
     var sttConfig = LoadSttConfiguration(builder.Configuration);
     var eventDispatchConfig = builder.Configuration.GetSection("EventDispatch").Get<EventDispatchConfiguration>()
         ?? new EventDispatchConfiguration();
-    // Back-compat: derive BootstrapConsumerUrl from the legacy
-    // TranscriptSink.PythonEndpoint shape so existing VM deploys keep
-    // working without an appsettings rewrite. Drop after one cycle.
-    if (string.IsNullOrWhiteSpace(eventDispatchConfig.BootstrapConsumerUrl))
-    {
-        var legacy = builder.Configuration["TranscriptSink:PythonEndpoint"];
-        if (!string.IsNullOrWhiteSpace(legacy))
-        {
-            var trimmed = legacy.TrimEnd('/');
-            var lastSlash = trimmed.LastIndexOf('/');
-            var basePart = lastSlash > 0 ? trimmed[..lastSlash] : trimmed;
-            eventDispatchConfig = eventDispatchConfig with { BootstrapConsumerUrl = $"{basePart}/events" };
-            Log.Warning(
-                "Derived EventDispatch.BootstrapConsumerUrl={Derived} from legacy TranscriptSink.PythonEndpoint={Legacy}; migrate appsettings to drop the TranscriptSink section.",
-                eventDispatchConfig.BootstrapConsumerUrl, legacy);
-        }
-    }
     var joinModeSettings = builder.Configuration.GetSection("JoinMode").Get<JoinModeSettings>()
         ?? new JoinModeSettings();
     var meetingChatConfig = builder.Configuration.GetSection("MeetingChat").Get<MeetingChatConfiguration>()

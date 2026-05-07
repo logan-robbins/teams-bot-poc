@@ -1499,41 +1499,12 @@ app.add_exception_handler(Exception, generic_exception_handler)
 # =============================================================================
 
 
-@app.post("/transcript", response_model=TranscriptResponse)
 async def receive_transcript(
     request: TranscriptEventRequest,
     state: AppStateDep,
 ) -> TranscriptResponse:
-    """
-    Receive transcript events from C# bot.
-
-    Supports both v1 and v2 formats:
-
-    v1 format (legacy):
-        {
-            "Kind": "recognizing" | "recognized" | "session_started" | "session_stopped" | "canceled",
-            "Text": "transcript text",
-            "TsUtc": "2026-01-28T20:33:12.3456789Z"
-        }
-
-    v2 format (diarized):
-        {
-            "event_type": "partial" | "final" | "session_started" | "session_stopped" | "error",
-            "text": "transcript text",
-            "timestamp_utc": "2026-01-28T20:33:12.3456789Z",
-            "speaker_id": "speaker_0",
-            "audio_start_ms": 1234.5,
-            "audio_end_ms": 5678.9,
-            "confidence": 0.95
-        }
-
-    Args:
-        request: The transcript event request (validated by Pydantic).
-        state: Application state from dependency injection.
-
-    Returns:
-        TranscriptResponse confirming receipt.
-    """
+    """Internal handler for transcript events delivered through ``/events``
+    with ``event_type ∈ {transcript.partial, transcript.final}``."""
     stats = state["stats"]
     session_registry = state["session_registry"]
     output_writer = state["output_writer"]
@@ -1764,17 +1735,13 @@ async def receive_transcript(
     )
 
 
-@app.post("/chat", response_model=TranscriptResponse)
 async def receive_chat_message(
     request: ChatMessageRequest,
     state: AppStateDep,
 ) -> TranscriptResponse:
-    """
-    Receive a meeting chat message from the C# bot.
-
-    Every meeting chat message (human or bot-echoed) flows through here
-    and becomes a first-class event in the unified meeting timeline.
-    """
+    """Internal handler for chat events delivered through ``/events``
+    with ``event_type = chat.message``. Lands every chat (human or bot-
+    echoed) as a first-class entry in the unified meeting timeline."""
     stats = state["stats"]
     session_registry = state["session_registry"]
     variant_plugin = state["variant_plugin"]
@@ -2858,12 +2825,13 @@ class SessionChannelLinkRequest(BaseModel):
     model_config = {"extra": "ignore"}
 
 
-@app.post("/session/link")
 async def link_session_to_channel(
     request: SessionChannelLinkRequest,
     state: AppStateDep,
 ) -> dict[str, Any]:
-    """Persist a session ↔ channel link and backfill prior events."""
+    """Internal handler for ``event_type = system.session_linked``
+    envelopes. Persists the session ↔ channel link and backfills prior
+    events."""
     store: SessionStore = state["store"]
     counts = await asyncio.to_thread(
         store.link_session_to_channel,
@@ -2947,19 +2915,18 @@ async def receive_event_envelope(
     if et in ("transcript.partial", "transcript.final"):
         request = TranscriptEventRequest(**payload)
         result = await receive_transcript(request, state)
-        return {"ok": True, "event_type": et, "result": result.model_dump()}
+        return result.model_dump()
 
     if et == "chat.message":
         if envelope.conversation_reference_id and not payload.get("conversation_reference_id"):
             payload["conversation_reference_id"] = envelope.conversation_reference_id
         request = ChatMessageRequest(**payload)
         result = await receive_chat_message(request, state)
-        return {"ok": True, "event_type": et, "result": result.model_dump()}
+        return result.model_dump()
 
     if et == "system.session_linked":
         request = SessionChannelLinkRequest(**payload)
-        result = await link_session_to_channel(request, state)
-        return {"ok": True, "event_type": et, "result": result}
+        return await link_session_to_channel(request, state)
 
     if et in ("system.channel_attached", "system.channel_detached"):
         logger.info(
@@ -2968,7 +2935,7 @@ async def receive_event_envelope(
             envelope.team_id,
             envelope.channel_id,
         )
-        return {"ok": True, "event_type": et, "action": "logged"}
+        return {"ok": True, "action": "logged"}
 
     logger.warning("Unsupported event_type on /events: %s", et)
     raise HTTPException(

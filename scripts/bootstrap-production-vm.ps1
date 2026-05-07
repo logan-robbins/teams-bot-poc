@@ -15,8 +15,7 @@ param(
     [string]$ServiceFqdn,
     [string]$InstancePublicIPAddress,
     [string]$CertificateThumbprint,
-    [string]$TranscriptSinkPythonEndpoint,
-    [string]$TranscriptSinkChatEndpoint,
+    [string]$BootstrapConsumerUrl,
     [string]$RunAsUser = "azureuser",
     [string]$RunAsPassword,
     [string]$SttProvider = "Deepgram",
@@ -284,8 +283,7 @@ function Write-ProductionConfig {
         [string]$BotServiceFqdn,
         [string]$PublicIp,
         [string]$CertThumbprint,
-        [string]$SinkEndpoint,
-        [string]$SinkChatEndpoint,
+        [string]$BootstrapConsumerUrl,
         [string]$Provider,
         [string]$DeepgramKey,
         [string]$DeepgramSelectedModel,
@@ -407,7 +405,7 @@ function Write-ProductionConfig {
             Provider = $providerName
         }
         EventDispatch = @{
-            BootstrapConsumerUrl = ($SinkEndpoint -replace '/transcript$', '/events')
+            BootstrapConsumerUrl = $BootstrapConsumerUrl
         }
         JoinMode = @{
             PreferredMode = $preferredJoinMode
@@ -510,7 +508,7 @@ Assert-Required "TenantId" $TenantId
 Assert-Required "NotificationUrl" $NotificationUrl
 Assert-Required "ServiceFqdn" $ServiceFqdn
 Assert-Required "InstancePublicIPAddress" $InstancePublicIPAddress
-Assert-Required "TranscriptSinkPythonEndpoint" $TranscriptSinkPythonEndpoint
+Assert-Required "BootstrapConsumerUrl" $BootstrapConsumerUrl
 
 if (($BootstrapOnly -ne 1) -or -not [string]::IsNullOrWhiteSpace($CertificateThumbprint)) {
     Assert-Required "CertificateThumbprint" $CertificateThumbprint
@@ -555,8 +553,7 @@ Write-ProductionConfig `
     -BotServiceFqdn $ServiceFqdn `
     -PublicIp $InstancePublicIPAddress `
     -CertThumbprint $CertificateThumbprint `
-    -SinkEndpoint $TranscriptSinkPythonEndpoint `
-    -SinkChatEndpoint $TranscriptSinkChatEndpoint `
+    -BootstrapConsumerUrl $BootstrapConsumerUrl `
     -Provider $SttProvider `
     -DeepgramKey $DeepgramApiKey `
     -DeepgramSelectedModel $DeepgramModel `

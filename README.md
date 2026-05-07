@@ -362,9 +362,9 @@ curl -sS -X DELETE "$BOT/api/channels/$TEAM/$ENC/consumers/team-b-summarizer"
 Bootstrap default: the bot config has an optional
 `EventDispatch.BootstrapConsumerUrl`. When set, every newly-attached
 channel (and any pre-existing channel with empty consumers and
-`legacy_seeded=false`) is auto-seeded with one consumer named
-`legacy-default` pointing at this URL. Operators can delete it via
-the CRUD API once a real consumer is registered. Disney's
+`bootstrap_seeded=false`) is auto-seeded with one consumer named
+`bootstrap-default` pointing at this URL. Operators can delete it
+via the CRUD API once a real consumer is registered. Disney's
 `appsettings.production.json` points it at the Disney sandbox
 sink so the channel-attached UI keeps working out of the box.
 
@@ -423,7 +423,7 @@ curl -sS -X POST "$SINK/session/link" -H "Content-Type: application/json" \
 ### VM operations (canonical pattern: `az vm run-command create`)
 
 `az vm run-command create` is the only sanctioned variant. Never use
-`az vm run-command invoke` — the legacy action variant wedges the
+`az vm run-command invoke` — the deprecated action variant wedges the
 extension and forces a manual cleanup over RDP.
 
 ```bash
@@ -610,7 +610,7 @@ tool dry-runs (logs + appends to the ledger, does not POST).
 | Sink container revision crashloops with `Product spec file not found at '/app/legionmeet_platform/...'` | Stale env var from pre-rename era. Fix: `az containerapp update -n ca-alfred-api -g rg-alfred-disney --set-env-vars PRODUCT_SPEC_PATH=/app/batcave_platform/specs/alfred.yaml`. |
 | `az vm run-command create` Phase 1 fails with `Access to the path 'C:\ProgramData\alfred\deploy_key' is denied` | Old ACL locked SYSTEM to Read-only. The current bootstrap script handles this on re-run; if it still fails, relax the ACL in-place (probe via Run Command: `icacls "C:\ProgramData\alfred\deploy_key" /grant:r "NT AUTHORITY\SYSTEM:F"`). |
 | `az vm get-instance-view` returns `vmAgent: null` | ARM cache lag. Probe directly with a Run Command (`Write-Host alive`); if it returns Succeeded, the agent is fine. |
-| `Conflict: Run command extension execution is in progress` | Legacy `az vm run-command invoke` wedged the extension. RDP in, remove `C:\Packages\Plugins\Microsoft.CPlat.Core.RunCommandWindows*`, restart `WindowsAzureGuestAgent` + `RdAgent`. |
+| `Conflict: Run command extension execution is in progress` | Deprecated `az vm run-command invoke` wedged the extension. RDP in, remove `C:\Packages\Plugins\Microsoft.CPlat.Core.RunCommandWindows*`, restart `WindowsAzureGuestAgent` + `RdAgent`. |
 | Sink `events_received` increments but ledger empty | Auto-start requires non-empty `text` on a `final` transcript or a non-deleted chat. Partials and pre-session chats land in `raw_ingest_events` with a `dropped_reason` instead of in the working ledger — verify via `/sessions/{id}/raw-events`. |
 | Call is active, media frames arrive, but transcript stays empty | Tail VM logs for `audio level stats`. `PeakSample=0` and `AverageAbsSample=0.0` means Teams is sending silence to the bot even though the media socket is alive. `PeakSample>0` with no transcript means debug Azure Speech/session cancellation and sink publishing. |
 | Ledger shows `speaker_0` instead of real names | C# `Call.Participants.OnUpdated` publisher to `POST /session/participants` is deferred (PROD.md E3). The Python resolver and tables are live; once the C# publisher lands, identities backfill automatically. |

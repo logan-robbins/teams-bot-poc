@@ -64,10 +64,10 @@ public sealed record ChannelAttachmentRecord
     /// <summary>
     /// True once the bootstrap-default consumer has been applied to
     /// this attachment. Latches forever — operators who delete
-    /// <c>legacy-default</c> stay deleted across restarts.
+    /// <c>bootstrap-default</c> stay deleted across restarts.
     /// </summary>
-    [JsonPropertyName("legacy_seeded")]
-    public bool LegacySeeded { get; init; }
+    [JsonPropertyName("bootstrap_seeded")]
+    public bool BootstrapSeeded { get; init; }
 
     public static string BuildKey(string teamId, string channelId) =>
         $"{teamId}|{channelId}";

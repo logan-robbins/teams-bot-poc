@@ -439,7 +439,7 @@ clean is the only mechanism.
 
 If you see `Conflict: Run command extension execution is in progress`
 or `provisioningState=Updating` that never settles, the extension is
-wedged — usually after a force-deleted action Run Command (the legacy
+wedged — usually after a force-deleted action Run Command (the deprecated
 `az vm run-command invoke` variant). Recovery:
 
 1. RDP into the VM.
@@ -590,10 +590,7 @@ Routing is all keyed on `chat_thread_id`:
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/events` | **Versioned envelope ingress** — single endpoint for the alfred-events-v1 contract. Routes by `event_type` to internal handlers. |
-| `POST` | `/transcript` | STT events from C# bot (legacy direct path; `/events` is preferred). |
-| `POST` | `/chat` | Bot Framework chat events from C# bot (legacy direct path; `/events` is preferred). |
-| `POST` | `/session/link` | Bind a thread to a channel; backfills prior events |
+| `POST` | `/events` | **Versioned envelope ingress** — the only event ingress. Routes by `event_type` to internal handlers (transcript / chat / session_linked). |
 | `GET` | `/session/link/{tid}` | Fetch a thread's channel link |
 | `GET` | `/channels/links` | List all session→channel links |
 | `GET` | `/c/{teamId}/{channelId}/events` | **Channel rollup** — every event under a channel, ordered by ts |

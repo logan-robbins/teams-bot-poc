@@ -10,8 +10,9 @@ Last Grunted: 02/05/2026
 from __future__ import annotations
 
 import os
+import uuid as _uuid
 from pathlib import Path
-from typing import TYPE_CHECKING, AsyncIterator
+from typing import TYPE_CHECKING, Any, AsyncIterator
 
 import pytest
 import pytest_asyncio
@@ -22,6 +23,63 @@ from tests.mock_data import (
     generate_v1_event_dict,
     generate_v2_event_dict,
 )
+
+
+# =============================================================================
+# Envelope helpers — POST /events is the only ingress. These wrap the
+# inner payload each test constructs into an alfred-events-v1 envelope
+# so call sites stay readable.
+# =============================================================================
+
+
+def _envelope_for_transcript(payload: dict[str, Any]) -> dict[str, Any]:
+    inner_kind = payload.get("event_type") or payload.get("Kind") or "final"
+    if inner_kind in ("recognizing",):
+        envelope_kind = "transcript.partial"
+    elif inner_kind in ("partial",):
+        envelope_kind = "transcript.partial"
+    else:
+        envelope_kind = "transcript.final"
+    return {
+        "schema_version": "alfred-events-v1",
+        "event_type": envelope_kind,
+        "event_id": _uuid.uuid4().hex,
+        "ts": payload.get("timestamp_utc") or payload.get("TsUtc") or "2026-01-01T00:00:00Z",
+        "team_id": payload.get("team_id"),
+        "channel_id": payload.get("channel_id"),
+        "chat_thread_id": payload.get("chat_thread_id") or "test-thread",
+        "channel_thread_id": payload.get("channel_thread_id"),
+        "payload": payload,
+    }
+
+
+def _envelope_for_chat(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": "alfred-events-v1",
+        "event_type": "chat.message",
+        "event_id": _uuid.uuid4().hex,
+        "ts": payload.get("timestamp_utc") or "2026-01-01T00:00:00Z",
+        "team_id": payload.get("team_id"),
+        "channel_id": payload.get("channel_id"),
+        "chat_thread_id": payload["chat_thread_id"],
+        "channel_thread_id": payload.get("channel_thread_id"),
+        "conversation_reference_id": payload.get("conversation_reference_id"),
+        "payload": payload,
+    }
+
+
+def _envelope_for_link(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": "alfred-events-v1",
+        "event_type": "system.session_linked",
+        "event_id": _uuid.uuid4().hex,
+        "ts": "2026-01-01T00:00:00Z",
+        "team_id": payload["team_id"],
+        "channel_id": payload["channel_id"],
+        "chat_thread_id": payload["chat_thread_id"],
+        "channel_thread_id": payload.get("channel_thread_id"),
+        "payload": payload,
+    }
 
 
 TEST_PRODUCT_SPEC_PATH = (
@@ -389,7 +447,7 @@ class TestTranscriptEndpoint:
             event_type="final",
         )
 
-        response = await client.post("/transcript", json=event_data)
+        response = await client.post("/events", json=_envelope_for_transcript(event_data))
 
         assert response.status_code == 200
         data = response.json()
@@ -405,7 +463,7 @@ class TestTranscriptEndpoint:
             event_type="partial",
         )
 
-        response = await client.post("/transcript", json=event_data)
+        response = await client.post("/events", json=_envelope_for_transcript(event_data))
 
         assert response.status_code == 200
 
@@ -421,65 +479,13 @@ class TestTranscriptEndpoint:
             text="This is a v1 format transcript.",
         )
 
-        response = await client.post("/transcript", json=event_data)
+        response = await client.post("/events", json=_envelope_for_transcript(event_data))
 
         assert response.status_code == 200
 
         # Check v1 events counter
         stats_response = await client.get("/stats")
         assert stats_response.json()["stats"]["v1_events"] >= 1
-
-    @pytest.mark.asyncio
-    async def test_receive_session_started_event(self, client: AsyncClient) -> None:
-        """Receiving session_started event."""
-        response = await client.post(
-            "/transcript",
-            json={
-                "event_type": "session_started",
-                "timestamp_utc": "2026-01-31T10:00:00.000Z",
-            },
-        )
-
-        assert response.status_code == 200
-
-        stats_response = await client.get("/stats")
-        assert stats_response.json()["stats"]["session_events"] >= 1
-
-    @pytest.mark.asyncio
-    async def test_receive_session_stopped_event(self, client: AsyncClient) -> None:
-        """Receiving session_stopped event."""
-        response = await client.post(
-            "/transcript",
-            json={
-                "event_type": "session_stopped",
-                "timestamp_utc": "2026-01-31T10:30:00.000Z",
-            },
-        )
-
-        assert response.status_code == 200
-
-        stats_response = await client.get("/stats")
-        assert stats_response.json()["stats"]["session_events"] >= 1
-
-    @pytest.mark.asyncio
-    async def test_receive_error_event(self, client: AsyncClient) -> None:
-        """Receiving error event."""
-        response = await client.post(
-            "/transcript",
-            json={
-                "event_type": "error",
-                "timestamp_utc": "2026-01-31T10:15:00.000Z",
-                "error": {
-                    "code": "RECOGNITION_FAILED",
-                    "message": "Audio quality too low",
-                },
-            },
-        )
-
-        assert response.status_code == 200
-
-        stats_response = await client.get("/stats")
-        assert stats_response.json()["stats"]["errors"] >= 1
 
     @pytest.mark.asyncio
     async def test_transcript_updates_stats(self, client: AsyncClient) -> None:
@@ -491,7 +497,7 @@ class TestTranscriptEndpoint:
                 text=f"Test transcript {i}",
                 event_type="final",
             )
-            await client.post("/transcript", json=event_data)
+            await client.post("/events", json=_envelope_for_transcript(event_data))
 
         response = await client.get("/stats")
         data = response.json()
@@ -515,7 +521,7 @@ class TestTranscriptEndpoint:
             text="Interview question here",
             event_type="final",
         )
-        await client.post("/transcript", json=event_data)
+        await client.post("/events", json=_envelope_for_transcript(event_data))
 
         # Check session
         response = await client.get("/session")
@@ -533,7 +539,7 @@ class TestTranscriptEndpoint:
             "TsUtc": "2026-01-31T10:00:00.000Z",
         }
 
-        response = await client.post("/transcript", json=v1_event)
+        response = await client.post("/events", json=_envelope_for_transcript(v1_event))
         assert response.status_code == 200
 
         # Should be counted as partial (recognizing -> partial)
@@ -621,11 +627,11 @@ class TestIntegrationFlow:
 
         # 3. Send session started event
         await client.post(
-            "/transcript",
-            json={
+            "/events",
+            json=_envelope_for_transcript({
                 "event_type": "session_started",
                 "timestamp_utc": "2026-01-31T10:00:00.000Z",
-            },
+            }),
         )
 
         # 4. Send interview transcripts
@@ -648,16 +654,16 @@ class TestIntegrationFlow:
                 text=text,
                 event_type="final",
             )
-            response = await client.post("/transcript", json=event_data)
+            response = await client.post("/events", json=_envelope_for_transcript(event_data))
             assert response.status_code == 200
 
         # 5. Send session stopped event
         await client.post(
-            "/transcript",
-            json={
+            "/events",
+            json=_envelope_for_transcript({
                 "event_type": "session_stopped",
                 "timestamp_utc": "2026-01-31T10:30:00.000Z",
-            },
+            }),
         )
 
         # 6. Check session state
@@ -717,7 +723,7 @@ class TestIntegrationFlow:
                 speaker_id="speaker_1",
                 text=f"Response from {candidate}",
             )
-            await client.post("/transcript", json=event_data)
+            await client.post("/events", json=_envelope_for_transcript(event_data))
 
             # End session
             end_response = await client.post("/session/end")
@@ -737,7 +743,7 @@ class TestIntegrationFlow:
             text="Transcript without session",
         )
 
-        response = await client.post("/transcript", json=event_data)
+        response = await client.post("/events", json=_envelope_for_transcript(event_data))
 
         assert response.status_code == 200
 
@@ -764,8 +770,8 @@ class TestChatEndpoint:
             json={"candidate_name": "Meeting", "meeting_url": "https://teams.microsoft.com/meet/x"},
         )
         response = await client.post(
-            "/chat",
-            json={
+            "/events",
+            json=_envelope_for_chat({
                 "chat_thread_id": "19:meeting_x@thread.v2",
                 "message_id": "m-1",
                 "text": "Hello from Alice",
@@ -773,7 +779,7 @@ class TestChatEndpoint:
                 "sender_id": "alice-upn",
                 "timestamp_utc": "2026-04-22T16:00:00Z",
                 "conversation_reference_id": "ref-abc",
-            },
+            }),
         )
         assert response.status_code == 200
 
@@ -796,31 +802,32 @@ class TestChatEndpoint:
         )
 
         await client.post(
-            "/chat",
-            json={
+            "/events",
+            json=_envelope_for_chat({
                 "chat_thread_id": "19:meeting_x@thread.v2",
                 "message_id": "m-early",
                 "text": "early chat",
                 "timestamp_utc": "2026-04-22T16:00:00Z",
-            },
+            }),
         )
         await client.post(
-            "/transcript",
-            json={
+            "/events",
+            json=_envelope_for_transcript({
                 "event_type": "final",
                 "text": "middle speech",
                 "timestamp_utc": "2026-04-22T16:00:30Z",
                 "speaker_id": "speaker_0",
-            },
+                "chat_thread_id": "19:meeting_x@thread.v2",
+            }),
         )
         await client.post(
-            "/chat",
-            json={
+            "/events",
+            json=_envelope_for_chat({
                 "chat_thread_id": "19:meeting_x@thread.v2",
                 "message_id": "m-late",
                 "text": "late chat",
                 "timestamp_utc": "2026-04-22T16:01:00Z",
-            },
+            }),
         )
 
         history = (await client.get("/session/status")).json()["session"][
@@ -840,13 +847,13 @@ class TestChatEndpoint:
     ) -> None:
         """A chat with chat_thread_id auto-starts a per-thread session."""
         await client.post(
-            "/chat",
-            json={
+            "/events",
+            json=_envelope_for_chat({
                 "chat_thread_id": "19:thread-only-A@thread.v2",
                 "message_id": "m-A",
                 "text": "hello A",
                 "timestamp_utc": "2026-04-22T16:00:00Z",
-            },
+            }),
         )
         meetings = (await client.get("/m")).json()["meetings"]
         thread_ids = [m["chat_thread_id"] for m in meetings]
@@ -862,14 +869,14 @@ class TestChatEndpoint:
             json={"candidate_name": "Meeting", "meeting_url": "https://teams.microsoft.com/meet/x"},
         )
         await client.post(
-            "/chat",
-            json={
+            "/events",
+            json=_envelope_for_chat({
                 "event_type": "chat_deleted",
                 "chat_thread_id": "19:meeting_x@thread.v2",
                 "message_id": "m-del",
                 "text": "this was deleted",
                 "timestamp_utc": "2026-04-22T16:00:00Z",
-            },
+            }),
         )
         history = (await client.get("/session/status")).json()["session"][
             "meeting_history"
@@ -891,24 +898,24 @@ class TestPerMeetingRouting:
     async def test_two_threads_get_distinct_sessions(self, client: AsyncClient) -> None:
         """Two distinct chat_thread_ids produce two distinct session managers."""
         await client.post(
-            "/transcript",
-            json={
+            "/events",
+            json=_envelope_for_transcript({
                 "event_type": "final",
                 "text": "meeting A line 1",
                 "timestamp_utc": "2026-04-30T17:00:01Z",
                 "chat_thread_id": "19:meet-A@thread.v2",
                 "speaker_id": "speaker_0",
-            },
+            }),
         )
         await client.post(
-            "/transcript",
-            json={
+            "/events",
+            json=_envelope_for_transcript({
                 "event_type": "final",
                 "text": "meeting B line 1",
                 "timestamp_utc": "2026-04-30T17:00:02Z",
                 "chat_thread_id": "19:meet-B@thread.v2",
                 "speaker_id": "speaker_0",
-            },
+            }),
         )
 
         meetings = (await client.get("/m")).json()["meetings"]
@@ -927,23 +934,23 @@ class TestPerMeetingRouting:
     ) -> None:
         """A meeting's /status only contains events with that chat_thread_id."""
         await client.post(
-            "/transcript",
-            json={
+            "/events",
+            json=_envelope_for_transcript({
                 "event_type": "final",
                 "text": "alpha line",
                 "timestamp_utc": "2026-04-30T17:00:01Z",
                 "chat_thread_id": "19:alpha@thread.v2",
                 "speaker_id": "speaker_0",
-            },
+            }),
         )
         await client.post(
-            "/chat",
-            json={
+            "/events",
+            json=_envelope_for_chat({
                 "chat_thread_id": "19:beta@thread.v2",
                 "message_id": "m-beta-1",
                 "text": "beta chat",
                 "timestamp_utc": "2026-04-30T17:00:05Z",
-            },
+            }),
         )
 
         alpha = (await client.get("/m/19:alpha@thread.v2/status")).json()["session"]
@@ -972,14 +979,14 @@ class TestPerMeetingRouting:
     ) -> None:
         """POST /m/<id>/end ends only that meeting's session."""
         await client.post(
-            "/transcript",
-            json={
+            "/events",
+            json=_envelope_for_transcript({
                 "event_type": "final",
                 "text": "ending soon",
                 "timestamp_utc": "2026-04-30T17:00:00Z",
                 "chat_thread_id": "19:ender@thread.v2",
                 "speaker_id": "speaker_0",
-            },
+            }),
         )
         end = await client.post("/m/19:ender@thread.v2/end")
         assert end.status_code == 200
@@ -1002,14 +1009,14 @@ class TestPerMeetingRouting:
             json={"candidate_name": "Legacy", "meeting_url": "https://teams.com/x"},
         )
         await client.post(
-            "/transcript",
-            json={
+            "/events",
+            json=_envelope_for_transcript({
                 "event_type": "final",
                 "text": "routes to legacy default slot",
                 "timestamp_utc": "2026-04-30T17:00:00Z",
                 "chat_thread_id": "19:absorbed@thread.v2",
                 "speaker_id": "speaker_0",
-            },
+            }),
         )
         legacy = (await client.get("/session/status")).json()["session"]
         assert legacy["total_events"] == 1
@@ -1040,13 +1047,13 @@ class TestRawIngestAudit:
         # Partial transcripts are filtered out of the ledger but must still
         # be captured in the immutable raw audit log.
         await client.post(
-            "/transcript",
-            json={
+            "/events",
+            json=_envelope_for_transcript({
                 "event_type": "partial",
                 "text": "hello wor",
                 "timestamp_utc": "2026-04-30T17:00:00Z",
                 "speaker_id": "speaker_0",
-            },
+            }),
         )
         rows = (await client.get(f"/sessions/{sid}/raw-events")).json()["events"]
         partials = [r for r in rows if r["event_type"] == "partial"]
@@ -1074,15 +1081,15 @@ class TestRawIngestAudit:
         # registry slot still exists, but is_active is False so the chat is
         # filtered. Raw audit must capture it anyway.
         await client.post(
-            "/chat",
-            json={
+            "/events",
+            json=_envelope_for_chat({
                 "event_type": "chat_created",
                 "chat_thread_id": "19:closed-meeting@thread.v2",
                 "message_id": "m-after-1",
                 "text": "post-end ping",
                 "timestamp_utc": "2026-04-30T17:00:00Z",
                 "from_bot": False,
-            },
+            }),
         )
 
         rows = (await client.get(f"/sessions/{sid}/raw-events")).json()["events"]
@@ -1101,13 +1108,13 @@ class TestRawIngestAudit:
         )
         sid = (await client.get("/session/status")).json()["session"]["session_id"]
         await client.post(
-            "/transcript",
-            json={
+            "/events",
+            json=_envelope_for_transcript({
                 "event_type": "final",
                 "text": "ship by friday",
                 "timestamp_utc": "2026-04-30T17:01:00Z",
                 "speaker_id": "speaker_0",
-            },
+            }),
         )
 
         # Raw row should reference the promoted meeting_events row.
@@ -1149,14 +1156,14 @@ class TestRawIngestAudit:
 
         # Speech that carries that MSI as dominant should resolve.
         await client.post(
-            "/transcript",
-            json={
+            "/events",
+            json=_envelope_for_transcript({
                 "event_type": "final",
                 "text": "sounds good",
                 "timestamp_utc": "2026-04-30T17:01:30Z",
                 "speaker_id": "speaker_0",
                 "dominant_media_source_id": 12345,
-            },
+            }),
         )
 
         identity = (await client.get(f"/sessions/{sid}/speaker-identity")).json()
@@ -1201,14 +1208,14 @@ class TestRawIngestAudit:
 
         for speaker, ts in (("speaker_1", "17:02:30"), ("speaker_2", "17:02:45")):
             await client.post(
-                "/transcript",
-                json={
+                "/events",
+                json=_envelope_for_transcript({
                     "event_type": "final",
                     "text": f"voice from {speaker}",
                     "timestamp_utc": f"2026-04-30T{ts}Z",
                     "speaker_id": speaker,
                     "dominant_media_source_id": 42,
-                },
+                }),
             )
 
         identity = (await client.get(f"/sessions/{sid}/speaker-identity")).json()
@@ -1253,14 +1260,14 @@ class TestRawIngestAudit:
 
         # Now post a transcript with MSI 42 -> Alex; the manual binding wins.
         await client.post(
-            "/transcript",
-            json={
+            "/events",
+            json=_envelope_for_transcript({
                 "event_type": "final",
                 "text": "this is bee speaking",
                 "timestamp_utc": "2026-04-30T17:03:00Z",
                 "speaker_id": "speaker_1",
                 "dominant_media_source_id": 42,
-            },
+            }),
         )
 
         identity = (await client.get(f"/sessions/{sid}/speaker-identity")).json()
@@ -1293,14 +1300,14 @@ class TestRawIngestAudit:
         )
 
         await client.post(
-            "/transcript",
-            json={
+            "/events",
+            json=_envelope_for_transcript({
                 "event_type": "final",
                 "text": "metadata-routed",
                 "timestamp_utc": "2026-04-30T17:04:00Z",
                 "speaker_id": "speaker_0",
                 "metadata": {"DominantMediaSourceId": 777},
-            },
+            }),
         )
 
         identity = (await client.get(f"/sessions/{sid}/speaker-identity")).json()
@@ -1318,13 +1325,13 @@ class TestRawIngestAudit:
         sid = (await client.get("/session/status")).json()["session"]["session_id"]
         for ts in ("2026-04-30T17:00:00Z", "2026-04-30T17:00:01Z"):
             await client.post(
-                "/transcript",
-                json={
+                "/events",
+                json=_envelope_for_transcript({
                     "event_type": "final",
                     "text": f"line at {ts}",
                     "timestamp_utc": ts,
                     "speaker_id": "speaker_0",
-                },
+                }),
             )
 
         response = await client.get(f"/sessions/{sid}/raw-events/export.ndjson")
@@ -1357,8 +1364,8 @@ class TestChannelLinkAndRollup:
         channel = "19:chan-1@thread.tacv2"
 
         await client.post(
-            "/chat",
-            json={
+            "/events",
+            json=_envelope_for_chat({
                 "chat_thread_id": channel,
                 "message_id": "m-channel-1",
                 "text": "hello channel",
@@ -1367,7 +1374,7 @@ class TestChannelLinkAndRollup:
                 "team_id": team,
                 "channel_id": channel,
                 "channel_thread_id": channel,
-            },
+            }),
         )
 
         events = (
@@ -1389,25 +1396,25 @@ class TestChannelLinkAndRollup:
 
         # Land events for the meeting WITHOUT channel context.
         await client.post(
-            "/chat",
-            json={
+            "/events",
+            json=_envelope_for_chat({
                 "chat_thread_id": meeting,
                 "message_id": "m-pre-1",
                 "text": "before link",
                 "timestamp_utc": "2026-04-22T16:00:00Z",
-            },
+            }),
         )
 
         # Now learn the link and confirm backfill counts.
         link = await client.post(
-            "/session/link",
-            json={
+            "/events",
+            json=_envelope_for_link({
                 "chat_thread_id": meeting,
                 "team_id": team,
                 "channel_id": channel,
                 "channel_thread_id": channel,
                 "source": "test_backfill",
-            },
+            }),
         )
         assert link.status_code == 200
         body = link.json()
@@ -1431,13 +1438,13 @@ class TestChannelLinkAndRollup:
 
         for _ in range(2):
             r = await client.post(
-                "/session/link",
-                json={
+                "/events",
+                json=_envelope_for_link({
                     "chat_thread_id": meeting,
                     "team_id": team,
                     "channel_id": channel,
                     "channel_thread_id": channel,
-                },
+                }),
             )
             assert r.status_code == 200
 
@@ -1484,9 +1491,7 @@ class TestEnvelopeIngress:
             },
         )
         assert r.status_code == 200, r.text
-        body = r.json()
-        assert body["ok"] is True
-        assert body["event_type"] == "chat.message"
+        assert r.json()["ok"] is True
 
         events = (await client.get(f"/c/{team}/{channel}/events")).json()["events"]
         texts = {e["text"]: e for e in events}
@@ -1533,13 +1538,13 @@ class TestEnvelopeIngress:
 
         # Land a chat with no channel context first.
         await client.post(
-            "/chat",
-            json={
+            "/events",
+            json=_envelope_for_chat({
                 "chat_thread_id": meeting,
                 "message_id": "m-pre-env",
                 "text": "pre-envelope-link",
                 "timestamp_utc": "2026-04-22T16:00:00Z",
-            },
+            }),
         )
 
         # Send the link as an envelope.
