@@ -92,6 +92,15 @@ decisions + open_questions + action_items + risks, merged by `id`) and
 optionally calls one tool — `send_to_meeting_chat(text, kind, ...)`.
 There is no `SEND/ASK/SILENT` enum. Silence is "did not call the tool".
 
+**Chunking / debouncing contract:** C# does not debounce Alfred. C# forwards
+Teams audio into STT, then POSTs every STT event to Python `/transcript`;
+it also POSTs every meeting-chat event to Python `/chat`. Python owns the
+working ledger and Alfred batching. `partial` transcripts are raw-audited
+but not promoted to the working ledger; `final` transcripts and chat
+messages can trigger Alfred. The agent loop debounces in
+`python/meeting_agent/debounce.py` with `DEFAULT_QUIET_WINDOW_SECONDS=1.5`
+and `DEFAULT_MAX_BATCH=8`, used by `python/transcript_sink.py`.
+
 ---
 
 ## 2. Disney environment
