@@ -174,6 +174,13 @@ to the raw rows that produced it.
 
 ## 5. Install in the M365 tenant
 
+Alfred can be installed into a meeting chat (per-meeting), a group chat,
+or a Teams **channel** (persistent — once attached, the bot listens to
+every post in the channel and is allowed to post back). Pick whichever
+matches the use case.
+
+### 5a. Per-meeting install (existing flow)
+
 1. Upload `manifest/alfred-sandbox.zip` via the Teams Developer Portal
    at `https://dev.teams.microsoft.com/apps` → **Import app**.
 2. **Preview in Teams** → **Add to a chat**. (Do **not** use "Add to a
@@ -185,6 +192,60 @@ to the raw rows that produced it.
    ./scripts/join_meeting.sh "<teams-meeting-join-url>" "Alfred"
    ```
 4. If the publisher is "unverified", see §3.
+
+### 5b. Persistent channel attachment (sandbox-channel flow)
+
+Channel attachment is the channel-level analog of "the bot is in this
+meeting". Once attached the bot listens to every channel post via a
+Graph change-notification subscription on
+`teams/{teamId}/channels/{channelId}/messages` and is allowed to post
+back via the existing `send_to_meeting_chat` tool. Attachments survive
+bot restarts (state lives in `C:\teams-bot-poc\state\channel-attachments.json`
+on the VM) and the renewal loop keeps the Graph subscription alive.
+
+There are two paths in:
+
+**Path A — install the app at the team level (preferred).** When Alfred
+is added to a team via Teams Admin Center → Manage apps → *Install* into
+a team, the bot receives a `membersAdded` event with the bot in the
+member list. `AlfredBot.OnMembersAddedAsync` reads `TeamsChannelData`,
+auto-attaches to the channel the install fired in, and creates the
+Graph subscription.
+
+**Path B — operator API attach by team-id + channel-id.** Useful when
+you want to attach Alfred to a specific channel without re-installing.
+Both ids come from Teams clients (`Get link to team/channel` →
+`groupId=…&channelId=…`).
+
+```bash
+BOT=https://alfred-disney-bot.eastus.cloudapp.azure.com
+TEAM_ID='<aad group id of the team>'
+CHANNEL_ID='19:<channel guid>@thread.tacv2'
+
+# Attach
+curl -sS -X POST "$BOT/api/channels/attach" \
+  -H "Content-Type: application/json" \
+  -d "$(jq -n --arg tid "$TEAM_ID" --arg cid "$CHANNEL_ID" \
+        '{team_id:$tid, channel_id:$cid, source:"manual_attach"}')" | jq
+
+# List active attachments (survives restarts)
+curl -sS "$BOT/api/channels" | jq
+
+# Detach (deletes the Graph subscription and removes the persistent record)
+curl -sS -X DELETE "$BOT/api/channels/$TEAM_ID/$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=""))' "$CHANNEL_ID")"
+```
+
+After attach, every channel post is forwarded to the Python sink's
+`/chat` endpoint with `conversation_kind:"channel"`, `team_id`, and
+`channel_id` populated. The session is keyed on
+`19:{channelId}@thread.tacv2` (the same id Bot Framework uses), so the
+existing per-thread routes (`/m/<chat_thread_id>/...`) work unchanged.
+
+Outbound: the bot posts back via `send_to_meeting_chat` using the
+captured `ConversationReference` for that channel. The reference is
+captured the first time Bot Framework delivers a channel activity to
+`/api/messages`; after that, proactive sends work the same as for
+meeting chats.
 
 ---
 
