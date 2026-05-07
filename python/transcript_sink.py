@@ -353,7 +353,14 @@ class SpeakerMappingOverride(BaseModel):
 
 
 class ChatMessageRequest(BaseModel):
-    """Meeting chat message pushed from the C# bot to POST /chat."""
+    """Chat or channel-message event pushed from the C# bot to POST /chat.
+
+    ``chat_thread_id`` is the canonical session key. For meeting chats it is
+    ``19:meeting_xxx@thread.v2``; for Teams channels the C# bot maps to
+    ``19:{channel_id}@thread.tacv2`` so both ingress paths key the same
+    Python session. ``conversation_kind`` distinguishes the source and
+    ``team_id`` / ``channel_id`` are populated for channel events.
+    """
 
     event_type: str = Field(
         default="chat_created",
@@ -372,6 +379,18 @@ class ChatMessageRequest(BaseModel):
     reply_to_message_id: str | None = None
     from_bot: bool = False
     raw: dict[str, Any] | None = None
+    conversation_kind: str | None = Field(
+        default=None,
+        description="meeting_chat | channel | group_chat | personal | unknown",
+    )
+    team_id: str | None = Field(
+        default=None,
+        description="Teams team (group) id when the event is in a team channel.",
+    )
+    channel_id: str | None = Field(
+        default=None,
+        description="Teams channel id when the event is in a team channel.",
+    )
 
     model_config = {"extra": "ignore"}
 
@@ -1691,6 +1710,9 @@ async def receive_chat_message(
         reply_to_message_id=request.reply_to_message_id,
         from_bot=request.from_bot,
         raw=request.raw,
+        conversation_kind=request.conversation_kind,
+        team_id=request.team_id,
+        channel_id=request.channel_id,
     )
 
     # Auto-start the meeting session on first non-deleted chat for an unseen

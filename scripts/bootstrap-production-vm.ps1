@@ -32,7 +32,8 @@ param(
     [int]$AutoFallbackToInviteAndGraphJoin = 1,
     [int]$RequireBotAttendeeForInviteJoin = 1,
     [int]$BootstrapOnly = 0,
-    [int]$SkipRepositorySync = 0
+    [int]$SkipRepositorySync = 0,
+    [string]$ChannelAttachmentStorePath = "C:\teams-bot-poc\state\channel-attachments.json"
 )
 
 $ErrorActionPreference = "Stop"
@@ -296,11 +297,43 @@ function Write-ProductionConfig {
         [int]$PublicMediaPort,
         [bool]$PolicyAutoInviteEnabled,
         [bool]$AutoFallbackToInviteGraphJoin,
-        [bool]$RequireBotInviteJoinAttendee
+        [bool]$RequireBotInviteJoinAttendee,
+        [string]$ChannelAttachmentStorePath
     )
 
     $providerName = if ([string]::IsNullOrWhiteSpace($Provider)) { "Deepgram" } else { $Provider.Trim() }
     $preferredJoinMode = if ($PolicyAutoInviteEnabled) { "policy_auto_invite" } else { "invite_and_graph_join" }
+
+    # Channel-attached Alfred uses Graph change-notification subscriptions
+    # on teams/{teamId}/channels/{channelId}/messages, which means
+    # MeetingChat MUST be enabled and ChatSubscriptionClientStateSecret
+    # must be stable per-VM (it round-trips through Graph and we use it to
+    # authenticate inbound notifications). Reuse any secret already in the
+    # existing production config so a redeploy never invalidates live
+    # subscriptions; otherwise mint a fresh GUID.
+    $existingChatStateSecret = $null
+    if (Test-Path $Path) {
+        try {
+            $existingConfig = Get-Content $Path -Raw | ConvertFrom-Json -ErrorAction Stop
+            if ($existingConfig -and $existingConfig.MeetingChat) {
+                $existingChatStateSecret = $existingConfig.MeetingChat.ChatSubscriptionClientStateSecret
+            }
+        }
+        catch {
+            Write-Warning "Could not read existing config at '$Path' to preserve MeetingChat secret: $($_.Exception.Message)"
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($existingChatStateSecret)) {
+        $existingChatStateSecret = [Guid]::NewGuid().ToString("N")
+    }
+
+    # GraphNotificationBaseUrl is the bot's public origin (HTTPS). The
+    # MeetingChatService appends /api/graph-notifications to it.
+    $graphNotificationBaseUrl = $BotNotificationUrl
+    if (-not [string]::IsNullOrWhiteSpace($graphNotificationBaseUrl)) {
+        $graphNotificationBaseUrl = $graphNotificationBaseUrl -replace '/api/calling/?$', ''
+        $graphNotificationBaseUrl = $graphNotificationBaseUrl.TrimEnd('/')
+    }
 
     # Cert thumbprint resolution order:
     #   1. caller-passed -CertThumbprint
@@ -390,6 +423,18 @@ function Write-ProductionConfig {
                     RequireBotAttendeeForInviteJoin = $RequireBotInviteJoinAttendee
                 }
             }
+        }
+        MeetingChat = @{
+            Enabled = $true
+            GraphNotificationBaseUrl = $graphNotificationBaseUrl
+            GraphSubscriptionEncryptionCertPath = $null
+            GraphSubscriptionEncryptionCertPassword = $null
+            GraphSubscriptionEncryptionCertId = $null
+            ChatSubscriptionClientStateSecret = $existingChatStateSecret
+            ChatSendMaxRps = 4.0
+            TeamsAppCatalogId = $null
+            UseInstalledToChatsSubscription = $false
+            ChannelAttachmentStorePath = $ChannelAttachmentStorePath
         }
     }
 
@@ -524,7 +569,15 @@ Write-ProductionConfig `
     -PublicMediaPort $MediaPort `
     -PolicyAutoInviteEnabled ($EnablePolicyAutoInvite -ne 0) `
     -AutoFallbackToInviteGraphJoin ($AutoFallbackToInviteAndGraphJoin -ne 0) `
-    -RequireBotInviteJoinAttendee ($RequireBotAttendeeForInviteJoin -ne 0)
+    -RequireBotInviteJoinAttendee ($RequireBotAttendeeForInviteJoin -ne 0) `
+    -ChannelAttachmentStorePath $ChannelAttachmentStorePath
+
+# Ensure the channel-attachment state directory exists with permissions the
+# service can read/write. Without it the first startup write fails.
+$channelStateDir = Split-Path -Parent $ChannelAttachmentStorePath
+if (-not [string]::IsNullOrWhiteSpace($channelStateDir) -and -not (Test-Path $channelStateDir)) {
+    New-Item -ItemType Directory -Path $channelStateDir -Force | Out-Null
+}
 
 $existingService = Get-Service -Name "TeamsMediaBot" -ErrorAction SilentlyContinue
 $wasServiceRunning = $false

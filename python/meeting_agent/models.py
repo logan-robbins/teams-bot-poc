@@ -73,12 +73,19 @@ class SpeakerMapping(BaseModel):
 
 
 class ChatMessage(BaseModel):
-    """A single meeting-chat message ingested from the C# bot."""
+    """A single chat or channel-message event ingested from the C# bot.
+
+    The bot forwards both meeting-chat activities and team-channel posts
+    here. ``chat_thread_id`` is the canonical session key for both flows
+    (channel posts are mapped to ``19:{channel_id}@thread.tacv2`` by the
+    bot). ``conversation_kind``, ``team_id``, and ``channel_id`` carry the
+    extra context needed when the source is a team channel.
+    """
 
     event_type: Literal["chat_created", "chat_updated", "chat_deleted"] = Field(
         default="chat_created"
     )
-    chat_thread_id: str = Field(..., description="Teams chat thread id backing the meeting")
+    chat_thread_id: str = Field(..., description="Teams chat thread id backing the conversation")
     message_id: str = Field(..., description="Teams chat message id (for reply/edit threading)")
     text: Optional[str] = Field(default=None, description="Plain-text message body")
     html: Optional[str] = Field(default=None, description="HTML body as rendered in Teams")
@@ -100,6 +107,18 @@ class ChatMessage(BaseModel):
         description="True when this chat was sent by our own bot (our outbound echo)",
     )
     raw: Optional[dict] = Field(default=None, description="Raw Graph chatMessage body")
+    conversation_kind: Optional[str] = Field(
+        default=None,
+        description="meeting_chat | channel | group_chat | personal | unknown",
+    )
+    team_id: Optional[str] = Field(
+        default=None,
+        description="Teams team (group) id when the event is in a team channel.",
+    )
+    channel_id: Optional[str] = Field(
+        default=None,
+        description="Teams channel id when the event is in a team channel.",
+    )
 
 
 class MeetingEvent(BaseModel):

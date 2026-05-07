@@ -9,10 +9,41 @@ public interface IMeetingChatService
     Task DetachFromCallAsync(ICall call, CancellationToken cancellationToken = default);
     string? GetChatThreadIdForCall(string callId);
     bool IsTrackedChatThread(string chatThreadId);
+    bool IsTrackedChannel(string teamId, string channelId);
+
+    /// <summary>
+    /// Returns true when the bot is actively listening on the given thread,
+    /// regardless of whether the thread belongs to a meeting chat or a team
+    /// channel. Used by <see cref="GraphNotificationProcessor"/> to filter.
+    /// </summary>
+    bool IsTrackedConversationThread(string threadId);
+
+    Task<ChannelSubscriptionResult> EnsureChannelMessagesSubscriptionAsync(
+        string teamId,
+        string channelId,
+        CancellationToken cancellationToken = default);
+
+    Task DeleteChannelMessagesSubscriptionAsync(
+        string teamId,
+        string channelId,
+        CancellationToken cancellationToken = default);
+
     Task HandleLifecycleEventAsync(
         string? subscriptionId,
         string? lifecycleEvent,
         CancellationToken cancellationToken = default);
+}
+
+/// <summary>
+/// Result of attaching a Graph subscription to a channel's messages
+/// resource. Returned to <see cref="ChannelAttachmentService"/> so the
+/// persistent attachment record can capture the subscription state.
+/// </summary>
+public sealed record ChannelSubscriptionResult
+{
+    public required string SubscriptionId { get; init; }
+    public required string Resource { get; init; }
+    public required DateTimeOffset ExpiresAtUtc { get; init; }
 }
 
 public sealed class MeetingChatService : IMeetingChatService, IAsyncDisposable
@@ -32,6 +63,8 @@ public sealed class MeetingChatService : IMeetingChatService, IAsyncDisposable
     private readonly Dictionary<string, int> _activeChatThreadRefCounts = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _resourceToSubscriptionId = new(StringComparer.Ordinal);
     private readonly Dictionary<string, GraphSubscriptionRecord> _subscriptionsById = new(StringComparer.Ordinal);
+
+    private readonly HashSet<string> _attachedChannelKeys = new(StringComparer.Ordinal);
 
     private Task? _renewalLoopTask;
     private bool _disposed;
@@ -169,6 +202,137 @@ public sealed class MeetingChatService : IMeetingChatService, IAsyncDisposable
 
         return _activeChatThreadRefCounts.ContainsKey(chatThreadId);
     }
+
+    public bool IsTrackedChannel(string teamId, string channelId)
+    {
+        if (string.IsNullOrWhiteSpace(teamId) || string.IsNullOrWhiteSpace(channelId))
+        {
+            return false;
+        }
+
+        var resource = BuildChannelMessagesResource(teamId, channelId);
+        return _resourceToSubscriptionId.ContainsKey(resource)
+            || _attachedChannelKeys.Contains(BuildChannelKey(teamId, channelId));
+    }
+
+    public bool IsTrackedConversationThread(string threadId)
+    {
+        if (string.IsNullOrWhiteSpace(threadId))
+        {
+            return false;
+        }
+
+        if (_activeChatThreadRefCounts.ContainsKey(threadId))
+        {
+            return true;
+        }
+
+        // Channel conversation ids look like "19:{channelId}@thread.tacv2"; we
+        // don't have a reverse map from conversation id to (teamId, channelId)
+        // here, so the GraphNotificationProcessor must compare against the
+        // resource path directly. Returning false is correct: channel
+        // notifications are gated on resource (teams/.../channels/.../messages),
+        // not on conversation thread id.
+        return false;
+    }
+
+    public async Task<ChannelSubscriptionResult> EnsureChannelMessagesSubscriptionAsync(
+        string teamId,
+        string channelId,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(teamId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(channelId);
+
+        if (!CanManageGraphSubscriptions())
+        {
+            throw new InvalidOperationException(
+                "Cannot manage channel subscriptions: MeetingChat.GraphNotificationBaseUrl and "
+                + "ChatSubscriptionClientStateSecret must be configured.");
+        }
+
+        var resource = BuildChannelMessagesResource(teamId, channelId);
+
+        await _mutex.WaitAsync(cancellationToken);
+        try
+        {
+            EnsureRenewalLoopStarted();
+            _attachedChannelKeys.Add(BuildChannelKey(teamId, channelId));
+
+            var subscription = await EnsureSubscriptionLockedAsync(resource, cancellationToken);
+            _logger.LogInformation(
+                "Ensured channel-messages subscription {SubscriptionId} for resource {Resource}",
+                subscription.Id,
+                subscription.Resource);
+
+            return new ChannelSubscriptionResult
+            {
+                SubscriptionId = subscription.Id,
+                Resource = subscription.Resource,
+                ExpiresAtUtc = subscription.ExpirationDateTime,
+            };
+        }
+        finally
+        {
+            _mutex.Release();
+        }
+    }
+
+    public async Task DeleteChannelMessagesSubscriptionAsync(
+        string teamId,
+        string channelId,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(teamId) || string.IsNullOrWhiteSpace(channelId))
+        {
+            return;
+        }
+
+        string? subscriptionIdToDelete = null;
+        var resource = BuildChannelMessagesResource(teamId, channelId);
+
+        await _mutex.WaitAsync(cancellationToken);
+        try
+        {
+            _attachedChannelKeys.Remove(BuildChannelKey(teamId, channelId));
+
+            if (_resourceToSubscriptionId.TryGetValue(resource, out var subscriptionId))
+            {
+                subscriptionIdToDelete = subscriptionId;
+                UnregisterSubscriptionLocked(subscriptionId);
+            }
+        }
+        finally
+        {
+            _mutex.Release();
+        }
+
+        if (!string.IsNullOrWhiteSpace(subscriptionIdToDelete))
+        {
+            try
+            {
+                await _graphApiClient.DeleteSubscriptionAsync(subscriptionIdToDelete, cancellationToken);
+                _logger.LogInformation(
+                    "Deleted channel subscription {SubscriptionId} for resource {Resource}",
+                    subscriptionIdToDelete,
+                    resource);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Failed to delete channel subscription {SubscriptionId} for resource {Resource}",
+                    subscriptionIdToDelete,
+                    resource);
+            }
+        }
+    }
+
+    private static string BuildChannelMessagesResource(string teamId, string channelId) =>
+        $"teams/{Uri.EscapeDataString(teamId)}/channels/{Uri.EscapeDataString(channelId)}/messages";
+
+    private static string BuildChannelKey(string teamId, string channelId) =>
+        $"{teamId}|{channelId}";
 
     public async Task HandleLifecycleEventAsync(
         string? subscriptionId,

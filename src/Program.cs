@@ -113,6 +113,20 @@ try
     builder.Services.AddSingleton<GraphValidationTokenValidator>();
     builder.Services.AddSingleton<GraphNotificationProcessor>();
 
+    // Persistent channel attachments (channel-level analog of "the bot is in
+    // this meeting"). Re-issues subscriptions for each persisted channel on
+    // startup so attachment is genuinely durable across bot restarts.
+    builder.Services.AddSingleton(new ChannelAttachmentStoreOptions
+    {
+        FilePath = meetingChatConfig.ChannelAttachmentStorePath,
+    });
+    builder.Services.AddSingleton<ChannelAttachmentStore>();
+    builder.Services.AddSingleton<ChannelAttachmentService>();
+    builder.Services.AddSingleton<IChannelAttachmentService>(sp =>
+        sp.GetRequiredService<ChannelAttachmentService>());
+    builder.Services.AddHostedService(sp =>
+        sp.GetRequiredService<ChannelAttachmentService>());
+
     // Register Graph Communications logger
     builder.Services.AddSingleton<IGraphLogger>(sp =>
     {

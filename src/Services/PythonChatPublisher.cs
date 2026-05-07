@@ -77,6 +77,14 @@ public sealed class PythonChatPublisher
 /// <summary>
 /// Wire shape sent to the Python sink's /chat endpoint.
 /// Must stay in sync with ChatMessageRequest in python/transcript_sink.py.
+///
+/// <para>
+/// <c>chat_thread_id</c> is the canonical session key. For meeting chats it is
+/// <c>19:meeting_xxx@thread.v2</c>; for Teams channels it is
+/// <c>19:{channel-id}@thread.tacv2</c> (or <c>@thread.skype</c> for legacy
+/// channels). <c>conversation_kind</c> distinguishes them, and
+/// <c>team_id</c>/<c>channel_id</c> are populated for channel activities.
+/// </para>
 /// </summary>
 public sealed record ChatEventPayload
 {
@@ -94,4 +102,15 @@ public sealed record ChatEventPayload
     [JsonPropertyName("reply_to_message_id")] public string? ReplyToMessageId { get; init; }
     [JsonPropertyName("from_bot")] public bool FromBot { get; init; }
     public Dictionary<string, object?>? Raw { get; init; }
+
+    /// <summary>
+    /// "meeting_chat", "channel", "group_chat", or "personal".
+    /// </summary>
+    [JsonPropertyName("conversation_kind")] public string? ConversationKind { get; init; }
+
+    /// <summary>Teams team (group) id when the activity is in a team channel.</summary>
+    [JsonPropertyName("team_id")] public string? TeamId { get; init; }
+
+    /// <summary>Teams channel id when the activity is in a team channel.</summary>
+    [JsonPropertyName("channel_id")] public string? ChannelId { get; init; }
 }

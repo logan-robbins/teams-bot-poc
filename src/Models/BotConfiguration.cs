@@ -296,4 +296,14 @@ public sealed class MeetingChatConfiguration
     /// When false, create per-chat subscriptions tied to active calls.
     /// </summary>
     public bool UseInstalledToChatsSubscription { get; init; } = true;
+
+    /// <summary>
+    /// Absolute path to the JSON file that persists Alfred's channel
+    /// attachments across bot restarts. Each entry binds a
+    /// <c>(teamId, channelId)</c> pair to its Graph subscription state, so
+    /// channel attachment really is persistent — once attached, the bot
+    /// resumes listening on every restart with no manual reattach.
+    /// </summary>
+    public string ChannelAttachmentStorePath { get; init; } =
+        @"C:\teams-bot-poc\state\channel-attachments.json";
 }

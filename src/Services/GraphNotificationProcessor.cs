@@ -117,9 +117,19 @@ public sealed partial class GraphNotificationProcessor
                 return;
             }
 
-            if (!_meetingChatService.IsTrackedChatThread(payload.ChatThreadId))
+            var isChannel = string.Equals(payload.ConversationKind, "channel", StringComparison.Ordinal);
+            var isTracked = isChannel
+                ? _meetingChatService.IsTrackedChannel(payload.TeamId ?? string.Empty, payload.ChannelId ?? string.Empty)
+                : _meetingChatService.IsTrackedChatThread(payload.ChatThreadId);
+
+            if (!isTracked)
             {
-                _logger.LogDebug("Skipping Graph chat event for inactive thread {ChatThreadId}", payload.ChatThreadId);
+                _logger.LogDebug(
+                    "Skipping Graph event for untracked source kind={Kind} thread={ChatThreadId} team={TeamId} channel={ChannelId}",
+                    payload.ConversationKind ?? "meeting_chat",
+                    payload.ChatThreadId,
+                    payload.TeamId,
+                    payload.ChannelId);
                 return;
             }
 
@@ -157,9 +167,24 @@ public sealed partial class GraphNotificationProcessor
     private ChatEventPayload? BuildChatEventPayload(GraphNotification notification, JsonDocument? document)
     {
         var root = document?.RootElement;
-        var chatThreadId = TryGetString(root, "chatId")
-            ?? ParseChatThreadId(notification.ResourceData?.OdataId)
-            ?? ParseChatThreadId(notification.Resource);
+
+        var resourceForParsing = notification.ResourceData?.OdataId ?? notification.Resource;
+        var (teamIdFromResource, channelIdFromResource) = ParseChannelIds(resourceForParsing);
+        var teamId = TryGetNestedString(root, "channelIdentity", "teamId") ?? teamIdFromResource;
+        var channelId = TryGetNestedString(root, "channelIdentity", "channelId") ?? channelIdFromResource;
+        var isChannel = !string.IsNullOrWhiteSpace(teamId) && !string.IsNullOrWhiteSpace(channelId);
+
+        string? chatThreadId;
+        if (isChannel)
+        {
+            chatThreadId = $"19:{channelId}@thread.tacv2";
+        }
+        else
+        {
+            chatThreadId = TryGetString(root, "chatId")
+                ?? ParseChatThreadId(notification.ResourceData?.OdataId)
+                ?? ParseChatThreadId(notification.Resource);
+        }
 
         if (string.IsNullOrWhiteSpace(chatThreadId))
         {
@@ -206,10 +231,46 @@ public sealed partial class GraphNotificationProcessor
             ReplyToMessageId = TryGetString(root, "replyToId"),
             FromBot = string.Equals(senderApplicationId, _botConfig.AppId, StringComparison.OrdinalIgnoreCase)
                 || string.Equals(senderId, _botConfig.AppId, StringComparison.OrdinalIgnoreCase),
+            ConversationKind = isChannel ? "channel" : "meeting_chat",
+            TeamId = teamId,
+            ChannelId = channelId,
             Raw = root.HasValue
                 ? JsonSerializer.Deserialize<Dictionary<string, object?>>(root.Value.GetRawText(), SerializerOptions)
                 : BuildMinimalRaw(notification, chatThreadId, messageId),
         };
+    }
+
+    /// <summary>
+    /// Parses <c>(teamId, channelId)</c> out of a Graph notification resource
+    /// path of the shape <c>teams/{teamId}/channels/{channelId}/messages/{id}</c>.
+    /// Returns <c>(null, null)</c> when the resource is not a channel-messages
+    /// path.
+    /// </summary>
+    private static (string? TeamId, string? ChannelId) ParseChannelIds(string? resource)
+    {
+        if (string.IsNullOrWhiteSpace(resource))
+        {
+            return (null, null);
+        }
+
+        var path = ExtractPath(resource);
+        var segments = path.Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        string? teamId = null;
+        string? channelId = null;
+        for (var index = 0; index < segments.Length - 1; index++)
+        {
+            if (string.Equals(segments[index], "teams", StringComparison.OrdinalIgnoreCase))
+            {
+                teamId = Uri.UnescapeDataString(segments[index + 1]);
+            }
+            else if (string.Equals(segments[index], "channels", StringComparison.OrdinalIgnoreCase))
+            {
+                channelId = Uri.UnescapeDataString(segments[index + 1]);
+            }
+        }
+
+        return (teamId, channelId);
     }
 
     private bool ValidateClientState(string? clientState)
