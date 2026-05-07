@@ -108,6 +108,7 @@ try
     // Meeting-chat services (inbound chat → Python sink; Graph subscription lifecycle).
     builder.Services.AddSingleton<IMeetingChatService, MeetingChatService>();
     builder.Services.AddHttpClient<PythonChatPublisher>();
+    builder.Services.AddHttpClient<ChannelLinkPublisher>();
     builder.Services.AddHttpClient<GraphApiClient>();
     builder.Services.AddSingleton<GraphNotificationCrypto>();
     builder.Services.AddSingleton<GraphValidationTokenValidator>();

@@ -145,7 +145,16 @@ public sealed class AzureSpeechRealtimeTranscriber : IRealtimeTranscriber
 
     /// <inheritdoc/>
     public string? ChatThreadId { get; set; }
-    
+
+    /// <inheritdoc/>
+    public string? TeamId { get; set; }
+
+    /// <inheritdoc/>
+    public string? ChannelId { get; set; }
+
+    /// <inheritdoc/>
+    public string? ChannelThreadId { get; set; }
+
     // Transcript file path - save to Desktop for easy viewing
     private static readonly string TranscriptFilePath = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
@@ -340,7 +349,10 @@ public sealed class AzureSpeechRealtimeTranscriber : IRealtimeTranscriber
             TimestampUtc: timestamp,
             ChatThreadId: ChatThreadId,
             Metadata: new EventMetadata(Provider: "azure_speech", Model: null, SessionId: null),
-            Error: error
+            Error: error,
+            TeamId: TeamId,
+            ChannelId: ChannelId,
+            ChannelThreadId: ChannelThreadId
         );
         
         // Publish to Python endpoint

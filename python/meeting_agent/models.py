@@ -119,6 +119,16 @@ class ChatMessage(BaseModel):
         default=None,
         description="Teams channel id when the event is in a team channel.",
     )
+    channel_thread_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Parent channel's conversation id (19:{channelId}@thread.tacv2). "
+            "For a channel post this equals chat_thread_id; for a meeting "
+            "spawned from the channel this points at the parent channel's "
+            "thread, allowing analytics to roll meetings up under their "
+            "parent channel by channel_id alone."
+        ),
+    )
 
 
 class MeetingEvent(BaseModel):
@@ -149,6 +159,21 @@ class MeetingEvent(BaseModel):
     superseded_by: Optional[str] = Field(
         default=None,
         description="When non-null, points at the event_id that supersedes this row (E2)",
+    )
+    team_id: Optional[str] = Field(
+        default=None,
+        description="Teams team (group) id; backfillable via /session/link.",
+    )
+    channel_id: Optional[str] = Field(
+        default=None,
+        description="Teams channel id; backfillable via /session/link.",
+    )
+    channel_thread_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Parent channel's conversation id; for events emitted by a "
+            "meeting spawned from a channel, points at the parent channel."
+        ),
     )
 
 
@@ -205,6 +230,21 @@ class RawIngestEvent(BaseModel):
             "malformed",
         ]
     ] = None
+    team_id: Optional[str] = Field(
+        default=None,
+        description="Teams team (group) id; backfillable via /session/link.",
+    )
+    channel_id: Optional[str] = Field(
+        default=None,
+        description="Teams channel id; backfillable via /session/link.",
+    )
+    channel_thread_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Parent channel's conversation id; for raw events emitted by a "
+            "meeting spawned from a channel, points at the parent channel."
+        ),
+    )
 
 
 class OutboundChatIntent(BaseModel):

@@ -23,6 +23,29 @@ public interface IRealtimeTranscriber : IAsyncDisposable
     string? ChatThreadId { get; set; }
 
     /// <summary>
+    /// Teams team (group) id of the parent channel, when the bot has
+    /// learned that this meeting was spawned from a channel. Stamped
+    /// on every emitted <see cref="TeamsMediaBot.Models.TranscriptEvent"/>
+    /// so the Python sink can roll transcripts up by channel without
+    /// a join. Null for private (non-channel) meetings.
+    /// </summary>
+    string? TeamId { get; set; }
+
+    /// <summary>
+    /// Teams channel id of the parent channel; paired with
+    /// <see cref="TeamId"/>. Null for private (non-channel) meetings.
+    /// </summary>
+    string? ChannelId { get; set; }
+
+    /// <summary>
+    /// Parent channel's conversation id (<c>19:{channelId}@thread.tacv2</c>),
+    /// distinct from this meeting's <see cref="ChatThreadId"/>. Lets
+    /// analytics group every event from every meeting back under the
+    /// channel that spawned it.
+    /// </summary>
+    string? ChannelThreadId { get; set; }
+
+    /// <summary>
     /// Starts the transcription session.
     /// </summary>
     /// <param name="ct">Optional cancellation token.</param>

@@ -25,7 +25,7 @@ import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
 
 from pydantic import BaseModel
 
@@ -81,6 +81,9 @@ CREATE TABLE IF NOT EXISTS meeting_events (
     raw_json TEXT,
     source_raw_event_ids_json TEXT DEFAULT '[]',
     superseded_by TEXT,
+    team_id TEXT,
+    channel_id TEXT,
+    channel_thread_id TEXT,
     PRIMARY KEY (session_id, event_id),
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
@@ -99,12 +102,31 @@ CREATE TABLE IF NOT EXISTS raw_ingest_events (
     raw_payload_json       TEXT NOT NULL,
     normalized_payload_json TEXT,
     normalized_event_id    TEXT,
-    dropped_reason         TEXT
+    dropped_reason         TEXT,
+    team_id                TEXT,
+    channel_id             TEXT,
+    channel_thread_id      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_raw_ingest_session_received
     ON raw_ingest_events(session_id, received_at_utc);
 CREATE INDEX IF NOT EXISTS idx_raw_ingest_payload_hash
     ON raw_ingest_events(payload_hash);
+
+-- Session ↔ channel link. Lets a meeting spawned from a channel inherit
+-- (team_id, channel_id, channel_thread_id) so analytics can group every
+-- event by channel_id alone. Populated by POST /session/link from the
+-- C# bot when channel context becomes known (often AFTER first events
+-- have already been written), and used to backfill prior events.
+CREATE TABLE IF NOT EXISTS session_channel_links (
+    chat_thread_id    TEXT PRIMARY KEY,
+    team_id           TEXT NOT NULL,
+    channel_id        TEXT NOT NULL,
+    channel_thread_id TEXT,
+    source            TEXT,
+    linked_at_utc     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_session_channel_links_channel
+    ON session_channel_links(channel_id);
 
 CREATE TABLE IF NOT EXISTS meeting_participants (
     session_id        TEXT NOT NULL,
@@ -218,18 +240,47 @@ class SessionStore:
 
     def _migrate(self, conn: sqlite3.Connection) -> None:
         """Best-effort additive column migrations for previously-deployed DBs."""
-        existing = {row[1] for row in conn.execute("PRAGMA table_info(meeting_events)")}
-        additive: list[tuple[str, str]] = [
+        existing_meeting = {
+            row[1] for row in conn.execute("PRAGMA table_info(meeting_events)")
+        }
+        meeting_additive: list[tuple[str, str]] = [
             ("participant_id", "TEXT"),
             ("aad_object_id", "TEXT"),
             ("media_source_id", "TEXT"),
             ("source_raw_event_ids_json", "TEXT DEFAULT '[]'"),
             ("superseded_by", "TEXT"),
+            ("team_id", "TEXT"),
+            ("channel_id", "TEXT"),
+            ("channel_thread_id", "TEXT"),
         ]
-        for column, decl in additive:
-            if column in existing:
+        for column, decl in meeting_additive:
+            if column in existing_meeting:
                 continue
             conn.execute(f"ALTER TABLE meeting_events ADD COLUMN {column} {decl}")
+
+        existing_raw = {
+            row[1] for row in conn.execute("PRAGMA table_info(raw_ingest_events)")
+        }
+        raw_additive: list[tuple[str, str]] = [
+            ("team_id", "TEXT"),
+            ("channel_id", "TEXT"),
+            ("channel_thread_id", "TEXT"),
+        ]
+        for column, decl in raw_additive:
+            if column in existing_raw:
+                continue
+            conn.execute(f"ALTER TABLE raw_ingest_events ADD COLUMN {column} {decl}")
+
+        # Backfill indexes that the original CREATE TABLE statements add
+        # only on fresh databases.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_meeting_events_channel_ts "
+            "ON meeting_events(channel_id, timestamp_utc)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_raw_ingest_channel_received "
+            "ON raw_ingest_events(channel_id, received_at_utc)"
+        )
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(
@@ -290,8 +341,9 @@ class SessionStore:
                     text, role, speaker_id, participant_id, aad_object_id,
                     media_source_id, display_name, message_id,
                     reply_to_message_id, from_bot, confidence, raw_json,
-                    source_raw_event_ids_json, superseded_by
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    source_raw_event_ids_json, superseded_by,
+                    team_id, channel_id, channel_thread_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
@@ -313,6 +365,9 @@ class SessionStore:
                     _json(event.raw) if event.raw is not None else None,
                     _json(event.source_raw_event_ids or []),
                     event.superseded_by,
+                    event.team_id,
+                    event.channel_id,
+                    event.channel_thread_id,
                 ),
             )
 
@@ -330,8 +385,9 @@ class SessionStore:
                     raw_event_id, session_id, received_at_utc,
                     provider_timestamp_utc, source, event_type,
                     speaker_or_sender_id, payload_hash, raw_payload_json,
-                    normalized_payload_json, normalized_event_id, dropped_reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    normalized_payload_json, normalized_event_id, dropped_reason,
+                    team_id, channel_id, channel_thread_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     raw.raw_event_id,
@@ -346,8 +402,136 @@ class SessionStore:
                     raw.normalized_payload_json,
                     raw.normalized_event_id,
                     raw.dropped_reason,
+                    raw.team_id,
+                    raw.channel_id,
+                    raw.channel_thread_id,
                 ),
             )
+
+    # -- Channel link / backfill -----------------------------------------
+
+    def link_session_to_channel(
+        self,
+        chat_thread_id: str,
+        team_id: str,
+        channel_id: str,
+        channel_thread_id: Optional[str] = None,
+        source: Optional[str] = None,
+    ) -> dict[str, int]:
+        """Persist a session ↔ channel binding and backfill prior events.
+
+        Used by ``POST /session/link`` so that meetings spawned from a
+        channel inherit ``(team_id, channel_id, channel_thread_id)`` even
+        on rows written before the link was known. Returns a count of
+        rows updated per table so callers can verify the backfill.
+        """
+        if not chat_thread_id or not team_id or not channel_id:
+            raise ValueError("chat_thread_id, team_id, and channel_id are required")
+
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO session_channel_links (
+                    chat_thread_id, team_id, channel_id, channel_thread_id,
+                    source, linked_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_thread_id) DO UPDATE SET
+                    team_id = excluded.team_id,
+                    channel_id = excluded.channel_id,
+                    channel_thread_id = excluded.channel_thread_id,
+                    source = excluded.source,
+                    linked_at_utc = excluded.linked_at_utc
+                """,
+                (
+                    chat_thread_id,
+                    team_id,
+                    channel_id,
+                    channel_thread_id,
+                    source,
+                    _iso_now(),
+                ),
+            )
+
+            # Backfill any session whose graph_chat_thread_id matches.
+            session_ids = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT session_id FROM sessions WHERE graph_chat_thread_id = ?",
+                    (chat_thread_id,),
+                )
+            ]
+
+            meeting_updates = 0
+            raw_updates = 0
+            for sid in session_ids:
+                cur_m = conn.execute(
+                    """
+                    UPDATE meeting_events
+                    SET team_id = ?, channel_id = ?, channel_thread_id = ?
+                    WHERE session_id = ?
+                    """,
+                    (team_id, channel_id, channel_thread_id, sid),
+                )
+                meeting_updates += cur_m.rowcount or 0
+
+                cur_r = conn.execute(
+                    """
+                    UPDATE raw_ingest_events
+                    SET team_id = ?, channel_id = ?, channel_thread_id = ?
+                    WHERE session_id = ?
+                    """,
+                    (team_id, channel_id, channel_thread_id, sid),
+                )
+                raw_updates += cur_r.rowcount or 0
+
+            return {
+                "sessions_matched": len(session_ids),
+                "meeting_events_updated": meeting_updates,
+                "raw_ingest_events_updated": raw_updates,
+            }
+
+    def get_channel_link(self, chat_thread_id: str) -> Optional[dict[str, Optional[str]]]:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT team_id, channel_id, channel_thread_id, source, linked_at_utc
+                FROM session_channel_links
+                WHERE chat_thread_id = ?
+                """,
+                (chat_thread_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "chat_thread_id": chat_thread_id,
+            "team_id": row[0],
+            "channel_id": row[1],
+            "channel_thread_id": row[2],
+            "source": row[3],
+            "linked_at_utc": row[4],
+        }
+
+    def list_channel_links(self) -> list[dict[str, Optional[str]]]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT chat_thread_id, team_id, channel_id, channel_thread_id,
+                       source, linked_at_utc
+                FROM session_channel_links
+                ORDER BY linked_at_utc DESC
+                """
+            ).fetchall()
+        return [
+            {
+                "chat_thread_id": r[0],
+                "team_id": r[1],
+                "channel_id": r[2],
+                "channel_thread_id": r[3],
+                "source": r[4],
+                "linked_at_utc": r[5],
+            }
+            for r in rows
+        ]
 
     # -- Participant identity (E3) ---------------------------------------
 
@@ -724,13 +908,72 @@ class SessionStore:
             "SELECT event_id, kind, source, timestamp_utc, text, role, speaker_id,"
             " participant_id, aad_object_id, media_source_id, display_name,"
             " message_id, reply_to_message_id, from_bot, confidence,"
-            " source_raw_event_ids_json, superseded_by"
+            " source_raw_event_ids_json, superseded_by,"
+            " team_id, channel_id, channel_thread_id"
             " FROM meeting_events WHERE session_id = ? ORDER BY timestamp_utc ASC"
         )
         params: list[Any] = [session_id]
         if limit is not None:
             query += " LIMIT ?"
             params.append(int(limit))
+        with self._connect() as conn:
+            cur = conn.execute(query, params)
+            rows = [dict(row) for row in cur.fetchall()]
+        for row in rows:
+            row["from_bot"] = bool(row["from_bot"])
+            row["source_raw_event_ids"] = json.loads(
+                row.pop("source_raw_event_ids_json") or "[]"
+            )
+        return rows
+
+    def get_channel_ledger(
+        self,
+        channel_id: str,
+        *,
+        team_id: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        kinds: list[str] | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return every meeting event tagged with this channel, ordered by time.
+
+        This is the analytical lens that motivated the metadata work:
+        one query that returns channel chat AND every meeting (chat +
+        STT) the bot saw under that channel, merged on
+        ``timestamp_utc``. Either rows are stamped at write time or
+        backfilled by ``link_session_to_channel``; both are equivalent.
+        """
+        clauses = ["channel_id = ?"]
+        params: list[Any] = [channel_id]
+        if team_id:
+            clauses.append("team_id = ?")
+            params.append(team_id)
+        if since:
+            clauses.append("timestamp_utc >= ?")
+            params.append(since)
+        if until:
+            clauses.append("timestamp_utc <= ?")
+            params.append(until)
+        if kinds:
+            placeholders = ",".join(["?"] * len(kinds))
+            clauses.append(f"kind IN ({placeholders})")
+            params.extend(kinds)
+
+        query = (
+            "SELECT session_id, event_id, kind, source, timestamp_utc, text, role,"
+            " speaker_id, participant_id, aad_object_id, media_source_id,"
+            " display_name, message_id, reply_to_message_id, from_bot, confidence,"
+            " source_raw_event_ids_json, superseded_by,"
+            " team_id, channel_id, channel_thread_id"
+            " FROM meeting_events"
+            f" WHERE {' AND '.join(clauses)}"
+            " ORDER BY timestamp_utc ASC"
+        )
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(int(limit))
+
         with self._connect() as conn:
             cur = conn.execute(query, params)
             rows = [dict(row) for row in cur.fetchall()]
@@ -751,7 +994,8 @@ class SessionStore:
         query = (
             "SELECT raw_event_id, session_id, received_at_utc, provider_timestamp_utc,"
             " source, event_type, speaker_or_sender_id, payload_hash, raw_payload_json,"
-            " normalized_payload_json, normalized_event_id, dropped_reason"
+            " normalized_payload_json, normalized_event_id, dropped_reason,"
+            " team_id, channel_id, channel_thread_id"
             " FROM raw_ingest_events WHERE session_id = ?"
         )
         params: list[Any] = [session_id]
@@ -771,7 +1015,8 @@ class SessionStore:
         query = (
             "SELECT raw_event_id, session_id, received_at_utc, provider_timestamp_utc,"
             " source, event_type, speaker_or_sender_id, payload_hash, raw_payload_json,"
-            " normalized_payload_json, normalized_event_id, dropped_reason"
+            " normalized_payload_json, normalized_event_id, dropped_reason,"
+            " team_id, channel_id, channel_thread_id"
             " FROM raw_ingest_events WHERE session_id = ? ORDER BY received_at_utc ASC"
         )
         with self._connect() as conn:

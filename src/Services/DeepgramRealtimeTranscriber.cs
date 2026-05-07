@@ -37,6 +37,15 @@ public sealed class DeepgramRealtimeTranscriber : IRealtimeTranscriber
     /// <inheritdoc/>
     public string? ChatThreadId { get; set; }
 
+    /// <inheritdoc/>
+    public string? TeamId { get; set; }
+
+    /// <inheritdoc/>
+    public string? ChannelId { get; set; }
+
+    /// <inheritdoc/>
+    public string? ChannelThreadId { get; set; }
+
     /// <summary>
     /// Initializes a new instance of the <see cref="DeepgramRealtimeTranscriber"/> class.
     /// </summary>
@@ -230,7 +239,10 @@ public sealed class DeepgramRealtimeTranscriber : IRealtimeTranscriber
                 Provider: "deepgram",
                 Model: _model,
                 SessionId: _sessionId
-            )
+            ),
+            TeamId: TeamId,
+            ChannelId: ChannelId,
+            ChannelThreadId: ChannelThreadId
         );
 
         // Fire-and-forget publish (don't block audio processing thread)
@@ -307,7 +319,10 @@ public sealed class DeepgramRealtimeTranscriber : IRealtimeTranscriber
             TimestampUtc: DateTime.UtcNow.ToString("O"),
             ChatThreadId: ChatThreadId,
             Metadata: new EventMetadata(Provider: "deepgram", Model: _model, SessionId: _sessionId),
-            Error: error
+            Error: error,
+            TeamId: TeamId,
+            ChannelId: ChannelId,
+            ChannelThreadId: ChannelThreadId
         );
         PublishEventAsync(transcriptEvent);
     }

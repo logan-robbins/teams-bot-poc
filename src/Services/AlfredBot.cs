@@ -29,17 +29,20 @@ public sealed class AlfredBot : TeamsActivityHandler
     private readonly IConversationReferenceStore _references;
     private readonly PythonChatPublisher _chatPublisher;
     private readonly IChannelAttachmentService _channelAttachments;
+    private readonly ChannelLinkPublisher _channelLinkPublisher;
     private readonly ILogger<AlfredBot> _logger;
 
     public AlfredBot(
         IConversationReferenceStore references,
         PythonChatPublisher chatPublisher,
         IChannelAttachmentService channelAttachments,
+        ChannelLinkPublisher channelLinkPublisher,
         ILogger<AlfredBot> logger)
     {
         _references = references;
         _chatPublisher = chatPublisher;
         _channelAttachments = channelAttachments;
+        _channelLinkPublisher = channelLinkPublisher;
         _logger = logger;
     }
 
@@ -127,6 +130,8 @@ public sealed class AlfredBot : TeamsActivityHandler
 
         var channelData = TryGetChannelData(activity);
         var conversationKind = ResolveConversationKind(activity, channelData);
+        var teamId = ResolveTeamId(channelData);
+        var channelId = channelData?.Channel?.Id;
 
         var payload = new ChatEventPayload
         {
@@ -142,11 +147,30 @@ public sealed class AlfredBot : TeamsActivityHandler
             ReplyToMessageId = activity.ReplyToId,
             FromBot = activity.From?.Role == "bot",
             ConversationKind = conversationKind,
-            TeamId = ResolveTeamId(channelData),
-            ChannelId = channelData?.Channel?.Id,
+            TeamId = teamId,
+            ChannelId = channelId,
+            ChannelThreadId = channelId,
         };
 
         await _chatPublisher.PublishAsync(payload, cancellationToken);
+
+        // If this activity is in a meeting chat that was spawned from a
+        // channel (channelData carries team + channel, but the chat
+        // thread id is the meeting's thread, not the channel's),
+        // tell the sink so every transcript / chat / system event for
+        // this meeting can later be rolled up under the parent channel.
+        if (!string.IsNullOrWhiteSpace(teamId)
+            && !string.IsNullOrWhiteSpace(channelId)
+            && !string.Equals(chatThreadId, channelId, StringComparison.Ordinal))
+        {
+            _ = _channelLinkPublisher.PublishLinkAsync(
+                chatThreadId,
+                teamId!,
+                channelId!,
+                channelId,
+                source: "bot_framework_channeldata",
+                cancellationToken: cancellationToken);
+        }
     }
 
     private void CaptureConversationReference(ITurnContext turnContext)

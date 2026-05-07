@@ -49,7 +49,27 @@ public record TranscriptEvent(
     /// E3: Snapshot of MediaSourceIds active in the buffer at publish
     /// time, sourced from AudioMediaBuffer.ActiveSpeakers.
     /// </summary>
-    uint[]? ActiveMediaSourceIds = null
+    uint[]? ActiveMediaSourceIds = null,
+
+    /// <summary>
+    /// Teams team (group) id, when the bot has learned that this
+    /// meeting was spawned from a channel. Stamped on every transcript
+    /// emitted for the call so the Python sink can group by channel
+    /// without an extra join.
+    /// </summary>
+    string? TeamId = null,
+
+    /// <summary>
+    /// Teams channel id, paired with <see cref="TeamId"/>.
+    /// </summary>
+    string? ChannelId = null,
+
+    /// <summary>
+    /// Parent channel's conversation id (<c>19:{channelId}@thread.tacv2</c>).
+    /// Lets meetings spawned from a channel roll up under it for
+    /// later channel-wide analytics.
+    /// </summary>
+    string? ChannelThreadId = null
 );
 
 public record WordDetail(

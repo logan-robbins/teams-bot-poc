@@ -275,6 +275,26 @@ class TranscriptEventRequest(BaseModel):
             "AudioMediaBuffer.ActiveSpeakers (E3)."
         ),
     )
+    team_id: str | None = Field(
+        default=None,
+        description=(
+            "Teams team (group) id, when the bot has learned that this "
+            "meeting was spawned from a channel. Stamped on every "
+            "downstream MeetingEvent + RawIngestEvent so analytics can "
+            "group transcripts by channel_id."
+        ),
+    )
+    channel_id: str | None = Field(
+        default=None,
+        description="Teams channel id, paired with team_id.",
+    )
+    channel_thread_id: str | None = Field(
+        default=None,
+        description=(
+            "Parent channel's conversation id (19:{channelId}@thread.tacv2). "
+            "Lets meetings spawned from a channel roll up under it."
+        ),
+    )
 
     # v1 fields (legacy aliases)
     Kind: str | None = Field(default=None, description="Legacy v1 event kind")
@@ -390,6 +410,14 @@ class ChatMessageRequest(BaseModel):
     channel_id: str | None = Field(
         default=None,
         description="Teams channel id when the event is in a team channel.",
+    )
+    channel_thread_id: str | None = Field(
+        default=None,
+        description=(
+            "Parent channel's conversation id (19:{channelId}@thread.tacv2). "
+            "For a channel post equals chat_thread_id; for a meeting "
+            "spawned from the channel points at the parent."
+        ),
     )
 
     model_config = {"extra": "ignore"}
@@ -926,6 +954,41 @@ def _stable_json(payload: Any) -> str:
     return _json_mod.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
 
 
+def resolve_channel_context(
+    store: SessionStore,
+    chat_thread_id: str | None,
+    *,
+    team_id: str | None = None,
+    channel_id: str | None = None,
+    channel_thread_id: str | None = None,
+) -> tuple[str | None, str | None, str | None]:
+    """Resolve the channel-context tuple stamped on every event.
+
+    Precedence: explicit values from the inbound request first
+    (the C# bot stamps these once it has learned the context), then
+    fall back to the persisted ``session_channel_links`` row for this
+    thread (set via ``POST /session/link``). Returning Nones is fine —
+    they indicate "no channel context known yet". A subsequent
+    ``/session/link`` will backfill prior rows.
+    """
+    if team_id and channel_id:
+        return team_id, channel_id, channel_thread_id
+    if not chat_thread_id:
+        return team_id, channel_id, channel_thread_id
+    try:
+        link = store.get_channel_link(chat_thread_id)
+    except Exception as exc:  # noqa: BLE001 - resolver must not break ingest
+        logger.debug("channel link lookup failed for %s: %s", chat_thread_id, exc)
+        return team_id, channel_id, channel_thread_id
+    if not link:
+        return team_id, channel_id, channel_thread_id
+    return (
+        team_id or link.get("team_id"),
+        channel_id or link.get("channel_id"),
+        channel_thread_id or link.get("channel_thread_id"),
+    )
+
+
 def record_raw(
     store: SessionStore,
     *,
@@ -938,6 +1001,9 @@ def record_raw(
     dropped_reason: str | None = None,
     normalized_payload: Any | None = None,
     normalized_event_id: str | None = None,
+    team_id: str | None = None,
+    channel_id: str | None = None,
+    channel_thread_id: str | None = None,
 ) -> str:
     """Record an inbound payload to the raw audit store and return its raw_event_id.
 
@@ -945,7 +1011,9 @@ def record_raw(
     session-active drop, echo suppression). The returned id is back-linked
     onto the promoted ``MeetingEvent.source_raw_event_ids`` when the event
     becomes a ledger row, or left dangling with ``dropped_reason`` set when
-    the event was filtered out.
+    the event was filtered out. ``team_id``/``channel_id``/``channel_thread_id``
+    are optional and let analytics filter raw audit rows by channel without
+    a join.
     """
     raw_payload_json = _stable_json(payload)
     raw_event = RawIngestEvent(
@@ -963,6 +1031,9 @@ def record_raw(
         ),
         normalized_event_id=normalized_event_id,
         dropped_reason=dropped_reason,  # type: ignore[arg-type]
+        team_id=team_id,
+        channel_id=channel_id,
+        channel_thread_id=channel_thread_id,
     )
     try:
         store.record_raw_ingest_event(raw_event)
@@ -1497,6 +1568,15 @@ async def receive_transcript(
     resolved_session_id = (
         session_manager.session.session_id if session_manager.session else None
     )
+    transcript_team_id, transcript_channel_id, transcript_channel_thread_id = (
+        resolve_channel_context(
+            store,
+            chat_thread_id,
+            team_id=request.team_id,
+            channel_id=request.channel_id,
+            channel_thread_id=request.channel_thread_id,
+        )
+    )
     raw_event_id = record_raw(
         store,
         source="stt",
@@ -1506,6 +1586,9 @@ async def receive_transcript(
         provider_timestamp_utc=event.timestamp_utc,
         speaker_or_sender_id=event.speaker_id,
         normalized_payload=normalized,
+        team_id=transcript_team_id,
+        channel_id=transcript_channel_id,
+        channel_thread_id=transcript_channel_thread_id,
     )
 
     # Update stats
@@ -1622,6 +1705,12 @@ async def receive_transcript(
             latest_event = session_manager.get_latest_meeting_event()
             if session_manager.session is not None and latest_event is not None:
                 sid = session_manager.session.session_id
+                if transcript_team_id and not latest_event.team_id:
+                    latest_event.team_id = transcript_team_id
+                if transcript_channel_id and not latest_event.channel_id:
+                    latest_event.channel_id = transcript_channel_id
+                if transcript_channel_thread_id and not latest_event.channel_thread_id:
+                    latest_event.channel_thread_id = transcript_channel_thread_id
                 try:
                     store.upsert_session(session_manager.session)
                     store.append_meeting_event(sid, latest_event)
@@ -1713,6 +1802,7 @@ async def receive_chat_message(
         conversation_kind=request.conversation_kind,
         team_id=request.team_id,
         channel_id=request.channel_id,
+        channel_thread_id=request.channel_thread_id,
     )
 
     # Auto-start the meeting session on first non-deleted chat for an unseen
@@ -1734,6 +1824,13 @@ async def receive_chat_message(
     resolved_session_id = (
         session_manager.session.session_id if session_manager.session else None
     )
+    chat_team_id, chat_channel_id, chat_channel_thread_id = resolve_channel_context(
+        store,
+        chat_thread_id,
+        team_id=request.team_id,
+        channel_id=request.channel_id,
+        channel_thread_id=request.channel_thread_id,
+    )
     raw_event_id = record_raw(
         store,
         source=raw_source,
@@ -1742,6 +1839,9 @@ async def receive_chat_message(
         session_id=resolved_session_id,
         provider_timestamp_utc=chat.timestamp_utc,
         speaker_or_sender_id=chat.sender_id,
+        team_id=chat_team_id,
+        channel_id=chat_channel_id,
+        channel_thread_id=chat_channel_thread_id,
     )
 
     if session_manager.is_active:
@@ -1796,6 +1896,12 @@ async def receive_chat_message(
         latest_event = session_manager.get_latest_meeting_event()
         if session_manager.session is not None and latest_event is not None:
             sid = session_manager.session.session_id
+            if chat_team_id and not latest_event.team_id:
+                latest_event.team_id = chat_team_id
+            if chat_channel_id and not latest_event.channel_id:
+                latest_event.channel_id = chat_channel_id
+            if chat_channel_thread_id and not latest_event.channel_thread_id:
+                latest_event.channel_thread_id = chat_channel_thread_id
             try:
                 store.upsert_session(session_manager.session)
                 store.append_meeting_event(sid, latest_event)
@@ -2721,6 +2827,124 @@ async def set_meeting_mute(
         session_id=sid,
     )
     return {"alfred_muted": manager.session.alfred_muted}
+
+
+class SessionChannelLinkRequest(BaseModel):
+    """Body of POST /session/link.
+
+    Lets the C# bot tell the sink "this meeting/chat thread belongs to
+    this Teams channel". Stamps every future event for the thread with
+    channel context AND backfills prior ``meeting_events`` /
+    ``raw_ingest_events`` rows so analytics can group by ``channel_id``
+    alone, regardless of whether the link was known when the event
+    landed.
+    """
+
+    chat_thread_id: str = Field(..., min_length=1)
+    team_id: str = Field(..., min_length=1)
+    channel_id: str = Field(..., min_length=1)
+    channel_thread_id: str | None = Field(
+        default=None,
+        description="Parent channel's conversation id (19:{channelId}@thread.tacv2).",
+    )
+    source: str | None = Field(
+        default=None,
+        description=(
+            "Free-form tag — e.g. 'channel_meeting_announcement', "
+            "'bot_framework_channeldata' — for forensic provenance."
+        ),
+    )
+
+    model_config = {"extra": "ignore"}
+
+
+@app.post("/session/link")
+async def link_session_to_channel(
+    request: SessionChannelLinkRequest,
+    state: AppStateDep,
+) -> dict[str, Any]:
+    """Persist a session ↔ channel link and backfill prior events."""
+    store: SessionStore = state["store"]
+    counts = await asyncio.to_thread(
+        store.link_session_to_channel,
+        request.chat_thread_id,
+        request.team_id,
+        request.channel_id,
+        request.channel_thread_id,
+        request.source,
+    )
+    logger.info(
+        "Linked session chat_thread_id=%s -> team=%s channel=%s; backfilled %s",
+        request.chat_thread_id,
+        request.team_id,
+        request.channel_id,
+        counts,
+    )
+    return {"ok": True, "link": request.model_dump(), "backfill": counts}
+
+
+@app.get("/session/link/{chat_thread_id:path}")
+async def get_session_channel_link(
+    chat_thread_id: str,
+    state: AppStateDep,
+) -> dict[str, Any]:
+    """Return the channel link (if any) for a chat thread."""
+    store: SessionStore = state["store"]
+    link = await asyncio.to_thread(store.get_channel_link, chat_thread_id)
+    if link is None:
+        return {"ok": True, "link": None}
+    return {"ok": True, "link": link}
+
+
+@app.get("/channels/links")
+async def list_session_channel_links(state: AppStateDep) -> dict[str, Any]:
+    """Return all session ↔ channel links."""
+    store: SessionStore = state["store"]
+    links = await asyncio.to_thread(store.list_channel_links)
+    return {"ok": True, "count": len(links), "links": links}
+
+
+@app.get("/c/{team_id}/{channel_id}/events")
+async def get_channel_events(
+    team_id: str,
+    channel_id: str,
+    state: AppStateDep,
+    since: str | None = None,
+    until: str | None = None,
+    kinds: str | None = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """Return every event (chat / STT / system) tagged with this channel.
+
+    Aggregates the channel's own session AND every meeting session that
+    has been linked to it via /session/link, ordered by timestamp_utc.
+    Use this for offline analytics or replay across an entire channel's
+    history (channel posts + every meeting + every transcript).
+
+    Query params:
+      - since: ISO 8601 timestamp lower bound (inclusive).
+      - until: ISO 8601 timestamp upper bound (inclusive).
+      - kinds: comma-separated list of "speech", "chat", "system".
+      - limit: max rows to return.
+    """
+    store: SessionStore = state["store"]
+    parsed_kinds = [k.strip() for k in kinds.split(",") if k.strip()] if kinds else None
+    events = await asyncio.to_thread(
+        store.get_channel_ledger,
+        channel_id,
+        team_id=team_id,
+        since=since,
+        until=until,
+        kinds=parsed_kinds,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "team_id": team_id,
+        "channel_id": channel_id,
+        "count": len(events),
+        "events": events,
+    }
 
 
 @app.get("/sessions/{session_id}/ledger", response_model=LedgerResponse)

@@ -113,4 +113,12 @@ public sealed record ChatEventPayload
 
     /// <summary>Teams channel id when the activity is in a team channel.</summary>
     [JsonPropertyName("channel_id")] public string? ChannelId { get; init; }
+
+    /// <summary>
+    /// Parent channel's conversation id (<c>19:{channelId}@thread.tacv2</c>).
+    /// For channel posts equals <see cref="ChatThreadId"/>; for meeting
+    /// chats spawned from a channel, points at the parent channel's
+    /// thread so analytics can roll meetings under their channel.
+    /// </summary>
+    [JsonPropertyName("channel_thread_id")] public string? ChannelThreadId { get; init; }
 }

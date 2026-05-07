@@ -1338,3 +1338,110 @@ class TestRawIngestAudit:
 
         parsed = [_json.loads(ln) for ln in lines]
         assert all("raw_event_id" in row for row in parsed)
+
+
+# =============================================================================
+# Channel link + rollup (POST /session/link, GET /c/{teamId}/{channelId}/events)
+# =============================================================================
+
+
+class TestChannelLinkAndRollup:
+    """Verify channel-id metadata is stamped, backfilled, and queryable."""
+
+    @pytest.mark.asyncio
+    async def test_chat_with_channel_context_stamps_meeting_event(
+        self, client: AsyncClient
+    ) -> None:
+        """Inbound chat carrying channel context lands on meeting_events with channel_id set."""
+        team = "team-aad-1"
+        channel = "19:chan-1@thread.tacv2"
+
+        await client.post(
+            "/chat",
+            json={
+                "chat_thread_id": channel,
+                "message_id": "m-channel-1",
+                "text": "hello channel",
+                "timestamp_utc": "2026-04-22T16:00:00Z",
+                "conversation_kind": "channel",
+                "team_id": team,
+                "channel_id": channel,
+                "channel_thread_id": channel,
+            },
+        )
+
+        events = (
+            await client.get(f"/c/{team}/{channel}/events")
+        ).json()["events"]
+        assert len(events) >= 1
+        last = events[-1]
+        assert last["channel_id"] == channel
+        assert last["team_id"] == team
+
+    @pytest.mark.asyncio
+    async def test_session_link_backfills_prior_events(
+        self, client: AsyncClient
+    ) -> None:
+        """Events written before /session/link learn channel context retroactively."""
+        team = "team-bf"
+        channel = "19:chan-bf@thread.tacv2"
+        meeting = "19:meeting_bf@thread.v2"
+
+        # Land events for the meeting WITHOUT channel context.
+        await client.post(
+            "/chat",
+            json={
+                "chat_thread_id": meeting,
+                "message_id": "m-pre-1",
+                "text": "before link",
+                "timestamp_utc": "2026-04-22T16:00:00Z",
+            },
+        )
+
+        # Now learn the link and confirm backfill counts.
+        link = await client.post(
+            "/session/link",
+            json={
+                "chat_thread_id": meeting,
+                "team_id": team,
+                "channel_id": channel,
+                "channel_thread_id": channel,
+                "source": "test_backfill",
+            },
+        )
+        assert link.status_code == 200
+        body = link.json()
+        assert body["ok"] is True
+        assert body["backfill"]["meeting_events_updated"] >= 1
+
+        events = (
+            await client.get(f"/c/{team}/{channel}/events")
+        ).json()["events"]
+        # The pre-link chat should now carry channel_id.
+        texts = {e["text"]: e for e in events}
+        assert "before link" in texts
+        assert texts["before link"]["channel_id"] == channel
+
+    @pytest.mark.asyncio
+    async def test_session_link_idempotent(self, client: AsyncClient) -> None:
+        """Re-linking the same thread updates rather than duplicating."""
+        team = "team-idem"
+        channel = "19:chan-idem@thread.tacv2"
+        meeting = "19:meeting_idem@thread.v2"
+
+        for _ in range(2):
+            r = await client.post(
+                "/session/link",
+                json={
+                    "chat_thread_id": meeting,
+                    "team_id": team,
+                    "channel_id": channel,
+                    "channel_thread_id": channel,
+                },
+            )
+            assert r.status_code == 200
+
+        links = (await client.get("/channels/links")).json()["links"]
+        matching = [l for l in links if l["chat_thread_id"] == meeting]
+        assert len(matching) == 1
+
