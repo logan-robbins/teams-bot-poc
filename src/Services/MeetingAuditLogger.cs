@@ -32,6 +32,9 @@ public sealed class MeetingAuditLogger
         _baseDir = baseDir;
     }
 
+    /// <summary>Absolute path to the directory holding per-thread audit files.</summary>
+    public string BaseDir => _baseDir;
+
     public void Append(string chatThreadId, string stream, object payload)
     {
         if (string.IsNullOrWhiteSpace(chatThreadId))

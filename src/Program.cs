@@ -162,10 +162,23 @@ try
     // Add health checks for monitoring
     builder.Services.AddHealthChecks();
 
+    // CORS for the operator UI (ca-alfred-web Container App calls
+    // /api/channels/.../consumers and /api/debug/* from a different
+    // origin). Internal/VPN deployment, so any origin is allowed.
+    const string OperatorUiCorsPolicy = "operator-ui";
+    builder.Services.AddCors(options =>
+    {
+        options.AddPolicy(OperatorUiCorsPolicy, policy => policy
+            .AllowAnyOrigin()
+            .AllowAnyMethod()
+            .AllowAnyHeader());
+    });
+
     var app = builder.Build();
 
     // Configure HTTP request pipeline
     app.UseRouting();
+    app.UseCors(OperatorUiCorsPolicy);
     app.MapControllers();
     app.MapHealthChecks("/health");
 

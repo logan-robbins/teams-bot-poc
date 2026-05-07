@@ -3,12 +3,16 @@
  *
  * Channel attachment + per-channel consumer registry live on the bot
  * (it owns the outbound EventFanoutDispatcher), distinct from the
- * Python reference sink. The dev server proxies /bot/* to BOT_URL
- * (see vite.config.ts); set VITE_BOT_URL in production so calls hit
- * the bot's absolute URL directly.
+ * Python reference sink. In dev the Vite dev server proxies /bot/* to
+ * BOT_URL (see vite.config.ts); in prod the page is served from a
+ * different origin than the bot, so we default to the bot's absolute
+ * URL. Override at build time with VITE_BOT_URL if needed.
  */
 
-const BASE: string = (import.meta.env.VITE_BOT_URL as string | undefined) ?? "/bot";
+const PROD_BOT_URL = "https://alfred-disney-bot.eastus.cloudapp.azure.com";
+const BASE: string =
+  (import.meta.env.VITE_BOT_URL as string | undefined) ??
+  (import.meta.env.DEV ? "/bot" : PROD_BOT_URL);
 
 async function json<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
@@ -65,6 +69,32 @@ function encodeChannelId(channelId: string): string {
   return encodeURIComponent(channelId);
 }
 
+export interface DebugThreadSummary {
+  chat_thread_id: string;
+  chat_thread_id_sanitized: string;
+  transcript_lines: number;
+  chat_lines: number;
+  system_lines: number;
+  last_modified_utc: string | null;
+  first_final_text: string | null;
+  last_final_text: string | null;
+}
+
+export interface DebugThreadsResponse {
+  count: number;
+  base_dir: string;
+  now_utc: string;
+  threads: DebugThreadSummary[];
+}
+
+export interface DebugTailResponse {
+  chat_thread_id: string;
+  chat_thread_id_sanitized: string;
+  kind: "transcript" | "chat" | "system";
+  count: number;
+  entries: Array<Record<string, unknown>>;
+}
+
 export const bot = {
   listChannels: () => json<ChannelAttachmentsResponse>("/api/channels"),
 
@@ -97,5 +127,16 @@ export const bot = {
     json<{ ok: boolean }>(
       `/api/channels/${encodeURIComponent(teamId)}/${encodeChannelId(channelId)}/consumers/${encodeURIComponent(name)}`,
       { method: "DELETE" },
+    ),
+
+  listDebugThreads: () => json<DebugThreadsResponse>("/api/debug/transcripts"),
+
+  tailDebug: (
+    sanitizedChatThreadId: string,
+    kind: "transcript" | "chat" | "system" = "transcript",
+    tail = 100,
+  ) =>
+    json<DebugTailResponse>(
+      `/api/debug/transcripts/${encodeURIComponent(sanitizedChatThreadId)}?kind=${kind}&tail=${tail}`,
     ),
 };
