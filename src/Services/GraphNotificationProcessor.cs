@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Net;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
@@ -20,7 +22,17 @@ public sealed partial class GraphNotificationProcessor
     private readonly GraphApiClient _graphApiClient;
     private readonly GraphNotificationCrypto _crypto;
     private readonly GraphValidationTokenValidator _tokenValidator;
+    private readonly TeamsCallingBotService _botService;
+    private readonly TranscriberFactory _transcriberFactory;
     private readonly ILogger<GraphNotificationProcessor> _logger;
+
+    /// <summary>
+    /// Per-<c>callId</c> latch so duplicate Graph notifications (or our
+    /// own subscription renewals) never trigger more than one join
+    /// attempt for the same Teams channel call.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, byte> _attemptedJoins =
+        new(StringComparer.Ordinal);
 
     public GraphNotificationProcessor(
         EventFanoutDispatcher dispatcher,
@@ -30,6 +42,8 @@ public sealed partial class GraphNotificationProcessor
         GraphApiClient graphApiClient,
         GraphNotificationCrypto crypto,
         GraphValidationTokenValidator tokenValidator,
+        TeamsCallingBotService botService,
+        TranscriberFactory transcriberFactory,
         ILogger<GraphNotificationProcessor> logger)
     {
         _dispatcher = dispatcher;
@@ -39,6 +53,8 @@ public sealed partial class GraphNotificationProcessor
         _graphApiClient = graphApiClient;
         _crypto = crypto;
         _tokenValidator = tokenValidator;
+        _botService = botService;
+        _transcriberFactory = transcriberFactory;
         _logger = logger;
     }
 
@@ -147,11 +163,169 @@ public sealed partial class GraphNotificationProcessor
                     Payload = payload,
                 },
                 cancellationToken);
+
+            // If this channel post is Teams' "Meeting started" system event,
+            // auto-join the call so audio capture begins without any operator
+            // action. Idempotent on callId.
+            if (isChannel)
+            {
+                MaybeAutoJoinChannelMeeting(payload, document?.RootElement);
+            }
         }
         finally
         {
             document?.Dispose();
         }
+    }
+
+    /// <summary>
+    /// Fires when Teams posts a <c>callStartedEventMessageDetail</c>
+    /// system message into a channel Alfred is attached to. Synthesizes
+    /// the channel-meeting join URL from the channel's threadId + the
+    /// initiator's tenant/object id, then dispatches the join workflow
+    /// fire-and-forget so this notification handler never blocks on the
+    /// SDK round-trip.
+    /// </summary>
+    private void MaybeAutoJoinChannelMeeting(ChatEventPayload payload, JsonElement? root)
+    {
+        if (!root.HasValue)
+        {
+            return;
+        }
+
+        var messageType = TryGetString(root, "messageType");
+        if (!string.Equals(messageType, "systemEventMessage", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        if (!root.Value.TryGetProperty("eventDetail", out var detail) ||
+            detail.ValueKind != JsonValueKind.Object)
+        {
+            return;
+        }
+
+        var detailType = detail.TryGetProperty("@odata.type", out var t) && t.ValueKind == JsonValueKind.String
+            ? t.GetString()
+            : null;
+
+        // Only the call-started event triggers a join. Other call lifecycle
+        // events (callEnded, callRecording, etc.) flow through as plain
+        // chat events without bot action.
+        if (string.IsNullOrWhiteSpace(detailType) ||
+            !detailType.Contains("callStartedEventMessageDetail", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        var callId = detail.TryGetProperty("callId", out var c) && c.ValueKind == JsonValueKind.String
+            ? c.GetString()
+            : null;
+        if (string.IsNullOrWhiteSpace(callId))
+        {
+            _logger.LogWarning(
+                "callStartedEventMessageDetail with no callId on channel {ChannelId}; skipping auto-join.",
+                payload.ChannelId);
+            return;
+        }
+
+        if (!_attemptedJoins.TryAdd(callId, 1))
+        {
+            _logger.LogDebug("Auto-join already attempted for callId={CallId}; skipping.", callId);
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(payload.TeamId) ||
+            string.IsNullOrWhiteSpace(payload.ChannelId) ||
+            string.IsNullOrWhiteSpace(payload.ChannelThreadId))
+        {
+            _logger.LogWarning(
+                "Cannot auto-join callId={CallId}: missing routing context (team={TeamId} channel={ChannelId} thread={ChannelThreadId}).",
+                callId, payload.TeamId, payload.ChannelId, payload.ChannelThreadId);
+            return;
+        }
+
+        var initiatorOid = detail.TryGetProperty("initiator", out var init) &&
+                           init.ValueKind == JsonValueKind.Object &&
+                           init.TryGetProperty("user", out var user) &&
+                           user.ValueKind == JsonValueKind.Object &&
+                           user.TryGetProperty("id", out var uid) &&
+                           uid.ValueKind == JsonValueKind.String
+            ? uid.GetString()
+            : null;
+
+        // For SingleTenant deployments the bot tenant === team tenant.
+        // Channel-meeting URLs use the team's tenant.
+        var tenantId = _botConfig.TenantId;
+        if (string.IsNullOrWhiteSpace(tenantId))
+        {
+            _logger.LogWarning(
+                "Cannot auto-join callId={CallId}: Bot.TenantId is unset.", callId);
+            return;
+        }
+
+        var joinUrl = BuildChannelMeetingJoinUrl(
+            payload.ChannelThreadId!,
+            tenantId,
+            initiatorOid ?? _botConfig.AppId ?? string.Empty);
+
+        _logger.LogInformation(
+            "Auto-joining channel meeting: team={TeamId} channel={ChannelId} thread={ThreadId} callId={CallId} initiator={InitiatorOid}",
+            payload.TeamId, payload.ChannelId, payload.ChannelThreadId, callId, initiatorOid);
+
+        // Fire-and-forget: don't block the notification handler on the
+        // Graph Communications SDK call. Failure is logged; the next
+        // call-started in the same channel will retry (different callId).
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var transcriber = _transcriberFactory.Create();
+                var result = await _botService.JoinMeetingWithModeAsync(
+                    new JoinMeetingCommand
+                    {
+                        JoinUrl = joinUrl,
+                        DisplayName = "Alfred",
+                        JoinAsGuest = false,
+                        RequestedJoinMode = JoinModeNames.InviteAndGraphJoin,
+                        MeetingId = callId,
+                        OrganizerTenantId = tenantId,
+                        // Channel-attached bots have RSC consent equivalent to
+                        // a roster invite; the BotAttendee check is moot.
+                        BotAttendeePresent = true,
+                    },
+                    transcriber).ConfigureAwait(false);
+
+                _logger.LogInformation(
+                    "Auto-join workflow completed for callId={CallId}: SelectedMode={Mode} BotCallId={BotCallId} Deferred={Deferred} Message={Message}",
+                    callId, result.SelectedJoinMode, result.CallId, result.Deferred, result.Message);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(
+                    ex,
+                    "Auto-join failed for callId={CallId} on channel={ChannelId}",
+                    callId, payload.ChannelId);
+                // Drop the latch so a later notification (if Teams resends)
+                // can retry.
+                _attemptedJoins.TryRemove(callId, out _);
+            }
+        });
+    }
+
+    /// <summary>
+    /// Synthesizes the canonical channel-meeting join URL. Channel
+    /// meetings live in the channel's persistent meeting room (one
+    /// thread, many sequential meeting instances), so this URL resolves
+    /// to the active call regardless of which specific meeting started
+    /// it.
+    /// </summary>
+    private static string BuildChannelMeetingJoinUrl(string channelThreadId, string tenantId, string organizerOid)
+    {
+        var encodedThread = WebUtility.UrlEncode(channelThreadId);
+        var contextJson = $"{{\"Tid\":\"{tenantId}\",\"Oid\":\"{organizerOid}\",\"MessageId\":\"0\"}}";
+        var encodedContext = WebUtility.UrlEncode(contextJson);
+        return $"https://teams.microsoft.com/l/meetup-join/{encodedThread}/0?context={encodedContext}";
     }
 
     private async Task<JsonDocument?> ResolveMessagePayloadAsync(
