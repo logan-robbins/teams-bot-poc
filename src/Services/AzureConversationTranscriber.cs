@@ -140,8 +140,18 @@ public sealed partial class AzureConversationTranscriber : IRealtimeTranscriber
         // CRITICAL: Enable intermediate diarization results for real-time speaker attribution
         // Source: Azure docs - PropertyId.SpeechServiceResponse_DiarizeIntermediateResults
         speechConfig.SetProperty(
-            PropertyId.SpeechServiceResponse_DiarizeIntermediateResults, 
+            PropertyId.SpeechServiceResponse_DiarizeIntermediateResults,
             "true");
+
+        // Latency tuning: drop the silence-to-end-of-utterance threshold
+        // from the ConversationTranscriber default (~500-1000ms) down to
+        // 200ms so finals fire ~300ms sooner once the speaker stops.
+        // Lower than ~150ms produces excessive false-end fragmentation
+        // mid-sentence; 200ms is the sweet spot for English meetings.
+        // Source: Azure Speech docs — Speech_SegmentationSilenceTimeoutMs
+        speechConfig.SetProperty(
+            PropertyId.Speech_SegmentationSilenceTimeoutMs,
+            "200");
 
         // Optional: Custom Speech model endpoint
         if (_endpointId is not null)
