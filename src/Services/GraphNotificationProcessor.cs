@@ -13,7 +13,7 @@ public sealed partial class GraphNotificationProcessor
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
     };
 
-    private readonly PythonChatPublisher _chatPublisher;
+    private readonly EventFanoutDispatcher _dispatcher;
     private readonly MeetingChatConfiguration _config;
     private readonly BotConfiguration _botConfig;
     private readonly IMeetingChatService _meetingChatService;
@@ -23,7 +23,7 @@ public sealed partial class GraphNotificationProcessor
     private readonly ILogger<GraphNotificationProcessor> _logger;
 
     public GraphNotificationProcessor(
-        PythonChatPublisher chatPublisher,
+        EventFanoutDispatcher dispatcher,
         MeetingChatConfiguration config,
         BotConfiguration botConfig,
         IMeetingChatService meetingChatService,
@@ -32,7 +32,7 @@ public sealed partial class GraphNotificationProcessor
         GraphValidationTokenValidator tokenValidator,
         ILogger<GraphNotificationProcessor> logger)
     {
-        _chatPublisher = chatPublisher;
+        _dispatcher = dispatcher;
         _config = config;
         _botConfig = botConfig;
         _meetingChatService = meetingChatService;
@@ -133,7 +133,20 @@ public sealed partial class GraphNotificationProcessor
                 return;
             }
 
-            await _chatPublisher.PublishAsync(payload, cancellationToken);
+            await _dispatcher.PublishAsync(
+                new AlfredEventEnvelope
+                {
+                    EventType = AlfredEventTypes.ChatMessage,
+                    EventId = Guid.NewGuid().ToString("N"),
+                    Ts = payload.TimestampUtc,
+                    TeamId = payload.TeamId,
+                    ChannelId = payload.ChannelId,
+                    ChatThreadId = payload.ChatThreadId,
+                    ChannelThreadId = payload.ChannelThreadId ?? payload.ChannelId,
+                    ConversationReferenceId = payload.ConversationReferenceId ?? payload.ChatThreadId,
+                    Payload = payload,
+                },
+                cancellationToken);
         }
         finally
         {

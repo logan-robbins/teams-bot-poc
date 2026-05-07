@@ -27,22 +27,21 @@ namespace TeamsMediaBot.Services;
 public sealed class AlfredBot : TeamsActivityHandler
 {
     private readonly IConversationReferenceStore _references;
-    private readonly PythonChatPublisher _chatPublisher;
+    private readonly EventFanoutDispatcher _dispatcher;
     private readonly IChannelAttachmentService _channelAttachments;
-    private readonly ChannelLinkPublisher _channelLinkPublisher;
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _publishedLinks =
+        new(StringComparer.Ordinal);
     private readonly ILogger<AlfredBot> _logger;
 
     public AlfredBot(
         IConversationReferenceStore references,
-        PythonChatPublisher chatPublisher,
+        EventFanoutDispatcher dispatcher,
         IChannelAttachmentService channelAttachments,
-        ChannelLinkPublisher channelLinkPublisher,
         ILogger<AlfredBot> logger)
     {
         _references = references;
-        _chatPublisher = chatPublisher;
+        _dispatcher = dispatcher;
         _channelAttachments = channelAttachments;
-        _channelLinkPublisher = channelLinkPublisher;
         _logger = logger;
     }
 
@@ -152,24 +151,56 @@ public sealed class AlfredBot : TeamsActivityHandler
             ChannelThreadId = channelId,
         };
 
-        await _chatPublisher.PublishAsync(payload, cancellationToken);
+        await _dispatcher.PublishAsync(
+            new AlfredEventEnvelope
+            {
+                EventType = AlfredEventTypes.ChatMessage,
+                EventId = Guid.NewGuid().ToString("N"),
+                Ts = payload.TimestampUtc,
+                TeamId = teamId,
+                ChannelId = channelId,
+                ChatThreadId = chatThreadId,
+                ChannelThreadId = channelId,
+                ConversationReferenceId = chatThreadId,
+                Payload = payload,
+            },
+            cancellationToken);
 
         // If this activity is in a meeting chat that was spawned from a
         // channel (channelData carries team + channel, but the chat
         // thread id is the meeting's thread, not the channel's),
-        // tell the sink so every transcript / chat / system event for
-        // this meeting can later be rolled up under the parent channel.
+        // emit a session-linked event so consumers can roll the meeting
+        // under its parent channel. De-duped per (chat_thread_id, team,
+        // channel) so we don't emit one on every chat activity.
         if (!string.IsNullOrWhiteSpace(teamId)
             && !string.IsNullOrWhiteSpace(channelId)
             && !string.Equals(chatThreadId, channelId, StringComparison.Ordinal))
         {
-            _ = _channelLinkPublisher.PublishLinkAsync(
-                chatThreadId,
-                teamId!,
-                channelId!,
-                channelId,
-                source: "bot_framework_channeldata",
-                cancellationToken: cancellationToken);
+            var linkKey = string.Join("|", chatThreadId, teamId, channelId);
+            if (_publishedLinks.TryAdd(linkKey, 1))
+            {
+                await _dispatcher.PublishAsync(
+                    new AlfredEventEnvelope
+                    {
+                        EventType = AlfredEventTypes.SessionLinked,
+                        EventId = Guid.NewGuid().ToString("N"),
+                        Ts = DateTimeOffset.UtcNow.ToString("O"),
+                        TeamId = teamId,
+                        ChannelId = channelId,
+                        ChatThreadId = chatThreadId,
+                        ChannelThreadId = channelId,
+                        ConversationReferenceId = chatThreadId,
+                        Payload = new SessionLinkedPayload
+                        {
+                            ChatThreadId = chatThreadId,
+                            TeamId = teamId!,
+                            ChannelId = channelId!,
+                            ChannelThreadId = channelId,
+                            Source = "bot_framework_channeldata",
+                        },
+                    },
+                    cancellationToken);
+            }
         }
     }
 

@@ -1,6 +1,7 @@
 import { BrowserRouter, Navigate, Route, Routes, useParams } from "react-router-dom";
 import { MeetingList } from "./components/MeetingList";
 import { MeetingDossier } from "./components/MeetingDossier";
+import { ChannelsAdmin } from "./components/ChannelsAdmin";
 
 /**
  * Alfred — Meeting Dossier.
@@ -8,7 +9,8 @@ import { MeetingDossier } from "./components/MeetingDossier";
  * The dossier is gated behind ``/m/:chatThreadId`` so a viewer can only
  * see the meeting whose chat_thread_id is in the URL. Anyone hitting the
  * root path is shown a meeting picker (``MeetingList``) — there is no
- * "current meeting" fallback.
+ * "current meeting" fallback. ``/channels/admin`` is the operator UI for
+ * per-channel consumer config.
  */
 export default function App() {
   return (
@@ -17,6 +19,7 @@ export default function App() {
         <Route path="/" element={<MeetingList />} />
         <Route path="/m" element={<Navigate to="/" replace />} />
         <Route path="/m/*" element={<KeyedDossier />} />
+        <Route path="/channels/admin" element={<ChannelsAdmin />} />
       </Routes>
     </BrowserRouter>
   );

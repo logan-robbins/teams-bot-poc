@@ -30,7 +30,7 @@ public sealed partial class AzureConversationTranscriber : IRealtimeTranscriber
     private readonly string _speechRegion;
     private readonly string _language;
     private readonly string? _endpointId;
-    private readonly PythonTranscriptPublisher _publisher;
+    private readonly EventFanoutDispatcher _dispatcher;
     private readonly ILogger<AzureConversationTranscriber> _logger;
     /// <summary>
     /// E3: Resolves the contemporaneous Teams MediaSourceId hint
@@ -82,20 +82,20 @@ public sealed partial class AzureConversationTranscriber : IRealtimeTranscriber
         string speechRegion,
         string language,
         string? endpointId,
-        PythonTranscriptPublisher publisher,
+        EventFanoutDispatcher dispatcher,
         ILogger<AzureConversationTranscriber> logger)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(speechKey);
         ArgumentException.ThrowIfNullOrWhiteSpace(speechRegion);
         ArgumentException.ThrowIfNullOrWhiteSpace(language);
-        ArgumentNullException.ThrowIfNull(publisher);
+        ArgumentNullException.ThrowIfNull(dispatcher);
         ArgumentNullException.ThrowIfNull(logger);
-        
+
         _speechKey = speechKey;
         _speechRegion = speechRegion;
         _language = language;
         _endpointId = string.IsNullOrWhiteSpace(endpointId) ? null : endpointId.Trim();
-        _publisher = publisher;
+        _dispatcher = dispatcher;
         _logger = logger;
     }
 
@@ -361,18 +361,9 @@ public sealed partial class AzureConversationTranscriber : IRealtimeTranscriber
             ChannelThreadId: ChannelThreadId
         );
 
-        // Fire-and-forget: don't block the caller (typically audio processing thread)
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                await _publisher.PublishAsync(transcriptEvent).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed to publish transcript event");
-            }
-        });
+        // Non-blocking: dispatcher enqueues to per-consumer bounded
+        // queues internally and returns immediately.
+        _ = _dispatcher.PublishTranscriptAsync(transcriptEvent);
     }
 
     /// <inheritdoc/>

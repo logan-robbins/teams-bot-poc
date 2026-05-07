@@ -145,6 +145,114 @@ public sealed class ChannelAttachmentController : ControllerBase
 
         return Ok(new { ok = true, detached = true });
     }
+
+    [HttpGet("{teamId}/{channelId}/consumers")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public IActionResult ListConsumers(string teamId, string channelId)
+    {
+        var record = _service.Get(teamId, channelId);
+        if (record is null)
+        {
+            return NotFound(new { error = "no attachment for that team_id + channel_id" });
+        }
+
+        return Ok(new
+        {
+            team_id = record.TeamId,
+            channel_id = record.ChannelId,
+            consumers = record.Consumers,
+        });
+    }
+
+    [HttpPut("{teamId}/{channelId}/consumers")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<IActionResult> ReplaceConsumers(
+        string teamId,
+        string channelId,
+        [FromBody] ReplaceConsumersRequest request,
+        CancellationToken cancellationToken)
+    {
+        if (request?.Consumers is null)
+        {
+            return BadRequest(new { error = "consumers array is required" });
+        }
+
+        try
+        {
+            var ok = await _service.SetConsumersAsync(
+                teamId, channelId, request.Consumers, cancellationToken);
+            if (!ok)
+            {
+                return NotFound(new { error = "no attachment for that team_id + channel_id" });
+            }
+        }
+        catch (InvalidOperationException ex)
+        {
+            return BadRequest(new { error = ex.Message });
+        }
+
+        var record = _service.Get(teamId, channelId)!;
+        return Ok(new { ok = true, consumers = record.Consumers });
+    }
+
+    [HttpPost("{teamId}/{channelId}/consumers")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<IActionResult> UpsertConsumer(
+        string teamId,
+        string channelId,
+        [FromBody] ConsumerConfig consumer,
+        CancellationToken cancellationToken)
+    {
+        if (consumer is null)
+        {
+            return BadRequest(new { error = "consumer body is required" });
+        }
+
+        try
+        {
+            var ok = await _service.UpsertConsumerAsync(
+                teamId, channelId, consumer, cancellationToken);
+            if (!ok)
+            {
+                return NotFound(new { error = "no attachment for that team_id + channel_id" });
+            }
+        }
+        catch (InvalidOperationException ex)
+        {
+            return BadRequest(new { error = ex.Message });
+        }
+
+        var record = _service.Get(teamId, channelId)!;
+        return Ok(new { ok = true, consumers = record.Consumers });
+    }
+
+    [HttpDelete("{teamId}/{channelId}/consumers/{consumerName}")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<IActionResult> RemoveConsumer(
+        string teamId,
+        string channelId,
+        string consumerName,
+        CancellationToken cancellationToken)
+    {
+        var ok = await _service.RemoveConsumerAsync(
+            teamId, channelId, consumerName, cancellationToken);
+        if (!ok)
+        {
+            return NotFound(new { error = "no consumer by that name (or no attachment for that channel)" });
+        }
+        return Ok(new { ok = true });
+    }
+}
+
+public sealed record ReplaceConsumersRequest
+{
+    [JsonProperty("consumers")] public List<ConsumerConfig>? Consumers { get; init; }
 }
 
 public sealed record AttachChannelRequest

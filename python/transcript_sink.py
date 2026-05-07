@@ -2883,6 +2883,100 @@ async def link_session_to_channel(
     return {"ok": True, "link": request.model_dump(), "backfill": counts}
 
 
+# =============================================================================
+# /events — versioned envelope ingress (alfred-events-v1 contract)
+# =============================================================================
+
+
+class AlfredEventEnvelopeRequest(BaseModel):
+    """Versioned envelope contract published by the C# bot's
+    EventFanoutDispatcher to every registered consumer URL.
+
+    See ``docs/event-contract.md`` for the canonical spec. This
+    Python sink is one reference consumer; other teams may publish
+    their own ``/events`` handlers behind their own URLs.
+    """
+
+    schema_version: str = Field(default="alfred-events-v1")
+    event_type: str = Field(..., min_length=1)
+    event_id: str = Field(..., min_length=1)
+    ts: str = Field(..., min_length=1)
+    team_id: str | None = None
+    channel_id: str | None = None
+    chat_thread_id: str = Field(..., min_length=1)
+    channel_thread_id: str | None = None
+    conversation_reference_id: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+    model_config = {"extra": "ignore"}
+
+
+@app.post("/events")
+async def receive_event_envelope(
+    envelope: AlfredEventEnvelopeRequest,
+    state: AppStateDep,
+) -> dict[str, Any]:
+    """Single ingress for the alfred-events-v1 contract.
+
+    Routes by ``event_type`` to existing handlers:
+
+    - ``transcript.partial`` / ``transcript.final`` → /transcript path
+    - ``chat.message``                              → /chat path
+    - ``system.session_linked``                     → /session/link path
+    - ``system.channel_attached`` / ``system.channel_detached`` → logged
+
+    This handler is the reference consumer for the published contract;
+    every team's own backend implements its own ``/events`` and
+    interprets envelopes however it wants.
+    """
+    et = envelope.event_type
+
+    # Stamp envelope-level routing keys onto the payload so the
+    # existing handlers see them even if the producer left them off
+    # the inner payload.
+    payload = dict(envelope.payload)
+    if envelope.chat_thread_id and not payload.get("chat_thread_id"):
+        payload["chat_thread_id"] = envelope.chat_thread_id
+    if envelope.team_id and not payload.get("team_id"):
+        payload["team_id"] = envelope.team_id
+    if envelope.channel_id and not payload.get("channel_id"):
+        payload["channel_id"] = envelope.channel_id
+    if envelope.channel_thread_id and not payload.get("channel_thread_id"):
+        payload["channel_thread_id"] = envelope.channel_thread_id
+
+    if et in ("transcript.partial", "transcript.final"):
+        request = TranscriptEventRequest(**payload)
+        result = await receive_transcript(request, state)
+        return {"ok": True, "event_type": et, "result": result.model_dump()}
+
+    if et == "chat.message":
+        if envelope.conversation_reference_id and not payload.get("conversation_reference_id"):
+            payload["conversation_reference_id"] = envelope.conversation_reference_id
+        request = ChatMessageRequest(**payload)
+        result = await receive_chat_message(request, state)
+        return {"ok": True, "event_type": et, "result": result.model_dump()}
+
+    if et == "system.session_linked":
+        request = SessionChannelLinkRequest(**payload)
+        result = await link_session_to_channel(request, state)
+        return {"ok": True, "event_type": et, "result": result}
+
+    if et in ("system.channel_attached", "system.channel_detached"):
+        logger.info(
+            "Received %s envelope team=%s channel=%s; reference sink does not act on attach lifecycle.",
+            et,
+            envelope.team_id,
+            envelope.channel_id,
+        )
+        return {"ok": True, "event_type": et, "action": "logged"}
+
+    logger.warning("Unsupported event_type on /events: %s", et)
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=f"Unsupported event_type: {et}",
+    )
+
+
 @app.get("/session/link/{chat_thread_id:path}")
 async def get_session_channel_link(
     chat_thread_id: str,

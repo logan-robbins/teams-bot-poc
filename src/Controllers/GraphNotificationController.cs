@@ -11,8 +11,8 @@ namespace TeamsMediaBot.Controllers;
 ///   - Validation handshake (10-second echo of validationToken) on creation.
 ///   - Lifecycle events (reauthorizationRequired / subscriptionRemoved / missed).
 ///   - Delivery of chatMessage resource data: decrypt (if includeResourceData),
-///     translate to ChatEventPayload, POST to the Python sink via
-///     PythonChatPublisher.
+///     translate to <see cref="ChatEventPayload"/>, hand to
+///     <see cref="EventFanoutDispatcher"/> for per-channel consumer fan-out.
 ///
 /// This file has the correct endpoint wiring + validation handshake. The
 /// encrypted-notification decrypt path is marked TODO for live-tenant

@@ -25,7 +25,7 @@ public sealed class DeepgramRealtimeTranscriber : IRealtimeTranscriber
     private readonly string _apiKey;
     private readonly string _model;
     private readonly bool _diarize;
-    private readonly PythonTranscriptPublisher _publisher;
+    private readonly EventFanoutDispatcher _dispatcher;
     private readonly ILogger<DeepgramRealtimeTranscriber> _logger;
     
     private IListenWebSocketClient? _client;
@@ -59,18 +59,18 @@ public sealed class DeepgramRealtimeTranscriber : IRealtimeTranscriber
         string apiKey,
         string model,
         bool diarize,
-        PythonTranscriptPublisher publisher,
+        EventFanoutDispatcher dispatcher,
         ILogger<DeepgramRealtimeTranscriber> logger)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(apiKey);
         ArgumentException.ThrowIfNullOrWhiteSpace(model);
-        ArgumentNullException.ThrowIfNull(publisher);
+        ArgumentNullException.ThrowIfNull(dispatcher);
         ArgumentNullException.ThrowIfNull(logger);
-        
+
         _apiKey = apiKey;
         _model = model;
         _diarize = diarize;
-        _publisher = publisher;
+        _dispatcher = dispatcher;
         _logger = logger;
     }
 
@@ -328,22 +328,13 @@ public sealed class DeepgramRealtimeTranscriber : IRealtimeTranscriber
     }
 
     /// <summary>
-    /// Publishes a transcript event asynchronously without blocking.
+    /// Hands the event off to the per-channel fan-out dispatcher. The
+    /// dispatcher is non-blocking (per-consumer bounded queue), so this
+    /// call returns synchronously.
     /// </summary>
     private void PublishEventAsync(TranscriptEvent transcriptEvent)
     {
-        // Fire-and-forget: don't block the caller (typically audio processing thread)
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                await _publisher.PublishAsync(transcriptEvent).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed to publish transcript event");
-            }
-        });
+        _ = _dispatcher.PublishTranscriptAsync(transcriptEvent);
     }
 
     /// <inheritdoc/>

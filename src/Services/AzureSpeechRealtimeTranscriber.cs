@@ -21,32 +21,21 @@ namespace TeamsMediaBot.Services;
 public sealed class TranscriberFactory
 {
     private readonly SttConfiguration _sttConfig;
-    private readonly string _pythonEndpoint;
+    private readonly EventFanoutDispatcher _dispatcher;
     private readonly ILoggerFactory _loggerFactory;
-    private readonly MeetingAuditLogger? _auditLogger;
 
-    /// <summary>
-    /// Initializes a new instance of the <see cref="TranscriberFactory"/> class.
-    /// </summary>
-    /// <param name="sttConfig">The STT configuration.</param>
-    /// <param name="pythonEndpoint">The Python endpoint for transcript events.</param>
-    /// <param name="loggerFactory">The logger factory.</param>
-    /// <param name="auditLogger">Optional audit logger passed through to each publisher.</param>
-    /// <exception cref="ArgumentNullException">Thrown when required parameters are null.</exception>
     public TranscriberFactory(
         SttConfiguration sttConfig,
-        string pythonEndpoint,
-        ILoggerFactory loggerFactory,
-        MeetingAuditLogger? auditLogger = null)
+        EventFanoutDispatcher dispatcher,
+        ILoggerFactory loggerFactory)
     {
         ArgumentNullException.ThrowIfNull(sttConfig);
-        ArgumentException.ThrowIfNullOrWhiteSpace(pythonEndpoint);
+        ArgumentNullException.ThrowIfNull(dispatcher);
         ArgumentNullException.ThrowIfNull(loggerFactory);
 
         _sttConfig = sttConfig;
-        _pythonEndpoint = pythonEndpoint;
+        _dispatcher = dispatcher;
         _loggerFactory = loggerFactory;
-        _auditLogger = auditLogger;
     }
 
     /// <summary>
@@ -61,32 +50,24 @@ public sealed class TranscriberFactory
     /// </exception>
     public IRealtimeTranscriber Create()
     {
-        var publisherLogger = _loggerFactory.CreateLogger<PythonTranscriptPublisher>();
-        var publisher = new PythonTranscriptPublisher(_pythonEndpoint, publisherLogger, _auditLogger);
-        
         var provider = (_sttConfig.Provider ?? "Deepgram").Trim();
 
-        // PRIMARY: Deepgram (best diarization quality)
         if (string.Equals(provider, "Deepgram", StringComparison.OrdinalIgnoreCase))
         {
-            return CreateDeepgramTranscriber(publisher);
+            return CreateDeepgramTranscriber();
         }
 
-        // FALLBACK: Azure Speech ConversationTranscriber
         if (string.Equals(provider, "AzureSpeech", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(provider, "Azure", StringComparison.OrdinalIgnoreCase))
         {
-            return CreateAzureTranscriber(publisher);
+            return CreateAzureTranscriber();
         }
 
         throw new NotSupportedException(
             $"STT provider '{provider}' is not supported. Use 'Deepgram' or 'AzureSpeech'.");
     }
 
-    /// <summary>
-    /// Creates a Deepgram transcriber instance.
-    /// </summary>
-    private DeepgramRealtimeTranscriber CreateDeepgramTranscriber(PythonTranscriptPublisher publisher)
+    private DeepgramRealtimeTranscriber CreateDeepgramTranscriber()
     {
         var config = _sttConfig.Deepgram ?? throw new InvalidOperationException(
             "STT provider 'Deepgram' selected but Stt.Deepgram config is missing.");
@@ -96,14 +77,11 @@ public sealed class TranscriberFactory
             config.ApiKey,
             config.Model,
             config.Diarize,
-            publisher,
+            _dispatcher,
             logger);
     }
 
-    /// <summary>
-    /// Creates an Azure ConversationTranscriber instance.
-    /// </summary>
-    private AzureConversationTranscriber CreateAzureTranscriber(PythonTranscriptPublisher publisher)
+    private AzureConversationTranscriber CreateAzureTranscriber()
     {
         var config = _sttConfig.AzureSpeech ?? throw new InvalidOperationException(
             "STT provider 'AzureSpeech' selected but Stt.AzureSpeech config is missing.");
@@ -114,7 +92,7 @@ public sealed class TranscriberFactory
             config.Region,
             config.RecognitionLanguage,
             config.EndpointId,
-            publisher,
+            _dispatcher,
             logger);
     }
 }
@@ -135,7 +113,7 @@ public sealed class AzureSpeechRealtimeTranscriber : IRealtimeTranscriber
     private readonly string _speechRegion;
     private readonly string _lang;
     private readonly string? _endpointId;
-    private readonly PythonTranscriptPublisher _publisher;
+    private readonly EventFanoutDispatcher _dispatcher;
     private readonly ILogger<AzureSpeechRealtimeTranscriber> _logger;
 
     private PushAudioInputStream? _push;
@@ -166,14 +144,14 @@ public sealed class AzureSpeechRealtimeTranscriber : IRealtimeTranscriber
         string speechRegion,
         string language,
         string? endpointId,
-        PythonTranscriptPublisher publisher,
+        EventFanoutDispatcher dispatcher,
         ILogger<AzureSpeechRealtimeTranscriber> logger)
     {
         _speechKey = speechKey;
         _speechRegion = speechRegion;
         _lang = language;
         _endpointId = string.IsNullOrWhiteSpace(endpointId) ? null : endpointId.Trim();
-        _publisher = publisher;
+        _dispatcher = dispatcher;
         _logger = logger;
     }
 
@@ -355,8 +333,8 @@ public sealed class AzureSpeechRealtimeTranscriber : IRealtimeTranscriber
             ChannelThreadId: ChannelThreadId
         );
         
-        // Publish to Python endpoint
-        _ = Task.Run(() => _publisher.PublishAsync(evt));
+        // Publish through the fan-out dispatcher (non-blocking).
+        _ = _dispatcher.PublishTranscriptAsync(evt);
         
         // Also save to desktop file
         _ = Task.Run(() => SaveToFile(kind, text, timestamp));

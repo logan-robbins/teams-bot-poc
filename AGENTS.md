@@ -563,20 +563,36 @@ script which installs win-acme + requests a fresh Let's Encrypt cert.
 | `POST` | `/api/calling` | Graph calling webhook |
 | `GET` | `/api/calling/health` | Per-call readiness snapshots |
 | `POST` | `/api/calling/join` | Manually trigger a call join |
-| `POST` | `/api/send-chat` | Internal — sink calls this when Alfred decides to post |
+| `POST` | `/api/send-chat` | Any consumer calls this to post into a Teams chat. Body must echo `conversation_reference_id` from the envelope. |
 | `POST` | `/api/graph-notifications` | Graph change-notification webhook |
 | `GET` | `/api/channels` | List persistent channel attachments |
 | `POST` | `/api/channels/attach` | Attach Alfred to a Teams channel |
 | `DELETE` | `/api/channels/{teamId}/{channelId}` | Detach |
+| `GET` | `/api/channels/{teamId}/{channelId}/consumers` | List the per-channel consumer URLs. |
+| `PUT` | `/api/channels/{teamId}/{channelId}/consumers` | Replace the entire consumer list. |
+| `POST` | `/api/channels/{teamId}/{channelId}/consumers` | Insert/replace one consumer by name. |
+| `DELETE` | `/api/channels/{teamId}/{channelId}/consumers/{name}` | Remove one consumer by name. |
+
+The bot's `EventFanoutDispatcher` POSTs every event for a channel to
+every registered consumer URL using the
+[`alfred-events-v1` envelope shape](docs/event-contract.md). Each
+team's backend lives behind one of those URLs; this repo's Python
+sink is one such reference consumer.
 
 ### 8.2 Sink HTTP API (Container App)
+
+This sink is the **reference consumer** for the
+[`alfred-events-v1` contract](docs/event-contract.md). It happens to
+power Disney's React UI, but other teams stand up their own backends
+behind their own URLs and consume the same envelope shape.
 
 Routing is all keyed on `chat_thread_id`:
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/transcript` | STT events from C# bot |
-| `POST` | `/chat` | Bot Framework chat events from C# bot |
+| `POST` | `/events` | **Versioned envelope ingress** — single endpoint for the alfred-events-v1 contract. Routes by `event_type` to internal handlers. |
+| `POST` | `/transcript` | STT events from C# bot (legacy direct path; `/events` is preferred). |
+| `POST` | `/chat` | Bot Framework chat events from C# bot (legacy direct path; `/events` is preferred). |
 | `POST` | `/session/link` | Bind a thread to a channel; backfills prior events |
 | `GET` | `/session/link/{tid}` | Fetch a thread's channel link |
 | `GET` | `/channels/links` | List all session→channel links |

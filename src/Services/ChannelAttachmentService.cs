@@ -1,6 +1,7 @@
 using Microsoft.Bot.Builder;
 using Microsoft.Bot.Schema;
 using Microsoft.Extensions.Hosting;
+using TeamsMediaBot.Models;
 
 namespace TeamsMediaBot.Services;
 
@@ -20,6 +21,24 @@ public interface IChannelAttachmentService
     ChannelAttachmentRecord? Get(string teamId, string channelId);
 
     ChannelAttachmentRecord? GetByConversationThreadId(string conversationThreadId);
+
+    Task<bool> SetConsumersAsync(
+        string teamId,
+        string channelId,
+        IReadOnlyList<ConsumerConfig> consumers,
+        CancellationToken cancellationToken = default);
+
+    Task<bool> UpsertConsumerAsync(
+        string teamId,
+        string channelId,
+        ConsumerConfig consumer,
+        CancellationToken cancellationToken = default);
+
+    Task<bool> RemoveConsumerAsync(
+        string teamId,
+        string channelId,
+        string consumerName,
+        CancellationToken cancellationToken = default);
 }
 
 /// <summary>
@@ -55,17 +74,22 @@ public sealed record ChannelAttachmentRequest
 /// </summary>
 public sealed class ChannelAttachmentService : IChannelAttachmentService, IHostedService
 {
+    private const string LegacyDefaultConsumerName = "legacy-default";
+
     private readonly ChannelAttachmentStore _store;
     private readonly IMeetingChatService _meetingChatService;
+    private readonly EventDispatchConfiguration _dispatchConfig;
     private readonly ILogger<ChannelAttachmentService> _logger;
 
     public ChannelAttachmentService(
         ChannelAttachmentStore store,
         IMeetingChatService meetingChatService,
+        EventDispatchConfiguration dispatchConfig,
         ILogger<ChannelAttachmentService> logger)
     {
         _store = store;
         _meetingChatService = meetingChatService;
+        _dispatchConfig = dispatchConfig;
         _logger = logger;
     }
 
@@ -80,14 +104,26 @@ public sealed class ChannelAttachmentService : IChannelAttachmentService, IHoste
                 var subscription = await _meetingChatService
                     .EnsureChannelMessagesSubscriptionAsync(record.TeamId, record.ChannelId, cancellationToken);
 
-                await _store.UpsertAsync(
-                    record with
+                var refreshed = record with
+                {
+                    SubscriptionId = subscription.SubscriptionId,
+                    SubscriptionResource = subscription.Resource,
+                    SubscriptionExpiresAtUtc = subscription.ExpiresAtUtc,
+                };
+
+                if (ShouldApplyLegacySeed(refreshed))
+                {
+                    refreshed = refreshed with
                     {
-                        SubscriptionId = subscription.SubscriptionId,
-                        SubscriptionResource = subscription.Resource,
-                        SubscriptionExpiresAtUtc = subscription.ExpiresAtUtc,
-                    },
-                    cancellationToken);
+                        Consumers = new[] { BuildLegacyDefaultConsumer(_dispatchConfig.BootstrapConsumerUrl!) },
+                        LegacySeeded = true,
+                    };
+                    _logger.LogInformation(
+                        "Seeded legacy-default consumer on existing attachment TeamId={TeamId} ChannelId={ChannelId} Url={Url}",
+                        refreshed.TeamId, refreshed.ChannelId, _dispatchConfig.BootstrapConsumerUrl);
+                }
+
+                await _store.UpsertAsync(refreshed, cancellationToken);
 
                 _logger.LogInformation(
                     "Restored channel subscription on startup TeamId={TeamId} ChannelId={ChannelId} SubscriptionId={SubscriptionId}",
@@ -106,6 +142,20 @@ public sealed class ChannelAttachmentService : IChannelAttachmentService, IHoste
         }
     }
 
+    private bool ShouldApplyLegacySeed(ChannelAttachmentRecord record) =>
+        !record.LegacySeeded
+        && record.Consumers.Count == 0
+        && !string.IsNullOrWhiteSpace(_dispatchConfig.BootstrapConsumerUrl);
+
+    private static ConsumerConfig BuildLegacyDefaultConsumer(string url) =>
+        new()
+        {
+            Name = LegacyDefaultConsumerName,
+            Url = url,
+            EventKinds = new[] { "*" },
+            Enabled = true,
+        };
+
     public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 
     public async Task AttachAsync(
@@ -122,6 +172,20 @@ public sealed class ChannelAttachmentService : IChannelAttachmentService, IHoste
             request.ChannelId,
             cancellationToken);
 
+        var consumers = existing?.Consumers ?? Array.Empty<ConsumerConfig>();
+        var legacySeeded = existing?.LegacySeeded ?? false;
+
+        if (existing is null
+            && consumers.Count == 0
+            && !string.IsNullOrWhiteSpace(_dispatchConfig.BootstrapConsumerUrl))
+        {
+            consumers = new[] { BuildLegacyDefaultConsumer(_dispatchConfig.BootstrapConsumerUrl!) };
+            legacySeeded = true;
+            _logger.LogInformation(
+                "Seeded legacy-default consumer on new attachment TeamId={TeamId} ChannelId={ChannelId} Url={Url}",
+                request.TeamId, request.ChannelId, _dispatchConfig.BootstrapConsumerUrl);
+        }
+
         var record = new ChannelAttachmentRecord
         {
             TeamId = request.TeamId,
@@ -137,6 +201,8 @@ public sealed class ChannelAttachmentService : IChannelAttachmentService, IHoste
             SubscriptionId = subscription.SubscriptionId,
             SubscriptionResource = subscription.Resource,
             SubscriptionExpiresAtUtc = subscription.ExpiresAtUtc,
+            Consumers = consumers,
+            LegacySeeded = legacySeeded,
         };
 
         await _store.UpsertAsync(record, cancellationToken);
@@ -161,4 +227,25 @@ public sealed class ChannelAttachmentService : IChannelAttachmentService, IHoste
 
     public ChannelAttachmentRecord? GetByConversationThreadId(string conversationThreadId) =>
         _store.GetByConversationThreadId(conversationThreadId);
+
+    public Task<bool> SetConsumersAsync(
+        string teamId,
+        string channelId,
+        IReadOnlyList<ConsumerConfig> consumers,
+        CancellationToken cancellationToken = default) =>
+        _store.SetConsumersAsync(teamId, channelId, consumers, cancellationToken);
+
+    public Task<bool> UpsertConsumerAsync(
+        string teamId,
+        string channelId,
+        ConsumerConfig consumer,
+        CancellationToken cancellationToken = default) =>
+        _store.UpsertConsumerAsync(teamId, channelId, consumer, cancellationToken);
+
+    public Task<bool> RemoveConsumerAsync(
+        string teamId,
+        string channelId,
+        string consumerName,
+        CancellationToken cancellationToken = default) =>
+        _store.RemoveConsumerAsync(teamId, channelId, consumerName, cancellationToken);
 }

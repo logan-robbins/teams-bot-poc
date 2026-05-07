@@ -1,0 +1,364 @@
+using System.Collections.Concurrent;
+using System.Net.Http.Json;
+using System.Text.Json;
+using System.Threading.Channels;
+using TeamsMediaBot.Models;
+
+namespace TeamsMediaBot.Services;
+
+/// <summary>
+/// Resolves the per-channel <see cref="ConsumerConfig"/> list for an
+/// outbound event and POSTs a versioned <see cref="AlfredEventEnvelope"/>
+/// to each enabled consumer. Owns the per-consumer queue and background
+/// drain task; <see cref="PublishAsync"/> never blocks on consumer
+/// latency.
+///
+/// <para>
+/// This is the single sanctioned outbound path. The bot does not know
+/// which downstream systems exist; it just publishes envelopes to
+/// every URL registered for a channel and lets each consumer interpret
+/// them. See <c>docs/event-contract.md</c> for the wire shape.
+/// </para>
+/// </summary>
+public sealed class EventFanoutDispatcher : IAsyncDisposable
+{
+    private static readonly JsonSerializerOptions SerializerOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
+        DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull,
+    };
+
+    private const int QueueCapacity = 1000;
+    private const int MaxAttempts = 3;
+    private static readonly TimeSpan[] RetryDelays =
+    [
+        TimeSpan.FromMilliseconds(250),
+        TimeSpan.FromSeconds(1),
+        TimeSpan.FromSeconds(4),
+    ];
+
+    private readonly ChannelAttachmentStore _store;
+    private readonly IHttpClientFactory _httpClientFactory;
+    private readonly ILogger<EventFanoutDispatcher> _logger;
+    private readonly ILoggerFactory _loggerFactory;
+    private readonly MeetingAuditLogger? _auditLogger;
+    private readonly CancellationTokenSource _cts = new();
+    private readonly ConcurrentDictionary<string, ConsumerWorker> _workers = new(StringComparer.Ordinal);
+    private bool _disposed;
+
+    public EventFanoutDispatcher(
+        ChannelAttachmentStore store,
+        IHttpClientFactory httpClientFactory,
+        ILogger<EventFanoutDispatcher> logger,
+        ILoggerFactory loggerFactory,
+        MeetingAuditLogger? auditLogger = null)
+    {
+        _store = store ?? throw new ArgumentNullException(nameof(store));
+        _httpClientFactory = httpClientFactory ?? throw new ArgumentNullException(nameof(httpClientFactory));
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _loggerFactory = loggerFactory ?? throw new ArgumentNullException(nameof(loggerFactory));
+        _auditLogger = auditLogger;
+    }
+
+    /// <summary>
+    /// Hands an envelope off to every enabled consumer registered for the
+    /// envelope's <c>(team_id, channel_id)</c>, or for the channel
+    /// attachment whose <c>conversation_thread_id</c> matches the
+    /// envelope's <c>chat_thread_id</c>. Non-blocking — audits to disk
+    /// inline (cheap append) then drops to per-consumer bounded queues.
+    /// </summary>
+    public ValueTask PublishAsync(AlfredEventEnvelope envelope, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(envelope);
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        if (_auditLogger is not null && !string.IsNullOrWhiteSpace(envelope.ChatThreadId))
+        {
+            _auditLogger.Append(envelope.ChatThreadId, AuditFolderFor(envelope.EventType), envelope);
+        }
+
+        var consumers = ResolveConsumers(envelope);
+        if (consumers.Count == 0)
+        {
+            return ValueTask.CompletedTask;
+        }
+
+        foreach (var consumer in consumers)
+        {
+            if (!consumer.Enabled)
+            {
+                continue;
+            }
+
+            if (!MatchesEventKind(consumer.EventKinds, envelope.EventType))
+            {
+                continue;
+            }
+
+            var worker = _workers.GetOrAdd(
+                consumer.Url,
+                static (_, ctx) => new ConsumerWorker(
+                    ctx.url,
+                    ctx.factory.CreateClient(),
+                    ctx.factory,
+                    ctx.loggerFactory.CreateLogger<ConsumerWorker>(),
+                    ctx.cts.Token),
+                (url: consumer.Url, factory: _httpClientFactory, loggerFactory: _loggerFactory, cts: _cts));
+
+            worker.Enqueue(envelope, consumer.Headers);
+        }
+
+        return ValueTask.CompletedTask;
+    }
+
+    private static string AuditFolderFor(string eventType) => eventType switch
+    {
+        AlfredEventTypes.TranscriptPartial or AlfredEventTypes.TranscriptFinal => "transcript",
+        AlfredEventTypes.ChatMessage => "chat",
+        _ => "system",
+    };
+
+    private IReadOnlyList<ConsumerConfig> ResolveConsumers(AlfredEventEnvelope envelope)
+    {
+        ChannelAttachmentRecord? record = null;
+
+        if (!string.IsNullOrWhiteSpace(envelope.TeamId) && !string.IsNullOrWhiteSpace(envelope.ChannelId))
+        {
+            record = _store.Get(envelope.TeamId!, envelope.ChannelId!);
+        }
+
+        if (record is null && !string.IsNullOrWhiteSpace(envelope.ChatThreadId))
+        {
+            record = _store.GetByConversationThreadId(envelope.ChatThreadId);
+        }
+
+        return record?.Consumers ?? Array.Empty<ConsumerConfig>();
+    }
+
+    private static bool MatchesEventKind(IReadOnlyList<string> kinds, string eventType)
+    {
+        if (kinds.Count == 0)
+        {
+            return true;
+        }
+        for (var i = 0; i < kinds.Count; i++)
+        {
+            var k = kinds[i];
+            if (k == "*" || string.Equals(k, eventType, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+        _disposed = true;
+        _cts.Cancel();
+        var workers = _workers.Values.ToList();
+        foreach (var w in workers)
+        {
+            await w.DisposeAsync();
+        }
+        _cts.Dispose();
+    }
+
+    /// <summary>
+    /// Helper for the audio path: maps a <see cref="TranscriptEvent"/>'s
+    /// internal <c>event_type</c> ("partial" / "final") to the envelope
+    /// event type and dispatches. STT-internal lifecycle events
+    /// (<c>session_started</c>, <c>session_stopped</c>, <c>error</c>)
+    /// are intentionally not emitted as envelopes.
+    /// </summary>
+    public ValueTask PublishTranscriptAsync(
+        TranscriptEvent transcript,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(transcript);
+
+        var envelopeType = transcript.EventType switch
+        {
+            "final" => AlfredEventTypes.TranscriptFinal,
+            "partial" => AlfredEventTypes.TranscriptPartial,
+            _ => null,
+        };
+        if (envelopeType is null || string.IsNullOrWhiteSpace(transcript.ChatThreadId))
+        {
+            return ValueTask.CompletedTask;
+        }
+
+        return PublishAsync(
+            new AlfredEventEnvelope
+            {
+                EventType = envelopeType,
+                EventId = Guid.NewGuid().ToString("N"),
+                Ts = transcript.TimestampUtc,
+                TeamId = transcript.TeamId,
+                ChannelId = transcript.ChannelId,
+                ChatThreadId = transcript.ChatThreadId!,
+                ChannelThreadId = transcript.ChannelThreadId,
+                ConversationReferenceId = transcript.ChatThreadId,
+                Payload = transcript,
+            },
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// Per-consumer-URL drain loop. One bounded channel + one background
+    /// task. Drop-oldest on overflow so a slow consumer can never block
+    /// the producer; bounded retry so a flapping consumer logs once and
+    /// moves on.
+    /// </summary>
+    private sealed class ConsumerWorker : IAsyncDisposable
+    {
+        private readonly string _url;
+        private readonly HttpClient _httpClient;
+        private readonly ILogger<ConsumerWorker> _logger;
+        private readonly Channel<QueuedEnvelope> _channel;
+        private readonly Task _drainTask;
+        private readonly CancellationToken _shutdownToken;
+
+        internal ConsumerWorker(
+            string url,
+            HttpClient httpClient,
+            IHttpClientFactory _,
+            ILogger<ConsumerWorker> logger,
+            CancellationToken shutdownToken)
+        {
+            _url = url;
+            _httpClient = httpClient;
+            _httpClient.Timeout = TimeSpan.FromSeconds(10);
+            _logger = logger;
+            _shutdownToken = shutdownToken;
+            _channel = Channel.CreateBounded<QueuedEnvelope>(new BoundedChannelOptions(QueueCapacity)
+            {
+                FullMode = BoundedChannelFullMode.DropOldest,
+                SingleReader = true,
+                SingleWriter = false,
+            });
+            _drainTask = Task.Run(DrainAsync);
+        }
+
+        internal void Enqueue(AlfredEventEnvelope envelope, IReadOnlyDictionary<string, string>? headers)
+        {
+            // Bounded channel with DropOldest never returns false on TryWrite;
+            // if it ever did we would log so the operator can see overflow.
+            if (!_channel.Writer.TryWrite(new QueuedEnvelope(envelope, headers)))
+            {
+                _logger.LogWarning("Consumer {Url} queue rejected an event; dropping.", _url);
+            }
+        }
+
+        private async Task DrainAsync()
+        {
+            try
+            {
+                await foreach (var item in _channel.Reader.ReadAllAsync(_shutdownToken))
+                {
+                    await PostWithRetryAsync(item).ConfigureAwait(false);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // shutdown
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Consumer drain task for {Url} crashed", _url);
+            }
+        }
+
+        private async Task PostWithRetryAsync(QueuedEnvelope item)
+        {
+            for (var attempt = 0; attempt < MaxAttempts; attempt++)
+            {
+                try
+                {
+                    using var request = new HttpRequestMessage(HttpMethod.Post, _url)
+                    {
+                        Content = JsonContent.Create(item.Envelope, options: SerializerOptions),
+                    };
+                    if (item.Headers is not null)
+                    {
+                        foreach (var (k, v) in item.Headers)
+                        {
+                            request.Headers.TryAddWithoutValidation(k, v);
+                        }
+                    }
+
+                    using var response = await _httpClient
+                        .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, _shutdownToken)
+                        .ConfigureAwait(false);
+
+                    if (response.IsSuccessStatusCode)
+                    {
+                        return;
+                    }
+
+                    if ((int)response.StatusCode is >= 400 and < 500
+                        and not 408 and not 429)
+                    {
+                        _logger.LogWarning(
+                            "Consumer {Url} returned {Status} for event {EventType} ({EventId}); not retrying.",
+                            _url, (int)response.StatusCode, item.Envelope.EventType, item.Envelope.EventId);
+                        return;
+                    }
+
+                    _logger.LogInformation(
+                        "Consumer {Url} returned {Status} for {EventType} (attempt {Attempt}/{Max}); will retry.",
+                        _url, (int)response.StatusCode, item.Envelope.EventType, attempt + 1, MaxAttempts);
+                }
+                catch (OperationCanceledException) when (_shutdownToken.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogInformation(
+                        ex,
+                        "Consumer {Url} POST failed for {EventType} (attempt {Attempt}/{Max}); will retry if attempts remain.",
+                        _url, item.Envelope.EventType, attempt + 1, MaxAttempts);
+                }
+
+                if (attempt + 1 < MaxAttempts)
+                {
+                    try
+                    {
+                        await Task.Delay(RetryDelays[attempt], _shutdownToken).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        return;
+                    }
+                }
+            }
+
+            _logger.LogWarning(
+                "Consumer {Url} dropped event {EventType} ({EventId}) after {Max} attempts.",
+                _url, item.Envelope.EventType, item.Envelope.EventId, MaxAttempts);
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            _channel.Writer.TryComplete();
+            try
+            {
+                await _drainTask.ConfigureAwait(false);
+            }
+            catch
+            {
+                // best-effort
+            }
+            _httpClient.Dispose();
+        }
+
+        private readonly record struct QueuedEnvelope(
+            AlfredEventEnvelope Envelope,
+            IReadOnlyDictionary<string, string>? Headers);
+    }
+}

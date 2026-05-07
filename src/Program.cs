@@ -49,8 +49,25 @@ try
     var botConfig = LoadRequiredConfiguration<BotConfiguration>(builder.Configuration, "Bot");
     var mediaConfigRaw = LoadRequiredConfiguration<MediaPlatformConfiguration>(builder.Configuration, "MediaPlatformSettings");
     var sttConfig = LoadSttConfiguration(builder.Configuration);
-    var transcriptSinkConfig = LoadRequiredConfiguration<TranscriptSinkConfiguration>(builder.Configuration, "TranscriptSink");
-    ValidateTranscriptSinkConfiguration(transcriptSinkConfig);
+    var eventDispatchConfig = builder.Configuration.GetSection("EventDispatch").Get<EventDispatchConfiguration>()
+        ?? new EventDispatchConfiguration();
+    // Back-compat: derive BootstrapConsumerUrl from the legacy
+    // TranscriptSink.PythonEndpoint shape so existing VM deploys keep
+    // working without an appsettings rewrite. Drop after one cycle.
+    if (string.IsNullOrWhiteSpace(eventDispatchConfig.BootstrapConsumerUrl))
+    {
+        var legacy = builder.Configuration["TranscriptSink:PythonEndpoint"];
+        if (!string.IsNullOrWhiteSpace(legacy))
+        {
+            var trimmed = legacy.TrimEnd('/');
+            var lastSlash = trimmed.LastIndexOf('/');
+            var basePart = lastSlash > 0 ? trimmed[..lastSlash] : trimmed;
+            eventDispatchConfig = eventDispatchConfig with { BootstrapConsumerUrl = $"{basePart}/events" };
+            Log.Warning(
+                "Derived EventDispatch.BootstrapConsumerUrl={Derived} from legacy TranscriptSink.PythonEndpoint={Legacy}; migrate appsettings to drop the TranscriptSink section.",
+                eventDispatchConfig.BootstrapConsumerUrl, legacy);
+        }
+    }
     var joinModeSettings = builder.Configuration.GetSection("JoinMode").Get<JoinModeSettings>()
         ?? new JoinModeSettings();
     var meetingChatConfig = builder.Configuration.GetSection("MeetingChat").Get<MeetingChatConfiguration>()
@@ -81,7 +98,7 @@ try
     builder.Services.AddSingleton(botConfig);
     builder.Services.AddSingleton(mediaConfig);
     builder.Services.AddSingleton(sttConfig);
-    builder.Services.AddSingleton(transcriptSinkConfig);
+    builder.Services.AddSingleton(eventDispatchConfig);
     builder.Services.AddSingleton(joinModeSettings);
     builder.Services.AddSingleton(meetingChatConfig);
 
@@ -105,14 +122,16 @@ try
         builder.Configuration["MeetingAuditLogDir"] ?? @"C:\teams-bot-poc\meeting-logs");
     builder.Services.AddSingleton(new MeetingAuditLogger(auditLogDir));
 
-    // Meeting-chat services (inbound chat → Python sink; Graph subscription lifecycle).
+    // Meeting-chat + Graph services. The single sanctioned outbound
+    // path is EventFanoutDispatcher → per-channel consumers; chat,
+    // transcripts, and system events all flow through it.
     builder.Services.AddSingleton<IMeetingChatService, MeetingChatService>();
-    builder.Services.AddHttpClient<PythonChatPublisher>();
-    builder.Services.AddHttpClient<ChannelLinkPublisher>();
+    builder.Services.AddHttpClient();
     builder.Services.AddHttpClient<GraphApiClient>();
     builder.Services.AddSingleton<GraphNotificationCrypto>();
     builder.Services.AddSingleton<GraphValidationTokenValidator>();
     builder.Services.AddSingleton<GraphNotificationProcessor>();
+    builder.Services.AddSingleton<EventFanoutDispatcher>();
 
     // Persistent channel attachments (channel-level analog of "the bot is in
     // this meeting"). Re-issues subscriptions for each persisted channel on
@@ -141,17 +160,14 @@ try
         return graphLogger;
     });
 
-    // Register transcriber factory (creates transcribers outside of DI tracking)
+    // Register transcriber factory (creates transcribers outside of DI tracking).
+    // Audit logging now happens inside EventFanoutDispatcher, so the
+    // factory only needs the dispatcher + a logger factory.
     builder.Services.AddSingleton<TranscriberFactory>(sp =>
-    {
-        var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
-        var meetingAuditLogger = sp.GetRequiredService<MeetingAuditLogger>();
-        return new TranscriberFactory(
+        new TranscriberFactory(
             sttConfig,
-            transcriptSinkConfig.PythonEndpoint,
-            loggerFactory,
-            meetingAuditLogger);
-    });
+            sp.GetRequiredService<EventFanoutDispatcher>(),
+            sp.GetRequiredService<ILoggerFactory>()));
 
     // Register bot service as singleton
     builder.Services.AddSingleton<TeamsCallingBotService>();
@@ -175,13 +191,13 @@ try
     await botService.InitializeAsync().ConfigureAwait(false);
 
     Log.Information(
-        "Teams Media Bot starting - InstanceId={InstanceId}, ListenUrl={ListenUrl}, NotificationUrl={NotificationUrl}, MediaEndpoint={ServiceFqdn}:{PublicPort}, SinkEndpoint={SinkEndpoint}",
+        "Teams Media Bot starting - InstanceId={InstanceId}, ListenUrl={ListenUrl}, NotificationUrl={NotificationUrl}, MediaEndpoint={ServiceFqdn}:{PublicPort}, BootstrapConsumerUrl={BootstrapConsumerUrl}",
         configResolution.InstanceId,
         botConfig.LocalHttpListenUrl,
         botConfig.NotificationUrl,
         mediaConfig.ServiceFqdn,
         mediaConfig.InstancePublicPort,
-        transcriptSinkConfig.PythonEndpoint);
+        eventDispatchConfig.BootstrapConsumerUrl ?? "<none>");
 
     await app.RunAsync().ConfigureAwait(false);
 
@@ -212,25 +228,6 @@ static T LoadRequiredConfiguration<T>(IConfiguration configuration, string secti
 {
     return configuration.GetSection(sectionName).Get<T>()
         ?? throw new InvalidOperationException($"Configuration section '{sectionName}' is missing or invalid.");
-}
-
-/// <summary>
-/// Validates endpoints required by the single Teams-chat ingress path.
-/// </summary>
-static void ValidateTranscriptSinkConfiguration(TranscriptSinkConfiguration config)
-{
-    ArgumentNullException.ThrowIfNull(config);
-    if (string.IsNullOrWhiteSpace(config.PythonEndpoint))
-    {
-        throw new InvalidOperationException(
-            "TranscriptSink.PythonEndpoint is required for transcript forwarding.");
-    }
-
-    if (string.IsNullOrWhiteSpace(config.ChatEndpoint))
-    {
-        throw new InvalidOperationException(
-            "TranscriptSink.ChatEndpoint is required for inbound Teams chat forwarding.");
-    }
 }
 
 /// <summary>

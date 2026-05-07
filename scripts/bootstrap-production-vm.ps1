@@ -406,9 +406,8 @@ function Write-ProductionConfig {
         Stt = @{
             Provider = $providerName
         }
-        TranscriptSink = @{
-            PythonEndpoint = $SinkEndpoint
-            ChatEndpoint = if ([string]::IsNullOrWhiteSpace($SinkChatEndpoint)) { ($SinkEndpoint -replace '/transcript$', '/chat') } else { $SinkChatEndpoint }
+        EventDispatch = @{
+            BootstrapConsumerUrl = ($SinkEndpoint -replace '/transcript$', '/events')
         }
         JoinMode = @{
             PreferredMode = $preferredJoinMode

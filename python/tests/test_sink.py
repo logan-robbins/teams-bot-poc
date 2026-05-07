@@ -1445,3 +1445,183 @@ class TestChannelLinkAndRollup:
         matching = [l for l in links if l["chat_thread_id"] == meeting]
         assert len(matching) == 1
 
+
+class TestEnvelopeIngress:
+    """Verify the alfred-events-v1 envelope ingress on /events.
+
+    The Python sink is the reference consumer for the published
+    contract. /events is a thin router over /transcript, /chat, and
+    /session/link, so each event_type's behavior must match its
+    legacy direct-POST equivalent.
+    """
+
+    @pytest.mark.asyncio
+    async def test_envelope_chat_message_routes_to_chat_handler(
+        self, client: AsyncClient
+    ) -> None:
+        team = "team-env"
+        channel = "19:chan-env@thread.tacv2"
+
+        r = await client.post(
+            "/events",
+            json={
+                "schema_version": "alfred-events-v1",
+                "event_type": "chat.message",
+                "event_id": "evt-1",
+                "ts": "2026-04-22T16:00:00Z",
+                "team_id": team,
+                "channel_id": channel,
+                "chat_thread_id": channel,
+                "channel_thread_id": channel,
+                "conversation_reference_id": channel,
+                "payload": {
+                    "chat_thread_id": channel,
+                    "message_id": "m-env-1",
+                    "text": "via envelope",
+                    "timestamp_utc": "2026-04-22T16:00:00Z",
+                    "conversation_kind": "channel",
+                },
+            },
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["ok"] is True
+        assert body["event_type"] == "chat.message"
+
+        events = (await client.get(f"/c/{team}/{channel}/events")).json()["events"]
+        texts = {e["text"]: e for e in events}
+        assert "via envelope" in texts
+        assert texts["via envelope"]["channel_id"] == channel
+
+    @pytest.mark.asyncio
+    async def test_envelope_transcript_final_routes_to_transcript_handler(
+        self, client: AsyncClient
+    ) -> None:
+        meeting = "19:meeting_env_tr@thread.v2"
+
+        r = await client.post(
+            "/events",
+            json={
+                "schema_version": "alfred-events-v1",
+                "event_type": "transcript.final",
+                "event_id": "evt-tr-1",
+                "ts": "2026-04-22T16:00:00Z",
+                "chat_thread_id": meeting,
+                "payload": {
+                    "event_type": "final",
+                    "text": "envelope-final-utterance",
+                    "timestamp_utc": "2026-04-22T16:00:00Z",
+                    "chat_thread_id": meeting,
+                },
+            },
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["ok"] is True
+
+        ledger = (await client.get(f"/m/{meeting}/ledger")).json()["events"]
+        assert any(
+            (e.get("text") or "") == "envelope-final-utterance" for e in ledger
+        ), ledger
+
+    @pytest.mark.asyncio
+    async def test_envelope_session_linked_backfills(
+        self, client: AsyncClient
+    ) -> None:
+        team = "team-env-link"
+        channel = "19:chan-env-link@thread.tacv2"
+        meeting = "19:meeting_env_link@thread.v2"
+
+        # Land a chat with no channel context first.
+        await client.post(
+            "/chat",
+            json={
+                "chat_thread_id": meeting,
+                "message_id": "m-pre-env",
+                "text": "pre-envelope-link",
+                "timestamp_utc": "2026-04-22T16:00:00Z",
+            },
+        )
+
+        # Send the link as an envelope.
+        r = await client.post(
+            "/events",
+            json={
+                "schema_version": "alfred-events-v1",
+                "event_type": "system.session_linked",
+                "event_id": "evt-link-1",
+                "ts": "2026-04-22T16:01:00Z",
+                "team_id": team,
+                "channel_id": channel,
+                "chat_thread_id": meeting,
+                "channel_thread_id": channel,
+                "payload": {
+                    "chat_thread_id": meeting,
+                    "team_id": team,
+                    "channel_id": channel,
+                    "channel_thread_id": channel,
+                    "source": "test_envelope_link",
+                },
+            },
+        )
+        assert r.status_code == 200, r.text
+
+        events = (await client.get(f"/c/{team}/{channel}/events")).json()["events"]
+        texts = {e["text"]: e for e in events}
+        assert "pre-envelope-link" in texts
+        assert texts["pre-envelope-link"]["channel_id"] == channel
+
+    @pytest.mark.asyncio
+    async def test_envelope_unsupported_event_type_returns_400(
+        self, client: AsyncClient
+    ) -> None:
+        r = await client.post(
+            "/events",
+            json={
+                "schema_version": "alfred-events-v1",
+                "event_type": "totally.unknown.kind",
+                "event_id": "evt-bad",
+                "ts": "2026-04-22T16:00:00Z",
+                "chat_thread_id": "19:meeting_bad@thread.v2",
+                "payload": {},
+            },
+        )
+        assert r.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_envelope_routing_keys_filled_into_payload(
+        self, client: AsyncClient
+    ) -> None:
+        """Envelope-level team_id/channel_id stamp onto the inner payload
+        when the producer left them off, so downstream is happy either
+        way."""
+        team = "team-env-stamp"
+        channel = "19:chan-env-stamp@thread.tacv2"
+
+        await client.post(
+            "/events",
+            json={
+                "schema_version": "alfred-events-v1",
+                "event_type": "chat.message",
+                "event_id": "evt-stamp",
+                "ts": "2026-04-22T16:00:00Z",
+                "team_id": team,
+                "channel_id": channel,
+                "chat_thread_id": channel,
+                "channel_thread_id": channel,
+                "payload": {
+                    # Note: payload omits team_id/channel_id; envelope
+                    # supplies them.
+                    "chat_thread_id": channel,
+                    "message_id": "m-stamp",
+                    "text": "stamped from envelope",
+                    "timestamp_utc": "2026-04-22T16:00:00Z",
+                    "conversation_kind": "channel",
+                },
+            },
+        )
+
+        events = (await client.get(f"/c/{team}/{channel}/events")).json()["events"]
+        texts = {e["text"]: e for e in events}
+        assert "stamped from envelope" in texts
+        assert texts["stamped from envelope"]["channel_id"] == channel
+

@@ -17,9 +17,16 @@ This README is the **what + why**. `AGENTS.md` is the **how**.
 
 ## TL;DR
 
-- **Three deployables:** C# bot on a Windows VM (audio + Teams APIs),
-  Python FastAPI sink on Container Apps (sessions + agent + SQLite),
-  React UI on Container Apps (read-only).
+- **The bot is a Teams platform.** It captures audio + chat for every
+  channel it's attached to, and POSTs each event as a versioned
+  envelope ([`alfred-events-v1`](docs/event-contract.md)) to every
+  consumer URL registered against that channel. Each team owns
+  whatever's behind their URL.
+- **Three deployables in this repo:** C# bot on a Windows VM (audio +
+  Teams APIs + per-channel consumer registry + outbound dispatcher),
+  Python FastAPI sink on Container Apps (the reference consumer +
+  sessions + agent + SQLite), React UI on Container Apps (read-only,
+  reads the reference sink).
 - **Single key:** `chat_thread_id` routes every transcript and chat
   to its session. The UI URL is `/m/<chat_thread_id>`.
 - **Channel rollup:** every event is also stamped with optional
@@ -299,13 +306,67 @@ meeting chats.
 
 ## 6. Operate
 
-The bot stamps every transcript and chat with the meeting's
-`chat_thread_id` and POSTs them to `/transcript` / `/chat` on the sink.
-The sink's `SessionRegistry` auto-starts a session keyed on that id and
-persists everything into both the immutable `raw_ingest_events` audit
-table and the working `meeting_events` ledger. The UI reads
-`/m/<chat_thread_id>/status` + live SSE at `/m/<chat_thread_id>/events`.
-Open `/` to pick from the active meeting list.
+The bot publishes every transcript and chat as a versioned envelope
+([`alfred-events-v1`](docs/event-contract.md)) to every consumer URL
+registered against that channel. Each consumer is one team's backend.
+The reference Python sink in this repo subscribes at `POST /events`,
+auto-starts a session keyed on `chat_thread_id`, and persists into
+both the immutable `raw_ingest_events` audit table and the working
+`meeting_events` ledger. The Disney UI reads from this reference
+sink: `/m/<chat_thread_id>/status` + live SSE at
+`/m/<chat_thread_id>/events`. Open `/` to pick from the active meeting
+list.
+
+### Per-channel consumer config (`/api/channels/.../consumers`)
+
+Every channel has its own list of downstream URLs. Manage them on
+the bot:
+
+```bash
+BOT=https://alfred-disney-bot.eastus.cloudapp.azure.com
+TEAM='<team AAD group id>'
+CHAN='19:<channel guid>@thread.tacv2'
+ENC=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=''))" "$CHAN")
+
+# List consumers for a channel
+curl -sS "$BOT/api/channels/$TEAM/$ENC/consumers" | jq
+
+# Replace the entire list
+curl -sS -X PUT "$BOT/api/channels/$TEAM/$ENC/consumers" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "consumers": [
+      {
+        "name": "alfred-disney-sink",
+        "url":  "https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io/events",
+        "event_kinds": ["*"]
+      },
+      {
+        "name": "team-b-summarizer",
+        "url":  "https://team-b.internal/sink",
+        "event_kinds": ["transcript.final","chat.message"],
+        "headers": {"X-Team":"B"}
+      }
+    ]
+  }'
+
+# Insert/replace one by name (the rest of the list stays put)
+curl -sS -X POST "$BOT/api/channels/$TEAM/$ENC/consumers" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"team-b-summarizer","url":"https://team-b.internal/sink","event_kinds":["transcript.final"]}'
+
+# Remove one by name
+curl -sS -X DELETE "$BOT/api/channels/$TEAM/$ENC/consumers/team-b-summarizer"
+```
+
+Bootstrap default: the bot config has an optional
+`EventDispatch.BootstrapConsumerUrl`. When set, every newly-attached
+channel (and any pre-existing channel with empty consumers and
+`legacy_seeded=false`) is auto-seeded with one consumer named
+`legacy-default` pointing at this URL. Operators can delete it via
+the CRUD API once a real consumer is registered. Disney's
+`appsettings.production.json` points it at the Disney sandbox
+sink so the channel-attached UI keeps working out of the box.
 
 ```bash
 SINK=https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io

@@ -223,22 +223,23 @@ public sealed class AzureSpeechConfiguration
 }
 
 /// <summary>
-/// Python transcript sink configuration.
+/// Event-dispatch configuration. Per-channel consumer lists are the
+/// canonical destination for Alfred events; this section only configures
+/// the optional bootstrap default applied to channels that have no
+/// consumers registered yet.
 /// </summary>
-public sealed class TranscriptSinkConfiguration
+public sealed record EventDispatchConfiguration
 {
     /// <summary>
-    /// Gets or sets the Python FastAPI endpoint URL for receiving transcript events.
+    /// Optional. When set, every newly-attached channel (and any existing
+    /// attached channel with empty consumers and <c>legacy_seeded=false</c>)
+    /// is seeded with a single consumer named <c>legacy-default</c>
+    /// pointing at this URL. Operators can delete it via the consumer
+    /// CRUD API once a real consumer is registered. Leave null to
+    /// require explicit consumer registration on every channel.
     /// </summary>
-    /// <example>https://agent.example.com/transcript</example>
-    public required string PythonEndpoint { get; init; }
-
-    /// <summary>
-    /// Gets or sets the Python endpoint URL for receiving meeting-chat events.
-    /// Typically the sink's /chat endpoint (e.g. https://agent.example.com/chat).
-    /// When null, the bot does not forward chat messages to the sink.
-    /// </summary>
-    public string? ChatEndpoint { get; init; }
+    /// <example>https://ca-alfred-api.example.com/events</example>
+    public string? BootstrapConsumerUrl { get; init; }
 }
 
 /// <summary>
