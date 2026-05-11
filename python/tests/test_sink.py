@@ -1630,3 +1630,64 @@ class TestEnvelopeIngress:
         assert "stamped from envelope" in texts
         assert texts["stamped from envelope"]["channel_id"] == channel
 
+    @pytest.mark.asyncio
+    async def test_envelope_official_transcript_persists_cues(
+        self, client: AsyncClient
+    ) -> None:
+        """transcript.official envelope persists every cue as a speech event."""
+        meeting = "19:meeting_off@thread.v2"
+        team = "team-off"
+        channel = "19:chan-off@thread.tacv2"
+
+        r = await client.post(
+            "/events",
+            json={
+                "schema_version": "alfred-events-v1",
+                "event_type": "transcript.official",
+                "event_id": "evt-off-1",
+                "ts": "2026-04-22T16:30:00Z",
+                "team_id": team,
+                "channel_id": channel,
+                "chat_thread_id": meeting,
+                "channel_thread_id": channel,
+                "payload": {
+                    "meeting_id": "graph-meeting-xyz",
+                    "transcript_id": "graph-transcript-abc",
+                    "organizer_oid": "00000000-0000-0000-0000-000000000001",
+                    "created_at_utc": "2026-04-22T16:30:01Z",
+                    "cue_count": 2,
+                    "cues": [
+                        {
+                            "speaker": "Logan Robbins",
+                            "text": "Hello team, welcome to the meeting.",
+                            "start_ms": 1000,
+                            "end_ms": 4000,
+                        },
+                        {
+                            "speaker": "Logan Robbins",
+                            "text": "Today we will discuss the new feature.",
+                            "start_ms": 4500,
+                            "end_ms": 8200,
+                        },
+                    ],
+                    "vtt_raw": "WEBVTT\n\n00:00:01.000 --> 00:00:04.000\n<v Logan Robbins>Hello.</v>\n",
+                },
+            },
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["ok"] is True
+        assert body["persisted"] == 2
+
+        ledger = (await client.get(f"/m/{meeting}/ledger")).json()["events"]
+        # Both cues land as speech events from graph_notification with the
+        # Teams-rendered speaker name in display_name.
+        from_graph = [
+            e for e in ledger
+            if e.get("source") == "graph_notification"
+            and e.get("display_name") == "Logan Robbins"
+        ]
+        assert len(from_graph) == 2
+        assert "Hello team" in from_graph[0]["text"]
+        assert "Today we will discuss" in from_graph[1]["text"]
+

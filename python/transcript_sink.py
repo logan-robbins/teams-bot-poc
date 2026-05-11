@@ -2928,6 +2928,9 @@ async def receive_event_envelope(
         request = SessionChannelLinkRequest(**payload)
         return await link_session_to_channel(request, state)
 
+    if et == "transcript.official":
+        return await _handle_official_transcript(envelope, payload, state)
+
     if et in ("system.channel_attached", "system.channel_detached"):
         logger.info(
             "Received %s envelope team=%s channel=%s; reference sink does not act on attach lifecycle.",
@@ -2942,6 +2945,84 @@ async def receive_event_envelope(
         status_code=status.HTTP_400_BAD_REQUEST,
         detail=f"Unsupported event_type: {et}",
     )
+
+
+async def _handle_official_transcript(
+    envelope: "AlfredEventEnvelopeRequest",
+    payload: dict[str, Any],
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """Persist Microsoft's official meeting transcript alongside live STT.
+
+    Each VTT cue lands as a ``MeetingEvent`` with ``kind="speech"`` and
+    ``source="official_transcript"`` so it shows up in the same per-meeting
+    and per-channel rollups as live transcripts. The envelope's
+    ``meeting_id`` / ``transcript_id`` are stamped on every row so consumers
+    can group by them.
+    """
+    store: SessionStore = state["store"]
+    session_registry: SessionRegistry = state["session_registry"]
+
+    chat_thread_id = envelope.chat_thread_id
+    cues = payload.get("cues") or []
+    meeting_id = payload.get("meeting_id") or ""
+    transcript_id = payload.get("transcript_id") or ""
+
+    manager, chat_thread_id = resolve_manager_for_inbound(
+        session_registry, chat_thread_id, auto_start=True
+    )
+    if manager is None or manager.session is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not resolve a session for transcript.official",
+        )
+
+    # FK on meeting_events.session_id requires the row to exist first.
+    await asyncio.to_thread(store.upsert_session, manager.session)
+
+    persisted = 0
+    for idx, cue in enumerate(cues):
+        text = (cue.get("text") or "").strip()
+        if not text:
+            continue
+        speaker = cue.get("speaker") or "unknown"
+        event = MeetingEvent(
+            event_id=str(_uuid.uuid4()),
+            kind="speech",
+            # The bot fetches this via Graph after meeting ends, so it
+            # belongs to graph_notification by source. Distinguish from
+            # live STT via transcript_provider below.
+            source="graph_notification",
+            timestamp_utc=envelope.ts,
+            display_name=speaker,
+            text=text,
+            transcript_provider="official_teams_transcript",
+            raw={
+                "meeting_id": meeting_id,
+                "transcript_id": transcript_id,
+                "cue_index": idx,
+                "start_ms": int(cue.get("start_ms") or 0),
+                "end_ms": int(cue.get("end_ms") or 0),
+            },
+            team_id=envelope.team_id,
+            channel_id=envelope.channel_id,
+            channel_thread_id=envelope.channel_thread_id,
+        )
+        await asyncio.to_thread(
+            store.append_meeting_event, manager.session.session_id, event
+        )
+        persisted += 1
+
+    logger.info(
+        "Persisted official transcript: meeting=%s transcript=%s cues=%s chat_thread_id=%s",
+        meeting_id, transcript_id, persisted, chat_thread_id,
+    )
+    return {
+        "ok": True,
+        "meeting_id": meeting_id,
+        "transcript_id": transcript_id,
+        "persisted": persisted,
+    }
 
 
 @app.get("/session/link/{chat_thread_id:path}")

@@ -115,6 +115,7 @@ try
     builder.Services.AddSingleton<GraphValidationTokenValidator>();
     builder.Services.AddSingleton<GraphNotificationProcessor>();
     builder.Services.AddSingleton<EventFanoutDispatcher>();
+    builder.Services.AddSingleton<OfficialTranscriptFetcher>();
 
     // Persistent channel attachments (channel-level analog of "the bot is in
     // this meeting"). Re-issues subscriptions for each persisted channel on

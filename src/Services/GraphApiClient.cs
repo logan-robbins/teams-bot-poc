@@ -145,6 +145,40 @@ public sealed class GraphApiClient
         return await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
     }
 
+    /// <summary>
+    /// GETs a resource and returns the raw response body as text. Used
+    /// for transcript content fetches (<c>text/vtt</c>) where we don't
+    /// want JSON parsing.
+    /// </summary>
+    public async Task<string> GetResourceTextAsync(
+        string resource,
+        string? acceptContentType = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(resource);
+
+        var request = new HttpRequestMessage(HttpMethod.Get, BuildUri(resource));
+        request.Headers.Authorization = new AuthenticationHeaderValue(
+            "Bearer", await AcquireTokenAsync(cancellationToken));
+        if (!string.IsNullOrWhiteSpace(acceptContentType))
+        {
+            request.Headers.Accept.Clear();
+            request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue(acceptContentType));
+        }
+
+        using var response = await _httpClient.SendAsync(request, cancellationToken);
+        var body = await response.Content.ReadAsStringAsync(cancellationToken);
+        if (!response.IsSuccessStatusCode)
+        {
+            _logger.LogWarning(
+                "Graph GET {Url} returned {StatusCode}: {Body}",
+                request.RequestUri, (int)response.StatusCode,
+                body.Length > 400 ? body[..400] : body);
+            throw new GraphApiException(response.StatusCode, body);
+        }
+        return body;
+    }
+
     private async Task<HttpResponseMessage> SendAsync(
         HttpMethod method,
         string relativeOrAbsoluteUrl,

@@ -19,11 +19,13 @@ public sealed partial class GraphNotificationProcessor
     private readonly MeetingChatConfiguration _config;
     private readonly BotConfiguration _botConfig;
     private readonly IMeetingChatService _meetingChatService;
+    private readonly IChannelAttachmentService _attachmentService;
     private readonly GraphApiClient _graphApiClient;
     private readonly GraphNotificationCrypto _crypto;
     private readonly GraphValidationTokenValidator _tokenValidator;
     private readonly TeamsCallingBotService _botService;
     private readonly TranscriberFactory _transcriberFactory;
+    private readonly OfficialTranscriptFetcher _transcriptFetcher;
     private readonly ILogger<GraphNotificationProcessor> _logger;
 
     /// <summary>
@@ -39,22 +41,26 @@ public sealed partial class GraphNotificationProcessor
         MeetingChatConfiguration config,
         BotConfiguration botConfig,
         IMeetingChatService meetingChatService,
+        IChannelAttachmentService attachmentService,
         GraphApiClient graphApiClient,
         GraphNotificationCrypto crypto,
         GraphValidationTokenValidator tokenValidator,
         TeamsCallingBotService botService,
         TranscriberFactory transcriberFactory,
+        OfficialTranscriptFetcher transcriptFetcher,
         ILogger<GraphNotificationProcessor> logger)
     {
         _dispatcher = dispatcher;
         _config = config;
         _botConfig = botConfig;
         _meetingChatService = meetingChatService;
+        _attachmentService = attachmentService;
         _graphApiClient = graphApiClient;
         _crypto = crypto;
         _tokenValidator = tokenValidator;
         _botService = botService;
         _transcriberFactory = transcriberFactory;
+        _transcriptFetcher = transcriptFetcher;
         _logger = logger;
     }
 
@@ -245,6 +251,17 @@ public sealed partial class GraphNotificationProcessor
             return;
         }
 
+        var attachment = _attachmentService.Get(payload.TeamId!, payload.ChannelId!);
+        if (attachment is not null && !attachment.AutoJoinEnabled)
+        {
+            _logger.LogInformation(
+                "Auto-join disabled for team={TeamId} channel={ChannelId}; skipping callId={CallId}. Use POST /api/channels/{TeamId}/{ChannelId}/join for manual trigger.",
+                payload.TeamId, payload.ChannelId, callId, payload.TeamId, payload.ChannelId);
+            // Drop the latch so a future re-enable + retry can succeed.
+            _attemptedJoins.TryRemove(callId, out _);
+            return;
+        }
+
         var initiatorOid = detail.TryGetProperty("initiator", out var init) &&
                            init.ValueKind == JsonValueKind.Object &&
                            init.TryGetProperty("user", out var user) &&
@@ -264,7 +281,7 @@ public sealed partial class GraphNotificationProcessor
             return;
         }
 
-        var joinUrl = BuildChannelMeetingJoinUrl(
+        var joinUrl = ChannelMeetingJoinUrls.Build(
             payload.ChannelThreadId!,
             tenantId,
             initiatorOid ?? _botConfig.AppId ?? string.Empty);
@@ -299,6 +316,17 @@ public sealed partial class GraphNotificationProcessor
                 _logger.LogInformation(
                     "Auto-join workflow completed for callId={CallId}: SelectedMode={Mode} BotCallId={BotCallId} Deferred={Deferred} Message={Message}",
                     callId, result.SelectedJoinMode, result.CallId, result.Deferred, result.Message);
+
+                if (!result.Deferred && !string.IsNullOrWhiteSpace(initiatorOid) && !string.IsNullOrWhiteSpace(result.CallId))
+                {
+                    _transcriptFetcher.Register(
+                        botCallId: result.CallId!,
+                        organizerOid: initiatorOid!,
+                        teamId: payload.TeamId!,
+                        channelId: payload.ChannelId!,
+                        channelThreadId: payload.ChannelThreadId!,
+                        registeredAtUtc: DateTimeOffset.UtcNow);
+                }
             }
             catch (Exception ex)
             {
@@ -311,21 +339,6 @@ public sealed partial class GraphNotificationProcessor
                 _attemptedJoins.TryRemove(callId, out _);
             }
         });
-    }
-
-    /// <summary>
-    /// Synthesizes the canonical channel-meeting join URL. Channel
-    /// meetings live in the channel's persistent meeting room (one
-    /// thread, many sequential meeting instances), so this URL resolves
-    /// to the active call regardless of which specific meeting started
-    /// it.
-    /// </summary>
-    private static string BuildChannelMeetingJoinUrl(string channelThreadId, string tenantId, string organizerOid)
-    {
-        var encodedThread = WebUtility.UrlEncode(channelThreadId);
-        var contextJson = $"{{\"Tid\":\"{tenantId}\",\"Oid\":\"{organizerOid}\",\"MessageId\":\"0\"}}";
-        var encodedContext = WebUtility.UrlEncode(contextJson);
-        return $"https://teams.microsoft.com/l/meetup-join/{encodedThread}/0?context={encodedContext}";
     }
 
     private async Task<JsonDocument?> ResolveMessagePayloadAsync(

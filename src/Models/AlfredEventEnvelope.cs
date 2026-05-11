@@ -89,4 +89,12 @@ public static class AlfredEventTypes
 
     /// <summary>Channel attachment removed. Payload: attachment record.</summary>
     public const string ChannelDetached = "system.channel_detached";
+
+    /// <summary>
+    /// Microsoft's own meeting transcript (the "Record and Transcribe"
+    /// product feature), retrieved from Graph after a meeting ends.
+    /// Payload: <see cref="OfficialTranscriptPayload"/> — VTT raw text
+    /// plus parsed cues with speaker names + timestamps.
+    /// </summary>
+    public const string TranscriptOfficial = "transcript.official";
 }

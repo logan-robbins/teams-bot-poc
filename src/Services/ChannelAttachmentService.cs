@@ -39,6 +39,12 @@ public interface IChannelAttachmentService
         string channelId,
         string consumerName,
         CancellationToken cancellationToken = default);
+
+    Task<bool> SetAutoJoinAsync(
+        string teamId,
+        string channelId,
+        bool enabled,
+        CancellationToken cancellationToken = default);
 }
 
 /// <summary>
@@ -248,4 +254,11 @@ public sealed class ChannelAttachmentService : IChannelAttachmentService, IHoste
         string consumerName,
         CancellationToken cancellationToken = default) =>
         _store.RemoveConsumerAsync(teamId, channelId, consumerName, cancellationToken);
+
+    public Task<bool> SetAutoJoinAsync(
+        string teamId,
+        string channelId,
+        bool enabled,
+        CancellationToken cancellationToken = default) =>
+        _store.SetAutoJoinAsync(teamId, channelId, enabled, cancellationToken);
 }

@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Mvc;
 using Newtonsoft.Json;
+using TeamsMediaBot.Models;
 using TeamsMediaBot.Services;
 
 namespace TeamsMediaBot.Controllers;
@@ -19,13 +20,25 @@ namespace TeamsMediaBot.Controllers;
 public sealed class ChannelAttachmentController : ControllerBase
 {
     private readonly IChannelAttachmentService _service;
+    private readonly BotConfiguration _botConfig;
+    private readonly TeamsCallingBotService _botService;
+    private readonly TranscriberFactory _transcriberFactory;
+    private readonly OfficialTranscriptFetcher _transcriptFetcher;
     private readonly ILogger<ChannelAttachmentController> _logger;
 
     public ChannelAttachmentController(
         IChannelAttachmentService service,
+        BotConfiguration botConfig,
+        TeamsCallingBotService botService,
+        TranscriberFactory transcriberFactory,
+        OfficialTranscriptFetcher transcriptFetcher,
         ILogger<ChannelAttachmentController> logger)
     {
         _service = service;
+        _botConfig = botConfig;
+        _botService = botService;
+        _transcriberFactory = transcriberFactory;
+        _transcriptFetcher = transcriptFetcher;
         _logger = logger;
     }
 
@@ -248,11 +261,137 @@ public sealed class ChannelAttachmentController : ControllerBase
         }
         return Ok(new { ok = true });
     }
+
+    /// <summary>
+    /// Toggles <c>auto_join_enabled</c> on the attachment record. When
+    /// false, the bot stops auto-joining channel meetings on
+    /// <c>callStartedEventMessageDetail</c>; operators must use the
+    /// manual <c>/join</c> endpoint instead.
+    /// </summary>
+    [HttpPatch("{teamId}/{channelId}/auto-join")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<IActionResult> SetAutoJoin(
+        string teamId,
+        string channelId,
+        [FromBody] SetAutoJoinRequest request,
+        CancellationToken cancellationToken)
+    {
+        if (request?.Enabled is null)
+        {
+            return BadRequest(new { error = "enabled (bool) is required" });
+        }
+
+        var ok = await _service.SetAutoJoinAsync(
+            teamId, channelId, request.Enabled.Value, cancellationToken);
+        if (!ok)
+        {
+            return NotFound(new { error = "no attachment for that team_id + channel_id" });
+        }
+
+        var record = _service.Get(teamId, channelId)!;
+        return Ok(new { ok = true, auto_join_enabled = record.AutoJoinEnabled });
+    }
+
+    /// <summary>
+    /// Manually triggers Alfred to join the channel's current meeting
+    /// room. Uses the same workflow as auto-join; synthesizes the
+    /// channel-meeting join URL from the attachment's channel thread
+    /// + the bot's tenant id. Returns the workflow result (call id,
+    /// selected mode, etc.) or a structured error.
+    /// </summary>
+    [HttpPost("{teamId}/{channelId}/join")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<IActionResult> JoinNow(
+        string teamId,
+        string channelId,
+        CancellationToken cancellationToken)
+    {
+        var record = _service.Get(teamId, channelId);
+        if (record is null)
+        {
+            return NotFound(new { error = "no attachment for that team_id + channel_id" });
+        }
+
+        var channelThreadId = record.ConversationThreadId;
+        if (string.IsNullOrWhiteSpace(channelThreadId))
+        {
+            channelThreadId = $"19:{record.ChannelId}@thread.tacv2";
+        }
+
+        var tenantId = record.TenantId ?? _botConfig.TenantId;
+        if (string.IsNullOrWhiteSpace(tenantId))
+        {
+            return BadRequest(new { error = "no tenant id on attachment or bot config" });
+        }
+
+        var joinUrl = ChannelMeetingJoinUrls.Build(
+            channelThreadId!,
+            tenantId!,
+            _botConfig.AppId ?? string.Empty);
+
+        try
+        {
+            var transcriber = _transcriberFactory.Create();
+            var result = await _botService.JoinMeetingWithModeAsync(
+                new JoinMeetingCommand
+                {
+                    JoinUrl = joinUrl,
+                    DisplayName = "Alfred",
+                    JoinAsGuest = false,
+                    RequestedJoinMode = JoinModeNames.InviteAndGraphJoin,
+                    OrganizerTenantId = tenantId,
+                    BotAttendeePresent = true,
+                },
+                transcriber);
+
+            _logger.LogInformation(
+                "Manual join requested team={TeamId} channel={ChannelId} result.CallId={CallId} mode={Mode}",
+                teamId, channelId, result.CallId, result.SelectedJoinMode);
+
+            // No organizer OID on manual trigger (no systemEventMessage in
+            // hand). Skip post-meeting transcript fetch — auto-join path
+            // wires it from initiator. Operators wanting the official
+            // transcript for a manual-trigger call should fetch via Graph
+            // directly using the meeting organizer's userId.
+            return Ok(new
+            {
+                ok = true,
+                call_id = result.CallId,
+                join_mode = result.SelectedJoinMode,
+                deferred = result.Deferred,
+                message = result.Message,
+                join_url = joinUrl,
+            });
+        }
+        catch (JoinWorkflowException ex)
+        {
+            _logger.LogWarning(ex,
+                "Manual join workflow rejected team={TeamId} channel={ChannelId} code={ErrorCode}",
+                teamId, channelId, ex.ErrorCode);
+            return BadRequest(new { error = ex.Message, error_code = ex.ErrorCode });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "Manual join failed team={TeamId} channel={ChannelId}", teamId, channelId);
+            return StatusCode(StatusCodes.Status500InternalServerError,
+                new { error = ex.Message });
+        }
+    }
 }
 
 public sealed record ReplaceConsumersRequest
 {
     [JsonProperty("consumers")] public List<ConsumerConfig>? Consumers { get; init; }
+}
+
+public sealed record SetAutoJoinRequest
+{
+    [JsonProperty("enabled")] public bool? Enabled { get; init; }
 }
 
 public sealed record AttachChannelRequest

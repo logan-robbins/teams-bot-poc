@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { Moon, Plus, Trash2, Save, RefreshCw } from "lucide-react";
+import { Moon, Plus, Trash2, Save, RefreshCw, Phone } from "lucide-react";
 import {
   bot,
   type ChannelAttachment,
@@ -129,6 +129,9 @@ function ChannelRow({
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [joining, setJoining] = useState(false);
+  const [joinMessage, setJoinMessage] = useState<string | null>(null);
+  const [autoJoin, setAutoJoin] = useState<boolean>(channel.auto_join_enabled !== false);
 
   async function load() {
     try {
@@ -145,6 +148,42 @@ function ChannelRow({
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [channel.team_id, channel.channel_id]);
+
+  useEffect(() => {
+    setAutoJoin(channel.auto_join_enabled !== false);
+  }, [channel.auto_join_enabled]);
+
+  async function joinNow() {
+    setJoining(true);
+    setJoinMessage(null);
+    setError(null);
+    try {
+      const r = await bot.joinNow(channel.team_id, channel.channel_id);
+      setJoinMessage(
+        r.deferred
+          ? `Deferred (${r.join_mode}): ${r.message ?? "Waiting for Teams to invite Alfred."}`
+          : r.call_id
+            ? `Alfred is joining. callId=${r.call_id}`
+            : (r.message ?? "OK"),
+      );
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Join failed");
+    } finally {
+      setJoining(false);
+    }
+  }
+
+  async function toggleAutoJoin(next: boolean) {
+    const prev = autoJoin;
+    setAutoJoin(next);
+    setError(null);
+    try {
+      await bot.setAutoJoin(channel.team_id, channel.channel_id, next);
+    } catch (e) {
+      setAutoJoin(prev);
+      setError(e instanceof Error ? e.message : "Toggle failed");
+    }
+  }
 
   function patchConsumer(idx: number, patch: Partial<ConsumerConfig>) {
     setConsumers((prev) => prev.map((c, i) => (i === idx ? { ...c, ...patch } : c)));
@@ -204,6 +243,30 @@ function ChannelRow({
       </div>
       <div className="mt-1 font-mono text-[10px] text-ink-500">
         team_id: {channel.team_id} · channel_id: {channel.channel_id}
+      </div>
+
+      <div className="mt-3 flex flex-wrap items-center gap-3 border-b border-ink-800 pb-3">
+        <button
+          type="button"
+          onClick={() => void joinNow()}
+          disabled={joining}
+          className="flex items-center gap-1 rounded-md bg-emerald-500/20 px-3 py-1.5 text-xs text-emerald-200 ring-1 ring-emerald-500/40 hover:bg-emerald-500/30 disabled:opacity-50"
+          title="Manually trigger Alfred to join the active channel meeting"
+        >
+          <Phone size={12} />
+          {joining ? "Joining…" : "Join now"}
+        </button>
+        <label className="flex items-center gap-2 text-xs text-ink-200">
+          <input
+            type="checkbox"
+            checked={autoJoin}
+            onChange={(e) => void toggleAutoJoin(e.target.checked)}
+          />
+          Auto-join meetings (fires on Teams "Meeting started" event)
+        </label>
+        {joinMessage ? (
+          <span className="font-mono text-[10px] text-emerald-300">{joinMessage}</span>
+        ) : null}
       </div>
 
       {error ? (

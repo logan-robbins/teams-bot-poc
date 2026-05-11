@@ -69,6 +69,15 @@ public sealed record ChannelAttachmentRecord
     [JsonPropertyName("bootstrap_seeded")]
     public bool BootstrapSeeded { get; init; }
 
+    /// <summary>
+    /// When true (the default), the bot auto-joins channel meetings as
+    /// soon as it sees a <c>callStartedEventMessageDetail</c> system
+    /// message in this channel. When false, joins only happen on
+    /// explicit operator action via <c>POST /api/channels/{teamId}/{channelId}/join</c>.
+    /// </summary>
+    [JsonPropertyName("auto_join_enabled")]
+    public bool AutoJoinEnabled { get; init; } = true;
+
     public static string BuildKey(string teamId, string channelId) =>
         $"{teamId}|{channelId}";
 
@@ -316,6 +325,41 @@ public sealed class ChannelAttachmentStore
                 .ToList();
 
             _byKey[key] = existing with { Consumers = updated };
+            await PersistLockedAsync(cancellationToken);
+            return true;
+        }
+        finally
+        {
+            _mutex.Release();
+        }
+    }
+
+    /// <summary>
+    /// Toggles <see cref="ChannelAttachmentRecord.AutoJoinEnabled"/>
+    /// on an existing attachment. Returns false when no attachment
+    /// exists for that <c>(teamId, channelId)</c>.
+    /// </summary>
+    public async Task<bool> SetAutoJoinAsync(
+        string teamId,
+        string channelId,
+        bool enabled,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(teamId) || string.IsNullOrWhiteSpace(channelId))
+        {
+            return false;
+        }
+
+        await _mutex.WaitAsync(cancellationToken);
+        try
+        {
+            var key = ChannelAttachmentRecord.BuildKey(teamId, channelId);
+            if (!_byKey.TryGetValue(key, out var existing))
+            {
+                return false;
+            }
+
+            _byKey[key] = existing with { AutoJoinEnabled = enabled };
             await PersistLockedAsync(cancellationToken);
             return true;
         }

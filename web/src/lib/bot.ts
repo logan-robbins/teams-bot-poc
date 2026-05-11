@@ -44,6 +44,16 @@ export interface ChannelAttachment {
   attached_at_utc?: string;
   subscription_id?: string | null;
   subscription_expires_at_utc?: string | null;
+  auto_join_enabled?: boolean;
+}
+
+export interface JoinNowResult {
+  ok: boolean;
+  call_id?: string | null;
+  join_mode?: string;
+  deferred?: boolean;
+  message?: string;
+  join_url?: string;
 }
 
 export interface ChannelAttachmentsResponse {
@@ -127,6 +137,18 @@ export const bot = {
     json<{ ok: boolean }>(
       `/api/channels/${encodeURIComponent(teamId)}/${encodeChannelId(channelId)}/consumers/${encodeURIComponent(name)}`,
       { method: "DELETE" },
+    ),
+
+  setAutoJoin: (teamId: string, channelId: string, enabled: boolean) =>
+    json<{ ok: boolean; auto_join_enabled: boolean }>(
+      `/api/channels/${encodeURIComponent(teamId)}/${encodeChannelId(channelId)}/auto-join`,
+      { method: "PATCH", body: JSON.stringify({ enabled }) },
+    ),
+
+  joinNow: (teamId: string, channelId: string) =>
+    json<JoinNowResult>(
+      `/api/channels/${encodeURIComponent(teamId)}/${encodeChannelId(channelId)}/join`,
+      { method: "POST", body: "{}" },
     ),
 
   listDebugThreads: () => json<DebugThreadsResponse>("/api/debug/transcripts"),
