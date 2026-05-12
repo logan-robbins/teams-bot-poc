@@ -29,7 +29,12 @@ public sealed class AlfredBot : TeamsActivityHandler
     private readonly IConversationReferenceStore _references;
     private readonly EventFanoutDispatcher _dispatcher;
     private readonly IChannelAttachmentService _channelAttachments;
+    private readonly TeamsCallingBotService _botService;
+    private readonly TranscriberFactory _transcriberFactory;
+    private readonly BotConfiguration _botConfig;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _publishedLinks =
+        new(StringComparer.Ordinal);
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTimeOffset> _meetingJoinAttempts =
         new(StringComparer.Ordinal);
     private readonly ILogger<AlfredBot> _logger;
 
@@ -37,11 +42,17 @@ public sealed class AlfredBot : TeamsActivityHandler
         IConversationReferenceStore references,
         EventFanoutDispatcher dispatcher,
         IChannelAttachmentService channelAttachments,
+        TeamsCallingBotService botService,
+        TranscriberFactory transcriberFactory,
+        BotConfiguration botConfig,
         ILogger<AlfredBot> logger)
     {
         _references = references;
         _dispatcher = dispatcher;
         _channelAttachments = channelAttachments;
+        _botService = botService;
+        _transcriberFactory = transcriberFactory;
+        _botConfig = botConfig;
         _logger = logger;
     }
 
@@ -101,8 +112,130 @@ public sealed class AlfredBot : TeamsActivityHandler
                     channelId);
             }
         }
+        else if (botAdded)
+        {
+            // Bot was added to a non-team context (meeting chat or
+            // group chat). For meeting chats specifically, "added to
+            // chat" is the user signalling intent for Alfred to join
+            // the call. Fire the auto-join.
+            var chatThreadId = activity.Conversation?.Id;
+            if (LooksLikeMeetingChat(chatThreadId))
+            {
+                _ = Task.Run(() => TryAutoJoinMeetingChatAsync(chatThreadId!, "added_to_meeting_chat"));
+            }
+        }
 
         await base.OnMembersAddedAsync(membersAdded, turnContext, cancellationToken);
+    }
+
+    /// <summary>
+    /// Heuristic — a Teams chat thread id of the form
+    /// <c>19:meeting_xxx@thread.v2</c> identifies a meeting chat. We
+    /// auto-join calls bound to those, since they correspond to a real
+    /// Teams meeting room. Channel chats (<c>@thread.tacv2</c>) are
+    /// handled by the channel-attachment / systemEventMessage paths.
+    /// </summary>
+    private static bool LooksLikeMeetingChat(string? chatThreadId)
+    {
+        if (string.IsNullOrWhiteSpace(chatThreadId)) return false;
+        return chatThreadId.Contains("meeting_", StringComparison.OrdinalIgnoreCase)
+               && chatThreadId.Contains("@thread.v2", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Auto-join a meeting Alfred was just added to (or @-mentioned in).
+    /// Synthesizes the meeting join URL from the chat thread id and the
+    /// bot's tenant; the SDK uses it to bind to the real meeting and the
+    /// bot's chat-scoped RSC carries the join permission. Per-thread
+    /// dedupe with a 60s window so we don't double-join on rapid retries
+    /// (multiple membersAdded + @-mention firing back-to-back).
+    /// </summary>
+    private async Task TryAutoJoinMeetingChatAsync(string chatThreadId, string source)
+    {
+        var now = DateTimeOffset.UtcNow;
+        if (_meetingJoinAttempts.TryGetValue(chatThreadId, out var prev)
+            && now - prev < TimeSpan.FromSeconds(60))
+        {
+            _logger.LogDebug(
+                "Skipping auto-join for thread={Thread} source={Source}; previous attempt {Age}s ago.",
+                chatThreadId, source, (int)(now - prev).TotalSeconds);
+            return;
+        }
+        _meetingJoinAttempts[chatThreadId] = now;
+
+        try
+        {
+            var tenantId = _botConfig.TenantId;
+            if (string.IsNullOrWhiteSpace(tenantId))
+            {
+                _logger.LogWarning("Auto-join skipped: BotConfig.TenantId is unset.");
+                return;
+            }
+
+            var joinUrl = ChannelMeetingJoinUrls.Build(
+                chatThreadId,
+                tenantId!,
+                _botConfig.AppId ?? string.Empty);
+
+            _logger.LogInformation(
+                "Auto-joining meeting chat thread={Thread} source={Source}",
+                chatThreadId, source);
+
+            var transcriber = _transcriberFactory.Create();
+            var result = await _botService.JoinMeetingWithModeAsync(
+                new JoinMeetingCommand
+                {
+                    JoinUrl = joinUrl,
+                    DisplayName = "Alfred",
+                    JoinAsGuest = false,
+                    RequestedJoinMode = JoinModeNames.InviteAndGraphJoin,
+                    OrganizerTenantId = tenantId,
+                    // The bot is installed in the meeting chat (that's
+                    // the only way these activities reached us), so the
+                    // chat-scoped Calls.JoinGroupCalls.Chat RSC covers
+                    // the join. Bot attendee check is moot.
+                    BotAttendeePresent = true,
+                },
+                transcriber).ConfigureAwait(false);
+
+            _logger.LogInformation(
+                "Meeting auto-join result thread={Thread} CallId={CallId} Mode={Mode} Deferred={Deferred} Msg={Msg}",
+                chatThreadId, result.CallId, result.SelectedJoinMode, result.Deferred, result.Message);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "Meeting auto-join failed thread={Thread} source={Source}",
+                chatThreadId, source);
+            // Drop the dedupe so a later @-mention can retry.
+            _meetingJoinAttempts.TryRemove(chatThreadId, out _);
+        }
+    }
+
+    /// <summary>True when an activity contains an @-mention of Alfred.</summary>
+    private bool WasBotMentioned(IMessageActivity activity)
+    {
+        var mentions = activity.GetMentions();
+        if (mentions is null || mentions.Length == 0) return false;
+        var botId = _botConfig.AppId;
+        foreach (var m in mentions)
+        {
+            var mentionedId = m.Mentioned?.Id ?? string.Empty;
+            // Bot Framework mention ids look like "28:<appid>" — match by
+            // the suffix to be safe across BF id formats.
+            if (!string.IsNullOrWhiteSpace(botId) && mentionedId.EndsWith(botId, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+            // Belt-and-suspenders: also match by the bot's name from the
+            // recipient field on the activity.
+            var recipientId = activity.Recipient?.Id ?? string.Empty;
+            if (!string.IsNullOrWhiteSpace(recipientId) && string.Equals(mentionedId, recipientId, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     /// <summary>
@@ -165,6 +298,17 @@ public sealed class AlfredBot : TeamsActivityHandler
                 Payload = payload,
             },
             cancellationToken);
+
+        // If Alfred was @-mentioned in a meeting chat AND isn't already
+        // in this call, treat it as user intent to bring him in. Per-
+        // thread dedupe inside TryAutoJoinMeetingChatAsync handles
+        // repeated mentions in the same meeting.
+        if (string.IsNullOrWhiteSpace(teamId)
+            && LooksLikeMeetingChat(chatThreadId)
+            && WasBotMentioned(activity))
+        {
+            _ = Task.Run(() => TryAutoJoinMeetingChatAsync(chatThreadId, "at_mention"));
+        }
 
         // If this activity is in a meeting chat that was spawned from a
         // channel (channelData carries team + channel, but the chat
