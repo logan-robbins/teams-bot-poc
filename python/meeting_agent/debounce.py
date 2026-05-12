@@ -20,8 +20,8 @@ from typing import TypeVar
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_QUIET_WINDOW_SECONDS: float = 1.5
-DEFAULT_MAX_BATCH: int = 8
+DEFAULT_QUIET_WINDOW_SECONDS: float = 1.0
+DEFAULT_MAX_BATCH: int = 6
 
 T = TypeVar("T")
 
