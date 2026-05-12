@@ -129,17 +129,27 @@ public sealed class AlfredBot : TeamsActivityHandler
     }
 
     /// <summary>
-    /// Heuristic — a Teams chat thread id of the form
-    /// <c>19:meeting_xxx@thread.v2</c> identifies a meeting chat. We
-    /// auto-join calls bound to those, since they correspond to a real
-    /// Teams meeting room. Channel chats (<c>@thread.tacv2</c>) are
-    /// handled by the channel-attachment / systemEventMessage paths.
+    /// Heuristic — recognizes a Teams thread id that is bound to an
+    /// active meeting:
+    ///   • <c>19:meeting_xxx@thread.v2</c>           — scheduled / ad-hoc meeting
+    ///   • <c>19:*@thread.tacv2;messageid=xxx</c>    — channel meeting (the
+    ///     messageid suffix is Teams' way of pinning the activity to the
+    ///     channel-meeting announcement)
     /// </summary>
     private static bool LooksLikeMeetingChat(string? chatThreadId)
     {
         if (string.IsNullOrWhiteSpace(chatThreadId)) return false;
-        return chatThreadId.Contains("meeting_", StringComparison.OrdinalIgnoreCase)
-               && chatThreadId.Contains("@thread.v2", StringComparison.OrdinalIgnoreCase);
+        if (chatThreadId.Contains("meeting_", StringComparison.OrdinalIgnoreCase)
+            && chatThreadId.Contains("@thread.v2", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+        if (chatThreadId.Contains("@thread.tacv2", StringComparison.OrdinalIgnoreCase)
+            && chatThreadId.Contains(";messageid=", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+        return false;
     }
 
     /// <summary>
@@ -209,6 +219,48 @@ public sealed class AlfredBot : TeamsActivityHandler
                 chatThreadId, source);
             // Drop the dedupe so a later @-mention can retry.
             _meetingJoinAttempts.TryRemove(chatThreadId, out _);
+        }
+    }
+
+    /// <summary>
+    /// Lazy attachment: when the bot sees its first channel activity for
+    /// a (team, channel) pair we don't yet know about, register it so the
+    /// admin UI surfaces the channel and the meeting-chat subscription
+    /// lifecycle treats it as tracked. Idempotent — guarded by
+    /// _channelAttachments.Get(...) at the call site.
+    /// </summary>
+    private async Task TryAutoAttachChannelAsync(
+        string teamId,
+        string channelId,
+        TeamsChannelData? channelData,
+        IMessageActivity activity,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await _channelAttachments.AttachAsync(
+                new ChannelAttachmentRequest
+                {
+                    TeamId = teamId,
+                    ChannelId = channelId,
+                    ConversationThreadId = channelId,
+                    ChannelDisplayName = channelData?.Channel?.Name,
+                    TeamDisplayName = channelData?.Team?.Name,
+                    ServiceUrl = activity.ServiceUrl,
+                    TenantId = channelData?.Tenant?.Id,
+                    Source = "auto_attach_on_chat",
+                },
+                cancellationToken);
+
+            _logger.LogInformation(
+                "Auto-attached channel on first chat TeamId={TeamId} ChannelId={ChannelId}",
+                teamId, channelId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "Auto-attach on chat failed TeamId={TeamId} ChannelId={ChannelId}",
+                teamId, channelId);
         }
     }
 
@@ -299,13 +351,25 @@ public sealed class AlfredBot : TeamsActivityHandler
             },
             cancellationToken);
 
-        // If Alfred was @-mentioned in a meeting chat AND isn't already
-        // in this call, treat it as user intent to bring him in. Per-
-        // thread dedupe inside TryAutoJoinMeetingChatAsync handles
-        // repeated mentions in the same meeting.
-        if (string.IsNullOrWhiteSpace(teamId)
-            && LooksLikeMeetingChat(chatThreadId)
-            && WasBotMentioned(activity))
+        // Bot Framework delivers channel chat activities even when
+        // OnMembersAddedAsync didn't fire (Teams doesn't always fire
+        // it for channel installs). When we see a channel chat with
+        // full team+channel context and we don't yet have an attachment,
+        // auto-attach so the admin UI surfaces it and the Graph
+        // subscription on channel messages gets created.
+        if (!string.IsNullOrWhiteSpace(teamId)
+            && !string.IsNullOrWhiteSpace(channelId)
+            && _channelAttachments.Get(teamId!, channelId!) is null)
+        {
+            _ = Task.Run(() => TryAutoAttachChannelAsync(
+                teamId!, channelId!, channelData, activity, cancellationToken));
+        }
+
+        // If Alfred was @-mentioned in any meeting (regular or channel
+        // meeting) AND isn't already in the call, treat it as user
+        // intent to bring him in. Per-thread dedupe inside
+        // TryAutoJoinMeetingChatAsync handles repeated mentions.
+        if (LooksLikeMeetingChat(chatThreadId) && WasBotMentioned(activity))
         {
             _ = Task.Run(() => TryAutoJoinMeetingChatAsync(chatThreadId, "at_mention"));
         }
