@@ -223,43 +223,103 @@ public sealed class AlfredBot : TeamsActivityHandler
     }
 
     /// <summary>
-    /// Lazy attachment: when the bot sees its first channel activity for
-    /// a (team, channel) pair we don't yet know about, register it so the
-    /// admin UI surfaces the channel and the meeting-chat subscription
-    /// lifecycle treats it as tracked. Idempotent — guarded by
-    /// _channelAttachments.Get(...) at the call site.
+    /// Idempotent attach: creates the channel attachment record if it
+    /// doesn't exist; otherwise just enriches missing display names so
+    /// the admin UI reads "Engineering / General" instead of the GUIDs.
     /// </summary>
-    private async Task TryAutoAttachChannelAsync(
+    private async Task EnsureChannelAttachedAsync(
+        ITurnContext turnContext,
         string teamId,
         string channelId,
         TeamsChannelData? channelData,
-        IMessageActivity activity,
         CancellationToken cancellationToken)
     {
         try
         {
+            var existing = _channelAttachments.Get(teamId, channelId);
+            var existingTeamName = existing?.TeamDisplayName;
+            var existingChannelName = existing?.ChannelDisplayName;
+            var needsAttach = existing is null;
+            var needsNameEnrichment =
+                string.IsNullOrWhiteSpace(existingTeamName) ||
+                string.IsNullOrWhiteSpace(existingChannelName);
+
+            if (!needsAttach && !needsNameEnrichment) return;
+
+            // Try the activity's TeamsChannelData first (cheap, no
+            // network). For channel chats Teams often omits these.
+            var teamName = channelData?.Team?.Name ?? existingTeamName;
+            var channelName = channelData?.Channel?.Name ?? existingChannelName;
+
+            // Fill the rest via TeamsInfo (Bot Framework helper that
+            // round-trips Teams' own conversation API, NOT Graph — so it
+            // works without any additional Graph permissions).
+            if (string.IsNullOrWhiteSpace(teamName))
+            {
+                try
+                {
+                    var details = await TeamsInfo.GetTeamDetailsAsync(
+                        turnContext, teamId, cancellationToken);
+                    teamName = details?.Name;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex,
+                        "TeamsInfo.GetTeamDetailsAsync failed for TeamId={TeamId}", teamId);
+                }
+            }
+            if (string.IsNullOrWhiteSpace(channelName))
+            {
+                try
+                {
+                    var channels = await TeamsInfo.GetTeamChannelsAsync(
+                        turnContext, teamId, cancellationToken);
+                    var match = channels?.FirstOrDefault(c =>
+                        string.Equals(c.Id, channelId, StringComparison.OrdinalIgnoreCase));
+                    channelName = match?.Name;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex,
+                        "TeamsInfo.GetTeamChannelsAsync failed for TeamId={TeamId} ChannelId={ChannelId}",
+                        teamId, channelId);
+                }
+            }
+
+            // Upsert with whatever names we resolved. Existing consumer
+            // lists / auto-join state / subscription are preserved by
+            // AttachAsync's merge-with-existing semantics.
             await _channelAttachments.AttachAsync(
                 new ChannelAttachmentRequest
                 {
                     TeamId = teamId,
                     ChannelId = channelId,
                     ConversationThreadId = channelId,
-                    ChannelDisplayName = channelData?.Channel?.Name,
-                    TeamDisplayName = channelData?.Team?.Name,
-                    ServiceUrl = activity.ServiceUrl,
+                    ChannelDisplayName = channelName,
+                    TeamDisplayName = teamName,
+                    ServiceUrl = turnContext.Activity.ServiceUrl,
                     TenantId = channelData?.Tenant?.Id,
-                    Source = "auto_attach_on_chat",
+                    Source = existing?.Source ?? "auto_attach_on_chat",
                 },
                 cancellationToken);
 
-            _logger.LogInformation(
-                "Auto-attached channel on first chat TeamId={TeamId} ChannelId={ChannelId}",
-                teamId, channelId);
+            if (needsAttach)
+            {
+                _logger.LogInformation(
+                    "Auto-attached channel on first chat TeamName='{Team}' ChannelName='{Channel}' TeamId={TeamId} ChannelId={ChannelId}",
+                    teamName, channelName, teamId, channelId);
+            }
+            else
+            {
+                _logger.LogInformation(
+                    "Enriched display names on existing attachment TeamName='{Team}' ChannelName='{Channel}' TeamId={TeamId} ChannelId={ChannelId}",
+                    teamName, channelName, teamId, channelId);
+            }
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex,
-                "Auto-attach on chat failed TeamId={TeamId} ChannelId={ChannelId}",
+                "EnsureChannelAttachedAsync failed TeamId={TeamId} ChannelId={ChannelId}",
                 teamId, channelId);
         }
     }
@@ -354,15 +414,17 @@ public sealed class AlfredBot : TeamsActivityHandler
         // Bot Framework delivers channel chat activities even when
         // OnMembersAddedAsync didn't fire (Teams doesn't always fire
         // it for channel installs). When we see a channel chat with
-        // full team+channel context and we don't yet have an attachment,
-        // auto-attach so the admin UI surfaces it and the Graph
-        // subscription on channel messages gets created.
+        // full team+channel context, ensure we have an attachment with
+        // friendly display names so the admin UI shows "Engineering /
+        // General" instead of GUIDs. Idempotent on existing names.
         if (!string.IsNullOrWhiteSpace(teamId)
-            && !string.IsNullOrWhiteSpace(channelId)
-            && _channelAttachments.Get(teamId!, channelId!) is null)
+            && !string.IsNullOrWhiteSpace(channelId))
         {
-            _ = Task.Run(() => TryAutoAttachChannelAsync(
-                teamId!, channelId!, channelData, activity, cancellationToken));
+            // We need the turnContext for TeamsInfo lookups, so do this
+            // inline (await) — TeamsInfo round-trips through Bot
+            // Framework, takes ~100ms.
+            await EnsureChannelAttachedAsync(
+                turnContext, teamId!, channelId!, channelData, cancellationToken);
         }
 
         // If Alfred was @-mentioned in any meeting (regular or channel

@@ -232,18 +232,22 @@ function ChannelRow({
     <li className="rounded-md border border-ink-800 bg-ink-900/40 px-4 py-3">
       <div className="flex items-baseline gap-3">
         <h3 className="font-serif text-base text-ink-100">
-          {channel.team_display_name ?? channel.team_id}
+          {channel.team_display_name ?? <span className="italic text-ink-400">Team (name unknown)</span>}
           <span className="text-ink-500"> / </span>
-          {channel.channel_display_name ?? channel.channel_id}
+          {channel.channel_display_name ?? <span className="italic text-ink-400">Channel (name unknown)</span>}
         </h3>
         <span className="ml-auto font-mono text-[10px] text-ink-500">
           {channel.source ?? "unknown source"} ·
           attached {fmtTs(channel.attached_at_utc)}
         </span>
       </div>
-      <div className="mt-1 font-mono text-[10px] text-ink-500">
-        team_id: {channel.team_id} · channel_id: {channel.channel_id}
-      </div>
+      <details className="mt-1 cursor-pointer text-[10px] text-ink-500">
+        <summary className="font-mono opacity-60 hover:opacity-100">show ids</summary>
+        <div className="mt-1 font-mono">
+          team_id: {channel.team_id}<br />
+          channel_id: {channel.channel_id}
+        </div>
+      </details>
 
       <div className="mt-2">
         <StatusPills channel={channel} />

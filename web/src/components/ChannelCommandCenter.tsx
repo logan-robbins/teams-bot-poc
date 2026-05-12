@@ -197,10 +197,12 @@ export function ChannelCommandCenter() {
         </button>
         <div className="flex flex-col leading-tight">
           <span className="font-serif text-lg font-medium text-ink-50">
-            {attachment?.channel_display_name ?? channelId}
+            {attachment?.channel_display_name ?? (
+              <span className="italic text-ink-400">Channel (name unknown)</span>
+            )}
           </span>
           <span className="font-mono text-[10px] uppercase tracking-widest text-ink-400">
-            {attachment?.team_display_name ?? teamId} · channel command center
+            {attachment?.team_display_name ?? "team (unknown)"} · channel command center
           </span>
         </div>
         <div className="ml-auto flex items-center gap-2">
