@@ -66,7 +66,7 @@ export function ChannelsDebug() {
             Bot Debug
           </span>
           <span className="font-mono text-[10px] uppercase tracking-widest text-ink-400">
-            per-thread audit · {threads.length} thread{threads.length === 1 ? "" : "s"}
+            per-thread audit · any chat / meeting / channel · {threads.length} thread{threads.length === 1 ? "" : "s"}
           </span>
         </div>
         <div className="ml-auto flex items-center gap-2 font-mono text-[10px] text-ink-500">
@@ -78,10 +78,12 @@ export function ChannelsDebug() {
       <main className="flex-1 overflow-auto px-6 py-6">
         <div className="mx-auto max-w-5xl">
           <p className="text-sm text-ink-300">
-            Every event Alfred sees is appended to a per-thread NDJSON file
-            on the bot VM before any consumer fan-out. This view tails
-            those files — useful for verifying STT is firing and the bot
-            is receiving real audio.
+            Every event Alfred sees is appended to a per-thread NDJSON
+            file on the bot VM before any consumer fan-out. Threads
+            include channel posts, channel meetings, standalone meeting
+            chats, group chats — anything the bot has heard from. This
+            view tails those files; useful for verifying STT is firing
+            and the bot is receiving real audio.
           </p>
           <p className="mt-1 text-[11px] text-ink-500">
             Threads modified within {LIVE_THRESHOLD_MS / 1000}s are flagged{" "}
