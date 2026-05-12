@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Mvc;
+using Newtonsoft.Json;
 using System.Text.Json;
 using TeamsMediaBot.Services;
 
@@ -71,7 +72,7 @@ public sealed class DebugController : ControllerBase
             count = rows.Count,
             base_dir = _audit.BaseDir,
             now_utc = DateTimeOffset.UtcNow,
-            threads = rows,
+            threads = rows.Select(r => r.ToWire()).ToList(),
         });
     }
 
@@ -113,7 +114,7 @@ public sealed class DebugController : ControllerBase
             chat_thread_id = TryRecoverChatThreadId(dir) ?? sanitizedChatThreadId,
             kind,
             count = entries.Count,
-            entries,
+            entries = entries.Select(e => Newtonsoft.Json.Linq.JToken.Parse(e.GetRawText())).ToList(),
         });
     }
 
@@ -285,5 +286,22 @@ public sealed class DebugController : ControllerBase
         public DateTimeOffset? LastModifiedUtc { get; init; }
         public string? FirstFinalText { get; init; }
         public string? LastFinalText { get; init; }
+
+        // Newtonsoft.Json (the controllers' configured serializer) defaults
+        // to camelCase property names without explicit attributes, but the
+        // UI + curl tooling all expect snake_case. Project to a wire DTO
+        // so we get snake_case keys without sprinkling [JsonProperty] on
+        // an internal record.
+        public object ToWire() => new
+        {
+            chat_thread_id_sanitized = ChatThreadIdSanitized,
+            chat_thread_id = ChatThreadId,
+            transcript_lines = TranscriptLines,
+            chat_lines = ChatLines,
+            system_lines = SystemLines,
+            last_modified_utc = LastModifiedUtc,
+            first_final_text = FirstFinalText,
+            last_final_text = LastFinalText,
+        };
     }
 }
