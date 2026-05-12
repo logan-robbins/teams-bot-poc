@@ -7,6 +7,17 @@ using TeamsMediaBot.Models;
 namespace TeamsMediaBot.Services;
 
 /// <summary>
+/// Marker name used for the synthetic fallback consumer derived from
+/// <see cref="EventDispatchConfiguration.BootstrapConsumerUrl"/>. Used
+/// when an event has no matching channel attachment (typically
+/// per-meeting / group-chat installs) so events still reach the sink.
+/// </summary>
+file static class FallbackConsumerName
+{
+    public const string Value = "fallback-default";
+}
+
+/// <summary>
 /// Resolves the per-channel <see cref="ConsumerConfig"/> list for an
 /// outbound event and POSTs a versioned <see cref="AlfredEventEnvelope"/>
 /// to each enabled consumer. Owns the per-consumer queue and background
@@ -42,6 +53,7 @@ public sealed class EventFanoutDispatcher : IAsyncDisposable
     private readonly ILogger<EventFanoutDispatcher> _logger;
     private readonly ILoggerFactory _loggerFactory;
     private readonly MeetingAuditLogger? _auditLogger;
+    private readonly IReadOnlyList<ConsumerConfig> _fallbackConsumers;
     private readonly CancellationTokenSource _cts = new();
     private readonly ConcurrentDictionary<string, ConsumerWorker> _workers = new(StringComparer.Ordinal);
     private bool _disposed;
@@ -49,6 +61,7 @@ public sealed class EventFanoutDispatcher : IAsyncDisposable
     public EventFanoutDispatcher(
         ChannelAttachmentStore store,
         IHttpClientFactory httpClientFactory,
+        EventDispatchConfiguration dispatchConfig,
         ILogger<EventFanoutDispatcher> logger,
         ILoggerFactory loggerFactory,
         MeetingAuditLogger? auditLogger = null)
@@ -58,6 +71,26 @@ public sealed class EventFanoutDispatcher : IAsyncDisposable
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _loggerFactory = loggerFactory ?? throw new ArgumentNullException(nameof(loggerFactory));
         _auditLogger = auditLogger;
+
+        // Fallback consumer for events that don't match any channel
+        // attachment (per-meeting installs, group chats). Without this,
+        // a bot that joins a meeting via /api/calling/join records
+        // audit to disk but never reaches any sink. With it set, events
+        // route to the bootstrap URL by default; channel attachments
+        // override on a per-channel basis.
+        var bootstrapUrl = dispatchConfig?.BootstrapConsumerUrl;
+        _fallbackConsumers = !string.IsNullOrWhiteSpace(bootstrapUrl)
+            ? new[]
+              {
+                  new ConsumerConfig
+                  {
+                      Name = FallbackConsumerName.Value,
+                      Url = bootstrapUrl!,
+                      EventKinds = new[] { "*" },
+                      Enabled = true,
+                  },
+              }
+            : Array.Empty<ConsumerConfig>();
     }
 
     /// <summary>
@@ -132,7 +165,16 @@ public sealed class EventFanoutDispatcher : IAsyncDisposable
             record = _store.GetByConversationThreadId(envelope.ChatThreadId);
         }
 
-        return record?.Consumers ?? Array.Empty<ConsumerConfig>();
+        if (record is not null && record.Consumers.Count > 0)
+        {
+            return record.Consumers;
+        }
+
+        // Per-meeting installs, group chats, and any other non-channel
+        // path with no attachment record fall through to the global
+        // fallback consumer (Disney sandbox's reference sink). Without
+        // this, those events would be audited but dropped.
+        return _fallbackConsumers;
     }
 
     private static bool MatchesEventKind(IReadOnlyList<string> kinds, string eventType)
