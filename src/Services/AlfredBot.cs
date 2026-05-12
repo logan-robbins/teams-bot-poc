@@ -32,6 +32,7 @@ public sealed class AlfredBot : TeamsActivityHandler
     private readonly TeamsCallingBotService _botService;
     private readonly TranscriberFactory _transcriberFactory;
     private readonly BotConfiguration _botConfig;
+    private readonly GraphApiClient _graph;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _publishedLinks =
         new(StringComparer.Ordinal);
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTimeOffset> _meetingJoinAttempts =
@@ -45,6 +46,7 @@ public sealed class AlfredBot : TeamsActivityHandler
         TeamsCallingBotService botService,
         TranscriberFactory transcriberFactory,
         BotConfiguration botConfig,
+        GraphApiClient graph,
         ILogger<AlfredBot> logger)
     {
         _references = references;
@@ -53,6 +55,7 @@ public sealed class AlfredBot : TeamsActivityHandler
         _botService = botService;
         _transcriberFactory = transcriberFactory;
         _botConfig = botConfig;
+        _graph = graph;
         _logger = logger;
     }
 
@@ -251,37 +254,51 @@ public sealed class AlfredBot : TeamsActivityHandler
             var teamName = channelData?.Team?.Name ?? existingTeamName;
             var channelName = channelData?.Channel?.Name ?? existingChannelName;
 
-            // Fill the rest via TeamsInfo (Bot Framework helper that
-            // round-trips Teams' own conversation API, NOT Graph — so it
-            // works without any additional Graph permissions).
+            // Fill the rest via Microsoft Graph using the bot's
+            // app-scoped token. RSC permissions TeamSettings.Read.Group
+            // and ChannelSettings.Read.Group are granted at install
+            // time, so no org-wide consent is required.
+            //
+            // We tried Bot Framework's TeamsInfo helpers first, but the
+            // Calling-bot connector's audience makes them return 400
+            // BadRequest for FetchTeamDetailsAsync /
+            // FetchChannelListAsync. Graph is the working path.
             if (string.IsNullOrWhiteSpace(teamName))
             {
                 try
                 {
-                    var details = await TeamsInfo.GetTeamDetailsAsync(
-                        turnContext, teamId, cancellationToken);
-                    teamName = details?.Name;
+                    using var doc = await _graph.GetResourceAsync(
+                        $"teams/{Uri.EscapeDataString(teamId)}",
+                        cancellationToken);
+                    if (doc.RootElement.TryGetProperty("displayName", out var dn) &&
+                        dn.ValueKind == System.Text.Json.JsonValueKind.String)
+                    {
+                        teamName = dn.GetString();
+                    }
                 }
                 catch (Exception ex)
                 {
                     _logger.LogWarning(ex,
-                        "TeamsInfo.GetTeamDetailsAsync failed for TeamId={TeamId}", teamId);
+                        "Graph GET /teams/{TeamId} failed", teamId);
                 }
             }
             if (string.IsNullOrWhiteSpace(channelName))
             {
                 try
                 {
-                    var channels = await TeamsInfo.GetTeamChannelsAsync(
-                        turnContext, teamId, cancellationToken);
-                    var match = channels?.FirstOrDefault(c =>
-                        string.Equals(c.Id, channelId, StringComparison.OrdinalIgnoreCase));
-                    channelName = match?.Name;
+                    using var doc = await _graph.GetResourceAsync(
+                        $"teams/{Uri.EscapeDataString(teamId)}/channels/{Uri.EscapeDataString(channelId)}",
+                        cancellationToken);
+                    if (doc.RootElement.TryGetProperty("displayName", out var dn) &&
+                        dn.ValueKind == System.Text.Json.JsonValueKind.String)
+                    {
+                        channelName = dn.GetString();
+                    }
                 }
                 catch (Exception ex)
                 {
                     _logger.LogWarning(ex,
-                        "TeamsInfo.GetTeamChannelsAsync failed for TeamId={TeamId} ChannelId={ChannelId}",
+                        "Graph GET /teams/{TeamId}/channels/{ChannelId} failed",
                         teamId, channelId);
                 }
             }
