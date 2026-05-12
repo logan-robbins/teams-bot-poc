@@ -34,6 +34,16 @@ async function json<T>(path: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T;
 }
 
+export interface AutoJoinAttempt {
+  ts: string;
+  trigger: "auto" | "manual";
+  status: "success" | "failure" | "deferred";
+  call_id?: string | null;
+  error_code?: string | null;
+  error_message?: string | null;
+  source_call_id?: string | null;
+}
+
 export interface ChannelAttachment {
   team_id: string;
   channel_id: string;
@@ -45,6 +55,22 @@ export interface ChannelAttachment {
   subscription_id?: string | null;
   subscription_expires_at_utc?: string | null;
   auto_join_enabled?: boolean;
+  last_auto_join_attempt?: AutoJoinAttempt | null;
+}
+
+export interface CallReadiness {
+  callId: string;
+  readiness?: string;
+  readiness_reason?: string;
+  unmixed_audio_frames?: number;
+  primary_mixed_audio_frames?: number;
+  recent_peak_sample?: number;
+  recent_average_abs_sample?: number;
+}
+
+export interface CallingHealthResponse {
+  status: string;
+  calls?: CallReadiness[];
 }
 
 export interface JoinNowResult {
@@ -107,6 +133,13 @@ export interface DebugTailResponse {
 
 export const bot = {
   listChannels: () => json<ChannelAttachmentsResponse>("/api/channels"),
+
+  getChannel: (teamId: string, channelId: string) =>
+    json<ChannelAttachment>(
+      `/api/channels/${encodeURIComponent(teamId)}/${encodeChannelId(channelId)}`,
+    ),
+
+  callingHealth: () => json<CallingHealthResponse>("/api/calling/health"),
 
   listConsumers: (teamId: string, channelId: string) =>
     json<ConsumersResponse>(

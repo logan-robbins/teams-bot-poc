@@ -45,6 +45,12 @@ public interface IChannelAttachmentService
         string channelId,
         bool enabled,
         CancellationToken cancellationToken = default);
+
+    Task<bool> RecordAutoJoinAttemptAsync(
+        string teamId,
+        string channelId,
+        AutoJoinAttempt attempt,
+        CancellationToken cancellationToken = default);
 }
 
 /// <summary>
@@ -261,4 +267,11 @@ public sealed class ChannelAttachmentService : IChannelAttachmentService, IHoste
         bool enabled,
         CancellationToken cancellationToken = default) =>
         _store.SetAutoJoinAsync(teamId, channelId, enabled, cancellationToken);
+
+    public Task<bool> RecordAutoJoinAttemptAsync(
+        string teamId,
+        string channelId,
+        AutoJoinAttempt attempt,
+        CancellationToken cancellationToken = default) =>
+        _store.RecordAutoJoinAttemptAsync(teamId, channelId, attempt, cancellationToken);
 }

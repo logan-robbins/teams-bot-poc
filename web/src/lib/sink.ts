@@ -46,6 +46,25 @@ export interface MeetingListResponse {
   meetings: MeetingListEntry[];
 }
 
+export interface ChannelLedgerEvent {
+  session_id?: string;
+  event_id: string;
+  kind: "speech" | "chat" | "system";
+  source: string;
+  timestamp_utc: string;
+  text: string;
+  speaker_id?: string | null;
+  display_name?: string | null;
+  message_id?: string | null;
+  team_id?: string | null;
+  channel_id?: string | null;
+  channel_thread_id?: string | null;
+}
+
+export interface ChannelEventsResponse {
+  events: ChannelLedgerEvent[];
+}
+
 export const sink = {
   // -- Per-meeting (URL-keyed) ------------------------------------------------
   meetingStatus: (chatThreadId: string) =>
@@ -64,6 +83,22 @@ export const sink = {
     }),
 
   listMeetings: () => json<MeetingListResponse>("/m"),
+
+  channelEvents: (
+    teamId: string,
+    channelId: string,
+    opts: { since?: string; kinds?: string; limit?: number } = {},
+  ) => {
+    const params = new URLSearchParams();
+    if (opts.since) params.set("since", opts.since);
+    if (opts.kinds) params.set("kinds", opts.kinds);
+    if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+    const qs = params.toString();
+    const suffix = qs ? `?${qs}` : "";
+    return json<ChannelEventsResponse>(
+      `/c/${encodeURIComponent(teamId)}/${encodeURIComponent(channelId)}/events${suffix}`,
+    );
+  },
 
   // -- Legacy (single-session) endpoints kept for diagnostics + tooling ------
   status: () => json<SessionStatusResponse>("/session/status"),

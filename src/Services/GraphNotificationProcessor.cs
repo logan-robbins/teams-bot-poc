@@ -317,6 +317,17 @@ public sealed partial class GraphNotificationProcessor
                     "Auto-join workflow completed for callId={CallId}: SelectedMode={Mode} BotCallId={BotCallId} Deferred={Deferred} Message={Message}",
                     callId, result.SelectedJoinMode, result.CallId, result.Deferred, result.Message);
 
+                await _attachmentService.RecordAutoJoinAttemptAsync(
+                    payload.TeamId!, payload.ChannelId!,
+                    new AutoJoinAttempt
+                    {
+                        Ts = DateTimeOffset.UtcNow.ToString("O"),
+                        Trigger = "auto",
+                        Status = result.Deferred ? "deferred" : "success",
+                        CallId = result.CallId,
+                        SourceCallId = callId,
+                    }).ConfigureAwait(false);
+
                 if (!result.Deferred && !string.IsNullOrWhiteSpace(initiatorOid) && !string.IsNullOrWhiteSpace(result.CallId))
                 {
                     _transcriptFetcher.Register(
@@ -328,14 +339,39 @@ public sealed partial class GraphNotificationProcessor
                         registeredAtUtc: DateTimeOffset.UtcNow);
                 }
             }
+            catch (JoinWorkflowException jex)
+            {
+                _logger.LogError(jex,
+                    "Auto-join workflow rejected for callId={CallId} on channel={ChannelId} code={ErrorCode}",
+                    callId, payload.ChannelId, jex.ErrorCode);
+                await _attachmentService.RecordAutoJoinAttemptAsync(
+                    payload.TeamId!, payload.ChannelId!,
+                    new AutoJoinAttempt
+                    {
+                        Ts = DateTimeOffset.UtcNow.ToString("O"),
+                        Trigger = "auto",
+                        Status = "failure",
+                        ErrorCode = jex.ErrorCode,
+                        ErrorMessage = jex.Message,
+                        SourceCallId = callId,
+                    }).ConfigureAwait(false);
+                _attemptedJoins.TryRemove(callId, out _);
+            }
             catch (Exception ex)
             {
-                _logger.LogError(
-                    ex,
+                _logger.LogError(ex,
                     "Auto-join failed for callId={CallId} on channel={ChannelId}",
                     callId, payload.ChannelId);
-                // Drop the latch so a later notification (if Teams resends)
-                // can retry.
+                await _attachmentService.RecordAutoJoinAttemptAsync(
+                    payload.TeamId!, payload.ChannelId!,
+                    new AutoJoinAttempt
+                    {
+                        Ts = DateTimeOffset.UtcNow.ToString("O"),
+                        Trigger = "auto",
+                        Status = "failure",
+                        ErrorMessage = ex.Message,
+                        SourceCallId = callId,
+                    }).ConfigureAwait(false);
                 _attemptedJoins.TryRemove(callId, out _);
             }
         });

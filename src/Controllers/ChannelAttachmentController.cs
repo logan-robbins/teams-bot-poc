@@ -47,24 +47,42 @@ public sealed class ChannelAttachmentController : ControllerBase
     public IActionResult List()
     {
         var items = _service.List()
-            .Select(record => new ChannelAttachmentResponse
-            {
-                TeamId = record.TeamId,
-                ChannelId = record.ChannelId,
-                ConversationThreadId = record.ConversationThreadId,
-                TeamDisplayName = record.TeamDisplayName,
-                ChannelDisplayName = record.ChannelDisplayName,
-                Source = record.Source,
-                AttachedAtUtc = record.AttachedAtUtc,
-                SubscriptionId = record.SubscriptionId,
-                SubscriptionExpiresAtUtc = record.SubscriptionExpiresAtUtc,
-            })
+            .Select(ToResponse)
             .OrderBy(item => item.TeamId, StringComparer.Ordinal)
             .ThenBy(item => item.ChannelId, StringComparer.Ordinal)
             .ToList();
 
         return Ok(new { count = items.Count, attachments = items });
     }
+
+    [HttpGet("{teamId}/{channelId}")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public IActionResult GetOne(string teamId, string channelId)
+    {
+        var record = _service.Get(teamId, channelId);
+        if (record is null)
+        {
+            return NotFound(new { error = "no attachment for that team_id + channel_id" });
+        }
+        return Ok(ToResponse(record));
+    }
+
+    private static ChannelAttachmentResponse ToResponse(ChannelAttachmentRecord record) =>
+        new()
+        {
+            TeamId = record.TeamId,
+            ChannelId = record.ChannelId,
+            ConversationThreadId = record.ConversationThreadId,
+            TeamDisplayName = record.TeamDisplayName,
+            ChannelDisplayName = record.ChannelDisplayName,
+            Source = record.Source,
+            AttachedAtUtc = record.AttachedAtUtc,
+            SubscriptionId = record.SubscriptionId,
+            SubscriptionExpiresAtUtc = record.SubscriptionExpiresAtUtc,
+            AutoJoinEnabled = record.AutoJoinEnabled,
+            LastAutoJoinAttempt = record.LastAutoJoinAttempt,
+        };
 
     [HttpPost("attach")]
     [ProducesResponseType(StatusCodes.Status200OK)]
@@ -352,11 +370,15 @@ public sealed class ChannelAttachmentController : ControllerBase
                 "Manual join requested team={TeamId} channel={ChannelId} result.CallId={CallId} mode={Mode}",
                 teamId, channelId, result.CallId, result.SelectedJoinMode);
 
-            // No organizer OID on manual trigger (no systemEventMessage in
-            // hand). Skip post-meeting transcript fetch — auto-join path
-            // wires it from initiator. Operators wanting the official
-            // transcript for a manual-trigger call should fetch via Graph
-            // directly using the meeting organizer's userId.
+            await _service.RecordAutoJoinAttemptAsync(teamId, channelId,
+                new AutoJoinAttempt
+                {
+                    Ts = DateTimeOffset.UtcNow.ToString("O"),
+                    Trigger = "manual",
+                    Status = result.Deferred ? "deferred" : "success",
+                    CallId = result.CallId,
+                });
+
             return Ok(new
             {
                 ok = true,
@@ -372,12 +394,29 @@ public sealed class ChannelAttachmentController : ControllerBase
             _logger.LogWarning(ex,
                 "Manual join workflow rejected team={TeamId} channel={ChannelId} code={ErrorCode}",
                 teamId, channelId, ex.ErrorCode);
+            await _service.RecordAutoJoinAttemptAsync(teamId, channelId,
+                new AutoJoinAttempt
+                {
+                    Ts = DateTimeOffset.UtcNow.ToString("O"),
+                    Trigger = "manual",
+                    Status = "failure",
+                    ErrorCode = ex.ErrorCode,
+                    ErrorMessage = ex.Message,
+                });
             return BadRequest(new { error = ex.Message, error_code = ex.ErrorCode });
         }
         catch (Exception ex)
         {
             _logger.LogError(ex,
                 "Manual join failed team={TeamId} channel={ChannelId}", teamId, channelId);
+            await _service.RecordAutoJoinAttemptAsync(teamId, channelId,
+                new AutoJoinAttempt
+                {
+                    Ts = DateTimeOffset.UtcNow.ToString("O"),
+                    Trigger = "manual",
+                    Status = "failure",
+                    ErrorMessage = ex.Message,
+                });
             return StatusCode(StatusCodes.Status500InternalServerError,
                 new { error = ex.Message });
         }
@@ -417,4 +456,6 @@ public sealed record ChannelAttachmentResponse
     [JsonProperty("attached_at_utc")] public DateTimeOffset AttachedAtUtc { get; init; }
     [JsonProperty("subscription_id")] public string? SubscriptionId { get; init; }
     [JsonProperty("subscription_expires_at_utc")] public DateTimeOffset? SubscriptionExpiresAtUtc { get; init; }
+    [JsonProperty("auto_join_enabled")] public bool AutoJoinEnabled { get; init; } = true;
+    [JsonProperty("last_auto_join_attempt")] public AutoJoinAttempt? LastAutoJoinAttempt { get; init; }
 }

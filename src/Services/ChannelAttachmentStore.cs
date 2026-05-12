@@ -78,6 +78,15 @@ public sealed record ChannelAttachmentRecord
     [JsonPropertyName("auto_join_enabled")]
     public bool AutoJoinEnabled { get; init; } = true;
 
+    /// <summary>
+    /// Most recent join attempt against this channel (auto or manual).
+    /// Surfaces in the admin UI so operators can see at a glance whether
+    /// Alfred is actually picking up "Meeting started" events. Null
+    /// until the first attempt fires.
+    /// </summary>
+    [JsonPropertyName("last_auto_join_attempt")]
+    public AutoJoinAttempt? LastAutoJoinAttempt { get; init; }
+
     public static string BuildKey(string teamId, string channelId) =>
         $"{teamId}|{channelId}";
 
@@ -90,6 +99,48 @@ public sealed record ChannelAttachmentRecord
 /// here, optionally filtered by <see cref="EventKinds"/>. Each consumer
 /// is a separate team's backend.
 /// </summary>
+/// <summary>
+/// One join-attempt outcome captured on a channel attachment. The
+/// attachment keeps only the most recent attempt; for richer history
+/// use the bot service logs.
+/// </summary>
+public sealed record AutoJoinAttempt
+{
+    /// <summary>ISO 8601 UTC of the attempt.</summary>
+    [JsonPropertyName("ts")] [NJ.JsonProperty("ts")]
+    public required string Ts { get; init; }
+
+    /// <summary>"auto" (callStartedEventMessageDetail) or "manual" (operator UI / API).</summary>
+    [JsonPropertyName("trigger")] [NJ.JsonProperty("trigger")]
+    public required string Trigger { get; init; }
+
+    /// <summary>"success", "failure", or "deferred" (e.g. PolicyAutoInvite).</summary>
+    [JsonPropertyName("status")] [NJ.JsonProperty("status")]
+    public required string Status { get; init; }
+
+    /// <summary>
+    /// Bot's internal callId when the join succeeded. Operators can
+    /// cross-reference this against <c>/api/calling/health</c>.
+    /// </summary>
+    [JsonPropertyName("call_id")] [NJ.JsonProperty("call_id")]
+    public string? CallId { get; init; }
+
+    /// <summary>JoinWorkflowException error code when the attempt failed.</summary>
+    [JsonPropertyName("error_code")] [NJ.JsonProperty("error_code")]
+    public string? ErrorCode { get; init; }
+
+    /// <summary>Human-readable error message when the attempt failed.</summary>
+    [JsonPropertyName("error_message")] [NJ.JsonProperty("error_message")]
+    public string? ErrorMessage { get; init; }
+
+    /// <summary>
+    /// The Graph-side callId from the systemEventMessage that triggered
+    /// the auto-join. Null for manual triggers (no source message).
+    /// </summary>
+    [JsonPropertyName("source_call_id")] [NJ.JsonProperty("source_call_id")]
+    public string? SourceCallId { get; init; }
+}
+
 public sealed record ConsumerConfig
 {
     /// <summary>
@@ -325,6 +376,41 @@ public sealed class ChannelAttachmentStore
                 .ToList();
 
             _byKey[key] = existing with { Consumers = updated };
+            await PersistLockedAsync(cancellationToken);
+            return true;
+        }
+        finally
+        {
+            _mutex.Release();
+        }
+    }
+
+    /// <summary>
+    /// Records the latest join attempt (auto or manual) against this
+    /// channel. Returns false when no attachment exists.
+    /// </summary>
+    public async Task<bool> RecordAutoJoinAttemptAsync(
+        string teamId,
+        string channelId,
+        AutoJoinAttempt attempt,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(attempt);
+        if (string.IsNullOrWhiteSpace(teamId) || string.IsNullOrWhiteSpace(channelId))
+        {
+            return false;
+        }
+
+        await _mutex.WaitAsync(cancellationToken);
+        try
+        {
+            var key = ChannelAttachmentRecord.BuildKey(teamId, channelId);
+            if (!_byKey.TryGetValue(key, out var existing))
+            {
+                return false;
+            }
+
+            _byKey[key] = existing with { LastAutoJoinAttempt = attempt };
             await PersistLockedAsync(cancellationToken);
             return true;
         }

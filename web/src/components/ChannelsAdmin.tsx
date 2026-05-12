@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { Moon, Plus, Trash2, Save, RefreshCw, Phone } from "lucide-react";
+import { Moon, Plus, Trash2, Save, RefreshCw, Phone, ExternalLink } from "lucide-react";
 import {
   bot,
   type ChannelAttachment,
@@ -245,7 +245,19 @@ function ChannelRow({
         team_id: {channel.team_id} · channel_id: {channel.channel_id}
       </div>
 
+      <div className="mt-2">
+        <StatusPills channel={channel} />
+      </div>
+
       <div className="mt-3 flex flex-wrap items-center gap-3 border-b border-ink-800 pb-3">
+        <Link
+          to={`/channels/inspect/${encodeURIComponent(channel.team_id)}/${encodeURIComponent(channel.channel_id)}`}
+          className="flex items-center gap-1 rounded-md bg-gold-500/20 px-3 py-1.5 text-xs text-gold-200 ring-1 ring-gold-500/40 hover:bg-gold-500/30"
+          title="Open per-channel command center"
+        >
+          <ExternalLink size={12} />
+          Open
+        </Link>
         <button
           type="button"
           onClick={() => void joinNow()}
@@ -393,4 +405,71 @@ function fmtTs(ts?: string): string {
   } catch {
     return ts;
   }
+}
+
+function StatusPills({ channel }: { channel: ChannelAttachment }) {
+  const sub = channel.subscription_id ? "ok" : "missing";
+  const autoJoinOn = channel.auto_join_enabled !== false;
+  const last = channel.last_auto_join_attempt;
+
+  const lastPill = last ? (
+    <span
+      className={
+        "inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] ring-1 " +
+        (last.status === "success"
+          ? "bg-emerald-500/15 text-emerald-200 ring-emerald-500/30"
+          : last.status === "failure"
+            ? "bg-crimson-500/15 text-crimson-200 ring-crimson-500/30"
+            : "bg-gold-500/15 text-gold-200 ring-gold-500/30")
+      }
+      title={
+        last.error_message
+          ? `${last.status} via ${last.trigger} · ${last.error_code ?? ""} ${last.error_message}`
+          : `${last.status} via ${last.trigger}`
+      }
+    >
+      last join: {last.status} ({fmtRelative(last.ts)})
+    </span>
+  ) : (
+    <span className="inline-flex items-center gap-1 rounded bg-ink-800/40 px-1.5 py-0.5 text-[10px] text-ink-400 ring-1 ring-ink-700">
+      no join attempts yet
+    </span>
+  );
+
+  return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      <span
+        className={
+          "inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] ring-1 " +
+          (sub === "ok"
+            ? "bg-emerald-500/15 text-emerald-200 ring-emerald-500/30"
+            : "bg-gold-500/15 text-gold-200 ring-gold-500/30")
+        }
+      >
+        sub: {sub}
+      </span>
+      <span
+        className={
+          "inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] ring-1 " +
+          (autoJoinOn
+            ? "bg-emerald-500/15 text-emerald-200 ring-emerald-500/30"
+            : "bg-ink-800/40 text-ink-300 ring-ink-700")
+        }
+      >
+        auto-join: {autoJoinOn ? "on" : "off"}
+      </span>
+      {lastPill}
+    </div>
+  );
+}
+
+function fmtRelative(ts?: string): string {
+  if (!ts) return "?";
+  const t = new Date(ts).getTime();
+  if (Number.isNaN(t)) return ts;
+  const diff = Date.now() - t;
+  if (diff < 60_000) return `${Math.round(diff / 1000)}s ago`;
+  if (diff < 3_600_000) return `${Math.round(diff / 60_000)}m ago`;
+  if (diff < 86_400_000) return `${Math.round(diff / 3_600_000)}h ago`;
+  return `${Math.round(diff / 86_400_000)}d ago`;
 }
