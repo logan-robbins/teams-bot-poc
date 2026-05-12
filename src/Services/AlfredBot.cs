@@ -264,7 +264,7 @@ public sealed class AlfredBot : TeamsActivityHandler
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogDebug(ex,
+                    _logger.LogWarning(ex,
                         "TeamsInfo.GetTeamDetailsAsync failed for TeamId={TeamId}", teamId);
                 }
             }
@@ -280,7 +280,7 @@ public sealed class AlfredBot : TeamsActivityHandler
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogDebug(ex,
+                    _logger.LogWarning(ex,
                         "TeamsInfo.GetTeamChannelsAsync failed for TeamId={TeamId} ChannelId={ChannelId}",
                         teamId, channelId);
                 }
