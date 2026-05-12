@@ -14,13 +14,14 @@ namespace TeamsMediaBot.Services;
 /// the fan-out dispatcher.
 ///
 /// <para>
-/// We poll <c>users/{organizerOid}/onlineMeetings/getAllTranscripts</c>
-/// (user-scoped, app-only auth) every 60s starting 60s after the join
-/// and time out at 30 min. The first transcript whose
-/// <c>createdDateTime</c> is after the join time is treated as the
-/// transcript for that call. The VTT content is fetched + parsed into
-/// cues with speaker names, then dispatched once and the pending fetch
-/// is removed.
+/// We poll the <b>app-scoped</b> Graph resource
+/// <c>appCatalogs/teamsApps/{teamsAppId}/installedToOnlineMeetings/getAllTranscripts</c>
+/// every 60s starting 60s after the join, timing out at 30 min. This
+/// resource is gated by the RSC <c>OnlineMeetingTranscript.Read.Chat</c>
+/// declared in the manifest and consented at team-install time — so no
+/// tenant-wide Entra application permission is required. The first
+/// transcript whose <c>createdDateTime</c> is after the join time is
+/// treated as the transcript for that call.
 /// </para>
 /// </summary>
 public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
@@ -33,6 +34,7 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
 
     private readonly EventFanoutDispatcher _dispatcher;
     private readonly GraphApiClient _graph;
+    private readonly BotConfiguration _botConfig;
     private readonly ILogger<OfficialTranscriptFetcher> _logger;
     private readonly CancellationTokenSource _cts = new();
     private readonly ConcurrentDictionary<string, Task> _activeFetches = new(StringComparer.Ordinal);
@@ -41,10 +43,12 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
     public OfficialTranscriptFetcher(
         EventFanoutDispatcher dispatcher,
         GraphApiClient graph,
+        BotConfiguration botConfig,
         ILogger<OfficialTranscriptFetcher> logger)
     {
         _dispatcher = dispatcher;
         _graph = graph;
+        _botConfig = botConfig;
         _logger = logger;
     }
 
@@ -93,7 +97,7 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
 
                 if (!string.IsNullOrEmpty(meetingId) && !string.IsNullOrEmpty(transcriptId))
                 {
-                    var vtt = await FetchVttAsync(pending.OrganizerOid, meetingId!, transcriptId!, cancellationToken)
+                    var vtt = await FetchVttAsync(meetingId!, transcriptId!, cancellationToken)
                         .ConfigureAwait(false);
                     if (!string.IsNullOrWhiteSpace(vtt))
                     {
@@ -136,8 +140,11 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
         // ISO 8601 with millisecond precision, no offset (Graph requires UTC `Z`).
         var sinceIso = pending.RegisteredAtUtc.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ss.fffZ");
         var encodedSince = WebUtility.UrlEncode(sinceIso);
+        var teamsAppId = _botConfig.AppId ?? string.Empty;
+        // App-scoped endpoint — gated by the OnlineMeetingTranscript.Read.Chat
+        // RSC consented at team install, NOT by any tenant-wide app permission.
         var resource =
-            $"users/{Uri.EscapeDataString(pending.OrganizerOid)}/onlineMeetings/getAllTranscripts" +
+            $"appCatalogs/teamsApps/{Uri.EscapeDataString(teamsAppId)}/installedToOnlineMeetings/getAllTranscripts" +
             $"?$filter=createdDateTime ge {encodedSince}&$orderby=createdDateTime asc&$top=5";
 
         try
@@ -161,27 +168,28 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
         catch (GraphApiException ex) when (ex.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.Forbidden)
         {
             _logger.LogDebug(
-                "getAllTranscripts returned {Status} for organizer={Oid}; polling will retry.",
-                ex.StatusCode, pending.OrganizerOid);
+                "getAllTranscripts returned {Status} for app={AppId}; polling will retry.",
+                ex.StatusCode, _botConfig.AppId);
         }
         catch (Exception ex)
         {
             _logger.LogDebug(ex,
-                "getAllTranscripts probe failed for organizer={Oid}; polling will retry.",
-                pending.OrganizerOid);
+                "getAllTranscripts probe failed for app={AppId}; polling will retry.",
+                _botConfig.AppId);
         }
 
         return (null, null, null);
     }
 
     private async Task<string?> FetchVttAsync(
-        string organizerOid,
         string meetingId,
         string transcriptId,
         CancellationToken cancellationToken)
     {
+        var teamsAppId = _botConfig.AppId ?? string.Empty;
+        // App-scoped content fetch — same RSC as the list call.
         var resource =
-            $"users/{Uri.EscapeDataString(organizerOid)}/onlineMeetings/" +
+            $"appCatalogs/teamsApps/{Uri.EscapeDataString(teamsAppId)}/installedToOnlineMeetings/" +
             $"{Uri.EscapeDataString(meetingId)}/transcripts/{Uri.EscapeDataString(transcriptId)}/content" +
             "?$format=text/vtt";
         try
