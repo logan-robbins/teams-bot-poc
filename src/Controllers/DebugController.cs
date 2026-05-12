@@ -102,12 +102,12 @@ public sealed class DebugController : ControllerBase
 
         var dir = Path.Combine(_audit.BaseDir, sanitizedChatThreadId);
         var path = Path.Combine(dir, $"{kind}.ndjson");
-        if (!System.IO.File.Exists(path))
-        {
-            return NotFound(new { error = "no audit file for that thread + kind" });
-        }
 
-        var entries = ReadTail(path, tail);
+        // "No audit file yet" is the normal state before the first event of
+        // this kind lands — return an empty stream instead of 404 so callers
+        // that poll (command center, debug panel) don't have to special-case
+        // a missing file vs. a transient error.
+        var entries = System.IO.File.Exists(path) ? ReadTail(path, tail) : new List<JsonElement>();
         return Ok(new
         {
             chat_thread_id_sanitized = sanitizedChatThreadId,
