@@ -26,9 +26,19 @@ This README is the **what + why**. `AGENTS.md` is the **how**.
   Teams APIs + per-channel consumer registry + outbound dispatcher),
   Python FastAPI sink on Container Apps (the reference consumer +
   sessions + agent + SQLite), React UI on Container Apps (read-only,
-  reads the reference sink).
+  reads the reference sink + bot operator API).
+- **Auto-join + manual join.** When Teams posts a `callStartedEventMessageDetail`
+  in an attached channel, Alfred joins automatically (per-channel
+  toggle). Operators can also click **Join now** in the admin UI.
+- **Post-meeting Microsoft transcript.** After every channel meeting,
+  the bot polls Graph (app-scoped, RSC only) for Microsoft's official
+  "Record and Transcribe" transcript and emits it as a
+  `transcript.official` envelope. Consumers get the speaker-labeled
+  VTT in addition to the live STT feed.
 - **Single key:** `chat_thread_id` routes every transcript and chat
-  to its session. The UI URL is `/m/<chat_thread_id>`.
+  to its session. The per-meeting UI URL is `/m/<chat_thread_id>`;
+  the per-channel command center URL is
+  `/channels/inspect/<teamId>/<channelId>`.
 - **Channel rollup:** every event is also stamped with optional
   `team_id` / `channel_id` / `channel_thread_id`, so analytics can
   query an entire channel's history (chat + every meeting +
@@ -37,6 +47,9 @@ This README is the **what + why**. `AGENTS.md` is the **how**.
   optionally one tool call (`send_to_meeting_chat`). No `SEND/ASK/SILENT`
   enum. Silence is "did not call the tool".
 - **Source of truth for agent behavior:** `python/batcave_platform/specs/alfred.yaml`.
+- **RSC-only.** Zero tenant-wide Entra application permissions. All
+  Graph access — calling, transcripts, recordings — goes through RSC
+  consented at team-install time. Manifest is at **`1.0.10`**.
 
 ---
 
@@ -52,60 +65,79 @@ This README is the **what + why**. `AGENTS.md` is the **how**.
   │  C# bot  src/  ·  Windows VM  ·  Graph Communications + Bot SDK    │
   │                                                                    │
   │  Audio path:  Join call → stream PCM → diarized TranscriptEvents   │
-  │               (Azure Speech, the only sanctioned Disney provider)  │
+  │               (Azure Speech ConversationTranscriber)               │
   │  Chat path:   Bot Framework + Graph subscriptions                  │
   │  Channel:     Persistent attach → ChannelMessage subscription      │
   │               + auto-attach on team-install (§5b)                  │
+  │  Auto-join:   GraphNotificationProcessor detects                   │
+  │               callStartedEventMessageDetail in attached channels   │
+  │               and runs JoinMeetingWithModeAsync. Per-channel       │
+  │               AutoJoinEnabled toggle. Last attempt + outcome       │
+  │               persisted on the attachment for the admin UI.        │
+  │  Post-meeting:OfficialTranscriptFetcher polls the app-scoped       │
+  │               appCatalogs/teamsApps/{id}/installedToOnlineMeetings │
+  │               /getAllTranscripts (RSC, not org-wide). VTT cues     │
+  │               emitted as transcript.official envelopes.            │
   │  Identity:    MSI ↔ AAD ↔ display_name from ICall.Participants     │
-  │  Audit:       Per-meeting NDJSON log on disk (§4)                  │
+  │  Audit:       Per-thread NDJSON log on disk (§4)                   │
   │  Outbound:    send_to_meeting_chat via Bot Framework adapter       │
-  │                                                                    │
-  │  Stamps every published event with chat_thread_id (always) and     │
-  │  team_id / channel_id / channel_thread_id (when known) so the      │
-  │  sink can later roll meetings up under their parent channel.       │
+  │  Dispatch:    EventFanoutDispatcher fans every audited event to    │
+  │               every URL in the channel's ConsumerConfig list,      │
+  │               per-consumer bounded queue + 3-attempt retry.        │
   └──────────────────┬─────────────────────────────────────────────────┘
                      │
-                     │  POST /transcript    POST /chat    POST /session/link
-                     │  POST /session/participants     POST /api/send-chat ◀── reverse
+                     │  POST /events   (alfred-events-v1 envelope; ONLY ingress)
+                     │  POST /api/send-chat ◀── any consumer can post back
                      ▼
   ┌────────────────────────────────────────────────────────────────────┐
-  │  Python sink  python/  ·  FastAPI on Container Apps                │
+  │  Python sink (reference consumer)  python/  ·  Container Apps      │
+  │                                                                    │
+  │  POST /events    →  routes by event_type:                          │
+  │                       transcript.partial / .final → ledger         │
+  │                       chat.message                → ledger         │
+  │                       transcript.official         → ledger w/      │
+  │                                                     source=graph_   │
+  │                                                     notification    │
+  │                       system.session_linked       → backfill       │
+  │                       system.channel_*            → log            │
   │                                                                    │
   │  E1 raw layer  (immutable):                                        │
   │      raw_ingest_events — every inbound event hashed, BEFORE any    │
   │        filter (partial drop, session-active, echo suppression)     │
-  │                                                                    │
   │  E2 working layer  (cleanable):                                    │
   │      SessionRegistry — one InterviewSessionManager per             │
   │        chat_thread_id; auto-starts on first non-empty final/chat   │
   │      meeting_events — normalized ledger; back-links to raw via     │
-  │        source_raw_event_ids; team_id/channel_id stamped at write   │
-  │        time and backfilled by /session/link                        │
-  │                                                                    │
+  │        source_raw_event_ids; team_id/channel_id stamped or         │
+  │        backfilled by system.session_linked envelopes               │
   │  E3 identity:  ParticipantResolver  manual > teams_msi_unique >    │
   │                teams_msi_group > sole_human > unresolved           │
-  │                                                                    │
   │  Agent:    AlfredAnalyzer — debounced, one AlfredExtraction per    │
   │            tick (rolling summary + topics + notes + decisions +    │
   │            open_questions + action_items + risks, merged by id)    │
   │  E4 policy:  alfred.yaml interventions + 45 s cooldown +           │
   │              directly-addressed bypass                             │
   │  Outbound:  send_to_meeting_chat (sole tool)                       │
-  │                                                                    │
   │  Channel rollup:                                                   │
   │      session_channel_links binds chat_thread_id → channel context  │
   │      /c/{teamId}/{channelId}/events returns chat + every meeting   │
-  │        + every transcript under one channel, ordered by ts         │
-  │                                                                    │
+  │        + every transcript (live STT + official VTT) under one      │
+  │        channel, ordered by ts                                      │
   │  SSE /m/{chat_thread_id}/events drives the UI                      │
   └──────────────────┬─────────────────────────────────────────────────┘
-                     │  SSE + JSON, filtered by chat_thread_id
+                     │  SSE + JSON
                      ▼
   ┌────────────────────────────────────────────────────────────────────┐
   │  React UI  web/  ·  Vite + React 19                                │
-  │     /           → MeetingList (polls /m every 2 s)                 │
-  │     /m/<id>     → MeetingDossier (Ledger / Dossier / Companion).   │
-  │                   Read-only — only Alfred speaks via the tool.     │
+  │     /                       → MeetingList                          │
+  │     /m/<id>                 → MeetingDossier (read-only)           │
+  │     /channels/admin         → consumer config CRUD + status pills  │
+  │     /channels/inspect/      → per-channel command center:          │
+  │       <teamId>/<channelId>     · status (sub/auto-join/active call)│
+  │                                · last join attempt + error code   │
+  │                                · live transcripts (bot audit tail) │
+  │                                · official transcripts (sink)      │
+  │     /channels/debug         → flat per-thread audit tail           │
   └────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -129,8 +161,8 @@ returns every event under one ordered timeline.
 enum. Do not introduce a parallel outbound path.
 
 **Debouncing contract.** C# does not debounce Alfred; it forwards
-*every* STT event to `/transcript` and *every* chat to `/chat`. Python
-owns the ledger and the agent's batching:
+*every* event through the dispatcher to consumers. The reference
+Python sink owns the ledger and the agent's batching:
 `python/meeting_agent/debounce.py` (`DEFAULT_QUIET_WINDOW_SECONDS=1.5`,
 `DEFAULT_MAX_BATCH=8`) used by `python/transcript_sink.py`.
 `partial` transcripts are raw-audited but not promoted to the working
@@ -163,17 +195,21 @@ active merge-request branch (`alfred-agent-updates`) for Disney review.
 
 ## 3. Permissions (RSC)
 
-The manifest declares 11 Resource-Specific Consent permissions split
-across the two operational shapes — meeting and channel. There are
-zero tenant-wide Graph permissions.
+The manifest declares **15 Resource-Specific Consent permissions**
+split across the two operational shapes — meeting and channel.
+There are **zero tenant-wide Entra application permissions**. All
+Graph access — including the post-meeting transcript fetch — is
+gated by RSC consented at team-install time.
 
 **Chat-scoped (per-meeting / per-chat install):**
 
 | Permission | Used for |
 |---|---|
-| `Calls.JoinGroupCalls.Chat` | Bot enters the call as a participant. |
+| `Calls.JoinGroupCalls.Chat` | Bot enters the call as a participant (auto-join + manual). |
 | `Calls.AccessMedia.Chat` | Receive 16 kHz / 16-bit / mono PCM audio. |
 | `OnlineMeetingParticipant.Read.Chat` | MSI ↔ AAD ↔ display-name lookup (E3). |
+| `OnlineMeetingTranscript.Read.Chat` | Fetch Microsoft's official post-meeting transcript via Graph. |
+| `OnlineMeetingRecording.Read.Chat` | Future: fetch the meeting recording artifact. |
 | `ChatMessage.Read.Chat` | Graph subscription on the meeting chat. |
 | `ChatMessageReadReceipt.Read.Chat` | Reserved (planned engagement signal). |
 
@@ -185,16 +221,21 @@ zero tenant-wide Graph permissions.
 | `ChannelMessage.Send.Group` | Optional Graph-based outbound (Bot Framework adapter is the default). |
 | `ChannelMeeting.ReadBasic.Group` | Discover channel meetings spawned in attached channels. |
 | `ChannelMeetingParticipant.Read.Group` | Roster lookups for channel meetings. |
+| `ChannelMeetingTranscript.Read.Group` | Channel-meeting transcripts for analytics rollup. |
+| `ChannelMeetingRecording.Read.Group` | Future: channel-meeting recording artifact. |
 | `TeamsAppInstallation.Read.Group` | Verify the bot is still installed at the team level. |
 | `TeamSettings.Read.Group` | Read team display name / settings for operator UI. |
 
 Plus two manifest-level Teams app permissions: `identity`,
 `messageTeamMembers`. The manifest also requests
-`supportsCalling: true`.
+`supportsCalling: true`. Manifest is currently at **`1.0.10`**.
 
-If the tenant treats Alfred as "unverified publisher", an M365 admin
-must grant org-wide consent in **Teams Admin Center → Manage apps →
-Permissions**. The manifest cannot bypass this.
+The only runtime gate outside RSC is the tenant's **calling policy**
+(`CsTeamsCallingPolicy` / `CsTeamsAppPermissionPolicy`). That's a
+Teams admin operational policy, not a permission grant. If calls
+return `502 CALL_JOIN_FAILED_7504_OR_7505` or
+`403 TENANT_NOT_ENABLED_FOR_MODE`, the gate to relax is the policy,
+not the manifest.
 
 ---
 
@@ -206,9 +247,9 @@ Permissions**. The manifest cannot bypass this.
 | `python/` | FastAPI sink + Alfred agent. Run with `uv run python run_variant_sink.py …` from this folder. |
 | `python/meeting_agent/` | Canonical session/agent state. `models.py`, `session.py`, `persistence.py`, `agent.py`, `tools.py`, `identity.py`. |
 | `python/batcave_platform/` | Product spec loader + output routes. `specs/alfred.yaml` is the **sole source of truth** for Alfred's prompt and intervention policy. |
-| `python/tests/` | `uv run pytest tests` baseline: **121 passed, 2 skipped**. |
-| `web/` | React 19 + Vite + Tailwind v4 UI. Per-meeting routing via `react-router-dom`. |
-| `manifest/` | Teams app manifest (`manifest.json`, `alfred-sandbox.zip`). Bot AppId, 11 RSC permissions, valid domains. Currently at version `1.0.7`. |
+| `python/tests/` | `uv run pytest tests` baseline: **124 passed, 2 skipped**. |
+| `web/` | React 19 + Vite + Tailwind v4 UI. Per-meeting routing + admin + per-channel command center + debug via `react-router-dom`. |
+| `manifest/` | Teams app manifest (`manifest.json`, `alfred-sandbox.zip`). Bot AppId, **15 RSC permissions**, valid domains. Currently at version **`1.0.10`**. |
 | `scripts/` | Deploy + ops scripts. Canonical entrypoints: `deploy-azure-vm.sh`, `deploy-azure-agent.sh`, `bootstrap-production-vm.ps1`, `join_meeting.sh`. |
 | `AGENTS.md` | **Operator manual for AI coding agents** — build, deploy, debug. Read this before changing anything in this tree. |
 
@@ -221,9 +262,9 @@ is `raw_ingest_events`; `MeetingEvent.source_raw_event_ids` back-links
 every working-ledger row to the raw rows that produced it.
 
 **Canonical channel link:** `session_channel_links` (chat_thread_id PK
-→ team_id, channel_id, channel_thread_id). Populated either by C#
-stamping at write time or by `POST /session/link`, which also
-backfills prior `meeting_events` and `raw_ingest_events` rows.
+→ team_id, channel_id, channel_thread_id). Populated by C# stamping
+at write time, or by a `system.session_linked` envelope which routes
+internally to the link-backfill handler.
 
 ---
 
@@ -290,11 +331,26 @@ curl -sS "$BOT/api/channels" | jq
 curl -sS -X DELETE "$BOT/api/channels/$TEAM_ID/$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=""))' "$CHANNEL_ID")"
 ```
 
-After attach, every channel post is forwarded to the Python sink's
-`/chat` endpoint with `conversation_kind:"channel"`, `team_id`, and
-`channel_id` populated. The session is keyed on
-`19:{channelId}@thread.tacv2` (the same id Bot Framework uses), so the
-existing per-thread routes (`/m/<chat_thread_id>/...`) work unchanged.
+After attach, every channel post is wrapped in an
+`alfred-events-v1` envelope (`event_type: "chat.message"`) and
+dispatched to every registered consumer URL for that channel
+(including the reference sink at `POST /events`). The session is
+keyed on `19:{channelId}@thread.tacv2`, so the per-meeting routes
+(`/m/<chat_thread_id>/...`) work unchanged.
+
+When Teams posts the channel-meeting "Meeting started" system
+message (`callStartedEventMessageDetail`), the bot auto-joins (per
+the channel's `AutoJoinEnabled` toggle), records the attempt outcome
+on the attachment, and after the meeting ends polls Graph
+(app-scoped, RSC-only) for Microsoft's word-for-word transcript and
+emits it as a `transcript.official` envelope.
+
+The admin UI exposes:
+- `/channels/admin` — config CRUD + status pills + Open button
+- `/channels/inspect/<teamId>/<channelId>` — per-channel command
+  center: status, last join attempt + error code, active call,
+  live transcripts, official post-meeting transcripts
+- `/channels/debug` — flat per-thread audit tail
 
 Outbound: the bot posts back via `send_to_meeting_chat` using the
 captured `ConversationReference` for that channel. The reference is
@@ -413,11 +469,58 @@ CHAN='19:<channel guid>@thread.tacv2'
 ENC=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=''))" "$CHAN")
 curl -sS "$SINK/c/$TEAM/$ENC/events?since=2026-05-01T00:00:00Z&kinds=speech,chat" | jq
 
-# Manually link a meeting thread to a channel (also retroactively backfills
-# all prior meeting_events / raw_ingest_events for that meeting):
-curl -sS -X POST "$SINK/session/link" -H "Content-Type: application/json" \
+# Manually link a meeting thread to a channel — POST a system.session_linked
+# envelope through the single /events ingress (also retroactively backfills
+# meeting_events / raw_ingest_events for that meeting):
+curl -sS -X POST "$SINK/events" -H "Content-Type: application/json" \
   -d "$(jq -n --arg tid "19:meeting_xxx@thread.v2" --arg team "$TEAM" --arg chan "$CHAN" \
-        '{chat_thread_id:$tid, team_id:$team, channel_id:$chan, channel_thread_id:$chan, source:"manual"}')"
+        '{schema_version:"alfred-events-v1", event_type:"system.session_linked",
+          event_id:"manual-link", ts:"2026-05-12T00:00:00Z",
+          team_id:$team, channel_id:$chan, chat_thread_id:$tid,
+          channel_thread_id:$chan,
+          payload:{chat_thread_id:$tid, team_id:$team, channel_id:$chan,
+                   channel_thread_id:$chan, source:"manual"}}')"
+```
+
+### Operator API for channel attachment + consumer routing
+
+```bash
+BOT=https://alfred-disney-bot.eastus.cloudapp.azure.com
+TEAM='<aad group id>'
+CHAN='19:<channel guid>@thread.tacv2'
+ENC=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=''))" "$CHAN")
+
+# Attach Alfred to a channel without re-installing in Teams
+curl -sS -X POST "$BOT/api/channels/attach" -H "Content-Type: application/json" \
+  -d "$(jq -n --arg tid "$TEAM" --arg cid "$CHAN" \
+        '{team_id:$tid, channel_id:$cid, source:"manual_attach"}')"
+
+# List active attachments (each row includes auto_join_enabled +
+# last_auto_join_attempt for at-a-glance debugging)
+curl -sS "$BOT/api/channels" | jq
+
+# One attachment in detail (same fields)
+curl -sS "$BOT/api/channels/$TEAM/$ENC" | jq
+
+# Manually trigger Alfred to join the active channel meeting
+curl -sS -X POST "$BOT/api/channels/$TEAM/$ENC/join" | jq
+
+# Toggle auto-join for this channel
+curl -sS -X PATCH "$BOT/api/channels/$TEAM/$ENC/auto-join" \
+  -H "Content-Type: application/json" -d '{"enabled": false}' | jq
+
+# Per-channel consumer registry (see docs/event-contract.md)
+curl -sS "$BOT/api/channels/$TEAM/$ENC/consumers" | jq
+
+# Bot-side debug: list every audited chat_thread_id with summary
+curl -sS "$BOT/api/debug/transcripts" | jq
+
+# Tail one thread's transcript audit
+SANITIZED=$(echo "$CHAN" | sed 's/[<>:"/\\|?*]/_/g')   # mirrors MeetingAuditLogger.Sanitize
+curl -sS "$BOT/api/debug/transcripts/$SANITIZED?kind=transcript&tail=50" | jq
+
+# Detach (deletes the Graph subscription and removes the persistent record)
+curl -sS -X DELETE "$BOT/api/channels/$TEAM/$ENC"
 ```
 
 ### VM operations (canonical pattern: `az vm run-command create`)
@@ -576,7 +679,7 @@ uv run python run_variant_sink.py --instance dev --port 8765 \
 cd web && npm install && npm run dev      # http://127.0.0.1:5173
 
 # Tests
-cd python && uv run pytest tests -v       # baseline: 121 passed, 2 skipped
+cd python && uv run pytest tests -v       # baseline: 124 passed, 2 skipped
 
 # C# build — Docker SDK image with a named NuGet volume so restore is
 # fast across runs (~12 min cold, seconds warm). See AGENTS.md §3.3.
@@ -617,7 +720,11 @@ tool dry-runs (logs + appends to the ledger, does not POST).
 | Transcripts log to `meet-{meetingId}` audit dir but chat logs to `19:meeting_xxx` dir | Joining via short URL (`teams.microsoft.com/meet/...`) yields a synthetic `meet-{meetingId}` thread id for audio; Bot Framework chat carries the real `19:` thread id. Resolution requires a Graph call during join to look up the real thread id from the meeting id. |
 | Newly-pushed C# code "deploys" but the running bot still has old behavior | `dotnet publish` is incremental — stale `bin/`+`obj/` from a previous build can produce a fresh-timestamped DLL with old content. Any deploy that touches code must `rm -rf src/bin src/obj` before `dotnet publish`. See `AGENTS.md` §7.4. |
 | `az vm run-command create` succeeded but its output is the *previous* attempt's error | Run-command resources are cached by name. Use a unique `--run-command-name` per attempt or `az vm run-command delete` first. See `AGENTS.md` §7.3. |
-| Channel rollup `/c/{tid}/{cid}/events` returns nothing for a real meeting | The bot only stamps `channel_id` once it sees a meeting-chat activity carrying `channelData`. If the meeting started but no chat activity has happened yet, post anything in the meeting chat to trigger `/session/link`. Or call `/session/link` manually with the meeting's `chat_thread_id`. |
+| Channel rollup `/c/{tid}/{cid}/events` returns nothing for a real meeting | The bot only stamps `channel_id` once it sees a meeting-chat activity carrying `channelData`. If the meeting started but no chat activity has happened yet, post anything in the meeting chat to fire the `system.session_linked` envelope. Or POST one manually to `/events` (see §6). |
+| Auto-join not firing on "Meeting started" | Check `/channels/admin` row for that channel — `last join: failure` with a tooltip shows the JoinWorkflow error code. If no attempt is recorded at all, the Graph subscription on `teams/{teamId}/channels/{channelId}/messages` isn't firing; check `subscription_id` in `/api/channels`. If `auto-join: off`, flip the toggle. |
+| Manual Join button returns `403 GRAPH_PERMISSION_MISSING` | Manifest 1.0.10 wasn't admin-consented yet, OR Teams admin app permission policy blocks this AppId. Re-import zip in Dev Portal, re-publish + admin-consent in Teams Admin Center. |
+| Manual Join button returns `502 CALL_JOIN_FAILED_7504_OR_7505` | Tenant `CsTeamsCallingPolicy` blocks the bot from making group calls. Not a permission grant — a Teams admin policy. Get the AppId allowlisted in the policy assigned to your test user. |
+| `transcript.official` never lands after a meeting | The meeting wasn't recorded+transcribed in Teams (no `callTranscript` artifact to fetch). OR RSC `OnlineMeetingTranscript.Read.Chat` wasn't consented (re-import 1.0.10). Bot logs show `getAllTranscripts returned Forbidden` for the consent case or empty list for the no-recording case. |
 
 ---
 
@@ -703,9 +810,12 @@ state:
 - **E2 raw/working ledger split** ✅ live
 - **E3 participant identity layer** ✅ Python live; C# `Call.Participants.OnUpdated` publisher deferred
 - **E4 explicit proactivity policy** ✅ live
-- **E5 multi-sink routing** 🟡 deferred — needs a meeting→sink registration story that survives auto-invite
+- **E5 multi-sink routing** ✅ live — per-channel `ConsumerConfig` registry on the bot, `EventFanoutDispatcher` fans every event to every registered URL with per-consumer bounded queue + 3-attempt retry. See [`docs/event-contract.md`](docs/event-contract.md).
 - **E6 per-meeting URL-routed UI** ✅ live
 - **E7 persistent channel attachment** ✅ live — auto-attach on team install + `POST /api/channels/attach`; Graph subscription on `teams/{teamId}/channels/{channelId}/messages` with renewal loop and on-startup restore
-- **E8 channel-id metadata + rollup** ✅ live — every event carries `team_id` / `channel_id` / `channel_thread_id`; `POST /session/link` backfills prior rows; `GET /c/{teamId}/{channelId}/events` returns the unified channel timeline
+- **E8 channel-id metadata + rollup** ✅ live — every event carries `team_id` / `channel_id` / `channel_thread_id`; `system.session_linked` envelope backfills prior rows; `GET /c/{teamId}/{channelId}/events` returns the unified channel timeline (live STT + chat + official transcripts)
+- **E9 channel-meeting auto-join + manual join** ✅ live — `GraphNotificationProcessor` detects `callStartedEventMessageDetail` and runs the same `JoinMeetingWithModeAsync` workflow. Per-channel `AutoJoinEnabled` toggle. Last attempt outcome persisted on attachment for the admin UI.
+- **E10 post-meeting Microsoft transcript** ✅ live (RSC-only) — `OfficialTranscriptFetcher` polls the app-scoped Graph endpoint and emits each meeting's VTT cues as `transcript.official` envelopes. Reference sink stores them as `source=graph_notification` speech events.
+- **E11 operator admin UI** ✅ live — `/channels/admin` (consumer CRUD + status pills), `/channels/inspect/<teamId>/<channelId>` (per-channel command center: status, last join attempt, active call, live + official transcripts), `/channels/debug` (per-thread audit tail).
 
 Read `PROD.md` before starting any of the deferred workstreams.
