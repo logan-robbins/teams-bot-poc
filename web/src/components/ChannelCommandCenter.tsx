@@ -10,8 +10,6 @@ import {
   FileText,
   Power,
   AlertCircle,
-  BookOpen,
-  ExternalLink,
 } from "lucide-react";
 import {
   bot,
@@ -21,22 +19,26 @@ import {
   type DebugTailResponse,
 } from "../lib/bot";
 import { sink, type ChannelLedgerEvent } from "../lib/sink";
-import type { SessionSummary } from "../lib/types";
 
 const POLL_MS = 2000;
-const NOTES_POLL_MS = 2500;
 const OFFICIAL_POLL_MS = 15_000;
 const TAIL_LINES = 50;
 
 /**
- * Per-channel command center. One page that surfaces, in priority order:
+ * Per-channel command center. Platform-agnostic: this page is for any
+ * team consuming the alfred-events-v1 stream, not specifically for the
+ * Alfred note-taker agent. Surfaces, in priority order:
  *
- *   1. Is Alfred actually picking up "Meeting started" events for this
+ *   1. Is the bot actually picking up "Meeting started" events for this
  *      channel? (last_auto_join_attempt + active call)
  *   2. What is being said RIGHT NOW? (live STT audit tail from the bot)
  *   3. What was the official Microsoft transcript for finished
  *      meetings? (sink's channel ledger, source=graph_notification)
  *   4. Configuration (consumers, toggle, manual trigger).
+ *
+ * Agent-specific consumer state (running summary, notes, dossier) is
+ * intentionally NOT rendered here — other teams may ingest the
+ * transcripts and build their own downstream UIs.
  */
 export function ChannelCommandCenter() {
   const params = useParams<{ teamId: string; channelId: string }>();
@@ -48,7 +50,6 @@ export function ChannelCommandCenter() {
   const [calls, setCalls] = useState<CallReadiness[]>([]);
   const [liveTail, setLiveTail] = useState<DebugTailResponse | null>(null);
   const [officialEvents, setOfficialEvents] = useState<ChannelLedgerEvent[]>([]);
-  const [alfredSession, setAlfredSession] = useState<SessionSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [joining, setJoining] = useState(false);
   const [joinMessage, setJoinMessage] = useState<string | null>(null);
@@ -91,31 +92,6 @@ export function ChannelCommandCenter() {
       if (timer) clearTimeout(timer);
     };
   }, [teamId, channelId, sanitizedThreadId]);
-
-  // Poll Alfred's rolling state for this channel's chat thread.
-  // For channel meetings, chat_thread_id IS the channel id; the agent
-  // session keyed there carries running_summary + notes + dossier.
-  useEffect(() => {
-    if (!channelId) return;
-    let cancelled = false;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-
-    async function tick() {
-      try {
-        const body = await sink.meetingStatus(channelId);
-        if (!cancelled) setAlfredSession(body.session ?? null);
-      } catch {
-        // No session yet for this channel — fine, leaves panel empty.
-      } finally {
-        if (!cancelled) timer = setTimeout(tick, NOTES_POLL_MS);
-      }
-    }
-    void tick();
-    return () => {
-      cancelled = true;
-      if (timer) clearTimeout(timer);
-    };
-  }, [channelId]);
 
   // Official transcripts poll less often.
   useEffect(() => {
@@ -233,8 +209,6 @@ export function ChannelCommandCenter() {
             onJoinNow={joinNow}
             onToggleAutoJoin={(v) => void toggleAutoJoin(v)}
           />
-
-          <AlfredNotesPanel session={alfredSession} chatThreadId={channelId} />
 
           <LivePanel tail={liveTail} />
 
@@ -417,116 +391,6 @@ function ActiveCall({ call }: { call: CallReadiness }) {
         {call.primary_mixed_audio_frames ?? 0} mixed · peak{" "}
         {call.recent_peak_sample ?? 0}
       </div>
-    </div>
-  );
-}
-
-function AlfredNotesPanel({
-  session,
-  chatThreadId,
-}: {
-  session: SessionSummary | null;
-  chatThreadId: string;
-}) {
-  const summary = session?.running_summary?.trim() ?? "";
-  const topics = session?.topics ?? [];
-  const notes = session?.notes ?? [];
-  const decisions = session?.decisions ?? [];
-  const questions = session?.open_questions ?? [];
-  const actions = session?.action_items ?? [];
-  const risks = session?.risks ?? [];
-
-  const recentNotes = notes.slice(-30).reverse();
-  const dossierTotal = decisions.length + questions.length + actions.length + risks.length;
-
-  return (
-    <section className="rounded-lg border border-ink-800 bg-ink-900/40">
-      <header className="flex items-center gap-2 border-b border-ink-800 px-5 py-2.5">
-        <BookOpen size={14} className="text-gold-400" />
-        <span className="font-serif text-sm text-ink-100">Alfred's running notes</span>
-        <span className="font-mono text-[10px] uppercase tracking-wider text-ink-500">
-          {recentNotes.length} notes · {dossierTotal} dossier items · refresh {NOTES_POLL_MS / 1000}s
-        </span>
-        <Link
-          to={`/m/${encodeURIComponent(chatThreadId)}`}
-          className="ml-auto flex items-center gap-1 rounded-md border border-ink-700 bg-ink-900 px-2 py-1 text-[10px] text-ink-200 hover:bg-ink-800"
-          title="Open full meeting dossier"
-        >
-          <ExternalLink size={10} />
-          Full dossier
-        </Link>
-      </header>
-      <div className="grid grid-cols-1 gap-4 px-5 py-3 lg:grid-cols-2">
-        <div className="space-y-3">
-          <div>
-            <div className="mb-1 font-mono text-[10px] uppercase tracking-wider text-ink-500">
-              Running summary
-            </div>
-            {summary ? (
-              <p className="whitespace-pre-wrap text-xs leading-relaxed text-ink-100">{summary}</p>
-            ) : (
-              <p className="text-xs italic text-ink-400">
-                Empty so far. The agent updates this every tick once substantive
-                content is discussed.
-              </p>
-            )}
-          </div>
-          {topics.length > 0 ? (
-            <div>
-              <div className="mb-1 font-mono text-[10px] uppercase tracking-wider text-ink-500">
-                Topics
-              </div>
-              <div className="flex flex-wrap gap-1">
-                {topics.map((t) => (
-                  <span
-                    key={t}
-                    className="rounded-full bg-gold-500/15 px-2 py-0.5 text-[10px] text-gold-200 ring-1 ring-gold-500/30"
-                  >
-                    {t}
-                  </span>
-                ))}
-              </div>
-            </div>
-          ) : null}
-          <div className="grid grid-cols-4 gap-2 text-[10px]">
-            <DossierCount label="Decisions" count={decisions.length} tone="text-emerald-300" />
-            <DossierCount label="Questions" count={questions.length} tone="text-gold-300" />
-            <DossierCount label="Actions" count={actions.length} tone="text-sky-300" />
-            <DossierCount label="Risks" count={risks.length} tone="text-crimson-300" />
-          </div>
-        </div>
-        <div>
-          <div className="mb-1 flex items-center gap-2 font-mono text-[10px] uppercase tracking-wider text-ink-500">
-            Recent notes (newest first)
-          </div>
-          {recentNotes.length === 0 ? (
-            <div className="text-xs italic text-ink-400">
-              No notes yet. With note-taker mode on, the agent should produce
-              1–3 notes per substantive tick.
-            </div>
-          ) : (
-            <ol className="max-h-72 space-y-1 overflow-auto pr-1">
-              {recentNotes.map((n, i) => (
-                <li
-                  key={i}
-                  className="rounded border border-ink-800 bg-ink-950/60 px-2.5 py-1.5 text-[11px] leading-relaxed text-ink-100"
-                >
-                  {n}
-                </li>
-              ))}
-            </ol>
-          )}
-        </div>
-      </div>
-    </section>
-  );
-}
-
-function DossierCount({ label, count, tone }: { label: string; count: number; tone: string }) {
-  return (
-    <div className="rounded-md border border-ink-800 bg-ink-950/60 px-2 py-1 text-center">
-      <div className={`font-mono text-sm ${tone}`}>{count}</div>
-      <div className="font-mono text-[9px] uppercase tracking-wider text-ink-500">{label}</div>
     </div>
   );
 }
