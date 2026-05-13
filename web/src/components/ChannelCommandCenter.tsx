@@ -3,6 +3,7 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import {
   ArrowLeft,
   Mic,
+  MessageSquare,
   Phone,
   PhoneOff,
   RefreshCw,
@@ -49,6 +50,7 @@ export function ChannelCommandCenter() {
   const [attachment, setAttachment] = useState<ChannelAttachment | null>(null);
   const [calls, setCalls] = useState<CallReadiness[]>([]);
   const [liveTail, setLiveTail] = useState<DebugTailResponse | null>(null);
+  const [chatTail, setChatTail] = useState<DebugTailResponse | null>(null);
   const [officialEvents, setOfficialEvents] = useState<ChannelLedgerEvent[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [joining, setJoining] = useState(false);
@@ -66,17 +68,21 @@ export function ChannelCommandCenter() {
 
     async function tick() {
       try {
-        const [a, h, t] = await Promise.all([
+        const [a, h, t, c] = await Promise.all([
           bot.getChannel(teamId, channelId),
           bot.callingHealth().catch(() => ({ status: "down", calls: [] })),
           bot
             .tailDebug(sanitizedThreadId, "transcript", TAIL_LINES)
+            .catch(() => null),
+          bot
+            .tailDebug(sanitizedThreadId, "chat", TAIL_LINES)
             .catch(() => null),
         ]);
         if (cancelled) return;
         setAttachment(a);
         setCalls(h.calls ?? []);
         setLiveTail(t);
+        setChatTail(c);
         setError(null);
       } catch (e) {
         if (!cancelled) {
@@ -209,6 +215,8 @@ export function ChannelCommandCenter() {
             onJoinNow={joinNow}
             onToggleAutoJoin={(v) => void toggleAutoJoin(v)}
           />
+
+          <ChatPanel tail={chatTail} />
 
           <LivePanel tail={liveTail} />
 
@@ -390,6 +398,72 @@ function ActiveCall({ call }: { call: CallReadiness }) {
         frames: {call.unmixed_audio_frames ?? 0} unmixed ·{" "}
         {call.primary_mixed_audio_frames ?? 0} mixed · peak{" "}
         {call.recent_peak_sample ?? 0}
+      </div>
+    </div>
+  );
+}
+
+function ChatPanel({ tail }: { tail: DebugTailResponse | null }) {
+  const entries = tail?.entries ?? [];
+  // Most recent message first — the bot writes oldest-first; reverse here
+  // so the panel reads like a chat scroll-back.
+  const reversed = [...entries].reverse();
+  return (
+    <section className="rounded-lg border border-ink-800 bg-ink-900/40">
+      <header className="flex items-center gap-2 border-b border-ink-800 px-5 py-2.5">
+        <MessageSquare size={14} className="text-emerald-400" />
+        <span className="font-serif text-sm text-ink-100">Live chat</span>
+        <span className="font-mono text-[10px] uppercase tracking-wider text-ink-500">
+          channel + meeting chat · {reversed.length} message{reversed.length === 1 ? "" : "s"} captured
+        </span>
+        <span className="ml-auto flex items-center gap-1 font-mono text-[10px] text-ink-500">
+          <RefreshCw size={10} className="animate-spin-slow" />
+          {POLL_MS / 1000}s
+        </span>
+      </header>
+      <div className="max-h-96 overflow-auto px-5 py-3">
+        {reversed.length === 0 ? (
+          <div className="text-xs italic text-ink-400">
+            No chat messages captured yet. Post in the channel or meeting
+            chat — the bot mirrors every chat into the audit + the per-channel
+            blob folder.
+          </div>
+        ) : (
+          <ol className="space-y-1">
+            {reversed.map((e, i) => (
+              <li
+                key={i}
+                className="rounded border border-ink-800 bg-ink-950/60 px-3 py-1.5 font-mono text-[11px] leading-relaxed text-ink-100"
+              >
+                <ChatCue entry={e} />
+              </li>
+            ))}
+          </ol>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function ChatCue({ entry }: { entry: Record<string, unknown> }) {
+  const ts = (entry.ts as string | undefined) ?? "?";
+  const payload = (entry.payload as Record<string, unknown> | undefined) ?? {};
+  const sender = (payload.sender_display_name as string | undefined) ?? "—";
+  const fromBot = (payload.from_bot as boolean | undefined) ?? false;
+  const text = (payload.text as string | undefined) ?? "";
+  const convKind = (payload.conversation_kind as string | undefined) ?? "";
+  return (
+    <div className="flex flex-col gap-0.5">
+      <div className="flex items-center gap-2 text-[10px] text-ink-500">
+        <span>{ts}</span>
+        <span className={fromBot ? "text-gold-400" : "text-emerald-300"}>
+          {sender}
+          {fromBot ? " (bot)" : ""}
+        </span>
+        {convKind ? <span className="text-ink-500">{convKind}</span> : null}
+      </div>
+      <div className="text-ink-100">
+        {text ? text : <em className="text-ink-500">(empty)</em>}
       </div>
     </div>
   );
