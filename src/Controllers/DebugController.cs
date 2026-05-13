@@ -24,12 +24,86 @@ public sealed class DebugController : ControllerBase
     private static readonly string[] AllowedKinds = ["transcript", "chat", "system"];
 
     private readonly MeetingAuditLogger _audit;
+    private readonly OfficialTranscriptFetcher _transcriptFetcher;
     private readonly ILogger<DebugController> _logger;
 
-    public DebugController(MeetingAuditLogger audit, ILogger<DebugController> logger)
+    public DebugController(
+        MeetingAuditLogger audit,
+        OfficialTranscriptFetcher transcriptFetcher,
+        ILogger<DebugController> logger)
     {
         _audit = audit;
+        _transcriptFetcher = transcriptFetcher;
         _logger = logger;
+    }
+
+    /// <summary>
+    /// Manually schedules an <see cref="OfficialTranscriptFetcher"/> run
+    /// for a specific meeting. Useful for backfilling transcripts of
+    /// meetings whose system-message notification arrived before the
+    /// bot was taught to recognize that shape (e.g. URIObject XML payloads
+    /// pre-b059810). Idempotent on <c>callId</c>.
+    /// </summary>
+    [HttpPost("fetch-transcript")]
+    public IActionResult ManualFetchTranscript([FromBody] ManualFetchRequest request)
+    {
+        if (string.IsNullOrWhiteSpace(request.CallId) ||
+            string.IsNullOrWhiteSpace(request.OrganizerOid) ||
+            string.IsNullOrWhiteSpace(request.TeamId) ||
+            string.IsNullOrWhiteSpace(request.ChannelId) ||
+            string.IsNullOrWhiteSpace(request.ChannelThreadId))
+        {
+            return BadRequest(new
+            {
+                error = "call_id, organizer_oid, team_id, channel_id, channel_thread_id all required",
+            });
+        }
+
+        // Look back enough that transcripts created during the meeting are
+        // still in scope of the fetcher's createdDateTime filter. 24h is
+        // generous and prevents false negatives for recently-ended meetings.
+        var registeredAt = request.RegisteredAtUtc ?? DateTimeOffset.UtcNow.AddHours(-24);
+
+        _logger.LogInformation(
+            "Manual transcript fetch registered call_id={CallId} organizer={Oid} team={TeamId} channel={ChannelId} since={Since}",
+            request.CallId, request.OrganizerOid, request.TeamId, request.ChannelId, registeredAt);
+
+        _transcriptFetcher.Register(
+            botCallId: request.CallId!,
+            organizerOid: request.OrganizerOid!,
+            teamId: request.TeamId!,
+            channelId: request.ChannelId!,
+            channelThreadId: request.ChannelThreadId!,
+            registeredAtUtc: registeredAt);
+
+        return Ok(new
+        {
+            ok = true,
+            registered_call_id = request.CallId,
+            registered_at_utc = registeredAt,
+            note = "Fetcher polls Graph for up to ~10 minutes. Watch _official-transcript.txt under meetings/<sanitizedChannelId>;messageid_*/.",
+        });
+    }
+
+    public sealed class ManualFetchRequest
+    {
+        [JsonProperty("call_id")]
+        public string? CallId { get; set; }
+
+        [JsonProperty("organizer_oid")]
+        public string? OrganizerOid { get; set; }
+
+        [JsonProperty("team_id")]
+        public string? TeamId { get; set; }
+
+        [JsonProperty("channel_id")]
+        public string? ChannelId { get; set; }
+
+        [JsonProperty("channel_thread_id")]
+        public string? ChannelThreadId { get; set; }
+
+        [JsonProperty("registered_at_utc")]
+        public DateTimeOffset? RegisteredAtUtc { get; set; }
     }
 
     /// <summary>
