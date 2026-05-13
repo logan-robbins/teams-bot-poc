@@ -105,6 +105,15 @@ try
         builder.Configuration["MeetingAuditLogDir"] ?? @"C:\teams-bot-poc\meeting-logs");
     builder.Services.AddSingleton(new MeetingAuditLogger(auditLogDir));
 
+    // Per-channel / per-meeting Azure Blob archive. Reads connection
+    // settings from "BlobArchive" config section. If unset, the archive
+    // service registers but no-ops on every call (IsEnabled=false).
+    var blobArchiveConfig =
+        builder.Configuration.GetSection("BlobArchive").Get<BlobArchiveConfiguration>()
+        ?? new BlobArchiveConfiguration();
+    builder.Services.AddSingleton(blobArchiveConfig);
+    builder.Services.AddSingleton<BlobEventArchive>();
+
     // Meeting-chat + Graph services. The single sanctioned outbound
     // path is EventFanoutDispatcher → per-channel consumers; chat,
     // transcripts, and system events all flow through it.

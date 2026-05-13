@@ -58,6 +58,10 @@
 
     <!-- HTTP Client -->
     <PackageReference Include="System.Net.Http.Json" Version="8.0.*" />
+
+    <!-- Azure Blob Storage: per-channel / per-meeting event + transcript archive -->
+    <PackageReference Include="Azure.Storage.Blobs" Version="12.22.*" />
+    <PackageReference Include="Azure.Identity" Version="1.13.*" />
   </ItemGroup>
 
 </Project>

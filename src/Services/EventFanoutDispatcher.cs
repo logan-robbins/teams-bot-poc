@@ -53,6 +53,7 @@ public sealed class EventFanoutDispatcher : IAsyncDisposable
     private readonly ILogger<EventFanoutDispatcher> _logger;
     private readonly ILoggerFactory _loggerFactory;
     private readonly MeetingAuditLogger? _auditLogger;
+    private readonly BlobEventArchive? _blobArchive;
     private readonly IReadOnlyList<ConsumerConfig> _fallbackConsumers;
     private readonly CancellationTokenSource _cts = new();
     private readonly ConcurrentDictionary<string, ConsumerWorker> _workers = new(StringComparer.Ordinal);
@@ -64,13 +65,15 @@ public sealed class EventFanoutDispatcher : IAsyncDisposable
         EventDispatchConfiguration dispatchConfig,
         ILogger<EventFanoutDispatcher> logger,
         ILoggerFactory loggerFactory,
-        MeetingAuditLogger? auditLogger = null)
+        MeetingAuditLogger? auditLogger = null,
+        BlobEventArchive? blobArchive = null)
     {
         _store = store ?? throw new ArgumentNullException(nameof(store));
         _httpClientFactory = httpClientFactory ?? throw new ArgumentNullException(nameof(httpClientFactory));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _loggerFactory = loggerFactory ?? throw new ArgumentNullException(nameof(loggerFactory));
         _auditLogger = auditLogger;
+        _blobArchive = blobArchive;
 
         // Fallback consumer for events that don't match any channel
         // attachment (per-meeting installs, group chats). Without this,
@@ -108,6 +111,13 @@ public sealed class EventFanoutDispatcher : IAsyncDisposable
         if (_auditLogger is not null && !string.IsNullOrWhiteSpace(envelope.ChatThreadId))
         {
             _auditLogger.Append(envelope.ChatThreadId, AuditFolderFor(envelope.EventType), envelope);
+        }
+
+        // Blob archive is fire-and-forget so it cannot slow the hot
+        // dispatch path. ArchiveEnvelopeAsync internally swallows errors.
+        if (_blobArchive is { IsEnabled: true })
+        {
+            _ = _blobArchive.ArchiveEnvelopeAsync(envelope, _cts.Token);
         }
 
         var consumers = ResolveConsumers(envelope);

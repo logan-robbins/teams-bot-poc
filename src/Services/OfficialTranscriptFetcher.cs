@@ -35,6 +35,7 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
     private readonly EventFanoutDispatcher _dispatcher;
     private readonly GraphApiClient _graph;
     private readonly BotConfiguration _botConfig;
+    private readonly BlobEventArchive? _blobArchive;
     private readonly ILogger<OfficialTranscriptFetcher> _logger;
     private readonly CancellationTokenSource _cts = new();
     private readonly ConcurrentDictionary<string, Task> _activeFetches = new(StringComparer.Ordinal);
@@ -44,11 +45,13 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
         EventFanoutDispatcher dispatcher,
         GraphApiClient graph,
         BotConfiguration botConfig,
-        ILogger<OfficialTranscriptFetcher> logger)
+        ILogger<OfficialTranscriptFetcher> logger,
+        BlobEventArchive? blobArchive = null)
     {
         _dispatcher = dispatcher;
         _graph = graph;
         _botConfig = botConfig;
+        _blobArchive = blobArchive;
         _logger = logger;
     }
 
@@ -226,6 +229,10 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
             VttRaw = vtt,
         };
 
+        var envelopeChatThreadId = string.IsNullOrWhiteSpace(pending.ChannelThreadId)
+            ? meetingId
+            : pending.ChannelThreadId;
+
         await _dispatcher.PublishAsync(new AlfredEventEnvelope
         {
             EventType = AlfredEventTypes.TranscriptOfficial,
@@ -233,10 +240,20 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
             Ts = createdAt ?? DateTimeOffset.UtcNow.ToString("O"),
             TeamId = string.IsNullOrWhiteSpace(pending.TeamId) ? null : pending.TeamId,
             ChannelId = string.IsNullOrWhiteSpace(pending.ChannelId) ? null : pending.ChannelId,
-            ChatThreadId = string.IsNullOrWhiteSpace(pending.ChannelThreadId) ? meetingId : pending.ChannelThreadId,
+            ChatThreadId = envelopeChatThreadId,
             ChannelThreadId = string.IsNullOrWhiteSpace(pending.ChannelThreadId) ? null : pending.ChannelThreadId,
             Payload = payload,
         }, cancellationToken).ConfigureAwait(false);
+
+        // Also drop the canonical Microsoft VTT transcript as a single
+        // flat _official-transcript.txt in the meeting's blob folder so
+        // an operator can grab the whole meeting in one download without
+        // walking through per-event chunks. Fire-and-forget; archive
+        // failures are swallowed inside ArchiveOfficialTranscriptAsync.
+        if (_blobArchive is { IsEnabled: true })
+        {
+            _ = _blobArchive.ArchiveOfficialTranscriptAsync(envelopeChatThreadId, vtt, cancellationToken);
+        }
 
         _logger.LogInformation(
             "Emitted transcript.official meetingId={MeetingId} transcriptId={TranscriptId} cues={CueCount} (botCallId={CallId})",
