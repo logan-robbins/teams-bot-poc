@@ -406,27 +406,40 @@ function ActiveCall({ call }: { call: CallReadiness }) {
 /**
  * True when this entry is a Teams meeting-lifecycle system payload that
  * was misrouted into chat.ndjson before the C# bot started classifying
- * them as `system.meeting_lifecycle`. These show as JSON blobs with
- * scopeId + callId in the chat text and are pure noise for an operator
- * reading the channel's live chat — filter them out defensively so
- * historical NDJSON files don't pollute the panel.
+ * them as `system.meeting_lifecycle`. Teams emits two shapes:
+ *   • JSON: `{"scopeId":"...","callId":"..."}` (call started / ended /
+ *     exported to ODSP)
+ *   • XML: `<URIObject type="Video.2/CallRecording.1">...` (recording
+ *     chunk / transcript ready notifications)
+ * Both are noise in an operator's live-chat view; filter them out
+ * defensively so historical NDJSON files don't pollute the panel.
  */
 function isTeamsSystemPayload(entry: Record<string, unknown>): boolean {
   const payload = entry.payload as Record<string, unknown> | undefined;
   if (!payload) return false;
   const text = payload.text as string | undefined;
-  if (!text || !text.trimStart().startsWith("{")) return false;
-  try {
-    const parsed = JSON.parse(text);
-    return (
-      parsed !== null &&
-      typeof parsed === "object" &&
-      "scopeId" in parsed &&
-      "callId" in parsed
-    );
-  } catch {
-    return false;
+  if (!text) return false;
+  const trimmed = text.trimStart();
+  if (trimmed.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(text);
+      return (
+        parsed !== null &&
+        typeof parsed === "object" &&
+        "scopeId" in parsed &&
+        "callId" in parsed
+      );
+    } catch {
+      return false;
+    }
   }
+  if (trimmed.startsWith("<URIObject")) {
+    return (
+      trimmed.includes('type="Video.2/CallRecording.1"') ||
+      trimmed.includes("type='Video.2/CallRecording.1'")
+    );
+  }
+  return false;
 }
 
 function ChatPanel({ tail }: { tail: DebugTailResponse | null }) {

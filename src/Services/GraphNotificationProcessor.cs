@@ -424,29 +424,106 @@ public sealed partial class GraphNotificationProcessor
         new(StringComparer.Ordinal);
 
     /// <summary>
+    /// Extracts <c>(callId, organizerOid)</c> from either supported Teams
+    /// meeting system-message shape (JSON with <c>scopeId</c>/<c>callId</c>
+    /// or the <c>&lt;URIObject type="Video.2/CallRecording.1"&gt;</c> XML
+    /// form). Returns nulls when the payload isn't a recognized shape.
+    /// </summary>
+    private static (string? callId, string? organizerOid) ExtractMeetingMetadata(string text)
+    {
+        var trimmed = text.TrimStart();
+
+        if (trimmed.StartsWith("{", StringComparison.Ordinal))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(text);
+                if (doc.RootElement.ValueKind != JsonValueKind.Object) return (null, null);
+                if (!doc.RootElement.TryGetProperty("callId", out var cId) ||
+                    cId.ValueKind != JsonValueKind.String)
+                {
+                    return (null, null);
+                }
+                var callId = cId.GetString();
+                string? organizerOid = null;
+                if (doc.RootElement.TryGetProperty("meetingOrganizerId", out var mo) &&
+                    mo.ValueKind == JsonValueKind.String)
+                {
+                    var raw = mo.GetString();
+                    organizerOid = raw is not null && raw.StartsWith("8:orgid:", StringComparison.Ordinal)
+                        ? raw.Substring("8:orgid:".Length)
+                        : raw;
+                }
+                return (callId, organizerOid);
+            }
+            catch
+            {
+                return (null, null);
+            }
+        }
+
+        if (trimmed.StartsWith("<URIObject", StringComparison.Ordinal))
+        {
+            var callMatch = _callIdRegex.Match(text);
+            var orgMatch = _organizerRegex.Match(text);
+            var callId = callMatch.Success ? callMatch.Groups[1].Value : null;
+            var organizerOid = orgMatch.Success ? orgMatch.Groups[1].Value : null;
+            return (callId, organizerOid);
+        }
+
+        return (null, null);
+    }
+
+    /// <summary>
     /// True when this chat-message text is a Teams meeting lifecycle
-    /// system payload — a JSON object carrying <c>scopeId</c> +
-    /// <c>callId</c> (e.g. "meeting started", "recording exported",
-    /// "transcript ready"). These are emitted by Teams into the channel
-    /// chat stream and would otherwise drown the chat.message wire
-    /// event with noise.
+    /// system payload. Teams emits two distinct shapes into channel
+    /// chat streams, both of which we want to peel off from the
+    /// human-chat envelope path:
+    /// <list type="bullet">
+    /// <item>JSON: <c>{"scopeId":"...","callId":"..."}</c> — call
+    /// started / ended / exported to ODSP.</item>
+    /// <item>XML: <c>&lt;URIObject type="Video.2/CallRecording.1"
+    /// ...&gt;...&lt;/URIObject&gt;</c> — recording / transcript
+    /// chunk-finished / call-ended notification with embedded
+    /// <c>&lt;Id type="callId"&gt;</c> and
+    /// <c>&lt;MeetingOrganizerId&gt;</c> elements.</item>
+    /// </list>
     /// </summary>
     private static bool LooksLikeTeamsMeetingSystemPayload(string? text)
     {
         if (string.IsNullOrWhiteSpace(text)) return false;
-        if (!text.TrimStart().StartsWith("{", StringComparison.Ordinal)) return false;
-        try
+        var trimmed = text.TrimStart();
+        if (trimmed.StartsWith("{", StringComparison.Ordinal))
         {
-            using var doc = JsonDocument.Parse(text);
-            if (doc.RootElement.ValueKind != JsonValueKind.Object) return false;
-            return doc.RootElement.TryGetProperty("scopeId", out _) &&
-                   doc.RootElement.TryGetProperty("callId", out _);
+            try
+            {
+                using var doc = JsonDocument.Parse(text);
+                if (doc.RootElement.ValueKind != JsonValueKind.Object) return false;
+                return doc.RootElement.TryGetProperty("scopeId", out _) &&
+                       doc.RootElement.TryGetProperty("callId", out _);
+            }
+            catch
+            {
+                return false;
+            }
         }
-        catch
+        if (trimmed.StartsWith("<URIObject", StringComparison.Ordinal))
         {
-            return false;
+            // Cheap content check: every Teams call/recording URIObject
+            // we've seen carries Video.2/CallRecording.1 in its type attr.
+            return trimmed.Contains("type=\"Video.2/CallRecording.1\"", StringComparison.Ordinal) ||
+                   trimmed.Contains("type='Video.2/CallRecording.1'", StringComparison.Ordinal);
         }
+        return false;
     }
+
+    private static readonly System.Text.RegularExpressions.Regex _callIdRegex = new(
+        @"<Id\s+type=""callId""\s+value=""([^""]+)""",
+        System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    private static readonly System.Text.RegularExpressions.Regex _organizerRegex = new(
+        @"<MeetingOrganizerId\s+value=""8:orgid:([^""]+)""",
+        System.Text.RegularExpressions.RegexOptions.Compiled);
 
     /// <summary>
     /// When Teams posts a meeting lifecycle system message (call ended,
@@ -462,46 +539,14 @@ public sealed partial class GraphNotificationProcessor
     private void MaybeFetchPostMeetingTranscript(ChatEventPayload payload)
     {
         if (string.IsNullOrWhiteSpace(payload.Text) ||
-            !payload.Text.TrimStart().StartsWith("{", StringComparison.Ordinal))
-        {
-            return;
-        }
-        if (string.IsNullOrWhiteSpace(payload.TeamId) ||
+            string.IsNullOrWhiteSpace(payload.TeamId) ||
             string.IsNullOrWhiteSpace(payload.ChannelId) ||
             string.IsNullOrWhiteSpace(payload.ChannelThreadId))
         {
             return;
         }
 
-        string? callId = null;
-        string? organizerOid = null;
-        try
-        {
-            using var doc = JsonDocument.Parse(payload.Text);
-            if (doc.RootElement.ValueKind != JsonValueKind.Object) return;
-            if (!doc.RootElement.TryGetProperty("scopeId", out _)) return;
-            if (!doc.RootElement.TryGetProperty("callId", out var cId) ||
-                cId.ValueKind != JsonValueKind.String)
-            {
-                return;
-            }
-            callId = cId.GetString();
-            if (doc.RootElement.TryGetProperty("meetingOrganizerId", out var mo) &&
-                mo.ValueKind == JsonValueKind.String)
-            {
-                var raw = mo.GetString();
-                // Teams formats this as "8:orgid:{aad-oid}"; strip the prefix
-                // so the fetcher gets a clean AAD object id.
-                organizerOid = raw is not null && raw.StartsWith("8:orgid:", StringComparison.Ordinal)
-                    ? raw.Substring("8:orgid:".Length)
-                    : raw;
-            }
-        }
-        catch
-        {
-            return; // body wasn't a Teams system JSON payload
-        }
-
+        var (callId, organizerOid) = ExtractMeetingMetadata(payload.Text!);
         if (string.IsNullOrWhiteSpace(callId) || string.IsNullOrWhiteSpace(organizerOid))
         {
             return;
