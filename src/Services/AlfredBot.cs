@@ -29,6 +29,8 @@ public sealed class AlfredBot : TeamsActivityHandler
     private readonly IConversationReferenceStore _references;
     private readonly EventFanoutDispatcher _dispatcher;
     private readonly IChannelAttachmentService _channelAttachments;
+    private readonly ChannelAttachmentStore _attachmentStore;
+    private readonly MeetingChannelLinkStore _meetingLinks;
     private readonly TeamsCallingBotService _botService;
     private readonly TranscriberFactory _transcriberFactory;
     private readonly BotConfiguration _botConfig;
@@ -43,6 +45,8 @@ public sealed class AlfredBot : TeamsActivityHandler
         IConversationReferenceStore references,
         EventFanoutDispatcher dispatcher,
         IChannelAttachmentService channelAttachments,
+        ChannelAttachmentStore attachmentStore,
+        MeetingChannelLinkStore meetingLinks,
         TeamsCallingBotService botService,
         TranscriberFactory transcriberFactory,
         BotConfiguration botConfig,
@@ -52,6 +56,8 @@ public sealed class AlfredBot : TeamsActivityHandler
         _references = references;
         _dispatcher = dispatcher;
         _channelAttachments = channelAttachments;
+        _attachmentStore = attachmentStore;
+        _meetingLinks = meetingLinks;
         _botService = botService;
         _transcriberFactory = transcriberFactory;
         _botConfig = botConfig;
@@ -444,6 +450,16 @@ public sealed class AlfredBot : TeamsActivityHandler
                 turnContext, teamId!, channelId!, channelData, cancellationToken);
         }
 
+        // If Alfred was @-mentioned with a "link to <channel-name>"
+        // directive, persist a MeetingChannelLink so this chat's future
+        // events get stamped with the target channel's team/channel ids.
+        // Operator UX: never asks for GUIDs — just the channel display
+        // name. Bot resolves it against the current attachment list.
+        if (WasBotMentioned(activity))
+        {
+            await TryHandleMeetingLinkCommandAsync(turnContext, chatThreadId, cancellationToken);
+        }
+
         // If Alfred was @-mentioned in any meeting (regular or channel
         // meeting) AND isn't already in the call, treat it as user
         // intent to bring him in. Per-thread dedupe inside
@@ -547,5 +563,122 @@ public sealed class AlfredBot : TeamsActivityHandler
         }
 
         return string.IsNullOrWhiteSpace(raw) ? "unknown" : raw;
+    }
+
+    // ---- meeting -> channel link command --------------------------------
+
+    /// <summary>
+    /// Matches the operator's chat command that says "this meeting
+    /// belongs to the alfred_test channel". Accepted phrasings (all
+    /// after stripping @-mentions and #-prefixes):
+    ///   "link to alfred_test"
+    ///   "link this to alfred_test"
+    ///   "link this meeting to alfred_test"
+    ///   "this meeting is for alfred_test"
+    ///   "this is for alfred_test"
+    ///   "associate with alfred_test"
+    ///   "channel: alfred_test"
+    /// The captured group is the channel display name; trimmed and
+    /// case-insensitively matched against the channel-attachment store.
+    /// </summary>
+    private static readonly System.Text.RegularExpressions.Regex _linkCommandRegex = new(
+        @"(?ix)
+          (?:
+              link \s+ (?:this \s+(?:meeting \s+)? )? to \s+
+            | this \s+ (?:meeting \s+)? is \s+ for \s+
+            | this \s+ is \s+ for \s+
+            | associate \s+ with \s+
+            | channel \s* : \s*
+          )
+          \#? \s* (?<name> [\w\-_\. ]{1,80}? )
+          \s* (?:[.,;!?]|$)
+        ",
+        System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    private async Task TryHandleMeetingLinkCommandAsync(
+        ITurnContext<IMessageActivity> turnContext,
+        string chatThreadId,
+        CancellationToken cancellationToken)
+    {
+        var activity = turnContext.Activity;
+        var raw = activity?.Text ?? string.Empty;
+        var stripped = StripMentionsAndTags(raw);
+        if (string.IsNullOrWhiteSpace(stripped)) return;
+
+        var match = _linkCommandRegex.Match(stripped);
+        if (!match.Success) return;
+
+        var requested = match.Groups["name"].Value.Trim().TrimEnd('.', ',', ';', '!', '?');
+        if (string.IsNullOrWhiteSpace(requested)) return;
+
+        var attachments = _attachmentStore.List();
+        var hits = attachments
+            .Where(a => string.Equals(a.ChannelDisplayName, requested, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        if (hits.Count == 0)
+        {
+            await turnContext.SendActivityAsync(
+                $"I'm not attached to a channel called **{requested}**. Add Alfred to that channel first, then try again.",
+                cancellationToken: cancellationToken);
+            return;
+        }
+        if (hits.Count > 1)
+        {
+            var disambiguation = string.Join(" / ",
+                hits.Select(h => $"`{h.TeamDisplayName ?? "team?"} / {h.ChannelDisplayName}`"));
+            await turnContext.SendActivityAsync(
+                $"Multiple channels named **{requested}** are attached: {disambiguation}. Tell me which team it's in.",
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        var target = hits[0];
+        var record = new MeetingChannelLinkRecord
+        {
+            ChatThreadId = chatThreadId,
+            TeamId = target.TeamId,
+            ChannelId = target.ChannelId,
+            ChannelThreadId = target.ConversationThreadId ?? target.ChannelId,
+            TeamDisplayName = target.TeamDisplayName,
+            ChannelDisplayName = target.ChannelDisplayName,
+            Source = "chat_command",
+        };
+        await _meetingLinks.UpsertAsync(record, cancellationToken);
+
+        _logger.LogInformation(
+            "Linked meeting ChatThreadId={ChatThreadId} -> Team='{Team}' / Channel='{Channel}' (via chat command)",
+            chatThreadId, target.TeamDisplayName, target.ChannelDisplayName);
+
+        await turnContext.SendActivityAsync(
+            $"Linked this meeting to **{target.TeamDisplayName ?? "team"} / {target.ChannelDisplayName}**. " +
+            "Future chat, audio STT, and post-meeting events from this meeting will roll up under that channel.",
+            cancellationToken: cancellationToken);
+    }
+
+    /// <summary>
+    /// Strips Bot Framework @-mention markup (the bot's name + leading
+    /// '#' tags) so the link-command regex sees clean text. Bot
+    /// Framework gives us text like "<at>Alfred Sandbox</at> link to
+    /// #alfred_test" or HTML-escaped variants; activity.Text already
+    /// drops the <at> tags but leaves the plain name in place. We do a
+    /// best-effort whittle.
+    /// </summary>
+    private static string StripMentionsAndTags(string raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return string.Empty;
+        var text = raw;
+        // Some clients leave "<at>Name</at>"; strip the tags but keep the name out
+        text = System.Text.RegularExpressions.Regex.Replace(text, @"<at[^>]*>[^<]*</at>", " ");
+        // Common bot name forms; remove them so they don't get parsed as channel names
+        foreach (var token in new[] { "alfred sandbox", "alfredsandbox", "alfred", "@alfred" })
+        {
+            text = System.Text.RegularExpressions.Regex.Replace(
+                text, $@"\b{System.Text.RegularExpressions.Regex.Escape(token)}\b",
+                " ", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        }
+        // Collapse whitespace
+        text = System.Text.RegularExpressions.Regex.Replace(text, @"\s+", " ").Trim();
+        return text;
     }
 }

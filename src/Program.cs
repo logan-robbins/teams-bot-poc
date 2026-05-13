@@ -137,6 +137,22 @@ try
     builder.Services.AddSingleton<ChannelAttachmentService>();
     builder.Services.AddSingleton<IChannelAttachmentService>(sp =>
         sp.GetRequiredService<ChannelAttachmentService>());
+
+    // Per-meeting -> channel links. A meeting chat can be told "this
+    // meeting is for #alfred_test" once; from then on every envelope
+    // from that chat_thread_id gets stamped with the linked
+    // team/channel ids so its blob archive lands under the channel.
+    var meetingChannelLinkPath = builder.Configuration["MeetingChannelLinkStorePath"]
+        ?? Path.Combine(
+            Path.GetDirectoryName(meetingChatConfig.ChannelAttachmentStorePath)
+                ?? @"C:\teams-bot-poc\state",
+            "meeting-channel-links.json");
+    builder.Services.AddSingleton(new MeetingChannelLinkStoreOptions
+    {
+        FilePath = meetingChannelLinkPath,
+    });
+    builder.Services.AddSingleton<MeetingChannelLinkStore>();
+    builder.Services.AddHostedService(sp => sp.GetRequiredService<MeetingChannelLinkStore>());
     builder.Services.AddHostedService(sp =>
         sp.GetRequiredService<ChannelAttachmentService>());
 

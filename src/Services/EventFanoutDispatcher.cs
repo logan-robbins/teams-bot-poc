@@ -49,6 +49,7 @@ public sealed class EventFanoutDispatcher : IAsyncDisposable
     ];
 
     private readonly ChannelAttachmentStore _store;
+    private readonly MeetingChannelLinkStore? _meetingLinks;
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ILogger<EventFanoutDispatcher> _logger;
     private readonly ILoggerFactory _loggerFactory;
@@ -68,7 +69,8 @@ public sealed class EventFanoutDispatcher : IAsyncDisposable
         ILogger<EventFanoutDispatcher> logger,
         ILoggerFactory loggerFactory,
         MeetingAuditLogger? auditLogger = null,
-        BlobEventArchive? blobArchive = null)
+        BlobEventArchive? blobArchive = null,
+        MeetingChannelLinkStore? meetingLinks = null)
     {
         _store = store ?? throw new ArgumentNullException(nameof(store));
         _httpClientFactory = httpClientFactory ?? throw new ArgumentNullException(nameof(httpClientFactory));
@@ -76,6 +78,7 @@ public sealed class EventFanoutDispatcher : IAsyncDisposable
         _loggerFactory = loggerFactory ?? throw new ArgumentNullException(nameof(loggerFactory));
         _auditLogger = auditLogger;
         _blobArchive = blobArchive;
+        _meetingLinks = meetingLinks;
 
         var throttleSeconds = Math.Max(0, dispatchConfig?.PartialThrottleSeconds ?? 60);
         _partialThrottle = TimeSpan.FromSeconds(throttleSeconds);
@@ -112,6 +115,14 @@ public sealed class EventFanoutDispatcher : IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(envelope);
         ObjectDisposedException.ThrowIf(_disposed, this);
+
+        // If a meeting chat has been linked to a channel via the
+        // `@Alfred link to <channel>` command, stamp the envelope with
+        // that channel's team/channel ids BEFORE audit + blob + fan-out
+        // see it. This makes blob paths route under the channel's
+        // folder and the sink's session_channel_links table see the
+        // join automatically.
+        envelope = StampWithMeetingLinkIfApplicable(envelope);
 
         if (_auditLogger is not null && !string.IsNullOrWhiteSpace(envelope.ChatThreadId))
         {
@@ -179,6 +190,28 @@ public sealed class EventFanoutDispatcher : IAsyncDisposable
         // lands in system.ndjson so the chat tail stays clean.
         _ => "system",
     };
+
+    private AlfredEventEnvelope StampWithMeetingLinkIfApplicable(AlfredEventEnvelope envelope)
+    {
+        if (_meetingLinks is null) return envelope;
+        // If a team_id and channel_id are already present, the event
+        // originated from a channel-aware source path and the operator
+        // link is redundant. Leave it alone.
+        if (!string.IsNullOrWhiteSpace(envelope.TeamId) &&
+            !string.IsNullOrWhiteSpace(envelope.ChannelId))
+        {
+            return envelope;
+        }
+        if (string.IsNullOrWhiteSpace(envelope.ChatThreadId)) return envelope;
+        var link = _meetingLinks.Get(envelope.ChatThreadId);
+        if (link is null) return envelope;
+        return envelope with
+        {
+            TeamId = link.TeamId,
+            ChannelId = link.ChannelId,
+            ChannelThreadId = link.ChannelThreadId ?? link.ChannelId,
+        };
+    }
 
     /// <summary>
     /// True iff this is a <c>transcript.partial</c> for a

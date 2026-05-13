@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { ChevronRight, Folder, FileText, ExternalLink, RefreshCw, Moon } from "lucide-react";
+import { bot, type ChannelAttachment } from "../lib/bot";
 
 /**
  * Read-only browser for the Azure Blob archive that mirrors every
@@ -115,13 +116,61 @@ function fmtTs(raw: string): string {
   }
 }
 
+/**
+ * Mirror of the C# BlobEventArchive.SanitizePathSegment + the Teams id
+ * shape. Builds two lookup maps so a raw blob folder segment can be
+ * rendered as a friendly display name:
+ *   teamId GUID  -> "WDI R&D"
+ *   sanitizedChannelId -> "alfred_test"
+ */
+function buildAttachmentMaps(attachments: ChannelAttachment[]) {
+  const teamMap = new Map<string, string>();
+  const channelMap = new Map<string, string>();
+  const sanitize = (raw: string) => raw.replace(/[^a-zA-Z0-9\-_.]/g, "_");
+  for (const a of attachments) {
+    if (a.team_id && a.team_display_name) {
+      teamMap.set(a.team_id, a.team_display_name);
+    }
+    if (a.channel_id && a.channel_display_name) {
+      channelMap.set(sanitize(a.channel_id), a.channel_display_name);
+    }
+  }
+  return { teamMap, channelMap };
+}
+
+/**
+ * Maps a slash-delimited folder segment within an /archive prefix to a
+ * human-friendly display name. Returns the original segment if no
+ * lookup matches (so unknown ids still render).
+ */
+function friendlyLabel(
+  segment: string,
+  positionInPath: number,
+  fullPath: string[],
+  maps: { teamMap: Map<string, string>; channelMap: Map<string, string> },
+): string {
+  // Pattern: channels/{teamId}/{sanitizedChannelId}/...
+  if (fullPath[0] === "channels") {
+    if (positionInPath === 1) {
+      return maps.teamMap.get(segment) ?? segment;
+    }
+    if (positionInPath === 2) {
+      return maps.channelMap.get(segment) ?? segment;
+    }
+  }
+  return segment;
+}
+
 export function ArchiveBrowser() {
   const [searchParams, setSearchParams] = useSearchParams();
   const prefix = searchParams.get("prefix") ?? "";
   const [blobs, setBlobs] = useState<BlobEntry[]>([]);
   const [prefixes, setPrefixes] = useState<PrefixEntry[]>([]);
+  const [attachments, setAttachments] = useState<ChannelAttachment[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const maps = useMemo(() => buildAttachmentMaps(attachments), [attachments]);
 
   async function refresh() {
     setLoading(true);
@@ -142,16 +191,35 @@ export function ArchiveBrowser() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [prefix]);
 
+  // Fetch the channel-attachments map once. Used to label otherwise-
+  // opaque blob path segments (team GUIDs, sanitized channel ids) with
+  // their human display names. Idempotent and silently best-effort.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const body = await bot.listChannels();
+        if (!cancelled) setAttachments(body.attachments ?? []);
+      } catch {
+        // No friendly names available — fall back to raw ids in the UI.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const crumbs = useMemo(() => {
     const segs = prefix.split("/").filter(Boolean);
     const acc: { label: string; prefix: string }[] = [{ label: "(root)", prefix: "" }];
     let running = "";
-    for (const s of segs) {
+    for (let i = 0; i < segs.length; i++) {
+      const s = segs[i];
       running += `${s}/`;
-      acc.push({ label: s, prefix: running });
+      acc.push({ label: friendlyLabel(s, i, segs, maps), prefix: running });
     }
     return acc;
-  }, [prefix]);
+  }, [prefix, maps]);
 
   function navigateTo(newPrefix: string) {
     if (newPrefix) {
@@ -243,21 +311,34 @@ export function ArchiveBrowser() {
                 Folders ({prefixes.length})
               </h2>
               <ul className="space-y-1">
-                {prefixes.map((p) => (
-                  <li key={p.name}>
-                    <button
-                      type="button"
-                      onClick={() => navigateTo(p.name)}
-                      className="flex w-full items-center gap-2 rounded-md border border-ink-800 bg-ink-900/40 px-3 py-2 text-left text-sm hover:bg-ink-900"
-                    >
-                      <Folder size={14} className="text-gold-400" />
-                      <span className="flex-1 truncate font-mono text-xs text-ink-100">
-                        {trailingSegment(p.name)}
-                      </span>
-                      <span className="font-mono text-[10px] text-ink-500">/</span>
-                    </button>
-                  </li>
-                ))}
+                {prefixes.map((p) => {
+                  const trail = trailingSegment(p.name);
+                  // Position in the path is "current depth" — strip the
+                  // leading prefix that's already visited, count remaining
+                  // segments to derive how deep this folder sits.
+                  const pathSegs = p.name.split("/").filter(Boolean);
+                  const positionInPath = pathSegs.length - 1;
+                  const pretty = friendlyLabel(trail, positionInPath, pathSegs, maps);
+                  const isFriendly = pretty !== trail;
+                  return (
+                    <li key={p.name}>
+                      <button
+                        type="button"
+                        onClick={() => navigateTo(p.name)}
+                        className="flex w-full items-center gap-2 rounded-md border border-ink-800 bg-ink-900/40 px-3 py-2 text-left text-sm hover:bg-ink-900"
+                        title={isFriendly ? `id: ${trail}` : trail}
+                      >
+                        <Folder size={14} className="text-gold-400" />
+                        <span className={isFriendly
+                          ? "flex-1 truncate font-serif text-sm text-ink-100"
+                          : "flex-1 truncate font-mono text-xs text-ink-100"}>
+                          {pretty}
+                        </span>
+                        <span className="font-mono text-[10px] text-ink-500">/</span>
+                      </button>
+                    </li>
+                  );
+                })}
               </ul>
             </section>
           ) : null}
