@@ -57,6 +57,13 @@ export function ChannelsAdmin() {
           </span>
         </div>
         <div className="ml-auto flex items-center gap-2">
+          <Link
+            to="/archive"
+            className="rounded-md border border-ink-700 bg-ink-900 px-3 py-1.5 text-xs text-ink-200 hover:bg-ink-800"
+            title="Browse the per-channel / per-meeting blob archive"
+          >
+            Archive
+          </Link>
           <button
             type="button"
             onClick={() => void refresh()}

@@ -4,6 +4,7 @@ import { MeetingDossier } from "./components/MeetingDossier";
 import { ChannelsAdmin } from "./components/ChannelsAdmin";
 import { ChannelsDebug } from "./components/ChannelsDebug";
 import { ChannelCommandCenter } from "./components/ChannelCommandCenter";
+import { ArchiveBrowser } from "./components/ArchiveBrowser";
 
 /**
  * Alfred — Meeting Dossier.
@@ -28,6 +29,7 @@ export default function App() {
         <Route path="/m/*" element={<KeyedDossier />} />
         <Route path="/channels" element={<ChannelsAdmin />} />
         <Route path="/debug" element={<ChannelsDebug />} />
+        <Route path="/archive" element={<ArchiveBrowser />} />
         <Route
           path="/channels/inspect/:teamId/:channelId"
           element={<ChannelCommandCenter />}
