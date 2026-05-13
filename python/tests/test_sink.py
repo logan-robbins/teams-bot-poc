@@ -964,14 +964,22 @@ class TestPerMeetingRouting:
         assert "alpha line" not in beta_texts
 
     @pytest.mark.asyncio
-    async def test_status_for_unknown_meeting_returns_404(
+    async def test_status_for_unknown_meeting_returns_empty_wrapper(
         self, client: AsyncClient
     ) -> None:
-        """Hitting /m/<unknown> returns 404 — no leak of other sessions."""
+        """Hitting /m/<unknown>/status returns 200 with session=None.
+
+        The command-center page polls this for every chat the operator
+        opens, including chats Alfred hasn't been registered into yet.
+        404 floods the browser console with no signal; empty is the
+        truthful representation.
+        """
         response = await client.get("/m/19:never-seen@thread.v2/status")
-        assert response.status_code == 404
+        assert response.status_code == 200
         body = response.json()
-        assert body["error_code"] == "MEETING_NOT_FOUND"
+        assert body["session"] is None
+        assert "agent_available" in body
+        assert "product_id" in body
 
     @pytest.mark.asyncio
     async def test_meeting_end_marks_session_inactive(

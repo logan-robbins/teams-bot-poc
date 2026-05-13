@@ -510,9 +510,19 @@ class SessionStatusResponse(BaseModel):
 
 
 class SessionStatusWrapper(BaseModel):
-    """Wrapper for session status response."""
+    """Wrapper for session status response.
 
-    session: SessionStatusResponse
+    ``session`` is optional because /m/{chat_thread_id}/status is polled
+    by the UI on every command-center mount, including for chats Alfred
+    has never been registered into. Returning an empty wrapper instead
+    of 404 keeps the browser console clean and matches how the UI
+    already handles "no session yet" (``body.session ?? null``).
+    """
+
+    session: SessionStatusResponse | None = Field(
+        default=None,
+        description="Session status snapshot, or null when no meeting has been registered for this chat_thread_id yet.",
+    )
     agent_available: bool = Field(..., description="Whether agent analysis is available")
     product_id: str = Field(..., description="Active product id")
 
@@ -2553,8 +2563,22 @@ async def get_meeting_status(
     chat_thread_id: str,
     state: AppStateDep,
 ) -> SessionStatusWrapper:
-    """Snapshot for the UI to seed the dossier on mount."""
-    manager = _resolve_meeting_or_404(state, chat_thread_id)
+    """Snapshot for the UI to seed the dossier on mount.
+
+    Unknown thread -> empty wrapper (200, session=None), not 404. The
+    command-center page polls this every few seconds for every chat
+    the operator opens, including chats Alfred hasn't been registered
+    into yet (channels with no completed meeting). A 404 per poll
+    floods the browser console with red and adds zero signal — empty
+    is the truthful representation.
+    """
+    manager = state["session_registry"].get(chat_thread_id)
+    if manager is None:
+        return SessionStatusWrapper(
+            session=None,
+            agent_available=AGENT_AVAILABLE,
+            product_id=PRODUCT_SPEC.product_id,
+        )
     checklist_manager = state["checklist_manager"]
     stats = state["stats"]
     context = manager.get_session_context()
