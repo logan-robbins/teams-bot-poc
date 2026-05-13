@@ -155,10 +155,20 @@ public sealed partial class GraphNotificationProcessor
                 return;
             }
 
+            // Teams emits meeting lifecycle events (call started, ended,
+            // recording exported, transcript ready) into a channel's chat
+            // stream as system-event chat messages whose body.content is
+            // JSON with scopeId + callId. Surface those under a dedicated
+            // event_type so consumers (and the UI's "Live chat" panel)
+            // see only real human + bot chat under chat.message.
+            var eventType = LooksLikeTeamsMeetingSystemPayload(payload.Text)
+                ? AlfredEventTypes.MeetingLifecycle
+                : AlfredEventTypes.ChatMessage;
+
             await _dispatcher.PublishAsync(
                 new AlfredEventEnvelope
                 {
-                    EventType = AlfredEventTypes.ChatMessage,
+                    EventType = eventType,
                     EventId = Guid.NewGuid().ToString("N"),
                     Ts = payload.TimestampUtc,
                     TeamId = payload.TeamId,
@@ -412,6 +422,31 @@ public sealed partial class GraphNotificationProcessor
 
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _attemptedTranscriptFetches =
         new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// True when this chat-message text is a Teams meeting lifecycle
+    /// system payload — a JSON object carrying <c>scopeId</c> +
+    /// <c>callId</c> (e.g. "meeting started", "recording exported",
+    /// "transcript ready"). These are emitted by Teams into the channel
+    /// chat stream and would otherwise drown the chat.message wire
+    /// event with noise.
+    /// </summary>
+    private static bool LooksLikeTeamsMeetingSystemPayload(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return false;
+        if (!text.TrimStart().StartsWith("{", StringComparison.Ordinal)) return false;
+        try
+        {
+            using var doc = JsonDocument.Parse(text);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object) return false;
+            return doc.RootElement.TryGetProperty("scopeId", out _) &&
+                   doc.RootElement.TryGetProperty("callId", out _);
+        }
+        catch
+        {
+            return false;
+        }
+    }
 
     /// <summary>
     /// When Teams posts a meeting lifecycle system message (call ended,

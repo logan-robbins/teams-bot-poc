@@ -91,6 +91,17 @@ public static class AlfredEventTypes
     public const string ChannelDetached = "system.channel_detached";
 
     /// <summary>
+    /// Teams-generated meeting lifecycle message (call started, call
+    /// ended, recording exported, transcript ready). Payload mirrors
+    /// the chat envelope shape, but the body's <c>text</c> is JSON
+    /// describing the meeting event rather than human chat. These are
+    /// emitted by Teams into the channel chat stream; the bot detects
+    /// them on inbound and routes them to this dedicated event type so
+    /// the <c>chat.message</c> stream is pure human + bot chat.
+    /// </summary>
+    public const string MeetingLifecycle = "system.meeting_lifecycle";
+
+    /// <summary>
     /// Microsoft's own meeting transcript (the "Record and Transcribe"
     /// product feature), retrieved from Graph after a meeting ends.
     /// Payload: <see cref="OfficialTranscriptPayload"/> — VTT raw text

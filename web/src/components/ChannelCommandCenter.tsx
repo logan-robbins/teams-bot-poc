@@ -403,8 +403,34 @@ function ActiveCall({ call }: { call: CallReadiness }) {
   );
 }
 
+/**
+ * True when this entry is a Teams meeting-lifecycle system payload that
+ * was misrouted into chat.ndjson before the C# bot started classifying
+ * them as `system.meeting_lifecycle`. These show as JSON blobs with
+ * scopeId + callId in the chat text and are pure noise for an operator
+ * reading the channel's live chat — filter them out defensively so
+ * historical NDJSON files don't pollute the panel.
+ */
+function isTeamsSystemPayload(entry: Record<string, unknown>): boolean {
+  const payload = entry.payload as Record<string, unknown> | undefined;
+  if (!payload) return false;
+  const text = payload.text as string | undefined;
+  if (!text || !text.trimStart().startsWith("{")) return false;
+  try {
+    const parsed = JSON.parse(text);
+    return (
+      parsed !== null &&
+      typeof parsed === "object" &&
+      "scopeId" in parsed &&
+      "callId" in parsed
+    );
+  } catch {
+    return false;
+  }
+}
+
 function ChatPanel({ tail }: { tail: DebugTailResponse | null }) {
-  const entries = tail?.entries ?? [];
+  const entries = (tail?.entries ?? []).filter((e) => !isTeamsSystemPayload(e));
   // Most recent message first — the bot writes oldest-first; reverse here
   // so the panel reads like a chat scroll-back.
   const reversed = [...entries].reverse();

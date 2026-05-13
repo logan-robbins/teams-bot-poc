@@ -175,6 +175,8 @@ public sealed class EventFanoutDispatcher : IAsyncDisposable
     {
         AlfredEventTypes.TranscriptPartial or AlfredEventTypes.TranscriptFinal => "transcript",
         AlfredEventTypes.ChatMessage => "chat",
+        // Everything else (system.*, transcript.official, meeting lifecycle)
+        // lands in system.ndjson so the chat tail stays clean.
         _ => "system",
     };
 
