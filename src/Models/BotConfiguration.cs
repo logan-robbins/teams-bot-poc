@@ -240,6 +240,17 @@ public sealed record EventDispatchConfiguration
     /// </summary>
     /// <example>https://ca-alfred-api.example.com/events</example>
     public string? BootstrapConsumerUrl { get; init; }
+
+    /// <summary>
+    /// Minimum seconds between emitted <c>transcript.partial</c> events
+    /// per <c>(chat_thread_id, speaker_id)</c> pair. Partials from the
+    /// STT engine arrive every ~250ms; without throttling a single
+    /// 30-min meeting produces thousands of partial blobs + POSTs.
+    /// Finals (<c>transcript.final</c>) are never throttled.
+    /// Set to 0 to disable throttling (legacy behavior).
+    /// Default: 60 seconds.
+    /// </summary>
+    public int PartialThrottleSeconds { get; init; } = 60;
 }
 
 /// <summary>

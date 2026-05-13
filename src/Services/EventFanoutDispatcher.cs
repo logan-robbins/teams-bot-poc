@@ -55,6 +55,8 @@ public sealed class EventFanoutDispatcher : IAsyncDisposable
     private readonly MeetingAuditLogger? _auditLogger;
     private readonly BlobEventArchive? _blobArchive;
     private readonly IReadOnlyList<ConsumerConfig> _fallbackConsumers;
+    private readonly TimeSpan _partialThrottle;
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _lastPartialEmitted = new(StringComparer.Ordinal);
     private readonly CancellationTokenSource _cts = new();
     private readonly ConcurrentDictionary<string, ConsumerWorker> _workers = new(StringComparer.Ordinal);
     private bool _disposed;
@@ -74,6 +76,9 @@ public sealed class EventFanoutDispatcher : IAsyncDisposable
         _loggerFactory = loggerFactory ?? throw new ArgumentNullException(nameof(loggerFactory));
         _auditLogger = auditLogger;
         _blobArchive = blobArchive;
+
+        var throttleSeconds = Math.Max(0, dispatchConfig?.PartialThrottleSeconds ?? 60);
+        _partialThrottle = TimeSpan.FromSeconds(throttleSeconds);
 
         // Fallback consumer for events that don't match any channel
         // attachment (per-meeting installs, group chats). Without this,
@@ -111,6 +116,18 @@ public sealed class EventFanoutDispatcher : IAsyncDisposable
         if (_auditLogger is not null && !string.IsNullOrWhiteSpace(envelope.ChatThreadId))
         {
             _auditLogger.Append(envelope.ChatThreadId, AuditFolderFor(envelope.EventType), envelope);
+        }
+
+        // Partial-transcript throttle: STT emits interim hypotheses every
+        // ~250ms. Without this, a 30-min meeting fans out thousands of
+        // partial POSTs + blob files per speaker. Throttle keeps the
+        // local NDJSON audit (cheap append) intact so the /debug tail
+        // still shows everything, but suppresses the expensive blob +
+        // consumer paths for partials within the window. Finals
+        // (transcript.final) are never throttled.
+        if (IsThrottledPartial(envelope))
+        {
+            return ValueTask.CompletedTask;
         }
 
         // Blob archive is fire-and-forget so it cannot slow the hot
@@ -160,6 +177,32 @@ public sealed class EventFanoutDispatcher : IAsyncDisposable
         AlfredEventTypes.ChatMessage => "chat",
         _ => "system",
     };
+
+    /// <summary>
+    /// True iff this is a <c>transcript.partial</c> for a
+    /// <c>(chat_thread_id, speaker_id)</c> we've already emitted within
+    /// the configured throttle window. Records the emit timestamp when
+    /// we pass through. Throttle of 0 disables — every partial passes.
+    /// </summary>
+    private bool IsThrottledPartial(AlfredEventEnvelope envelope)
+    {
+        if (_partialThrottle <= TimeSpan.Zero) return false;
+        if (!string.Equals(envelope.EventType, AlfredEventTypes.TranscriptPartial, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var speakerId = (envelope.Payload as TranscriptEvent)?.SpeakerId ?? "_unknown";
+        var key = $"{envelope.ChatThreadId}|{speakerId}";
+        var now = DateTimeOffset.UtcNow;
+        var last = _lastPartialEmitted.GetValueOrDefault(key, DateTimeOffset.MinValue);
+        if (now - last < _partialThrottle)
+        {
+            return true;
+        }
+        _lastPartialEmitted[key] = now;
+        return false;
+    }
 
     private IReadOnlyList<ConsumerConfig> ResolveConsumers(AlfredEventEnvelope envelope)
     {
