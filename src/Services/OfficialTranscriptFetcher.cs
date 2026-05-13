@@ -146,8 +146,12 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
         var teamsAppId = _botConfig.AppId ?? string.Empty;
         // App-scoped endpoint — gated by the OnlineMeetingTranscript.Read.Chat
         // RSC consented at team install, NOT by any tenant-wide app permission.
+        // appCatalogs/.../installedToOnlineMeetings/getAllTranscripts only
+        // exists on the Graph BETA channel; v1.0 returns 400 "Resource not
+        // found for the segment 'installedToOnlineMeetings'." so build an
+        // absolute URL pinned to /beta/.
         var resource =
-            $"appCatalogs/teamsApps/{Uri.EscapeDataString(teamsAppId)}/installedToOnlineMeetings/getAllTranscripts" +
+            $"https://graph.microsoft.com/beta/appCatalogs/teamsApps/{Uri.EscapeDataString(teamsAppId)}/installedToOnlineMeetings/getAllTranscripts" +
             $"?$filter=createdDateTime ge {encodedSince}&$orderby=createdDateTime asc&$top=5";
 
         try
@@ -190,9 +194,10 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
         CancellationToken cancellationToken)
     {
         var teamsAppId = _botConfig.AppId ?? string.Empty;
-        // App-scoped content fetch — same RSC as the list call.
+        // App-scoped content fetch — same RSC as the list call, same
+        // beta-only endpoint pinning.
         var resource =
-            $"appCatalogs/teamsApps/{Uri.EscapeDataString(teamsAppId)}/installedToOnlineMeetings/" +
+            $"https://graph.microsoft.com/beta/appCatalogs/teamsApps/{Uri.EscapeDataString(teamsAppId)}/installedToOnlineMeetings/" +
             $"{Uri.EscapeDataString(meetingId)}/transcripts/{Uri.EscapeDataString(transcriptId)}/content" +
             "?$format=text/vtt";
         try
