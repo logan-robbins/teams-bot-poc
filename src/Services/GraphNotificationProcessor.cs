@@ -176,6 +176,16 @@ public sealed partial class GraphNotificationProcessor
             if (isChannel)
             {
                 MaybeAutoJoinChannelMeeting(payload, document?.RootElement);
+
+                // Independently: if Teams posted a meeting-export /
+                // recording-ready / transcript-ready system payload into
+                // this channel (the JSON-in-text shape with scopeId +
+                // callId + isExportedToOdsp), register the post-meeting
+                // transcript fetch. This runs even when the bot was NOT
+                // in the call — covers exec-demo scenarios where tenant
+                // calling policy blocks the bot from joining but Microsoft
+                // still produced an official Record-and-Transcribe artifact.
+                MaybeFetchPostMeetingTranscript(payload);
             }
         }
         finally
@@ -398,6 +408,94 @@ public sealed partial class GraphNotificationProcessor
         }
 
         return await _graphApiClient.GetResourceAsync(resource, cancellationToken);
+    }
+
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _attemptedTranscriptFetches =
+        new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// When Teams posts a meeting lifecycle system message (call ended,
+    /// recording exported, transcript ready) into an attached channel,
+    /// the message body is a JSON payload with <c>scopeId</c>,
+    /// <c>callId</c>, and <c>meetingOrganizerId</c>. Use that to
+    /// register a post-meeting Graph transcript fetch even if Alfred
+    /// never joined the call itself — the
+    /// <c>installedToOnlineMeetings/getAllTranscripts</c> endpoint is
+    /// gated by the channel's team-level install, not by whether the
+    /// bot was a participant.
+    /// </summary>
+    private void MaybeFetchPostMeetingTranscript(ChatEventPayload payload)
+    {
+        if (string.IsNullOrWhiteSpace(payload.Text) ||
+            !payload.Text.TrimStart().StartsWith("{", StringComparison.Ordinal))
+        {
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(payload.TeamId) ||
+            string.IsNullOrWhiteSpace(payload.ChannelId) ||
+            string.IsNullOrWhiteSpace(payload.ChannelThreadId))
+        {
+            return;
+        }
+
+        string? callId = null;
+        string? organizerOid = null;
+        try
+        {
+            using var doc = JsonDocument.Parse(payload.Text);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object) return;
+            if (!doc.RootElement.TryGetProperty("scopeId", out _)) return;
+            if (!doc.RootElement.TryGetProperty("callId", out var cId) ||
+                cId.ValueKind != JsonValueKind.String)
+            {
+                return;
+            }
+            callId = cId.GetString();
+            if (doc.RootElement.TryGetProperty("meetingOrganizerId", out var mo) &&
+                mo.ValueKind == JsonValueKind.String)
+            {
+                var raw = mo.GetString();
+                // Teams formats this as "8:orgid:{aad-oid}"; strip the prefix
+                // so the fetcher gets a clean AAD object id.
+                organizerOid = raw is not null && raw.StartsWith("8:orgid:", StringComparison.Ordinal)
+                    ? raw.Substring("8:orgid:".Length)
+                    : raw;
+            }
+        }
+        catch
+        {
+            return; // body wasn't a Teams system JSON payload
+        }
+
+        if (string.IsNullOrWhiteSpace(callId) || string.IsNullOrWhiteSpace(organizerOid))
+        {
+            return;
+        }
+
+        // Idempotent per callId — Teams emits several system messages per
+        // meeting (start, end, recording exported, etc.) and we only need
+        // to schedule one fetch per call.
+        if (!_attemptedTranscriptFetches.TryAdd(callId!, 1))
+        {
+            return;
+        }
+
+        // Register with a small look-back so transcripts created during
+        // the call (before this "export" message lands) still match the
+        // fetcher's createdDateTime filter.
+        var registerAt = DateTimeOffset.UtcNow.AddMinutes(-30);
+
+        _logger.LogInformation(
+            "Scheduling post-meeting transcript fetch from channel system event callId={CallId} organizer={Oid} team={TeamId} channel={ChannelId}",
+            callId, organizerOid, payload.TeamId, payload.ChannelId);
+
+        _transcriptFetcher.Register(
+            botCallId: callId!,
+            organizerOid: organizerOid!,
+            teamId: payload.TeamId!,
+            channelId: payload.ChannelId!,
+            channelThreadId: payload.ChannelThreadId!,
+            registeredAtUtc: registerAt);
     }
 
     private ChatEventPayload? BuildChatEventPayload(GraphNotification notification, JsonDocument? document)
