@@ -30,17 +30,23 @@ public sealed class SendChatController : ControllerBase
     private readonly IBotFrameworkHttpAdapter _adapter;
     private readonly IConversationReferenceStore _references;
     private readonly BotConfiguration _botConfig;
+    private readonly EventFanoutDispatcher _dispatcher;
+    private readonly ChannelAttachmentStore _attachmentStore;
     private readonly ILogger<SendChatController> _logger;
 
     public SendChatController(
         IBotFrameworkHttpAdapter adapter,
         IConversationReferenceStore references,
         BotConfiguration botConfig,
+        EventFanoutDispatcher dispatcher,
+        ChannelAttachmentStore attachmentStore,
         ILogger<SendChatController> logger)
     {
         _adapter = adapter;
         _references = references;
         _botConfig = botConfig;
+        _dispatcher = dispatcher;
+        _attachmentStore = attachmentStore;
         _logger = logger;
     }
 
@@ -86,6 +92,7 @@ public sealed class SendChatController : ControllerBase
 
         var gate = Gates.GetOrAdd(conversationReferenceId, static _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(ct);
+        string? sentActivityId = null;
         try
         {
             var adapter = (BotAdapter)_adapter;
@@ -99,7 +106,8 @@ public sealed class SendChatController : ControllerBase
                     {
                         activity.ReplyToId = request.ReplyToMessageId;
                     }
-                    await turnCtx.SendActivityAsync(activity, innerCt);
+                    var response = await turnCtx.SendActivityAsync(activity, innerCt);
+                    sentActivityId = response?.Id;
                 },
                 ct);
         }
@@ -108,7 +116,80 @@ public sealed class SendChatController : ControllerBase
             gate.Release();
         }
 
+        // Mirror the outbound reply into the same chat.message stream we
+        // publish for inbound activities. Without this, archive +
+        // consumer fan-out see only the human side of the conversation,
+        // not Alfred's replies. Team/channel ids are looked up from the
+        // channel attachment store so the blob lands at
+        // channels/{teamId}/{channelId}/chat.message/... when the chat
+        // is a channel post (matches the inbound path's blob layout).
+        await PublishOutboundChatAsync(conversationReferenceId, messageText, sentActivityId, request.ReplyToMessageId, ct);
+
         return Ok(new { ok = true });
+    }
+
+    /// <summary>
+    /// Emits an envelope describing the bot's outbound reply. Best-effort —
+    /// archive failures must never bubble up and 500 the API call the
+    /// Python sink is awaiting. The dispatcher's own paths swallow per-
+    /// consumer errors internally; only synchronous publish exceptions
+    /// would surface here, which would be code bugs worth logging loudly.
+    /// </summary>
+    private async Task PublishOutboundChatAsync(
+        string conversationReferenceId,
+        string messageText,
+        string? sentActivityId,
+        string? replyToMessageId,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            // For channel posts, the conversation reference id IS the
+            // channel thread id (19:{channelId}@thread.tacv2). The
+            // attachment store is keyed by (teamId, channelId) so we walk
+            // its records to find the one whose conversation_thread_id
+            // matches, giving us team/channel ids for the envelope.
+            var attachment = _attachmentStore.GetByConversationThreadId(conversationReferenceId);
+
+            var payload = new ChatEventPayload
+            {
+                EventType = "chat_created",
+                ChatThreadId = conversationReferenceId,
+                MessageId = sentActivityId ?? Guid.NewGuid().ToString("N"),
+                Text = messageText,
+                SenderId = _botConfig.AppId,
+                SenderDisplayName = "Alfred",
+                TimestampUtc = DateTimeOffset.UtcNow.ToString("o"),
+                ConversationReferenceId = conversationReferenceId,
+                ReplyToMessageId = replyToMessageId,
+                FromBot = true,
+                ConversationKind = attachment is not null ? "channel" : "meeting_chat",
+                TeamId = attachment?.TeamId,
+                ChannelId = attachment?.ChannelId,
+                ChannelThreadId = attachment?.ChannelId,
+            };
+
+            await _dispatcher.PublishAsync(
+                new AlfredEventEnvelope
+                {
+                    EventType = AlfredEventTypes.ChatMessage,
+                    EventId = Guid.NewGuid().ToString("N"),
+                    Ts = payload.TimestampUtc,
+                    TeamId = payload.TeamId,
+                    ChannelId = payload.ChannelId,
+                    ChatThreadId = conversationReferenceId,
+                    ChannelThreadId = payload.ChannelThreadId,
+                    ConversationReferenceId = conversationReferenceId,
+                    Payload = payload,
+                },
+                cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "Failed to publish outbound chat envelope for ConversationReferenceId={RefId}",
+                conversationReferenceId);
+        }
     }
 }
 
