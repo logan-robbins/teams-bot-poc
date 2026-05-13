@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Literal
+from xml.etree import ElementTree as ET
 
 import httpx
 from agents import RunContextWrapper, function_tool
@@ -28,9 +30,19 @@ from .session import InterviewSessionManager
 __all__ = [
     "AlfredAgentContext",
     "SendResult",
+    "TranscriptResult",
     "build_alfred_tools",
+    "fetch_meeting_transcript_impl",
     "send_to_meeting_chat_impl",
 ]
+
+
+# Public-read Azure Blob container that the C# bot mirrors every Alfred
+# event + post-meeting transcript into. Override at deploy time with
+# BLOB_ARCHIVE_URL if the storage account changes.
+_BLOB_ARCHIVE_URL_DEFAULT = "https://stalfreddisney.blob.core.windows.net/alfred-events"
+
+_BLOB_PATH_UNSAFE = re.compile(r"[^a-zA-Z0-9\-_.]")
 
 
 def _parse_iso_utc(timestamp: str | None) -> datetime | None:
@@ -124,6 +136,24 @@ class SendResult(BaseModel):
     reason: str | None = None
     posted_at: str | None = None
     message_id: str | None = None
+
+
+class TranscriptResult(BaseModel):
+    """What the fetch-transcript tool returns to the LLM.
+
+    On success, ``transcript`` is Microsoft's official Record-and-Transcribe
+    output rendered as speaker-per-line plaintext (the same content the
+    C# bot wrote to ``_official-transcript.txt`` in the blob archive).
+    On failure, ``reason`` is a short error code the LLM can surface.
+    """
+
+    ok: bool
+    transcript: str | None = None
+    meeting_thread_id_sanitized: str | None = None
+    blob_url: str | None = None
+    last_modified: str | None = None
+    bytes: int | None = None
+    reason: str | None = None
 
 
 def _resolve_send_chat_url(explicit: str | None) -> str | None:
@@ -298,6 +328,147 @@ async def send_to_meeting_chat_impl(
     return result
 
 
+def _archive_url() -> str:
+    raw = (os.environ.get("BLOB_ARCHIVE_URL") or _BLOB_ARCHIVE_URL_DEFAULT).strip()
+    return raw.rstrip("/")
+
+
+def _sanitize_blob_segment(raw: str) -> str:
+    """Mirror of ``BlobEventArchive.SanitizePathSegment`` in the C# bot.
+
+    The bot replaces every non-alphanumeric path char with ``_`` when it
+    writes blobs. This Python helper must produce the same string from a
+    given Teams id so the agent can build the right list/get URLs.
+    """
+    return _BLOB_PATH_UNSAFE.sub("_", raw)
+
+
+def _resolve_channel_id(
+    session_channel_id: str | None,
+    session_channel_thread_id: str | None,
+    session_chat_thread_id: str | None,
+    explicit: str | None,
+) -> str | None:
+    """Pick the most specific channel id available for the transcript lookup.
+
+    Order: explicit arg > ``channel_thread_id`` (channel meetings stamp
+    the parent here) > ``channel_id`` (raw channel install) > the
+    session's own ``chat_thread_id`` (which, for a channel install, IS
+    the channel thread id). Strips a ``;messageid=...`` suffix when
+    present so the prefix matches the blob's sanitized channel folder.
+    """
+    candidate = (
+        (explicit or "").strip()
+        or (session_channel_thread_id or "").strip()
+        or (session_channel_id or "").strip()
+        or (session_chat_thread_id or "").strip()
+    )
+    if not candidate:
+        return None
+    semi = candidate.find(";")
+    if semi >= 0:
+        candidate = candidate[:semi]
+    return candidate
+
+
+async def fetch_meeting_transcript_impl(
+    context: AlfredAgentContext,
+    channel_id: str | None = None,
+) -> TranscriptResult:
+    """Fetch the most recent meeting's official transcript from the blob archive.
+
+    The C# bot writes one ``_official-transcript.txt`` per meeting at
+    ``meetings/{sanitizedChatThreadId}/_official-transcript.txt`` in the
+    public-read alfred-events container. For channel meetings, the
+    sanitized chat thread id starts with the sanitized channel id (with
+    ``_messageid_xxx`` appended), so a prefix list scoped to the current
+    channel finds every meeting that happened in that channel.
+
+    The newest such transcript wins. The transcript body is returned to
+    the LLM so it can read it and answer the user's question — no
+    summarization happens inside this tool.
+    """
+    session = context.session_manager.session
+    resolved_channel = _resolve_channel_id(
+        session_channel_id=getattr(session, "channel_id", None) if session is not None else None,
+        session_channel_thread_id=getattr(session, "channel_thread_id", None) if session is not None else None,
+        session_chat_thread_id=getattr(session, "chat_thread_id", None) if session is not None else None,
+        explicit=channel_id,
+    )
+    if not resolved_channel:
+        return TranscriptResult(ok=False, reason="no_channel_context")
+
+    archive = _archive_url()
+    list_prefix = f"meetings/{_sanitize_blob_segment(resolved_channel)}"
+    list_url = (
+        f"{archive}?restype=container&comp=list&prefix={list_prefix}&maxresults=500"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            list_response = await client.get(list_url)
+            list_response.raise_for_status()
+            xml_text = list_response.text
+    except Exception as e:
+        logger.warning("fetch_meeting_transcript list failed: %s", e)
+        return TranscriptResult(ok=False, reason=f"list_failed: {e!r}")
+
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as e:
+        logger.warning("fetch_meeting_transcript list parse failed: %s", e)
+        return TranscriptResult(ok=False, reason=f"parse_failed: {e!r}")
+
+    candidates: list[tuple[str, str]] = []
+    for blob in root.iter("Blob"):
+        name = blob.findtext("Name") or ""
+        if not name.endswith("/_official-transcript.txt"):
+            continue
+        last_modified = blob.findtext("Properties/Last-Modified") or ""
+        candidates.append((last_modified, name))
+
+    if not candidates:
+        return TranscriptResult(ok=False, reason="no_transcript_found")
+
+    candidates.sort(reverse=True)
+    last_modified, blob_name = candidates[0]
+    blob_url = f"{archive}/{blob_name}"
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            get_response = await client.get(blob_url)
+            get_response.raise_for_status()
+            transcript_text = get_response.text
+    except Exception as e:
+        logger.warning("fetch_meeting_transcript download failed: %s", e)
+        return TranscriptResult(ok=False, reason=f"download_failed: {e!r}")
+
+    # blob_name = meetings/{sanitized}/_official-transcript.txt
+    parts = blob_name.split("/")
+    meeting_thread_id_sanitized = parts[1] if len(parts) >= 3 else None
+
+    context.record(
+        "fetch_meeting_transcript",
+        {"channel_id": resolved_channel},
+        {
+            "blob_url": blob_url,
+            "last_modified": last_modified,
+            "bytes": len(transcript_text),
+            "meeting_thread_id_sanitized": meeting_thread_id_sanitized,
+        },
+        ok=True,
+    )
+
+    return TranscriptResult(
+        ok=True,
+        transcript=transcript_text,
+        meeting_thread_id_sanitized=meeting_thread_id_sanitized,
+        blob_url=blob_url,
+        last_modified=last_modified,
+        bytes=len(transcript_text),
+    )
+
+
 def build_alfred_tools() -> tuple[Any, ...]:
     """Build the tools tuple wired against ``AlfredAgentContext`` for the SDK."""
 
@@ -327,4 +498,33 @@ def build_alfred_tools() -> tuple[Any, ...]:
             reply_to_message_id=reply_to_message_id,
         )
 
-    return (send_to_meeting_chat,)
+    @function_tool
+    async def fetch_meeting_transcript(
+        ctx: RunContextWrapper[AlfredAgentContext],
+        channel_id: str | None = None,
+    ) -> TranscriptResult:
+        """Fetch the most recent meeting's full official transcript so you can READ it and answer questions about what was said.
+
+        Call this any time a user explicitly asks you to look up, recap,
+        summarize, or answer a question about a past meeting in this
+        channel ("alfred, get the transcript", "what did the team
+        decide?", "summarize the last meeting", etc.). The returned
+        ``transcript`` is Microsoft's official Record-and-Transcribe
+        output as speaker-per-line plaintext — read it, then answer the
+        user via ``send_to_meeting_chat`` (concise; quote sparingly).
+
+        Do NOT call this on a normal silence-default tick. Only call
+        when a user is directly addressing you with a question or
+        recap request.
+
+        Args:
+            channel_id: Optional Teams channel id (``19:...@thread.tacv2``).
+                If omitted, uses the current channel context resolved
+                from this session.
+        """
+        return await fetch_meeting_transcript_impl(
+            context=ctx.context,
+            channel_id=channel_id,
+        )
+
+    return (send_to_meeting_chat, fetch_meeting_transcript)
