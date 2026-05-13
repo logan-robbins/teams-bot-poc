@@ -108,6 +108,40 @@ public sealed class DebugController : ControllerBase
         // that poll (command center, debug panel) don't have to special-case
         // a missing file vs. a transient error.
         var entries = System.IO.File.Exists(path) ? ReadTail(path, tail) : new List<JsonElement>();
+
+        // Channel reply threads spawn their own audit dir keyed by
+        // chat_thread_id;messageid=... — same channel, different
+        // conversation. When the caller asks for the bare channel id and
+        // the exact match has nothing for this kind, merge in everything
+        // from sibling dirs that start with the same prefix so the
+        // command-center "Live chat" panel sees every channel reply
+        // thread under one view. Sorted by timestamp ascending then
+        // tail-capped so we keep the newest N across all threads.
+        if (entries.Count < tail && Directory.Exists(_audit.BaseDir))
+        {
+            var prefix = sanitizedChatThreadId + ";";
+            foreach (var siblingDir in Directory.EnumerateDirectories(_audit.BaseDir))
+            {
+                var name = Path.GetFileName(siblingDir);
+                if (!name.StartsWith(prefix, StringComparison.Ordinal)) continue;
+                var siblingPath = Path.Combine(siblingDir, $"{kind}.ndjson");
+                if (!System.IO.File.Exists(siblingPath)) continue;
+                entries.AddRange(ReadTail(siblingPath, tail));
+            }
+            entries.Sort((a, b) =>
+            {
+                var aTs = a.TryGetProperty("ts", out var at) && at.ValueKind == JsonValueKind.String
+                    ? at.GetString() ?? string.Empty : string.Empty;
+                var bTs = b.TryGetProperty("ts", out var bt) && bt.ValueKind == JsonValueKind.String
+                    ? bt.GetString() ?? string.Empty : string.Empty;
+                return string.CompareOrdinal(aTs, bTs);
+            });
+            if (entries.Count > tail)
+            {
+                entries.RemoveRange(0, entries.Count - tail);
+            }
+        }
+
         return Ok(new
         {
             chat_thread_id_sanitized = sanitizedChatThreadId,
