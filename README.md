@@ -49,7 +49,7 @@ This README is the **what + why**. `AGENTS.md` is the **how**.
 - **Source of truth for agent behavior:** `python/batcave_platform/specs/alfred.yaml`.
 - **RSC-only.** Zero tenant-wide Entra application permissions. All
   Graph access — calling, transcripts, recordings — goes through RSC
-  consented at team-install time. Manifest is at **`1.0.10`**.
+  consented at team-install time. Manifest is at **`1.0.11`**.
 
 ---
 
@@ -131,13 +131,17 @@ This README is the **what + why**. `AGENTS.md` is the **how**.
   │  React UI  web/  ·  Vite + React 19                                │
   │     /                       → MeetingList                          │
   │     /m/<id>                 → MeetingDossier (read-only)           │
-  │     /channels/admin         → consumer config CRUD + status pills  │
+  │     /channels               → consumer config CRUD + status pills  │
+  │                               + Join-by-URL panel (any meeting)    │
   │     /channels/inspect/      → per-channel command center:          │
   │       <teamId>/<channelId>     · status (sub/auto-join/active call)│
   │                                · last join attempt + error code   │
+  │                                · live chat (bot audit tail)        │
   │                                · live transcripts (bot audit tail) │
   │                                · official transcripts (sink)      │
-  │     /channels/debug         → flat per-thread audit tail           │
+  │     /archive                → blob-archive folder browser          │
+  │                               (every event + post-meeting VTT)    │
+  │     /debug                  → flat per-thread audit tail           │
   └────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -195,7 +199,7 @@ active merge-request branch (`alfred-agent-updates`) for Disney review.
 
 ## 3. Permissions (RSC)
 
-The manifest declares **15 Resource-Specific Consent permissions**
+The manifest declares **16 Resource-Specific Consent permissions**
 split across the two operational shapes — meeting and channel.
 There are **zero tenant-wide Entra application permissions**. All
 Graph access — including the post-meeting transcript fetch — is
@@ -224,11 +228,18 @@ gated by RSC consented at team-install time.
 | `ChannelMeetingTranscript.Read.Group` | Channel-meeting transcripts for analytics rollup. |
 | `ChannelMeetingRecording.Read.Group` | Future: channel-meeting recording artifact. |
 | `TeamsAppInstallation.Read.Group` | Verify the bot is still installed at the team level. |
-| `TeamSettings.Read.Group` | Read team display name / settings for operator UI. |
+| `TeamSettings.Read.Group` | Read team display name for the operator UI (`GET /teams/{id}`). |
+| `ChannelSettings.Read.Group` | Read channel display name for the operator UI (`GET /teams/{id}/channels/{id}`). |
 
 Plus two manifest-level Teams app permissions: `identity`,
 `messageTeamMembers`. The manifest also requests
-`supportsCalling: true`. Manifest is currently at **`1.0.10`**.
+`supportsCalling: true`. Manifest is currently at **`1.0.11`**.
+
+**Adding a new RSC requires re-installing on the team.** Bumping the
+manifest, re-uploading to the org catalog, and admin-consenting is
+necessary but not sufficient — Teams binds RSC scopes at install
+time, so the team must update or reinstall Alfred for the new scope
+to take effect on that resource.
 
 The only runtime gate outside RSC is the tenant's **calling policy**
 (`CsTeamsCallingPolicy` / `CsTeamsAppPermissionPolicy`). That's a
@@ -249,7 +260,7 @@ not the manifest.
 | `python/batcave_platform/` | Product spec loader + output routes. `specs/alfred.yaml` is the **sole source of truth** for Alfred's prompt and intervention policy. |
 | `python/tests/` | `uv run pytest tests` baseline: **124 passed, 2 skipped**. |
 | `web/` | React 19 + Vite + Tailwind v4 UI. Per-meeting routing + admin + per-channel command center + debug via `react-router-dom`. |
-| `manifest/` | Teams app manifest (`manifest.json`, `alfred-sandbox.zip`). Bot AppId, **15 RSC permissions**, valid domains. Currently at version **`1.0.10`**. |
+| `manifest/` | Teams app manifest (`manifest.json`, `alfred-sandbox.zip`). Bot AppId, **16 RSC permissions**, valid domains. Currently at version **`1.0.11`**. |
 | `scripts/` | Deploy + ops scripts. Canonical entrypoints: `deploy-azure-vm.sh`, `deploy-azure-agent.sh`, `bootstrap-production-vm.ps1`, `join_meeting.sh`. |
 | `AGENTS.md` | **Operator manual for AI coding agents** — build, deploy, debug. Read this before changing anything in this tree. |
 
@@ -346,11 +357,14 @@ on the attachment, and after the meeting ends polls Graph
 emits it as a `transcript.official` envelope.
 
 The admin UI exposes:
-- `/channels/admin` — config CRUD + status pills + Open button
+- `/channels` — config CRUD + status pills + Open button + join-any-
+  meeting-by-URL panel
 - `/channels/inspect/<teamId>/<channelId>` — per-channel command
   center: status, last join attempt + error code, active call,
-  live transcripts, official post-meeting transcripts
-- `/channels/debug` — flat per-thread audit tail
+  live chat, live transcripts, official post-meeting transcripts
+- `/archive` — folder browser over the per-channel/per-meeting blob
+  archive (see [`docs/retrieving-transcripts.md`](docs/retrieving-transcripts.md))
+- `/debug` — flat per-thread audit tail
 
 Outbound: the bot posts back via `send_to_meeting_chat` using the
 captured `ConversationReference` for that channel. The reference is
@@ -481,6 +495,42 @@ curl -sS -X POST "$SINK/events" -H "Content-Type: application/json" \
           payload:{chat_thread_id:$tid, team_id:$team, channel_id:$chan,
                    channel_thread_id:$chan, source:"manual"}}')"
 ```
+
+### Per-channel / per-meeting blob archive
+
+Every event the bot fans out is also persisted as an individual
+`.txt` file in Azure Blob Storage so downstream teams can consume the
+history without registering a consumer URL. Post-meeting Microsoft
+transcripts get a special single-file path.
+
+| | |
+|---|---|
+| Storage account | `stalfreddisney` |
+| Container | `alfred-events` |
+| Endpoint | `https://stalfreddisney.blob.core.windows.net/alfred-events/` |
+| Reads | Anonymous (container ACL = `container`) |
+| Writes | Bot service writes with the storage account key (env: `BlobArchive__ConnectionString`) |
+
+Path layout:
+```
+channels/{teamId}/{sanitizedChannelId}/{eventKind}/{utcTs}-{eventId}.txt
+meetings/{sanitizedChatThreadId}/{eventKind}/{utcTs}-{eventId}.txt
+meetings/{sanitizedChatThreadId}/_official-transcript.txt   ← full VTT
+```
+
+Knobs:
+- `EventDispatch__PartialThrottleSeconds` (default `60`) — minimum
+  seconds between emitted `transcript.partial` events per
+  `(chat_thread_id, speaker_id)` pair. Finals are never throttled.
+  Set to `0` for legacy per-partial behavior.
+- `BlobArchive__ConnectionString` — full connection string with key
+  (current sandbox path). Swap to managed identity by setting
+  `BlobArchive__AccountUrl` instead, once an admin grants the bot's
+  MI the `Storage Blob Data Contributor` role on the storage account.
+- `BlobArchive__ContainerName` — defaults to `alfred-events`.
+
+Full retrieval guide (Python, curl, az CLI):
+**[`docs/retrieving-transcripts.md`](docs/retrieving-transcripts.md)**.
 
 ### Operator API for channel attachment + consumer routing
 
@@ -721,10 +771,11 @@ tool dry-runs (logs + appends to the ledger, does not POST).
 | Newly-pushed C# code "deploys" but the running bot still has old behavior | `dotnet publish` is incremental — stale `bin/`+`obj/` from a previous build can produce a fresh-timestamped DLL with old content. Any deploy that touches code must `rm -rf src/bin src/obj` before `dotnet publish`. See `AGENTS.md` §7.4. |
 | `az vm run-command create` succeeded but its output is the *previous* attempt's error | Run-command resources are cached by name. Use a unique `--run-command-name` per attempt or `az vm run-command delete` first. See `AGENTS.md` §7.3. |
 | Channel rollup `/c/{tid}/{cid}/events` returns nothing for a real meeting | The bot only stamps `channel_id` once it sees a meeting-chat activity carrying `channelData`. If the meeting started but no chat activity has happened yet, post anything in the meeting chat to fire the `system.session_linked` envelope. Or POST one manually to `/events` (see §6). |
-| Auto-join not firing on "Meeting started" | Check `/channels/admin` row for that channel — `last join: failure` with a tooltip shows the JoinWorkflow error code. If no attempt is recorded at all, the Graph subscription on `teams/{teamId}/channels/{channelId}/messages` isn't firing; check `subscription_id` in `/api/channels`. If `auto-join: off`, flip the toggle. |
-| Manual Join button returns `403 GRAPH_PERMISSION_MISSING` | Manifest 1.0.10 wasn't admin-consented yet, OR Teams admin app permission policy blocks this AppId. Re-import zip in Dev Portal, re-publish + admin-consent in Teams Admin Center. |
+| Auto-join not firing on "Meeting started" | Check `/channels` row for that channel — `last join: failure` with a tooltip shows the JoinWorkflow error code. If no attempt is recorded at all, the Graph subscription on `teams/{teamId}/channels/{channelId}/messages` isn't firing; check `subscription_id` in `/api/channels`. If `auto-join: off`, flip the toggle. |
+| Manual Join button returns `403 GRAPH_PERMISSION_MISSING` | Manifest 1.0.11 wasn't admin-consented yet, OR the team hasn't been re-installed to pick up the latest RSC scopes, OR Teams admin app permission policy blocks this AppId. Re-import zip in Dev Portal, re-publish + admin-consent in Teams Admin Center, then update/reinstall on the team. |
 | Manual Join button returns `502 CALL_JOIN_FAILED_7504_OR_7505` | Tenant `CsTeamsCallingPolicy` blocks the bot from making group calls. Not a permission grant — a Teams admin policy. Get the AppId allowlisted in the policy assigned to your test user. |
-| `transcript.official` never lands after a meeting | The meeting wasn't recorded+transcribed in Teams (no `callTranscript` artifact to fetch). OR RSC `OnlineMeetingTranscript.Read.Chat` wasn't consented (re-import 1.0.10). Bot logs show `getAllTranscripts returned Forbidden` for the consent case or empty list for the no-recording case. |
+| `transcript.official` never lands after a meeting | The meeting wasn't recorded+transcribed in Teams (no `callTranscript` artifact to fetch). OR RSC `OnlineMeetingTranscript.Read.Chat` wasn't consented (re-import 1.0.11 and reinstall on the team). Bot logs show `getAllTranscripts returned Forbidden` for the consent case or empty list for the no-recording case. |
+| `/archive` shows only `_sentinel.txt` after deploys | The blob archive only writes when events fire after the bot has been restarted. Send a message to Alfred in an attached channel — `system.channel_attached` + `chat.message` blobs will appear under `channels/{teamId}/{sanitizedChannelId}/...`. If they don't, tail bot logs for `BlobEventArchive` warnings (`BlobArchive__ConnectionString` may be unset or invalid). |
 
 ---
 
@@ -797,7 +848,10 @@ gh api repos/logan-robbins/alfred-teams-bot/keys \
     regenerate `alfred-sandbox.zip` (`cd manifest && rm
     alfred-sandbox.zip && zip -j alfred-sandbox.zip manifest.json
     color.png outline.png`), re-import in Teams Developer Portal,
-    re-grant admin consent if RSCs changed.
+    re-grant admin consent if RSCs changed. **If new RSCs were added,
+    every team that already had Alfred installed must `Update` or
+    reinstall the app** — Teams binds RSC scopes at install time and
+    will not retroactively grant new scopes to existing installs.
 
 ---
 
@@ -816,6 +870,7 @@ state:
 - **E8 channel-id metadata + rollup** ✅ live — every event carries `team_id` / `channel_id` / `channel_thread_id`; `system.session_linked` envelope backfills prior rows; `GET /c/{teamId}/{channelId}/events` returns the unified channel timeline (live STT + chat + official transcripts)
 - **E9 channel-meeting auto-join + manual join** ✅ live — `GraphNotificationProcessor` detects `callStartedEventMessageDetail` and runs the same `JoinMeetingWithModeAsync` workflow. Per-channel `AutoJoinEnabled` toggle. Last attempt outcome persisted on attachment for the admin UI.
 - **E10 post-meeting Microsoft transcript** ✅ live (RSC-only) — `OfficialTranscriptFetcher` polls the app-scoped Graph endpoint and emits each meeting's VTT cues as `transcript.official` envelopes. Reference sink stores them as `source=graph_notification` speech events.
-- **E11 operator admin UI** ✅ live — `/channels/admin` (consumer CRUD + status pills), `/channels/inspect/<teamId>/<channelId>` (per-channel command center: status, last join attempt, active call, live + official transcripts), `/channels/debug` (per-thread audit tail).
+- **E11 operator admin UI** ✅ live — `/channels` (consumer CRUD + status pills + join-by-URL), `/channels/inspect/<teamId>/<channelId>` (per-channel command center: status, last join attempt, active call, live chat, live + official transcripts), `/archive` (blob folder browser — see [`docs/retrieving-transcripts.md`](docs/retrieving-transcripts.md)), `/debug` (per-thread audit tail).
+- **E12 blob archive** ✅ live — every event mirrored to Azure Blob (`stalfreddisney/alfred-events`), per-channel / per-meeting prefix layout, post-meeting Microsoft VTT written to `_official-transcript.txt`. Anonymous public read; full retrieval guide in [`docs/retrieving-transcripts.md`](docs/retrieving-transcripts.md). `EventDispatch:PartialThrottleSeconds` (default 60) caps STT partial fan-out per `(chat_thread_id, speaker_id)`.
 
 Read `PROD.md` before starting any of the deferred workstreams.
