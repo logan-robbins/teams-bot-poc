@@ -82,6 +82,30 @@ export interface JoinNowResult {
   join_url?: string;
 }
 
+/**
+ * Response from POST /api/calling/join. CallingController serializes with
+ * Newtonsoft using camelCase, so keys are camelCase here (not snake_case).
+ */
+export interface JoinMeetingResult {
+  callId?: string | null;
+  message?: string | null;
+  joinUrl?: string | null;
+  joinMode?: string | null;
+  effectiveTenantId?: string | null;
+  meetingId?: string | null;
+  deferred?: boolean;
+}
+
+/**
+ * Error envelope returned by POST /api/calling/join when the join workflow
+ * rejects the request. ``errorCode`` is one of JoinWorkflowErrorCodes
+ * defined in the bot — surface it so the UI can give a precise reason.
+ */
+export interface JoinMeetingError {
+  error?: string;
+  errorCode?: string;
+}
+
 export interface ChannelAttachmentsResponse {
   count: number;
   attachments: ChannelAttachment[];
@@ -183,6 +207,18 @@ export const bot = {
       `/api/channels/${encodeURIComponent(teamId)}/${encodeChannelId(channelId)}/join`,
       { method: "POST", body: "{}" },
     ),
+
+  /**
+   * Join any Teams meeting by URL — no channel attachment required.
+   * Drives the same Graph Communications Calls.AddAsync path that
+   * auto-join and channel "Join now" use, just keyed off a raw meeting
+   * URL instead of a stored team/channel record.
+   */
+  joinMeetingByUrl: (joinUrl: string, displayName = "Alfred") =>
+    json<JoinMeetingResult>("/api/calling/join", {
+      method: "POST",
+      body: JSON.stringify({ joinUrl, displayName }),
+    }),
 
   listDebugThreads: () => json<DebugThreadsResponse>("/api/debug/transcripts"),
 

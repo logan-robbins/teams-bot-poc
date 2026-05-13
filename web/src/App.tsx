@@ -8,15 +8,16 @@ import { ChannelCommandCenter } from "./components/ChannelCommandCenter";
 /**
  * Alfred — Meeting Dossier.
  *
- * The dossier is gated behind ``/m/:chatThreadId`` so a viewer can only
- * see the meeting whose chat_thread_id is in the URL. Anyone hitting the
- * root path is shown a meeting picker (``MeetingList``) — there is no
- * "current meeting" fallback. ``/channels/admin`` is the operator UI for
- * per-channel consumer config; ``/debug`` tails the bot's per-thread
- * audit logs (every chat / meeting / channel the bot has heard from,
- * not just channels); ``/channels/inspect/:teamId/:channelId`` is the
- * per-channel command center combining status, live transcripts, and
- * Microsoft's official post-meeting transcripts in one view.
+ * Routes:
+ *   ``/``                                 meeting picker (MeetingList)
+ *   ``/m/:chatThreadId``                  per-meeting dossier
+ *   ``/channels``                         operator UI: attached channels +
+ *                                         per-channel consumer config +
+ *                                         join-any-meeting-by-URL panel
+ *   ``/channels/inspect/:teamId/:channelId``
+ *                                         per-channel command center (live
+ *                                         transcript + official transcripts)
+ *   ``/debug``                            bot's per-thread NDJSON tail
  */
 export default function App() {
   return (
@@ -25,13 +26,8 @@ export default function App() {
         <Route path="/" element={<MeetingList />} />
         <Route path="/m" element={<Navigate to="/" replace />} />
         <Route path="/m/*" element={<KeyedDossier />} />
-        <Route path="/channels/admin" element={<ChannelsAdmin />} />
+        <Route path="/channels" element={<ChannelsAdmin />} />
         <Route path="/debug" element={<ChannelsDebug />} />
-        {/* Back-compat for any bookmarks of the old path. */}
-        <Route
-          path="/channels/debug"
-          element={<Navigate to="/debug" replace />}
-        />
         <Route
           path="/channels/inspect/:teamId/:channelId"
           element={<ChannelCommandCenter />}

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { Moon, Plus, Trash2, Save, RefreshCw, Phone, ExternalLink } from "lucide-react";
+import { Moon, Plus, Trash2, Save, RefreshCw, Phone, ExternalLink, Link2 } from "lucide-react";
 import {
   bot,
   type ChannelAttachment,
@@ -70,7 +70,9 @@ export function ChannelsAdmin() {
 
       <main className="flex-1 overflow-auto px-6 py-8">
         <div className="mx-auto max-w-5xl">
-          <p className="text-sm text-ink-300">
+          <JoinByUrlPanel />
+
+          <p className="mt-8 text-sm text-ink-300">
             Each row is one Teams channel Alfred is attached to. The bot
             POSTs every event for that channel to every consumer URL
             below. See{" "}
@@ -476,4 +478,85 @@ function fmtRelative(ts?: string): string {
   if (diff < 3_600_000) return `${Math.round(diff / 60_000)}m ago`;
   if (diff < 86_400_000) return `${Math.round(diff / 3_600_000)}h ago`;
   return `${Math.round(diff / 86_400_000)}d ago`;
+}
+
+/**
+ * Join any Teams meeting by URL. No channel attachment required — drives
+ * POST /api/calling/join, which is the same Graph Communications
+ * Calls.AddAsync path that channel auto-join uses, just keyed off a
+ * raw join URL. Useful for one-off meetings the user wants Alfred in
+ * without going through a team install.
+ */
+function JoinByUrlPanel() {
+  const [url, setUrl] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  async function join() {
+    const trimmed = url.trim();
+    if (!trimmed) {
+      setError("Paste a Teams meeting join URL.");
+      return;
+    }
+    setBusy(true);
+    setResult(null);
+    setError(null);
+    try {
+      const r = await bot.joinMeetingByUrl(trimmed);
+      setResult(
+        r.deferred
+          ? `Deferred (${r.joinMode ?? "?"}): ${r.message ?? "Alfred will join when the meeting starts."}`
+          : r.callId
+            ? `Joining. callId=${r.callId}${r.joinMode ? ` mode=${r.joinMode}` : ""}`
+            : (r.message ?? "OK"),
+      );
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Join failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="rounded-md border border-ink-800 bg-ink-900/40 px-4 py-3">
+      <div className="flex items-center gap-2">
+        <Link2 size={14} className="text-gold-400" />
+        <h2 className="font-serif text-base text-ink-100">Join a meeting by URL</h2>
+      </div>
+      <p className="mt-1 text-xs text-ink-400">
+        Drop Alfred into a one-off meeting without installing him in a
+        channel. Same code path as channel auto-join (Graph Communications{" "}
+        <code className="font-mono">Calls.AddAsync</code>) — needs the
+        tenant <code className="font-mono">CsApplicationAccessPolicy</code>{" "}
+        grant and either the meeting's RSC or admin-consented{" "}
+        <code className="font-mono">Calls.JoinGroupCall.All</code>.
+      </p>
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <input
+          type="url"
+          value={url}
+          onChange={(e) => setUrl(e.target.value)}
+          placeholder="https://teams.microsoft.com/l/meetup-join/..."
+          className="min-w-[28rem] flex-1 rounded border border-ink-700 bg-ink-950 px-3 py-1.5 font-mono text-xs text-ink-100"
+          disabled={busy}
+        />
+        <button
+          type="button"
+          onClick={() => void join()}
+          disabled={busy || url.trim().length === 0}
+          className="flex items-center gap-1 rounded-md bg-emerald-500/20 px-3 py-1.5 text-xs text-emerald-200 ring-1 ring-emerald-500/40 hover:bg-emerald-500/30 disabled:opacity-50"
+        >
+          <Phone size={12} />
+          {busy ? "Joining…" : "Join"}
+        </button>
+      </div>
+      {result ? (
+        <p className="mt-2 font-mono text-[10px] text-emerald-300">{result}</p>
+      ) : null}
+      {error ? (
+        <p className="mt-2 font-mono text-[10px] text-crimson-300">{error}</p>
+      ) : null}
+    </section>
+  );
 }

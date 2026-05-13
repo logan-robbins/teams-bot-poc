@@ -189,7 +189,7 @@ export function ChannelCommandCenter() {
       <header className="flex items-center gap-3 border-b border-ink-800 bg-ink-950/80 px-6 py-3 backdrop-blur">
         <button
           type="button"
-          onClick={() => navigate("/channels/admin")}
+          onClick={() => navigate("/channels")}
           className="flex h-9 w-9 items-center justify-center rounded-lg bg-ink-900 ring-1 ring-ink-800 hover:bg-ink-800"
           aria-label="Back to channels"
         >
@@ -207,7 +207,7 @@ export function ChannelCommandCenter() {
         </div>
         <div className="ml-auto flex items-center gap-2">
           <Link
-            to="/channels/admin"
+            to="/channels"
             className="flex items-center gap-1 rounded-md border border-ink-700 bg-ink-900 px-3 py-1.5 text-xs text-ink-200 hover:bg-ink-800"
           >
             All channels
@@ -249,7 +249,7 @@ function Navigate() {
   return (
     <div className="flex h-screen items-center justify-center bg-ink-950 text-ink-50">
       Missing team_id or channel_id in URL.
-      <Link to="/channels/admin" className="ml-2 text-gold-400 underline">
+      <Link to="/channels" className="ml-2 text-gold-400 underline">
         Back to channels
       </Link>
     </div>
