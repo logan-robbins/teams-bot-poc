@@ -145,11 +145,22 @@ public sealed class SendChatController : ControllerBase
         try
         {
             // For channel posts, the conversation reference id IS the
-            // channel thread id (19:{channelId}@thread.tacv2). The
-            // attachment store is keyed by (teamId, channelId) so we walk
-            // its records to find the one whose conversation_thread_id
-            // matches, giving us team/channel ids for the envelope.
-            var attachment = _attachmentStore.GetByConversationThreadId(conversationReferenceId);
+            // channel thread id (19:{channelId}@thread.tacv2). When the
+            // bot is replying inside a Teams thread (a reply chain under
+            // a parent message), the reference id has a ";messageid=..."
+            // suffix; the channel attachment record stores only the bare
+            // channel id, so strip the suffix before lookup. Without
+            // this strip the outbound chat envelope was missing
+            // team/channel ids and the blob landed at meetings/... rather
+            // than channels/{teamId}/{channelId}/ alongside the inbound
+            // message it was replying to.
+            var attachmentLookupKey = conversationReferenceId;
+            var semiIdx = attachmentLookupKey.IndexOf(';');
+            if (semiIdx >= 0)
+            {
+                attachmentLookupKey = attachmentLookupKey.Substring(0, semiIdx);
+            }
+            var attachment = _attachmentStore.GetByConversationThreadId(attachmentLookupKey);
 
             var payload = new ChatEventPayload
             {
