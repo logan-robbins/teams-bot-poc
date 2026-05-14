@@ -51,6 +51,7 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
     private readonly ILogger<TeamsCallingBotService> _logger;
     private readonly IGraphLogger _graphLogger;
     private readonly TranscriberFactory _transcriberFactory;
+    private readonly GraphMetadataResolver _metadataResolver;
     private readonly ConcurrentDictionary<string, IRealtimeTranscriber> _pendingTranscribers = new();
     private readonly ConcurrentDictionary<string, string> _callIdToMeetingId = new();
 
@@ -107,7 +108,8 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
         ILogger<TeamsCallingBotService> logger,
         IGraphLogger graphLogger,
         IServiceProvider serviceProvider,
-        TranscriberFactory transcriberFactory)
+        TranscriberFactory transcriberFactory,
+        GraphMetadataResolver metadataResolver)
     {
         ArgumentNullException.ThrowIfNull(botConfig);
         ArgumentNullException.ThrowIfNull(mediaConfig);
@@ -116,7 +118,8 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(graphLogger);
         ArgumentNullException.ThrowIfNull(transcriberFactory);
-        
+        ArgumentNullException.ThrowIfNull(metadataResolver);
+
         _botConfig = botConfig;
         _mediaConfig = mediaConfig;
         _joinModeSettings = joinModeSettings;
@@ -124,6 +127,7 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
         _logger = logger;
         _graphLogger = graphLogger;
         _transcriberFactory = transcriberFactory;
+        _metadataResolver = metadataResolver;
         // Note: serviceProvider is kept in signature for DI but not used
     }
 
@@ -649,11 +653,16 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
             throw new InvalidOperationException($"Bot is already in a call for thread: {threadId}");
         }
 
-        // threadId = chatInfo.ThreadId, the meeting chat thread id.
-        // Use it as best-effort meeting_id until Graph resolution is available.
+        // Resolve the canonical Graph onlineMeeting.id before any meeting.* events
+        // are published. The chat thread id (19:meeting_xxx@thread.v2) is NOT the
+        // onlineMeeting.id; we bridge via GET /chats/{threadId} → joinWebUrl →
+        // GET /users/{organizerOid}/onlineMeetings?filter=joinWebUrl eq '...'.
+        var organizerOid = meetingInfo.Organizer?.User?.Id;
+        var resolvedMeetingId = await TryResolveMeetingIdFromChatThreadAsync(threadId, organizerOid);
+
         transcriber.MeetingRef = new Models.MeetingRef
         {
-            MeetingId = threadId,
+            MeetingId = resolvedMeetingId ?? threadId,
             MeetingChatThreadId = threadId,
         };
 
@@ -698,6 +707,40 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
 
         // If no pending transcriber, create a new one using the factory
         return _transcriberFactory.Create();
+    }
+
+    private async Task<string?> TryResolveMeetingIdFromChatThreadAsync(
+        string chatThreadId,
+        string? organizerOid)
+    {
+        if (string.IsNullOrWhiteSpace(chatThreadId) || string.IsNullOrWhiteSpace(organizerOid))
+        {
+            return null;
+        }
+        try
+        {
+            var chat = await _metadataResolver.GetChatAsync(chatThreadId, CancellationToken.None);
+            if (chat?.JoinWebUrl is null)
+            {
+                return null;
+            }
+            var meeting = await _metadataResolver.GetOnlineMeetingByJoinUrlAsync(
+                organizerOid, chat.JoinWebUrl, CancellationToken.None);
+            if (!string.IsNullOrWhiteSpace(meeting?.Id))
+            {
+                _logger.LogInformation(
+                    "Resolved canonical MeetingId={MeetingId} from ChatThreadId={ChatThreadId}",
+                    meeting!.Id, chatThreadId);
+                return meeting.Id;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "Could not resolve canonical meeting_id for ChatThreadId={ChatThreadId}; using thread id as fallback",
+                chatThreadId);
+        }
+        return null;
     }
 
     private string ResolveEffectiveTenantId(string? organizerTenantId)

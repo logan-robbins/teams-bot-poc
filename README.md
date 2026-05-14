@@ -34,50 +34,75 @@ ship in this repo as the canonical consumer.
   │   Names    ──► resolved via GraphApiClient using RSCs            │
   │                                                                  │
   │   Every event flows through EventFanoutDispatcher.PublishAsync:  │
-  │     ├─► MeetingAuditLogger   (per-thread NDJSON on disk)         │
-  │     ├─► BlobEventArchive     (per-channel/meeting .txt blobs)    │
-  │     └─► per-channel consumer URLs  (POST /events, retry/queue)   │
+  │     ├─► BlobEventArchive   (per-event JSON blobs in Blob Storage) │
+  │     └─► per-channel consumer URLs  (POST, retry/queue)           │
   │                                                                  │
-  │   Linkage: chat command "@Alfred link to <channel-name>" persists│
-  │   a MeetingChannelLink; dispatcher then stamps every event from  │
-  │   that meeting with the linked team/channel ids so it rolls up.  │
+  │   Schema: alfred-v2. Two event families:                         │
+  │     channel.*   → ChannelRef { team_id, channel_id, thread_id }  │
+  │     meeting.*   → MeetingRef { meeting_id, channel_link? }       │
+  │                                                                  │
+  │   Linkage: "@Alfred link to <channel>" persists a channel_link   │
+  │   on MeetingRef. All subsequent meeting events carry the link.   │
   └────────────────────┬─────────────────────────────────────────────┘
                        │
-                       │  POST  https://{consumer}/events     (HTTP)
-                       │  PUT   stalfreddisney/alfred-events  (Blob)
+                       │  POST  https://{consumer}/v2/events  (HTTP)
+                       │  PUT   stalfreddisney/alfred-events   (Blob)
                        ▼
   ┌──────────────────────────────────────────────────────────────────┐
-  │   PYTHON SINK   python/   ·   ca-alfred-api Container App       │
+  │   PYTHON SINK   python/   ·   ca-alfred-api Container App        │
+  │   (⚠ in-progress rewrite to v2 — currently running v1 schema)    │
   │                                                                  │
-  │   /events    →  raw_ingest_events (immutable audit)              │
-  │                 + working meeting_events ledger                  │
-  │   /m/{id}/*  →  per-session status / dossier / SSE stream       │
-  │   /c/{t}/{c}/events → unified channel timeline (chat + meetings) │
+  │   POST /v2/events  →  single ingest for all event types          │
+  │   GET  /v2/teams/{tid}/channels/{cid}/threads/…  hierarchical    │
+  │   GET  /v2/meetings/{mid}/…                       reads          │
+  │   GET  /v2/resolve?kind=meeting&subject=…         name lookup    │
+  │   GET  /v2/index                                  index files    │
   │                                                                  │
-  │   AlfredAnalyzer (gpt-5-mini, OpenAI Agents SDK):                │
+  │   AlfredAnalyzer (claude-haiku-4-5, Anthropic Agents SDK):       │
   │     · runs on every debounced tick                               │
-  │     · emits one AlfredExtraction (summary + structured items)    │
-  │     · two tools: send_to_meeting_chat, fetch_meeting_transcript  │
+  │     · tools: send_to_meeting_chat, fetch_meeting_transcript,     │
+  │              list_meetings, resolve_meeting_by_name              │
   │     · spec: python/batcave_platform/specs/alfred.yaml            │
   └────────────────────┬─────────────────────────────────────────────┘
                        │  SSE + JSON
                        ▼
   ┌──────────────────────────────────────────────────────────────────┐
   │   REACT UI   web/   ·   ca-alfred-web Container App              │
-  │     /                    → meeting picker                        │
-  │     /m/<chat_thread_id>  → per-meeting dossier (read-only)       │
+  │   (⚠ in-progress rewrite to v2 — currently pointing at v1 API)   │
+  │     /                    → meeting picker (by subject)           │
+  │     /m/<meeting_id>      → per-meeting dossier (read-only)       │
   │     /channels            → consumer admin + join-any-meeting     │
   │     /channels/inspect/.. → per-channel command center            │
   │     /archive             → blob-archive folder browser           │
-  │     /debug               → per-thread NDJSON tail                │
   └──────────────────────────────────────────────────────────────────┘
 ```
 
-**Single key:** `chat_thread_id`
-(`19:meeting_xxx@thread.v2` for a meeting,
-`19:{channelId}@thread.tacv2` for a channel). Every event carries
-it. Optional `team_id` / `channel_id` / `channel_thread_id` stamp
-enables channel-wide rollups without joins.
+**Two canonical keys, mirroring the Microsoft Graph URL hierarchy:**
+
+```
+Team (team_id)
+  └── Channel (team_id, channel_id)
+        └── Thread (thread_id = root message id)
+              └── Messages / Attachments
+
+Meeting (meeting_id = Graph onlineMeeting id)
+  ├── Chat (meeting_chat_thread_id) → Messages / Attachments
+  ├── Transcripts → partial / final / official VTT
+  └── channel_link? → optional back-reference to (team_id, channel_id)
+```
+
+**Channel meetings have no audio.** The bot lacks `Calls.AccessMedia`
+at team scope. A meeting inside a channel shows up only as
+`channel.message.*` events. The `meeting.*` event family exists only
+for **private meetings the bot was added to via `+ Apps`**.
+
+**The channel-link problem.** Microsoft Graph does not natively tie a
+meeting to a channel. Alfred bridges this via: (a) Bot Framework
+`channelData` when the Teams client tells us which channel spawned the
+meeting, (b) the `@Alfred link to <channel-name>` chat command, or (c)
+`GraphMetadataResolver` lookups at join time. The `channel_link` on
+`MeetingRef` is the result; once set, it rides on every subsequent
+event for that meeting.
 
 ---
 
@@ -260,19 +285,24 @@ rolls up under the named channel.
 ```bash
 BOT=https://alfred-disney-bot.eastus.cloudapp.azure.com
 SINK=https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io
+SA=https://stalfreddisney.blob.core.windows.net/alfred-events
 
 curl -sS $BOT/api/calling/health | jq            # bot media readiness
 curl -sS $SINK/health                            # sink
 
-curl -sS $BOT/api/channels | jq                  # attachments + last_auto_join_attempt
-curl -sS $BOT/api/debug/transcripts | jq         # per-thread NDJSON audit listing
+curl -sS $BOT/api/channels | jq                  # channel attachments + last_auto_join_attempt
 
-curl -sS "$SINK/m/<chat_thread_id>/status"  | jq
-curl -sS "$SINK/m/<chat_thread_id>/ledger"  | jq
+# Blob archive index — what meetings Alfred has ever seen
+curl -sS "$SA/indexes/meetings.json" | jq 'to_entries | map({id:.key,subject:.value.subject})'
+
+# Meeting transcript (official VTT after meeting ends)
+MID="<meeting_id>"
+curl -sS "$SA/meetings/$MID/transcripts/official.vtt"
 
 # Manual transcript backfill (when the auto-trigger missed a meeting)
+# meeting_chat_thread_id is optional; call_id and organizer_oid are required
 curl -sS -X POST "$BOT/api/debug/fetch-transcript" -H 'Content-Type: application/json' \
-  -d '{"call_id":"...","organizer_oid":"...","team_id":"...","channel_id":"...","channel_thread_id":"..."}'
+  -d '{"call_id":"...","organizer_oid":"...","meeting_chat_thread_id":"..."}'
 ```
 
 **See `AGENTS.md` §7** for the full symptom→fix index (auto-join
@@ -283,35 +313,29 @@ name caching, etc.).
 
 ## 8. Editing rules (do not violate)
 
-1. **Single canonical meeting ledger** — `InterviewSession.meeting_events`,
-   one session per `chat_thread_id`. Immutable layer is
-   `raw_ingest_events`; back-link new ledger rows via
-   `source_raw_event_ids`.
-2. **`chat_thread_id` is THE meeting key.** Every transcript and chat
-   carries it; UI URL requires it. Never reintroduce a "current
-   meeting" fallback.
-3. **One inbound chat path** — Bot Framework `/api/messages` → C#
+1. **`meeting_id` is the canonical meeting key** — the Graph
+   `onlineMeeting` id (URL-safe base64). `meeting_chat_thread_id` is a
+   sub-resource. Never use `chat_thread_id` as a surrogate meeting key.
+2. **Discriminated envelope** — every `AlfredEventEnvelope` has exactly
+   one of `ChannelRef` or `MeetingRef` populated, never both, never
+   neither. The discriminator is the `event_type` prefix (`channel.*`
+   → `ChannelRef`; `meeting.*` → `MeetingRef`).
+3. **No v1 shims.** Do not add "if old schema, do X else Y" branches.
+   `alfred-v2` is the only schema the bot emits. v1 is dead.
+4. **Channel meetings have no `meeting.*` events.** They surface only
+   as `channel.message.*` on the channel thread. Do not model channel
+   meetings as first-class `Meeting` entities.
+5. **One inbound chat path** — Bot Framework `/api/messages` → C#
    bot publishes via `EventFanoutDispatcher`. No parallel ingress.
-4. **Outbound Alfred chat** goes through the
-   `send_to_meeting_chat` tool. The old `teams_chat` output route is
-   gone.
-5. **Agent contract** = `AlfredExtraction` (structured output) +
-   `send_to_meeting_chat` + `fetch_meeting_transcript`. **Do not**
-   reintroduce a `SEND/ASK/SILENT` enum.
-6. **`alfred.yaml` is the sole source of truth** for Alfred's prompt
+6. **Outbound Alfred chat** goes through the `send_to_meeting_chat`
+   tool only.
+7. **`alfred.yaml` is the sole source of truth** for Alfred's prompt
    and intervention policy. `AlfredAnalyzer` raises at construction
    if `instructions` is missing — do not add a code fallback.
-7. **One canonical implementation per concern.** No duplicate files,
-   no parallel paths, no `v2` copies. If a feature is multi-tenant
-   in spirit, model it as a single lookup with one entry today.
-8. **Fail fast.** Clear, specific errors at system boundaries. No
+8. **One canonical implementation per concern.** No duplicate files,
+   no parallel paths, no `v2` copies.
+9. **Fail fast.** Clear, specific errors at system boundaries. No
    validation for impossible scenarios.
-9. **Channel link integrity.** Stamp `team_id` / `channel_id` /
-   `channel_thread_id` at write time when known; backfill prior rows
-   via `POST /session/link` or the
-   `MeetingChannelLink` chat command. Don't introduce a parallel
-   "channel session" model — channel and meeting sessions are both
-   `chat_thread_id`-keyed.
 10. **`dotnet publish` always after `rm -rf src/bin src/obj`** in any
     deploy script that touches code. See AGENTS.md §7.4.
 11. **Manifest changes** require: bump `version`, regenerate

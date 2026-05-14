@@ -122,6 +122,7 @@ try
     builder.Services.AddHttpClient<GraphApiClient>();
     builder.Services.AddSingleton<GraphNotificationCrypto>();
     builder.Services.AddSingleton<GraphValidationTokenValidator>();
+    builder.Services.AddSingleton<GraphMetadataResolver>();
     builder.Services.AddSingleton<GraphNotificationProcessor>();
     builder.Services.AddSingleton<EventFanoutDispatcher>();
     builder.Services.AddSingleton<OfficialTranscriptFetcher>();

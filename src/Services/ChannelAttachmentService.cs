@@ -1,5 +1,3 @@
-using Microsoft.Bot.Builder;
-using Microsoft.Bot.Schema;
 using Microsoft.Extensions.Hosting;
 using TeamsMediaBot.Models;
 
@@ -91,17 +89,20 @@ public sealed class ChannelAttachmentService : IChannelAttachmentService, IHoste
     private readonly ChannelAttachmentStore _store;
     private readonly IMeetingChatService _meetingChatService;
     private readonly EventDispatchConfiguration _dispatchConfig;
+    private readonly EventFanoutDispatcher _dispatcher;
     private readonly ILogger<ChannelAttachmentService> _logger;
 
     public ChannelAttachmentService(
         ChannelAttachmentStore store,
         IMeetingChatService meetingChatService,
         EventDispatchConfiguration dispatchConfig,
+        EventFanoutDispatcher dispatcher,
         ILogger<ChannelAttachmentService> logger)
     {
         _store = store;
         _meetingChatService = meetingChatService;
         _dispatchConfig = dispatchConfig;
+        _dispatcher = dispatcher;
         _logger = logger;
     }
 
@@ -218,6 +219,12 @@ public sealed class ChannelAttachmentService : IChannelAttachmentService, IHoste
         };
 
         await _store.UpsertAsync(record, cancellationToken);
+
+        await PublishChannelLifecycleAsync(
+            AlfredEventTypes.ChannelAttached,
+            record.TeamId, record.ChannelId,
+            record.TeamDisplayName, record.ChannelDisplayName,
+            cancellationToken);
     }
 
     public async Task<bool> DetachAsync(
@@ -228,8 +235,55 @@ public sealed class ChannelAttachmentService : IChannelAttachmentService, IHoste
         ArgumentException.ThrowIfNullOrWhiteSpace(teamId);
         ArgumentException.ThrowIfNullOrWhiteSpace(channelId);
 
+        var existing = _store.Get(teamId, channelId);
         await _meetingChatService.DeleteChannelMessagesSubscriptionAsync(teamId, channelId, cancellationToken);
-        return await _store.RemoveAsync(teamId, channelId, cancellationToken);
+        var removed = await _store.RemoveAsync(teamId, channelId, cancellationToken);
+
+        if (removed && existing is not null)
+        {
+            await PublishChannelLifecycleAsync(
+                AlfredEventTypes.ChannelDetached,
+                teamId, channelId,
+                existing.TeamDisplayName, existing.ChannelDisplayName,
+                cancellationToken);
+        }
+
+        return removed;
+    }
+
+    private async Task PublishChannelLifecycleAsync(
+        string eventType,
+        string teamId,
+        string channelId,
+        string? teamDisplayName,
+        string? channelDisplayName,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await _dispatcher.PublishAsync(
+                new AlfredEventEnvelope
+                {
+                    EventType = eventType,
+                    EventId = Guid.NewGuid().ToString("N"),
+                    Ts = DateTimeOffset.UtcNow.ToString("O"),
+                    ChannelRef = new ChannelRef
+                    {
+                        TeamId = teamId,
+                        ChannelId = channelId,
+                        TeamDisplayName = teamDisplayName,
+                        ChannelDisplayName = channelDisplayName,
+                    },
+                    Payload = new ChannelLifecyclePayload(),
+                },
+                cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "Failed to publish {EventType} for TeamId={TeamId} ChannelId={ChannelId}",
+                eventType, teamId, channelId);
+        }
     }
 
     public IReadOnlyList<ChannelAttachmentRecord> List() => _store.List();
