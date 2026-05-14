@@ -399,111 +399,128 @@ public sealed class AlfredBot : TeamsActivityHandler
         var conversationKind = ResolveConversationKind(activity, channelData);
         var teamId = ResolveTeamId(channelData);
         var channelId = channelData?.Channel?.Id;
-
-        var payload = new ChatEventPayload
+        var ts = (activity.Timestamp ?? DateTimeOffset.UtcNow).UtcDateTime.ToString("o");
+        var sender = new SenderRef
         {
-            EventType = "chat_created",
-            ChatThreadId = chatThreadId,
-            MessageId = activity.Id ?? Guid.NewGuid().ToString("N"),
-            Text = activity.Text,
-            Html = activity.Attachments?.FirstOrDefault(a => a.ContentType == "text/html")?.Content?.ToString(),
-            SenderId = activity.From?.AadObjectId ?? activity.From?.Id,
-            SenderDisplayName = activity.From?.Name,
-            TimestampUtc = (activity.Timestamp ?? DateTimeOffset.UtcNow).UtcDateTime.ToString("o"),
-            ConversationReferenceId = chatThreadId,
-            ReplyToMessageId = activity.ReplyToId,
-            FromBot = activity.From?.Role == "bot",
-            ConversationKind = conversationKind,
-            TeamId = teamId,
-            ChannelId = channelId,
-            ChannelThreadId = channelId,
+            AadId = activity.From?.AadObjectId ?? activity.From?.Id,
+            DisplayName = activity.From?.Name,
         };
+        var fromBot = activity.From?.Role == "bot";
+        var messageId = activity.Id ?? Guid.NewGuid().ToString("N");
+        var html = activity.Attachments?.FirstOrDefault(a => a.ContentType == "text/html")?.Content?.ToString();
 
-        await _dispatcher.PublishAsync(
-            new AlfredEventEnvelope
-            {
-                EventType = AlfredEventTypes.ChatMessage,
-                EventId = Guid.NewGuid().ToString("N"),
-                Ts = payload.TimestampUtc,
-                TeamId = teamId,
-                ChannelId = channelId,
-                ChatThreadId = chatThreadId,
-                ChannelThreadId = channelId,
-                ConversationReferenceId = chatThreadId,
-                Payload = payload,
-            },
-            cancellationToken);
-
-        // Bot Framework delivers channel chat activities even when
-        // OnMembersAddedAsync didn't fire (Teams doesn't always fire
-        // it for channel installs). When we see a channel chat with
-        // full team+channel context, ensure we have an attachment with
-        // friendly display names so the admin UI shows "Engineering /
-        // General" instead of GUIDs. Idempotent on existing names.
-        if (!string.IsNullOrWhiteSpace(teamId)
+        if (string.Equals(conversationKind, "channel", StringComparison.Ordinal)
+            && !string.IsNullOrWhiteSpace(teamId)
             && !string.IsNullOrWhiteSpace(channelId))
         {
-            // We need the turnContext for TeamsInfo lookups, so do this
-            // inline (await) — TeamsInfo round-trips through Bot
-            // Framework, takes ~100ms.
+            var channelPayload = new ChannelMessagePayload
+            {
+                Sender = sender,
+                Text = activity.Text,
+                Html = html,
+                TimestampUtc = ts,
+                ReplyToMessageId = activity.ReplyToId,
+                IsRoot = string.IsNullOrWhiteSpace(activity.ReplyToId),
+                FromBot = fromBot,
+            };
+            await _dispatcher.PublishAsync(
+                new AlfredEventEnvelope
+                {
+                    EventType = AlfredEventTypes.ChannelMessageCreated,
+                    EventId = Guid.NewGuid().ToString("N"),
+                    Ts = ts,
+                    ChannelRef = new ChannelRef
+                    {
+                        TeamId = teamId!,
+                        ChannelId = channelId!,
+                        ThreadId = chatThreadId,
+                        MessageId = messageId,
+                    },
+                    ConversationReferenceId = chatThreadId,
+                    Payload = channelPayload,
+                },
+                cancellationToken);
+
+            // Bot Framework delivers channel activities even when OnMembersAddedAsync didn't fire.
+            // Ensure the attachment exists with friendly display names. Idempotent on existing names.
             await EnsureChannelAttachedAsync(
                 turnContext, teamId!, channelId!, channelData, cancellationToken);
         }
+        else
+        {
+            var meetingPayload = new MeetingChatPayload
+            {
+                MessageId = messageId,
+                Sender = sender,
+                Text = activity.Text,
+                Html = html,
+                TimestampUtc = ts,
+                ReplyToMessageId = activity.ReplyToId,
+                FromBot = fromBot,
+            };
+            await _dispatcher.PublishAsync(
+                new AlfredEventEnvelope
+                {
+                    EventType = AlfredEventTypes.MeetingChatCreated,
+                    EventId = Guid.NewGuid().ToString("N"),
+                    Ts = ts,
+                    MeetingRef = new MeetingRef
+                    {
+                        MeetingId = chatThreadId,
+                        MeetingChatThreadId = chatThreadId,
+                    },
+                    ConversationReferenceId = chatThreadId,
+                    Payload = meetingPayload,
+                },
+                cancellationToken);
 
-        // If Alfred was @-mentioned with a "link to <channel-name>"
-        // directive, persist a MeetingChannelLink so this chat's future
-        // events get stamped with the target channel's team/channel ids.
-        // Operator UX: never asks for GUIDs — just the channel display
-        // name. Bot resolves it against the current attachment list.
+            // When a meeting chat carries channel context (channel meeting), emit meeting.linked
+            // once per (chatThreadId, teamId, channelId) so consumers can roll this meeting under
+            // its parent channel.
+            if (!string.IsNullOrWhiteSpace(teamId)
+                && !string.IsNullOrWhiteSpace(channelId)
+                && !string.Equals(chatThreadId, channelId, StringComparison.Ordinal))
+            {
+                var linkKey = string.Join("|", chatThreadId, teamId, channelId);
+                if (_publishedLinks.TryAdd(linkKey, 1))
+                {
+                    var channelLink = new ChannelLink
+                    {
+                        TeamId = teamId!,
+                        ChannelId = channelId!,
+                        LinkedAtUtc = DateTimeOffset.UtcNow.ToString("O"),
+                        LinkedSource = "bot_framework_channeldata",
+                    };
+                    await _dispatcher.PublishAsync(
+                        new AlfredEventEnvelope
+                        {
+                            EventType = AlfredEventTypes.MeetingLinked,
+                            EventId = Guid.NewGuid().ToString("N"),
+                            Ts = DateTimeOffset.UtcNow.ToString("O"),
+                            MeetingRef = new MeetingRef
+                            {
+                                MeetingId = chatThreadId,
+                                MeetingChatThreadId = chatThreadId,
+                                ChannelLink = channelLink,
+                            },
+                            ConversationReferenceId = chatThreadId,
+                            Payload = new MeetingLinkedPayload { LinkedSource = "bot_framework_channeldata" },
+                        },
+                        cancellationToken);
+                }
+            }
+        }
+
+        // If Alfred was @-mentioned with a "link to <channel-name>" directive, handle it.
         if (WasBotMentioned(activity))
         {
             await TryHandleMeetingLinkCommandAsync(turnContext, chatThreadId, cancellationToken);
         }
 
-        // If Alfred was @-mentioned in any meeting (regular or channel
-        // meeting) AND isn't already in the call, treat it as user
-        // intent to bring him in. Per-thread dedupe inside
-        // TryAutoJoinMeetingChatAsync handles repeated mentions.
+        // If Alfred was @-mentioned in any meeting chat AND isn't already in the call, auto-join.
         if (LooksLikeMeetingChat(chatThreadId) && WasBotMentioned(activity))
         {
             _ = Task.Run(() => TryAutoJoinMeetingChatAsync(chatThreadId, "at_mention"));
-        }
-
-        // If this activity is in a meeting chat that was spawned from a
-        // channel (channelData carries team + channel, but the chat
-        // thread id is the meeting's thread, not the channel's),
-        // emit a session-linked event so consumers can roll the meeting
-        // under its parent channel. De-duped per (chat_thread_id, team,
-        // channel) so we don't emit one on every chat activity.
-        if (!string.IsNullOrWhiteSpace(teamId)
-            && !string.IsNullOrWhiteSpace(channelId)
-            && !string.Equals(chatThreadId, channelId, StringComparison.Ordinal))
-        {
-            var linkKey = string.Join("|", chatThreadId, teamId, channelId);
-            if (_publishedLinks.TryAdd(linkKey, 1))
-            {
-                await _dispatcher.PublishAsync(
-                    new AlfredEventEnvelope
-                    {
-                        EventType = AlfredEventTypes.SessionLinked,
-                        EventId = Guid.NewGuid().ToString("N"),
-                        Ts = DateTimeOffset.UtcNow.ToString("O"),
-                        TeamId = teamId,
-                        ChannelId = channelId,
-                        ChatThreadId = chatThreadId,
-                        ChannelThreadId = channelId,
-                        ConversationReferenceId = chatThreadId,
-                        Payload = new SessionLinkedPayload
-                        {
-                            ChatThreadId = chatThreadId,
-                            TeamId = teamId!,
-                            ChannelId = channelId!,
-                            ChannelThreadId = channelId,
-                            Source = "bot_framework_channeldata",
-                        },
-                    },
-                    cancellationToken);
-            }
         }
     }
 
@@ -649,6 +666,33 @@ public sealed class AlfredBot : TeamsActivityHandler
         _logger.LogInformation(
             "Linked meeting ChatThreadId={ChatThreadId} -> Team='{Team}' / Channel='{Channel}' (via chat command)",
             chatThreadId, target.TeamDisplayName, target.ChannelDisplayName);
+
+        var channelLink = new ChannelLink
+        {
+            TeamId = target.TeamId,
+            TeamDisplayName = target.TeamDisplayName,
+            ChannelId = target.ChannelId,
+            ChannelDisplayName = target.ChannelDisplayName,
+            ThreadId = target.ConversationThreadId ?? target.ChannelId,
+            LinkedAtUtc = DateTimeOffset.UtcNow.ToString("O"),
+            LinkedSource = "manual_command",
+        };
+        await _dispatcher.PublishAsync(
+            new AlfredEventEnvelope
+            {
+                EventType = AlfredEventTypes.MeetingLinked,
+                EventId = Guid.NewGuid().ToString("N"),
+                Ts = DateTimeOffset.UtcNow.ToString("O"),
+                MeetingRef = new MeetingRef
+                {
+                    MeetingId = chatThreadId,
+                    MeetingChatThreadId = chatThreadId,
+                    ChannelLink = channelLink,
+                },
+                ConversationReferenceId = chatThreadId,
+                Payload = new MeetingLinkedPayload { LinkedSource = "manual_command" },
+            },
+            cancellationToken);
 
         await turnContext.SendActivityAsync(
             $"Linked this meeting to **{target.TeamDisplayName ?? "team"} / {target.ChannelDisplayName}**. " +

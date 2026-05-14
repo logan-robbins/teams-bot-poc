@@ -48,14 +48,11 @@ public sealed class DebugController : ControllerBase
     public IActionResult ManualFetchTranscript([FromBody] ManualFetchRequest request)
     {
         if (string.IsNullOrWhiteSpace(request.CallId) ||
-            string.IsNullOrWhiteSpace(request.OrganizerOid) ||
-            string.IsNullOrWhiteSpace(request.TeamId) ||
-            string.IsNullOrWhiteSpace(request.ChannelId) ||
-            string.IsNullOrWhiteSpace(request.ChannelThreadId))
+            string.IsNullOrWhiteSpace(request.OrganizerOid))
         {
             return BadRequest(new
             {
-                error = "call_id, organizer_oid, team_id, channel_id, channel_thread_id all required",
+                error = "call_id and organizer_oid are required",
             });
         }
 
@@ -65,15 +62,13 @@ public sealed class DebugController : ControllerBase
         var registeredAt = request.RegisteredAtUtc ?? DateTimeOffset.UtcNow.AddHours(-24);
 
         _logger.LogInformation(
-            "Manual transcript fetch registered call_id={CallId} organizer={Oid} team={TeamId} channel={ChannelId} since={Since}",
-            request.CallId, request.OrganizerOid, request.TeamId, request.ChannelId, registeredAt);
+            "Manual transcript fetch registered call_id={CallId} organizer={Oid} meetingChatThreadId={MeetingChatThreadId} since={Since}",
+            request.CallId, request.OrganizerOid, request.MeetingChatThreadId, registeredAt);
 
         _transcriptFetcher.Register(
             botCallId: request.CallId!,
             organizerOid: request.OrganizerOid!,
-            teamId: request.TeamId!,
-            channelId: request.ChannelId!,
-            channelThreadId: request.ChannelThreadId!,
+            meetingChatThreadId: request.MeetingChatThreadId ?? string.Empty,
             registeredAtUtc: registeredAt);
 
         return Ok(new
@@ -81,7 +76,7 @@ public sealed class DebugController : ControllerBase
             ok = true,
             registered_call_id = request.CallId,
             registered_at_utc = registeredAt,
-            note = "Fetcher polls Graph for up to ~10 minutes. Watch _official-transcript.txt under meetings/<sanitizedChannelId>;messageid_*/.",
+            note = "Fetcher polls Graph for up to ~30 minutes. Watch meetings/<meeting_id>/transcripts/ in blob storage.",
         });
     }
 
@@ -93,14 +88,8 @@ public sealed class DebugController : ControllerBase
         [JsonProperty("organizer_oid")]
         public string? OrganizerOid { get; set; }
 
-        [JsonProperty("team_id")]
-        public string? TeamId { get; set; }
-
-        [JsonProperty("channel_id")]
-        public string? ChannelId { get; set; }
-
-        [JsonProperty("channel_thread_id")]
-        public string? ChannelThreadId { get; set; }
+        [JsonProperty("meeting_chat_thread_id")]
+        public string? MeetingChatThreadId { get; set; }
 
         [JsonProperty("registered_at_utc")]
         public DateTimeOffset? RegisteredAtUtc { get; set; }

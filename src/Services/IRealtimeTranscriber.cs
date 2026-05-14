@@ -1,72 +1,24 @@
+using TeamsMediaBot.Models;
+
 namespace TeamsMediaBot.Services;
 
 /// <summary>
 /// Abstraction for real-time speech-to-text implementations.
 /// </summary>
 /// <remarks>
-/// <para>
-/// Keeps the call/media pipeline independent of any single STT provider.
-/// Implementations include Deepgram (primary) and Azure Speech (fallback).
-/// </para>
-/// <para>
 /// Audio format: 16kHz, 16-bit, mono PCM (640 bytes per 20ms frame).
-/// </para>
 /// </remarks>
 public interface IRealtimeTranscriber : IAsyncDisposable
 {
     /// <summary>
-    /// Teams chat thread id of the meeting this transcriber is bound to.
-    /// Set after construction by the join workflow once the threadId is known.
-    /// Stamped on every <see cref="TeamsMediaBot.Models.TranscriptEvent"/> so
-    /// the Python sink can route transcripts to the correct meeting session.
+    /// Meeting reference stamped on every emitted transcript envelope.
+    /// Set by the join workflow after construction once the meeting id is known.
     /// </summary>
-    string? ChatThreadId { get; set; }
+    MeetingRef? MeetingRef { get; set; }
 
-    /// <summary>
-    /// Teams team (group) id of the parent channel, when the bot has
-    /// learned that this meeting was spawned from a channel. Stamped
-    /// on every emitted <see cref="TeamsMediaBot.Models.TranscriptEvent"/>
-    /// so the Python sink can roll transcripts up by channel without
-    /// a join. Null for private (non-channel) meetings.
-    /// </summary>
-    string? TeamId { get; set; }
-
-    /// <summary>
-    /// Teams channel id of the parent channel; paired with
-    /// <see cref="TeamId"/>. Null for private (non-channel) meetings.
-    /// </summary>
-    string? ChannelId { get; set; }
-
-    /// <summary>
-    /// Parent channel's conversation id (<c>19:{channelId}@thread.tacv2</c>),
-    /// distinct from this meeting's <see cref="ChatThreadId"/>. Lets
-    /// analytics group every event from every meeting back under the
-    /// channel that spawned it.
-    /// </summary>
-    string? ChannelThreadId { get; set; }
-
-    /// <summary>
-    /// Starts the transcription session.
-    /// </summary>
-    /// <param name="ct">Optional cancellation token.</param>
-    /// <returns>A task representing the asynchronous start operation.</returns>
     Task StartAsync(CancellationToken ct = default);
-    
-    /// <summary>
-    /// Pushes a PCM audio frame to the transcriber.
-    /// </summary>
-    /// <remarks>
-    /// Expected format: 16kHz sample rate, 16-bit signed, mono channel.
-    /// Teams Media SDK delivers 20ms frames (640 bytes each).
-    /// This method must be non-blocking as it's called from the audio receive callback.
-    /// </remarks>
-    /// <param name="pcmFrame">The PCM audio data.</param>
+
     void PushPcm16k16bitMono(ReadOnlySpan<byte> pcmFrame);
-    
-    /// <summary>
-    /// Stops the transcription session.
-    /// </summary>
-    /// <returns>A task representing the asynchronous stop operation.</returns>
+
     Task StopAsync();
 }
-

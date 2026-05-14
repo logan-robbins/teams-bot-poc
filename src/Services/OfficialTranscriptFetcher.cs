@@ -63,9 +63,7 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
     public void Register(
         string botCallId,
         string organizerOid,
-        string teamId,
-        string channelId,
-        string channelThreadId,
+        string meetingChatThreadId,
         DateTimeOffset registeredAtUtc)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -78,8 +76,7 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
             return;
         }
 
-        var pending = new PendingFetch(
-            botCallId, organizerOid, teamId, channelId, channelThreadId, registeredAtUtc);
+        var pending = new PendingFetch(botCallId, organizerOid, meetingChatThreadId, registeredAtUtc);
 
         _activeFetches.GetOrAdd(botCallId, _ => Task.Run(() => RunAsync(pending, _cts.Token)));
     }
@@ -121,15 +118,15 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
             }
 
             _logger.LogWarning(
-                "Official transcript fetch timed out after {Mins} min for botCallId={CallId} team={TeamId} channel={ChannelId}.",
-                (int)PollDuration.TotalMinutes, pending.BotCallId, pending.TeamId, pending.ChannelId);
+                "Official transcript fetch timed out after {Mins} min for botCallId={CallId} meetingChatThreadId={MeetingChatThreadId}.",
+                (int)PollDuration.TotalMinutes, pending.BotCallId, pending.MeetingChatThreadId);
         }
         catch (OperationCanceledException) { /* shutdown */ }
         catch (Exception ex)
         {
             _logger.LogError(ex,
-                "Official transcript fetch crashed for botCallId={CallId} team={TeamId} channel={ChannelId}.",
-                pending.BotCallId, pending.TeamId, pending.ChannelId);
+                "Official transcript fetch crashed for botCallId={CallId} meetingChatThreadId={MeetingChatThreadId}.",
+                pending.BotCallId, pending.MeetingChatThreadId);
         }
         finally
         {
@@ -223,49 +220,43 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
         CancellationToken cancellationToken)
     {
         var cues = ParseVtt(vtt);
-        var payload = new OfficialTranscriptPayload
+        var fetchedAt = DateTimeOffset.UtcNow.ToString("O");
+        var payload = new MeetingOfficialTranscriptPayload
         {
-            MeetingId = meetingId,
             TranscriptId = transcriptId,
             OrganizerOid = pending.OrganizerOid,
+            FetchedAtUtc = fetchedAt,
             CreatedAtUtc = createdAt,
+            VttUrl = $"meetings/{SanitizeBlobSegment(meetingId)}/transcripts/official.vtt",
             CueCount = cues.Count,
             Cues = cues,
-            VttRaw = vtt,
         };
-
-        var envelopeChatThreadId = string.IsNullOrWhiteSpace(pending.ChannelThreadId)
-            ? meetingId
-            : pending.ChannelThreadId;
 
         await _dispatcher.PublishAsync(new AlfredEventEnvelope
         {
-            EventType = AlfredEventTypes.TranscriptOfficial,
+            EventType = AlfredEventTypes.MeetingTranscriptOfficial,
             EventId = Guid.NewGuid().ToString("N"),
-            Ts = createdAt ?? DateTimeOffset.UtcNow.ToString("O"),
-            TeamId = string.IsNullOrWhiteSpace(pending.TeamId) ? null : pending.TeamId,
-            ChannelId = string.IsNullOrWhiteSpace(pending.ChannelId) ? null : pending.ChannelId,
-            ChatThreadId = envelopeChatThreadId,
-            ChannelThreadId = string.IsNullOrWhiteSpace(pending.ChannelThreadId) ? null : pending.ChannelThreadId,
+            Ts = createdAt ?? fetchedAt,
+            MeetingRef = new MeetingRef
+            {
+                MeetingId = meetingId,
+                MeetingChatThreadId = string.IsNullOrWhiteSpace(pending.MeetingChatThreadId)
+                    ? null : pending.MeetingChatThreadId,
+            },
             Payload = payload,
         }, cancellationToken).ConfigureAwait(false);
 
-        // Also drop the canonical Microsoft VTT transcript as a single
-        // flat _official-transcript.txt in the meeting's blob folder so
-        // an operator can grab the whole meeting in one download without
-        // walking through per-event chunks. Fire-and-forget; archive
-        // failures are swallowed inside ArchiveOfficialTranscriptAsync.
         if (_blobArchive is { IsEnabled: true })
         {
-            _ = _blobArchive.ArchiveOfficialTranscriptAsync(envelopeChatThreadId, vtt, cancellationToken);
+            _ = _blobArchive.ArchiveOfficialTranscriptAsync(meetingId, vtt, cancellationToken);
         }
 
         _logger.LogInformation(
-            "Emitted transcript.official meetingId={MeetingId} transcriptId={TranscriptId} cues={CueCount} (botCallId={CallId})",
+            "Emitted meeting.transcript.official meetingId={MeetingId} transcriptId={TranscriptId} cues={CueCount} (botCallId={CallId})",
             meetingId, transcriptId, cues.Count, pending.BotCallId);
     }
 
-    private static List<OfficialTranscriptCue> ParseVtt(string vtt)
+    private static IReadOnlyList<OfficialTranscriptCue> ParseVtt(string vtt)
     {
         var cues = new List<OfficialTranscriptCue>();
         var lines = vtt.Replace("\r\n", "\n").Split('\n');
@@ -312,7 +303,7 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
 
             cues.Add(new OfficialTranscriptCue
             {
-                Speaker = speaker,
+                Speaker = speaker is null ? null : new SpeakerRef { DisplayName = speaker },
                 Text = text,
                 StartMs = startMs,
                 EndMs = endMs,
@@ -347,6 +338,9 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
     [GeneratedRegex(@"<v\s+(?<speaker>[^>]+)>(?<text>.*?)</v>", RegexOptions.Compiled | RegexOptions.Singleline)]
     private static partial Regex VoiceRegex();
 
+    private static string SanitizeBlobSegment(string s) =>
+        Regex.Replace(s, @"[^a-zA-Z0-9\-_.]", "_");
+
     public async ValueTask DisposeAsync()
     {
         if (_disposed) return;
@@ -363,8 +357,6 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
     private readonly record struct PendingFetch(
         string BotCallId,
         string OrganizerOid,
-        string TeamId,
-        string ChannelId,
-        string ChannelThreadId,
+        string MeetingChatThreadId,
         DateTimeOffset RegisteredAtUtc);
 }

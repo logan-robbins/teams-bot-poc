@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using TeamsMediaBot.Models;
 
 namespace TeamsMediaBot.Services;
 
@@ -128,6 +129,29 @@ public sealed class MeetingChannelLinkStore : IHostedService
         var semi = key.IndexOf(';');
         if (semi >= 0) key = key.Substring(0, semi);
         return _byThreadId.TryGetValue(key, out var record) ? record : null;
+    }
+
+    /// <summary>
+    /// Returns a <see cref="ChannelLink"/> for the given Graph
+    /// <c>onlineMeeting</c> id. Also checks the <c>meet-{id}</c> prefix
+    /// used for short-URL joins. Returns null when no link is found.
+    /// Full rewrite to key by meeting_id is Task 7.
+    /// </summary>
+    public ChannelLink? GetChannelLink(string meetingId)
+    {
+        if (string.IsNullOrWhiteSpace(meetingId)) return null;
+        var record = Get(meetingId) ?? Get($"meet-{meetingId}");
+        if (record is null) return null;
+        return new ChannelLink
+        {
+            TeamId = record.TeamId,
+            TeamDisplayName = record.TeamDisplayName,
+            ChannelId = record.ChannelId,
+            ChannelDisplayName = record.ChannelDisplayName,
+            ThreadId = record.ChannelThreadId,
+            LinkedAtUtc = record.LinkedAtUtc.ToString("O"),
+            LinkedSource = record.Source ?? "unknown",
+        };
     }
 
     public IReadOnlyList<MeetingChannelLinkRecord> List() => _byThreadId.Values.ToList();

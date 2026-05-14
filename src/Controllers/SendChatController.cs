@@ -162,38 +162,66 @@ public sealed class SendChatController : ControllerBase
             }
             var attachment = _attachmentStore.GetByConversationThreadId(attachmentLookupKey);
 
-            var payload = new ChatEventPayload
-            {
-                EventType = "chat_created",
-                ChatThreadId = conversationReferenceId,
-                MessageId = sentActivityId ?? Guid.NewGuid().ToString("N"),
-                Text = messageText,
-                SenderId = _botConfig.AppId,
-                SenderDisplayName = "Alfred",
-                TimestampUtc = DateTimeOffset.UtcNow.ToString("o"),
-                ConversationReferenceId = conversationReferenceId,
-                ReplyToMessageId = replyToMessageId,
-                FromBot = true,
-                ConversationKind = attachment is not null ? "channel" : "meeting_chat",
-                TeamId = attachment?.TeamId,
-                ChannelId = attachment?.ChannelId,
-                ChannelThreadId = attachment?.ChannelId,
-            };
+            var ts = DateTimeOffset.UtcNow.ToString("o");
+            var messageId = sentActivityId ?? Guid.NewGuid().ToString("N");
+            var sender = new SenderRef { AadId = _botConfig.AppId, DisplayName = "Alfred" };
 
-            await _dispatcher.PublishAsync(
-                new AlfredEventEnvelope
+            if (attachment is not null)
+            {
+                var channelPayload = new ChannelMessagePayload
                 {
-                    EventType = AlfredEventTypes.ChatMessage,
-                    EventId = Guid.NewGuid().ToString("N"),
-                    Ts = payload.TimestampUtc,
-                    TeamId = payload.TeamId,
-                    ChannelId = payload.ChannelId,
-                    ChatThreadId = conversationReferenceId,
-                    ChannelThreadId = payload.ChannelThreadId,
-                    ConversationReferenceId = conversationReferenceId,
-                    Payload = payload,
-                },
-                cancellationToken);
+                    Sender = sender,
+                    Text = messageText,
+                    TimestampUtc = ts,
+                    ReplyToMessageId = replyToMessageId,
+                    IsRoot = string.IsNullOrWhiteSpace(replyToMessageId),
+                    FromBot = true,
+                };
+                await _dispatcher.PublishAsync(
+                    new AlfredEventEnvelope
+                    {
+                        EventType = AlfredEventTypes.ChannelMessageCreated,
+                        EventId = Guid.NewGuid().ToString("N"),
+                        Ts = ts,
+                        ChannelRef = new ChannelRef
+                        {
+                            TeamId = attachment.TeamId,
+                            ChannelId = attachment.ChannelId,
+                            ThreadId = conversationReferenceId,
+                            MessageId = messageId,
+                        },
+                        ConversationReferenceId = conversationReferenceId,
+                        Payload = channelPayload,
+                    },
+                    cancellationToken);
+            }
+            else
+            {
+                var meetingPayload = new MeetingChatPayload
+                {
+                    MessageId = messageId,
+                    Sender = sender,
+                    Text = messageText,
+                    TimestampUtc = ts,
+                    ReplyToMessageId = replyToMessageId,
+                    FromBot = true,
+                };
+                await _dispatcher.PublishAsync(
+                    new AlfredEventEnvelope
+                    {
+                        EventType = AlfredEventTypes.MeetingChatCreated,
+                        EventId = Guid.NewGuid().ToString("N"),
+                        Ts = ts,
+                        MeetingRef = new MeetingRef
+                        {
+                            MeetingId = conversationReferenceId,
+                            MeetingChatThreadId = conversationReferenceId,
+                        },
+                        ConversationReferenceId = conversationReferenceId,
+                        Payload = meetingPayload,
+                    },
+                    cancellationToken);
+            }
         }
         catch (Exception ex)
         {

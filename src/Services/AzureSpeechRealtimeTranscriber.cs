@@ -122,16 +122,7 @@ public sealed class AzureSpeechRealtimeTranscriber : IRealtimeTranscriber
     private long _bytesReceived;
 
     /// <inheritdoc/>
-    public string? ChatThreadId { get; set; }
-
-    /// <inheritdoc/>
-    public string? TeamId { get; set; }
-
-    /// <inheritdoc/>
-    public string? ChannelId { get; set; }
-
-    /// <inheritdoc/>
-    public string? ChannelThreadId { get; set; }
+    public MeetingRef? MeetingRef { get; set; }
 
     // Transcript file path - save to Desktop for easy viewing
     private static readonly string TranscriptFilePath = Path.Combine(
@@ -295,49 +286,38 @@ public sealed class AzureSpeechRealtimeTranscriber : IRealtimeTranscriber
     }
 
     /// <summary>
-    /// Fire-and-forget publish to Python (don't block audio thread)
-    /// Also saves to desktop file for easy viewing
-    /// 
+    /// Fire-and-forget publish (don't block audio thread). Also saves to desktop file.
     /// NOTE: This class is deprecated. Use AzureConversationTranscriber for diarization support.
     /// </summary>
     private void FireAndForget(string kind, string? text, string? details = null)
     {
-        var timestamp = DateTime.UtcNow.ToString("O");
-        
-        // Map old event types to new format
-        var eventType = kind switch
+        var envelopeType = kind switch
         {
-            "recognizing" => "partial",
-            "recognized" => "final",
-            "session_started" => "session_started",
-            "session_stopped" => "session_stopped",
-            "canceled" => "error",
-            _ => kind
+            "recognizing" => AlfredEventTypes.MeetingTranscriptPartial,
+            "recognized" => AlfredEventTypes.MeetingTranscriptFinal,
+            _ => null,
         };
-        
-        EventError? error = null;
-        if (kind == "canceled" && !string.IsNullOrWhiteSpace(details))
+
+        if (envelopeType is not null && MeetingRef is not null)
         {
-            error = new EventError("AZURE_SPEECH_ERROR", details);
+            var ts = DateTime.UtcNow.ToString("O");
+            var payload = new MeetingTranscriptPayload
+            {
+                Text = text ?? string.Empty,
+                TimestampUtc = ts,
+                Provider = new TranscriptProvider { Name = "azure_speech" },
+            };
+            _ = _dispatcher.PublishAsync(new AlfredEventEnvelope
+            {
+                EventType = envelopeType,
+                EventId = Guid.NewGuid().ToString("N"),
+                Ts = ts,
+                MeetingRef = MeetingRef,
+                Payload = payload,
+            });
         }
-        
-        var evt = new TranscriptEvent(
-            EventType: eventType,
-            Text: text,
-            TimestampUtc: timestamp,
-            ChatThreadId: ChatThreadId,
-            Metadata: new EventMetadata(Provider: "azure_speech", Model: null, SessionId: null),
-            Error: error,
-            TeamId: TeamId,
-            ChannelId: ChannelId,
-            ChannelThreadId: ChannelThreadId
-        );
-        
-        // Publish through the fan-out dispatcher (non-blocking).
-        _ = _dispatcher.PublishTranscriptAsync(evt);
-        
-        // Also save to desktop file
-        _ = Task.Run(() => SaveToFile(kind, text, timestamp));
+
+        _ = Task.Run(() => SaveToFile(kind, text, DateTime.UtcNow.ToString("O")));
     }
     
     /// <summary>

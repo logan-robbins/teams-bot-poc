@@ -116,17 +116,18 @@ public sealed class EventFanoutDispatcher : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(envelope);
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        // If a meeting chat has been linked to a channel via the
-        // `@Alfred link to <channel>` command, stamp the envelope with
-        // that channel's team/channel ids BEFORE audit + blob + fan-out
-        // see it. This makes blob paths route under the channel's
-        // folder and the sink's session_channel_links table see the
-        // join automatically.
+        // If a meeting has been linked to a channel via the `@Alfred link to <channel>`
+        // command, stamp the ChannelLink onto MeetingRef BEFORE audit + blob + fan-out
+        // see it, so blob paths and consumer routing use the linked channel.
         envelope = StampWithMeetingLinkIfApplicable(envelope);
 
-        if (_auditLogger is not null && !string.IsNullOrWhiteSpace(envelope.ChatThreadId))
+        var auditKey = envelope.MeetingRef?.MeetingId
+            ?? (envelope.ChannelRef is not null
+                ? $"{envelope.ChannelRef.TeamId}|{envelope.ChannelRef.ChannelId}"
+                : null);
+        if (_auditLogger is not null && auditKey is not null)
         {
-            _auditLogger.Append(envelope.ChatThreadId, AuditFolderFor(envelope.EventType), envelope);
+            _auditLogger.Append(auditKey, AuditFolderFor(envelope.EventType), envelope);
         }
 
         // Partial-transcript throttle: STT emits interim hypotheses every
@@ -184,51 +185,43 @@ public sealed class EventFanoutDispatcher : IAsyncDisposable
 
     private static string AuditFolderFor(string eventType) => eventType switch
     {
-        AlfredEventTypes.TranscriptPartial or AlfredEventTypes.TranscriptFinal => "transcript",
-        AlfredEventTypes.ChatMessage => "chat",
-        // Everything else (system.*, transcript.official, meeting lifecycle)
-        // lands in system.ndjson so the chat tail stays clean.
+        AlfredEventTypes.MeetingTranscriptPartial or AlfredEventTypes.MeetingTranscriptFinal => "transcript",
+        AlfredEventTypes.ChannelMessageCreated or AlfredEventTypes.ChannelMessageUpdated or
+        AlfredEventTypes.ChannelMessageDeleted or AlfredEventTypes.MeetingChatCreated or
+        AlfredEventTypes.MeetingChatUpdated or AlfredEventTypes.MeetingChatDeleted => "chat",
         _ => "system",
     };
 
     private AlfredEventEnvelope StampWithMeetingLinkIfApplicable(AlfredEventEnvelope envelope)
     {
         if (_meetingLinks is null) return envelope;
-        // If a team_id and channel_id are already present, the event
-        // originated from a channel-aware source path and the operator
-        // link is redundant. Leave it alone.
-        if (!string.IsNullOrWhiteSpace(envelope.TeamId) &&
-            !string.IsNullOrWhiteSpace(envelope.ChannelId))
-        {
-            return envelope;
-        }
-        if (string.IsNullOrWhiteSpace(envelope.ChatThreadId)) return envelope;
-        var link = _meetingLinks.Get(envelope.ChatThreadId);
+        if (envelope.MeetingRef is null) return envelope;
+        // If a channel link is already present the event is already stamped.
+        if (envelope.MeetingRef.ChannelLink is not null) return envelope;
+        var link = _meetingLinks.GetChannelLink(envelope.MeetingRef.MeetingId);
         if (link is null) return envelope;
         return envelope with
         {
-            TeamId = link.TeamId,
-            ChannelId = link.ChannelId,
-            ChannelThreadId = link.ChannelThreadId ?? link.ChannelId,
+            MeetingRef = envelope.MeetingRef with { ChannelLink = link },
         };
     }
 
     /// <summary>
-    /// True iff this is a <c>transcript.partial</c> for a
-    /// <c>(chat_thread_id, speaker_id)</c> we've already emitted within
-    /// the configured throttle window. Records the emit timestamp when
-    /// we pass through. Throttle of 0 disables — every partial passes.
+    /// True iff this is a <c>meeting.transcript.partial</c> for a
+    /// <c>(meeting_id, speaker_id)</c> we've already emitted within the
+    /// configured throttle window. Throttle of 0 disables — every partial passes.
     /// </summary>
     private bool IsThrottledPartial(AlfredEventEnvelope envelope)
     {
         if (_partialThrottle <= TimeSpan.Zero) return false;
-        if (!string.Equals(envelope.EventType, AlfredEventTypes.TranscriptPartial, StringComparison.Ordinal))
+        if (!string.Equals(envelope.EventType, AlfredEventTypes.MeetingTranscriptPartial, StringComparison.Ordinal))
         {
             return false;
         }
 
-        var speakerId = (envelope.Payload as TranscriptEvent)?.SpeakerId ?? "_unknown";
-        var key = $"{envelope.ChatThreadId}|{speakerId}";
+        var speakerId = (envelope.Payload as MeetingTranscriptPayload)?.Speaker?.Id ?? "_unknown";
+        var meetingId = envelope.MeetingRef?.MeetingId ?? "_unknown";
+        var key = $"{meetingId}|{speakerId}";
         var now = DateTimeOffset.UtcNow;
         var last = _lastPartialEmitted.GetValueOrDefault(key, DateTimeOffset.MinValue);
         if (now - last < _partialThrottle)
@@ -243,14 +236,22 @@ public sealed class EventFanoutDispatcher : IAsyncDisposable
     {
         ChannelAttachmentRecord? record = null;
 
-        if (!string.IsNullOrWhiteSpace(envelope.TeamId) && !string.IsNullOrWhiteSpace(envelope.ChannelId))
+        // Channel events: look up by team + channel directly.
+        if (envelope.ChannelRef is { } cr)
         {
-            record = _store.Get(envelope.TeamId!, envelope.ChannelId!);
+            record = _store.Get(cr.TeamId, cr.ChannelId);
         }
 
-        if (record is null && !string.IsNullOrWhiteSpace(envelope.ChatThreadId))
+        // Meeting events: if linked to a channel, look up by that channel.
+        if (record is null && envelope.MeetingRef?.ChannelLink is { } link)
         {
-            record = _store.GetByConversationThreadId(envelope.ChatThreadId);
+            record = _store.Get(link.TeamId, link.ChannelId);
+        }
+
+        // Fallback: look up by meeting chat thread id as a conversation id.
+        if (record is null && !string.IsNullOrWhiteSpace(envelope.MeetingRef?.MeetingChatThreadId))
+        {
+            record = _store.GetByConversationThreadId(envelope.MeetingRef.MeetingChatThreadId!);
         }
 
         if (record is not null && record.Consumers.Count > 0)
@@ -258,10 +259,6 @@ public sealed class EventFanoutDispatcher : IAsyncDisposable
             return record.Consumers;
         }
 
-        // Per-meeting installs, group chats, and any other non-channel
-        // path with no attachment record fall through to the global
-        // fallback consumer (Disney sandbox's reference sink). Without
-        // this, those events would be audited but dropped.
         return _fallbackConsumers;
     }
 
@@ -296,46 +293,6 @@ public sealed class EventFanoutDispatcher : IAsyncDisposable
             await w.DisposeAsync();
         }
         _cts.Dispose();
-    }
-
-    /// <summary>
-    /// Helper for the audio path: maps a <see cref="TranscriptEvent"/>'s
-    /// internal <c>event_type</c> ("partial" / "final") to the envelope
-    /// event type and dispatches. STT-internal lifecycle events
-    /// (<c>session_started</c>, <c>session_stopped</c>, <c>error</c>)
-    /// are intentionally not emitted as envelopes.
-    /// </summary>
-    public ValueTask PublishTranscriptAsync(
-        TranscriptEvent transcript,
-        CancellationToken cancellationToken = default)
-    {
-        ArgumentNullException.ThrowIfNull(transcript);
-
-        var envelopeType = transcript.EventType switch
-        {
-            "final" => AlfredEventTypes.TranscriptFinal,
-            "partial" => AlfredEventTypes.TranscriptPartial,
-            _ => null,
-        };
-        if (envelopeType is null || string.IsNullOrWhiteSpace(transcript.ChatThreadId))
-        {
-            return ValueTask.CompletedTask;
-        }
-
-        return PublishAsync(
-            new AlfredEventEnvelope
-            {
-                EventType = envelopeType,
-                EventId = Guid.NewGuid().ToString("N"),
-                Ts = transcript.TimestampUtc,
-                TeamId = transcript.TeamId,
-                ChannelId = transcript.ChannelId,
-                ChatThreadId = transcript.ChatThreadId!,
-                ChannelThreadId = transcript.ChannelThreadId,
-                ConversationReferenceId = transcript.ChatThreadId,
-                Payload = transcript,
-            },
-            cancellationToken);
     }
 
     /// <summary>

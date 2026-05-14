@@ -293,9 +293,14 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
         
         // Get or create transcriber (may have been pre-registered by JoinMeetingAsync)
         var transcriber = GetOrCreateTranscriber(threadId);
-        // Bind transcriber to this meeting's chat thread id so every published
-        // TranscriptEvent carries chat_thread_id for sink-side per-meeting routing.
-        transcriber.ChatThreadId ??= threadId;
+        if (transcriber.MeetingRef is null)
+        {
+            transcriber.MeetingRef = new Models.MeetingRef
+            {
+                MeetingId = threadId,
+                MeetingChatThreadId = threadId,
+            };
+        }
 
         // Get media session from call
         var mediaSession = call.GetLocalMediaSession();
@@ -586,8 +591,12 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
             throw new InvalidOperationException($"Bot is already in this meeting: {meetingId}");
         }
 
-        // Bind transcriber to this thread so any pre-Established events carry it.
-        transcriber.ChatThreadId = threadId;
+        // meetingId here is the short-URL meeting id which IS the Graph onlineMeeting id.
+        transcriber.MeetingRef = new Models.MeetingRef
+        {
+            MeetingId = meetingId,
+            MeetingChatThreadId = threadId,
+        };
 
         // Store transcriber for when CallHandler is created
         _pendingTranscribers[threadId] = transcriber;
@@ -640,8 +649,13 @@ public sealed partial class TeamsCallingBotService : IAsyncDisposable
             throw new InvalidOperationException($"Bot is already in a call for thread: {threadId}");
         }
 
-        // Bind transcriber to this thread so any pre-Established events carry it.
-        transcriber.ChatThreadId = threadId;
+        // threadId = chatInfo.ThreadId, the meeting chat thread id.
+        // Use it as best-effort meeting_id until Graph resolution is available.
+        transcriber.MeetingRef = new Models.MeetingRef
+        {
+            MeetingId = threadId,
+            MeetingChatThreadId = threadId,
+        };
 
         // Store transcriber for when CallHandler is created
         _pendingTranscribers[threadId] = transcriber;

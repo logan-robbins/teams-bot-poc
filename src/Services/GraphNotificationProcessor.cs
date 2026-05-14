@@ -133,69 +133,106 @@ public sealed partial class GraphNotificationProcessor
         try
         {
             document = await ResolveMessagePayloadAsync(notification, cancellationToken);
-            var payload = BuildChatEventPayload(notification, document);
-            if (payload is null)
+            var ctx = BuildMessageContext(notification, document);
+            if (ctx is null)
             {
                 return;
             }
 
-            var isChannel = string.Equals(payload.ConversationKind, "channel", StringComparison.Ordinal);
-            var isTracked = isChannel
-                ? _meetingChatService.IsTrackedChannel(payload.TeamId ?? string.Empty, payload.ChannelId ?? string.Empty)
-                : _meetingChatService.IsTrackedChatThread(payload.ChatThreadId);
+            var isTracked = ctx.Value.IsChannel
+                ? _meetingChatService.IsTrackedChannel(ctx.Value.TeamId ?? string.Empty, ctx.Value.ChannelId ?? string.Empty)
+                : _meetingChatService.IsTrackedChatThread(ctx.Value.ChatThreadId);
 
             if (!isTracked)
             {
                 _logger.LogDebug(
                     "Skipping Graph event for untracked source kind={Kind} thread={ChatThreadId} team={TeamId} channel={ChannelId}",
-                    payload.ConversationKind ?? "meeting_chat",
-                    payload.ChatThreadId,
-                    payload.TeamId,
-                    payload.ChannelId);
+                    ctx.Value.IsChannel ? "channel" : "meeting_chat",
+                    ctx.Value.ChatThreadId,
+                    ctx.Value.TeamId,
+                    ctx.Value.ChannelId);
                 return;
             }
 
-            // Teams emits meeting lifecycle events (call started, ended,
-            // recording exported, transcript ready) into a channel's chat
-            // stream as system-event chat messages whose body.content is
-            // JSON with scopeId + callId. Surface those under a dedicated
-            // event_type so consumers (and the UI's "Live chat" panel)
-            // see only real human + bot chat under chat.message.
-            var eventType = LooksLikeTeamsMeetingSystemPayload(payload.Text)
-                ? AlfredEventTypes.MeetingLifecycle
-                : AlfredEventTypes.ChatMessage;
+            var sender = new SenderRef { AadId = ctx.Value.SenderId, DisplayName = ctx.Value.SenderDisplayName };
 
-            await _dispatcher.PublishAsync(
-                new AlfredEventEnvelope
-                {
-                    EventType = eventType,
-                    EventId = Guid.NewGuid().ToString("N"),
-                    Ts = payload.TimestampUtc,
-                    TeamId = payload.TeamId,
-                    ChannelId = payload.ChannelId,
-                    ChatThreadId = payload.ChatThreadId,
-                    ChannelThreadId = payload.ChannelThreadId ?? payload.ChannelId,
-                    ConversationReferenceId = payload.ConversationReferenceId ?? payload.ChatThreadId,
-                    Payload = payload,
-                },
-                cancellationToken);
-
-            // If this channel post is Teams' "Meeting started" system event,
-            // auto-join the call so audio capture begins without any operator
-            // action. Idempotent on callId.
-            if (isChannel)
+            if (ctx.Value.IsChannel)
             {
-                MaybeAutoJoinChannelMeeting(payload, document?.RootElement);
+                var eventType = ctx.Value.ChangeType.Equals("updated", StringComparison.OrdinalIgnoreCase)
+                    ? AlfredEventTypes.ChannelMessageUpdated
+                    : ctx.Value.ChangeType.Equals("deleted", StringComparison.OrdinalIgnoreCase)
+                        ? AlfredEventTypes.ChannelMessageDeleted
+                        : AlfredEventTypes.ChannelMessageCreated;
 
-                // Independently: if Teams posted a meeting-export /
-                // recording-ready / transcript-ready system payload into
-                // this channel (the JSON-in-text shape with scopeId +
-                // callId + isExportedToOdsp), register the post-meeting
-                // transcript fetch. This runs even when the bot was NOT
-                // in the call — covers exec-demo scenarios where tenant
-                // calling policy blocks the bot from joining but Microsoft
-                // still produced an official Record-and-Transcribe artifact.
-                MaybeFetchPostMeetingTranscript(payload);
+                var channelPayload = new ChannelMessagePayload
+                {
+                    Sender = sender,
+                    Text = ctx.Value.Text,
+                    Html = ctx.Value.Html,
+                    TimestampUtc = ctx.Value.TimestampUtc,
+                    ReplyToMessageId = ctx.Value.ReplyToMessageId,
+                    IsRoot = string.IsNullOrWhiteSpace(ctx.Value.ReplyToMessageId),
+                    FromBot = ctx.Value.FromBot,
+                    Raw = ctx.Value.Raw,
+                };
+                await _dispatcher.PublishAsync(
+                    new AlfredEventEnvelope
+                    {
+                        EventType = eventType,
+                        EventId = Guid.NewGuid().ToString("N"),
+                        Ts = ctx.Value.TimestampUtc,
+                        ChannelRef = new ChannelRef
+                        {
+                            TeamId = ctx.Value.TeamId!,
+                            ChannelId = ctx.Value.ChannelId!,
+                            ThreadId = ctx.Value.ChatThreadId,
+                            MessageId = ctx.Value.MessageId,
+                        },
+                        ConversationReferenceId = ctx.Value.ChatThreadId,
+                        Payload = channelPayload,
+                    },
+                    cancellationToken);
+
+                // Auto-join the channel meeting when Teams posts a callStartedEventMessageDetail.
+                MaybeAutoJoinChannelMeeting(ctx.Value.TeamId!, ctx.Value.ChannelId!, ctx.Value.ChatThreadId, document?.RootElement);
+
+                // Register post-meeting transcript fetch on meeting-export system payloads.
+                MaybeFetchPostMeetingTranscript(ctx.Value.Text, ctx.Value.TeamId!, ctx.Value.ChannelId!, ctx.Value.ChatThreadId);
+            }
+            else
+            {
+                var eventType = ctx.Value.ChangeType.Equals("updated", StringComparison.OrdinalIgnoreCase)
+                    ? AlfredEventTypes.MeetingChatUpdated
+                    : ctx.Value.ChangeType.Equals("deleted", StringComparison.OrdinalIgnoreCase)
+                        ? AlfredEventTypes.MeetingChatDeleted
+                        : AlfredEventTypes.MeetingChatCreated;
+
+                var meetingPayload = new MeetingChatPayload
+                {
+                    MessageId = ctx.Value.MessageId,
+                    Sender = sender,
+                    Text = ctx.Value.Text,
+                    Html = ctx.Value.Html,
+                    TimestampUtc = ctx.Value.TimestampUtc,
+                    ReplyToMessageId = ctx.Value.ReplyToMessageId,
+                    FromBot = ctx.Value.FromBot,
+                    Raw = ctx.Value.Raw,
+                };
+                await _dispatcher.PublishAsync(
+                    new AlfredEventEnvelope
+                    {
+                        EventType = eventType,
+                        EventId = Guid.NewGuid().ToString("N"),
+                        Ts = ctx.Value.TimestampUtc,
+                        MeetingRef = new MeetingRef
+                        {
+                            MeetingId = ctx.Value.ChatThreadId,
+                            MeetingChatThreadId = ctx.Value.ChatThreadId,
+                        },
+                        ConversationReferenceId = ctx.Value.ChatThreadId,
+                        Payload = meetingPayload,
+                    },
+                    cancellationToken);
             }
         }
         finally
@@ -212,7 +249,7 @@ public sealed partial class GraphNotificationProcessor
     /// fire-and-forget so this notification handler never blocks on the
     /// SDK round-trip.
     /// </summary>
-    private void MaybeAutoJoinChannelMeeting(ChatEventPayload payload, JsonElement? root)
+    private void MaybeAutoJoinChannelMeeting(string teamId, string channelId, string channelThreadId, JsonElement? root)
     {
         if (!root.HasValue)
         {
@@ -251,7 +288,7 @@ public sealed partial class GraphNotificationProcessor
         {
             _logger.LogWarning(
                 "callStartedEventMessageDetail with no callId on channel {ChannelId}; skipping auto-join.",
-                payload.ChannelId);
+                channelId);
             return;
         }
 
@@ -261,22 +298,12 @@ public sealed partial class GraphNotificationProcessor
             return;
         }
 
-        if (string.IsNullOrWhiteSpace(payload.TeamId) ||
-            string.IsNullOrWhiteSpace(payload.ChannelId) ||
-            string.IsNullOrWhiteSpace(payload.ChannelThreadId))
-        {
-            _logger.LogWarning(
-                "Cannot auto-join callId={CallId}: missing routing context (team={TeamId} channel={ChannelId} thread={ChannelThreadId}).",
-                callId, payload.TeamId, payload.ChannelId, payload.ChannelThreadId);
-            return;
-        }
-
-        var attachment = _attachmentService.Get(payload.TeamId!, payload.ChannelId!);
+        var attachment = _attachmentService.Get(teamId, channelId);
         if (attachment is not null && !attachment.AutoJoinEnabled)
         {
             _logger.LogInformation(
                 "Auto-join disabled for team={TeamId} channel={ChannelId}; skipping callId={CallId}. Use POST /api/channels/{TeamId}/{ChannelId}/join for manual trigger.",
-                payload.TeamId, payload.ChannelId, callId, payload.TeamId, payload.ChannelId);
+                teamId, channelId, callId, teamId, channelId);
             // Drop the latch so a future re-enable + retry can succeed.
             _attemptedJoins.TryRemove(callId, out _);
             return;
@@ -302,13 +329,13 @@ public sealed partial class GraphNotificationProcessor
         }
 
         var joinUrl = ChannelMeetingJoinUrls.Build(
-            payload.ChannelThreadId!,
+            channelThreadId,
             tenantId,
             initiatorOid ?? _botConfig.AppId ?? string.Empty);
 
         _logger.LogInformation(
             "Auto-joining channel meeting: team={TeamId} channel={ChannelId} thread={ThreadId} callId={CallId} initiator={InitiatorOid}",
-            payload.TeamId, payload.ChannelId, payload.ChannelThreadId, callId, initiatorOid);
+            teamId, channelId, channelThreadId, callId, initiatorOid);
 
         // Fire-and-forget: don't block the notification handler on the
         // Graph Communications SDK call. Failure is logged; the next
@@ -338,7 +365,7 @@ public sealed partial class GraphNotificationProcessor
                     callId, result.SelectedJoinMode, result.CallId, result.Deferred, result.Message);
 
                 await _attachmentService.RecordAutoJoinAttemptAsync(
-                    payload.TeamId!, payload.ChannelId!,
+                    teamId, channelId,
                     new AutoJoinAttempt
                     {
                         Ts = DateTimeOffset.UtcNow.ToString("O"),
@@ -353,9 +380,7 @@ public sealed partial class GraphNotificationProcessor
                     _transcriptFetcher.Register(
                         botCallId: result.CallId!,
                         organizerOid: initiatorOid!,
-                        teamId: payload.TeamId!,
-                        channelId: payload.ChannelId!,
-                        channelThreadId: payload.ChannelThreadId!,
+                        meetingChatThreadId: channelThreadId,
                         registeredAtUtc: DateTimeOffset.UtcNow);
                 }
             }
@@ -363,9 +388,9 @@ public sealed partial class GraphNotificationProcessor
             {
                 _logger.LogError(jex,
                     "Auto-join workflow rejected for callId={CallId} on channel={ChannelId} code={ErrorCode}",
-                    callId, payload.ChannelId, jex.ErrorCode);
+                    callId, channelId, jex.ErrorCode);
                 await _attachmentService.RecordAutoJoinAttemptAsync(
-                    payload.TeamId!, payload.ChannelId!,
+                    teamId, channelId,
                     new AutoJoinAttempt
                     {
                         Ts = DateTimeOffset.UtcNow.ToString("O"),
@@ -381,9 +406,9 @@ public sealed partial class GraphNotificationProcessor
             {
                 _logger.LogError(ex,
                     "Auto-join failed for callId={CallId} on channel={ChannelId}",
-                    callId, payload.ChannelId);
+                    callId, channelId);
                 await _attachmentService.RecordAutoJoinAttemptAsync(
-                    payload.TeamId!, payload.ChannelId!,
+                    teamId, channelId,
                     new AutoJoinAttempt
                     {
                         Ts = DateTimeOffset.UtcNow.ToString("O"),
@@ -536,17 +561,14 @@ public sealed partial class GraphNotificationProcessor
     /// gated by the channel's team-level install, not by whether the
     /// bot was a participant.
     /// </summary>
-    private void MaybeFetchPostMeetingTranscript(ChatEventPayload payload)
+    private void MaybeFetchPostMeetingTranscript(string? text, string teamId, string channelId, string channelThreadId)
     {
-        if (string.IsNullOrWhiteSpace(payload.Text) ||
-            string.IsNullOrWhiteSpace(payload.TeamId) ||
-            string.IsNullOrWhiteSpace(payload.ChannelId) ||
-            string.IsNullOrWhiteSpace(payload.ChannelThreadId))
+        if (string.IsNullOrWhiteSpace(text))
         {
             return;
         }
 
-        var (callId, organizerOid) = ExtractMeetingMetadata(payload.Text!);
+        var (callId, organizerOid) = ExtractMeetingMetadata(text!);
         if (string.IsNullOrWhiteSpace(callId) || string.IsNullOrWhiteSpace(organizerOid))
         {
             return;
@@ -567,18 +589,33 @@ public sealed partial class GraphNotificationProcessor
 
         _logger.LogInformation(
             "Scheduling post-meeting transcript fetch from channel system event callId={CallId} organizer={Oid} team={TeamId} channel={ChannelId}",
-            callId, organizerOid, payload.TeamId, payload.ChannelId);
+            callId, organizerOid, teamId, channelId);
 
         _transcriptFetcher.Register(
             botCallId: callId!,
             organizerOid: organizerOid!,
-            teamId: payload.TeamId!,
-            channelId: payload.ChannelId!,
-            channelThreadId: payload.ChannelThreadId!,
+            meetingChatThreadId: channelThreadId,
             registeredAtUtc: registerAt);
     }
 
-    private ChatEventPayload? BuildChatEventPayload(GraphNotification notification, JsonDocument? document)
+    private readonly record struct MessageContext(
+        string ChangeType,
+        string ChatThreadId,
+        string MessageId,
+        string? Text,
+        string? Html,
+        string? SenderId,
+        string? SenderDisplayName,
+        string TimestampUtc,
+        bool FromBot,
+        bool IsChannel,
+        string? TeamId,
+        string? ChannelId,
+        string? ReplyToMessageId,
+        Dictionary<string, object?>? Raw
+    );
+
+    private MessageContext? BuildMessageContext(GraphNotification notification, JsonDocument? document)
     {
         var root = document?.RootElement;
 
@@ -629,29 +666,25 @@ public sealed partial class GraphNotificationProcessor
             ?? TryGetNestedString(root, "from", "application", "displayName");
         var senderApplicationId = TryGetNestedString(root, "from", "application", "id");
 
-        return new ChatEventPayload
-        {
-            EventType = MapEventType(notification.ChangeType),
-            ChatThreadId = chatThreadId,
-            MessageId = messageId,
-            Text = text,
-            Html = html,
-            SenderId = senderId,
-            SenderDisplayName = senderDisplayName,
-            TimestampUtc = timestamp,
-            ConversationReferenceId = chatThreadId,
-            Attachments = DeserializeJsonList(root, "attachments"),
-            Mentions = DeserializeJsonList(root, "mentions"),
-            ReplyToMessageId = TryGetString(root, "replyToId"),
-            FromBot = string.Equals(senderApplicationId, _botConfig.AppId, StringComparison.OrdinalIgnoreCase)
+        return new MessageContext(
+            ChangeType: notification.ChangeType ?? "created",
+            ChatThreadId: chatThreadId,
+            MessageId: messageId,
+            Text: text,
+            Html: html,
+            SenderId: senderId,
+            SenderDisplayName: senderDisplayName,
+            TimestampUtc: timestamp,
+            FromBot: string.Equals(senderApplicationId, _botConfig.AppId, StringComparison.OrdinalIgnoreCase)
                 || string.Equals(senderId, _botConfig.AppId, StringComparison.OrdinalIgnoreCase),
-            ConversationKind = isChannel ? "channel" : "meeting_chat",
-            TeamId = teamId,
-            ChannelId = channelId,
-            Raw = root.HasValue
+            IsChannel: isChannel,
+            TeamId: teamId,
+            ChannelId: channelId,
+            ReplyToMessageId: TryGetString(root, "replyToId"),
+            Raw: root.HasValue
                 ? JsonSerializer.Deserialize<Dictionary<string, object?>>(root.Value.GetRawText(), SerializerOptions)
-                : BuildMinimalRaw(notification, chatThreadId, messageId),
-        };
+                : BuildMinimalRaw(notification, chatThreadId, messageId)
+        );
     }
 
     /// <summary>
@@ -702,14 +735,6 @@ public sealed partial class GraphNotificationProcessor
 
         return true;
     }
-
-    private static string MapEventType(string? changeType) =>
-        changeType?.ToLowerInvariant() switch
-        {
-            "updated" => "chat_updated",
-            "deleted" => "chat_deleted",
-            _ => "chat_created",
-        };
 
     private static Dictionary<string, object?> BuildMinimalRaw(
         GraphNotification notification,

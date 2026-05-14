@@ -35,16 +35,7 @@ public sealed class DeepgramRealtimeTranscriber : IRealtimeTranscriber
     private bool _isDisposed;
 
     /// <inheritdoc/>
-    public string? ChatThreadId { get; set; }
-
-    /// <inheritdoc/>
-    public string? TeamId { get; set; }
-
-    /// <inheritdoc/>
-    public string? ChannelId { get; set; }
-
-    /// <inheritdoc/>
-    public string? ChannelThreadId { get; set; }
+    public MeetingRef? MeetingRef { get; set; }
 
     /// <summary>
     /// Initializes a new instance of the <see cref="DeepgramRealtimeTranscriber"/> class.
@@ -171,21 +162,18 @@ public sealed class DeepgramRealtimeTranscriber : IRealtimeTranscriber
     /// </remarks>
     private void ProcessTranscriptionResult(ResultResponse result)
     {
-        if (result.Channel?.Alternatives is not { Count: > 0 })
-        {
-            return;
-        }
+        if (result.Channel?.Alternatives is not { Count: > 0 }) return;
 
         var alternative = result.Channel.Alternatives[0];
-        if (string.IsNullOrWhiteSpace(alternative.Transcript))
-        {
-            return;
-        }
+        if (string.IsNullOrWhiteSpace(alternative.Transcript)) return;
 
         var isFinal = result.IsFinal ?? false;
-        var eventType = isFinal ? "final" : "partial";
+        var envelopeType = isFinal
+            ? AlfredEventTypes.MeetingTranscriptFinal
+            : AlfredEventTypes.MeetingTranscriptPartial;
 
-        // Extract speaker ID from first word (Deepgram assigns speaker per word)
+        if (MeetingRef is null) return;
+
         string? speakerId = null;
         if (_diarize && alternative.Words is { Count: > 0 })
         {
@@ -193,60 +181,48 @@ public sealed class DeepgramRealtimeTranscriber : IRealtimeTranscriber
             speakerId = firstSpeaker.HasValue ? $"speaker_{firstSpeaker.Value}" : null;
         }
 
-        // Build word-level details with timing and speaker attribution
-        List<WordDetail>? words = null;
+        IReadOnlyList<TranscriptWord>? words = null;
         if (alternative.Words is { Count: > 0 })
         {
-            words = alternative.Words.Select(w => new WordDetail(
-                Word: w.PunctuatedWord ?? w.HeardWord ?? string.Empty,
-                StartMs: (double)(w.Start ?? 0m) * 1000,
-                EndMs: (double)(w.End ?? 0m) * 1000,
-                Confidence: (float?)(w.Confidence ?? 0),
-                SpeakerId: w.Speaker.HasValue ? $"speaker_{w.Speaker.Value}" : null
-            )).ToList();
+            words = alternative.Words.Select(w => new TranscriptWord
+            {
+                Word = w.PunctuatedWord ?? w.HeardWord ?? string.Empty,
+                StartMs = (double)(w.Start ?? 0m) * 1000,
+                EndMs = (double)(w.End ?? 0m) * 1000,
+                Confidence = (float?)(w.Confidence ?? 0),
+                SpeakerId = w.Speaker.HasValue ? $"speaker_{w.Speaker.Value}" : null,
+            }).ToList();
         }
 
         var audioStartMs = (double)(result.Start ?? 0m) * 1000;
         var audioEndMs = audioStartMs + ((double)(result.Duration ?? 0m) * 1000);
 
-        // Log transcription results with structured logging
         if (isFinal)
-        {
-            _logger.LogInformation(
-                "[FINAL] Speaker={SpeakerId}: {Text}",
-                speakerId ?? "unknown",
-                alternative.Transcript);
-        }
+            _logger.LogInformation("[FINAL] Speaker={SpeakerId}: {Text}", speakerId ?? "unknown", alternative.Transcript);
         else
+            _logger.LogDebug("[PARTIAL] Speaker={SpeakerId}: {Text}", speakerId ?? "unknown", alternative.Transcript);
+
+        var ts = DateTime.UtcNow.ToString("O");
+        var payload = new MeetingTranscriptPayload
         {
-            _logger.LogDebug(
-                "[PARTIAL] Speaker={SpeakerId}: {Text}",
-                speakerId ?? "unknown",
-                alternative.Transcript);
-        }
+            Text = alternative.Transcript,
+            TimestampUtc = ts,
+            Speaker = speakerId is null ? null : new SpeakerRef { Id = speakerId },
+            AudioStartMs = audioStartMs,
+            AudioEndMs = audioEndMs,
+            Confidence = (float?)(alternative.Confidence ?? 0),
+            Words = words,
+            Provider = new TranscriptProvider { Name = "deepgram", Model = _model, SessionId = _sessionId },
+        };
 
-        var transcriptEvent = new TranscriptEvent(
-            EventType: eventType,
-            Text: alternative.Transcript,
-            TimestampUtc: DateTime.UtcNow.ToString("O"),
-            ChatThreadId: ChatThreadId,
-            SpeakerId: speakerId,
-            AudioStartMs: audioStartMs,
-            AudioEndMs: audioEndMs,
-            Confidence: (float?)(alternative.Confidence ?? 0),
-            Words: words,
-            Metadata: new EventMetadata(
-                Provider: "deepgram",
-                Model: _model,
-                SessionId: _sessionId
-            ),
-            TeamId: TeamId,
-            ChannelId: ChannelId,
-            ChannelThreadId: ChannelThreadId
-        );
-
-        // Fire-and-forget publish (don't block audio processing thread)
-        PublishEventAsync(transcriptEvent);
+        _ = _dispatcher.PublishAsync(new AlfredEventEnvelope
+        {
+            EventType = envelopeType,
+            EventId = Guid.NewGuid().ToString("N"),
+            Ts = ts,
+            MeetingRef = MeetingRef,
+            Payload = payload,
+        });
     }
 
     /// <inheritdoc/>
@@ -309,32 +285,34 @@ public sealed class DeepgramRealtimeTranscriber : IRealtimeTranscriber
     }
 
     /// <summary>
-    /// Publishes a transcript event asynchronously without blocking.
+    /// Publishes a lifecycle event. Only partial/final produce envelopes;
+    /// session_started / session_stopped / error are dropped.
     /// </summary>
     private void PublishEventAsync(string eventType, string? text, EventError? error = null)
     {
-        var transcriptEvent = new TranscriptEvent(
-            EventType: eventType,
-            Text: text,
-            TimestampUtc: DateTime.UtcNow.ToString("O"),
-            ChatThreadId: ChatThreadId,
-            Metadata: new EventMetadata(Provider: "deepgram", Model: _model, SessionId: _sessionId),
-            Error: error,
-            TeamId: TeamId,
-            ChannelId: ChannelId,
-            ChannelThreadId: ChannelThreadId
-        );
-        PublishEventAsync(transcriptEvent);
-    }
+        var envelopeType = eventType switch
+        {
+            "partial" => AlfredEventTypes.MeetingTranscriptPartial,
+            "final" => AlfredEventTypes.MeetingTranscriptFinal,
+            _ => null,
+        };
+        if (envelopeType is null || MeetingRef is null) return;
 
-    /// <summary>
-    /// Hands the event off to the per-channel fan-out dispatcher. The
-    /// dispatcher is non-blocking (per-consumer bounded queue), so this
-    /// call returns synchronously.
-    /// </summary>
-    private void PublishEventAsync(TranscriptEvent transcriptEvent)
-    {
-        _ = _dispatcher.PublishTranscriptAsync(transcriptEvent);
+        var ts = DateTime.UtcNow.ToString("O");
+        var payload = new MeetingTranscriptPayload
+        {
+            Text = text ?? string.Empty,
+            TimestampUtc = ts,
+            Provider = new TranscriptProvider { Name = "deepgram", Model = _model, SessionId = _sessionId },
+        };
+        _ = _dispatcher.PublishAsync(new AlfredEventEnvelope
+        {
+            EventType = envelopeType,
+            EventId = Guid.NewGuid().ToString("N"),
+            Ts = ts,
+            MeetingRef = MeetingRef,
+            Payload = payload,
+        });
     }
 
     /// <inheritdoc/>

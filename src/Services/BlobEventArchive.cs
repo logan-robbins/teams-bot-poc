@@ -153,39 +153,54 @@ public sealed class BlobEventArchive
         var ts = envelope.Ts ?? string.Empty;
         return envelope.EventType switch
         {
-            AlfredEventTypes.ChatMessage => SummarizeChat(envelope, ts),
-            AlfredEventTypes.TranscriptPartial => SummarizeTranscript(envelope, ts, "partial"),
-            AlfredEventTypes.TranscriptFinal => SummarizeTranscript(envelope, ts, "final"),
-            AlfredEventTypes.TranscriptOfficial => $"[{ts}] official transcript fetched (event_id={envelope.EventId})",
-            AlfredEventTypes.ChannelAttached => $"[{ts}] channel attached (team={envelope.TeamId} channel={envelope.ChannelId})",
-            AlfredEventTypes.ChannelDetached => $"[{ts}] channel detached (team={envelope.TeamId} channel={envelope.ChannelId})",
-            AlfredEventTypes.SessionLinked => $"[{ts}] session linked (thread={envelope.ChatThreadId} team={envelope.TeamId} channel={envelope.ChannelId})",
+            AlfredEventTypes.ChannelMessageCreated or
+            AlfredEventTypes.ChannelMessageUpdated or
+            AlfredEventTypes.ChannelMessageDeleted => SummarizeChannelMessage(envelope, ts),
+            AlfredEventTypes.MeetingChatCreated or
+            AlfredEventTypes.MeetingChatUpdated or
+            AlfredEventTypes.MeetingChatDeleted => SummarizeMeetingChat(envelope, ts),
+            AlfredEventTypes.MeetingTranscriptPartial => SummarizeTranscript(envelope, ts, "partial"),
+            AlfredEventTypes.MeetingTranscriptFinal => SummarizeTranscript(envelope, ts, "final"),
+            AlfredEventTypes.MeetingTranscriptOfficial => $"[{ts}] official transcript fetched (event_id={envelope.EventId})",
+            AlfredEventTypes.ChannelAttached => $"[{ts}] channel attached (team={envelope.ChannelRef?.TeamId} channel={envelope.ChannelRef?.ChannelId})",
+            AlfredEventTypes.ChannelDetached => $"[{ts}] channel detached (team={envelope.ChannelRef?.TeamId} channel={envelope.ChannelRef?.ChannelId})",
+            AlfredEventTypes.MeetingLinked => $"[{ts}] meeting linked (meetingId={envelope.MeetingRef?.MeetingId} team={envelope.MeetingRef?.ChannelLink?.TeamId} channel={envelope.MeetingRef?.ChannelLink?.ChannelId})",
             _ => $"[{ts}] {envelope.EventType} (event_id={envelope.EventId})",
         };
     }
 
-    private static string SummarizeChat(AlfredEventEnvelope envelope, string ts)
+    private static string SummarizeChannelMessage(AlfredEventEnvelope envelope, string ts)
     {
-        if (envelope.Payload is ChatEventPayload p)
+        if (envelope.Payload is ChannelMessagePayload p)
         {
-            var sender = string.IsNullOrWhiteSpace(p.SenderDisplayName)
-                ? (p.SenderId ?? "?")
-                : p.SenderDisplayName!;
+            var sender = string.IsNullOrWhiteSpace(p.Sender.DisplayName) ? (p.Sender.AadId ?? "?") : p.Sender.DisplayName!;
             var botTag = p.FromBot ? " (bot)" : string.Empty;
-            var kind = string.IsNullOrWhiteSpace(p.ConversationKind) ? "chat" : p.ConversationKind!;
             var text = (p.Text ?? string.Empty).Replace('\n', ' ');
             if (text.Length > 400) text = text.Substring(0, 400) + "…";
-            return $"[{ts}] {sender}{botTag} ({kind}): {text}";
+            return $"[{ts}] {sender}{botTag} (channel): {text}";
         }
-        return $"[{ts}] chat.message (event_id={envelope.EventId})";
+        return $"[{ts}] {envelope.EventType} (event_id={envelope.EventId})";
+    }
+
+    private static string SummarizeMeetingChat(AlfredEventEnvelope envelope, string ts)
+    {
+        if (envelope.Payload is MeetingChatPayload p)
+        {
+            var sender = string.IsNullOrWhiteSpace(p.Sender.DisplayName) ? (p.Sender.AadId ?? "?") : p.Sender.DisplayName!;
+            var botTag = p.FromBot ? " (bot)" : string.Empty;
+            var text = (p.Text ?? string.Empty).Replace('\n', ' ');
+            if (text.Length > 400) text = text.Substring(0, 400) + "…";
+            return $"[{ts}] {sender}{botTag} (meeting_chat): {text}";
+        }
+        return $"[{ts}] {envelope.EventType} (event_id={envelope.EventId})";
     }
 
     private static string SummarizeTranscript(AlfredEventEnvelope envelope, string ts, string kind)
     {
-        if (envelope.Payload is TranscriptEvent te)
+        if (envelope.Payload is MeetingTranscriptPayload p)
         {
-            var speaker = te.SpeakerId ?? "?";
-            var text = (te.Text ?? string.Empty).Replace('\n', ' ');
+            var speaker = p.Speaker?.Id ?? p.Speaker?.DisplayName ?? "?";
+            var text = (p.Text ?? string.Empty).Replace('\n', ' ');
             if (text.Length > 400) text = text.Substring(0, 400) + "…";
             return $"[{ts}] {speaker} ({kind}): {text}";
         }
@@ -205,7 +220,7 @@ public sealed class BlobEventArchive
     /// Both overwrite if a previous fetch already landed.
     /// </summary>
     public async Task ArchiveOfficialTranscriptAsync(
-        string chatThreadId,
+        string meetingId,
         string vttText,
         CancellationToken cancellationToken = default)
     {
@@ -213,29 +228,29 @@ public sealed class BlobEventArchive
         {
             return;
         }
-        if (string.IsNullOrWhiteSpace(chatThreadId) || string.IsNullOrWhiteSpace(vttText))
+        if (string.IsNullOrWhiteSpace(meetingId) || string.IsNullOrWhiteSpace(vttText))
         {
             return;
         }
 
         try
         {
-            var safeThread = SanitizePathSegment(chatThreadId);
-            var basePath = $"meetings/{safeThread}";
+            var safeMeeting = SanitizePathSegment(meetingId);
+            var basePath = $"meetings/{safeMeeting}/transcripts";
 
-            var clean = RenderHumanReadableTranscript(chatThreadId, vttText);
-            await UploadAsync($"{basePath}/_official-transcript.txt", clean, "text/plain", cancellationToken);
-            await UploadAsync($"{basePath}/_official-transcript.vtt", vttText, "text/vtt", cancellationToken);
+            var clean = RenderHumanReadableTranscript(meetingId, vttText);
+            await UploadAsync($"{basePath}/official.txt", clean, "text/plain", cancellationToken);
+            await UploadAsync($"{basePath}/official.vtt", vttText, "text/vtt", cancellationToken);
 
             _logger.LogInformation(
-                "BlobEventArchive uploaded official transcript ChatThreadId={ChatThreadId} VttBytes={Bytes} CleanBytes={Clean} Path={Path}",
-                chatThreadId, vttText.Length, clean.Length, basePath);
+                "BlobEventArchive uploaded official transcript MeetingId={MeetingId} VttBytes={Bytes} CleanBytes={Clean} Path={Path}",
+                meetingId, vttText.Length, clean.Length, basePath);
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex,
-                "BlobEventArchive official transcript write failed ChatThreadId={ChatThreadId}",
-                chatThreadId);
+                "BlobEventArchive official transcript write failed MeetingId={MeetingId}",
+                meetingId);
         }
     }
 
@@ -327,57 +342,17 @@ public sealed class BlobEventArchive
             ? parsed.ToString("yyyyMMddTHHmmssfffZ", CultureInfo.InvariantCulture)
             : DateTimeOffset.UtcNow.ToString("yyyyMMddTHHmmssfffZ", CultureInfo.InvariantCulture);
         var safeId = SanitizePathSegment(envelope.EventId ?? Guid.NewGuid().ToString("N"));
+        var safeKind = SanitizePathSegment(envelope.EventType ?? "event");
 
-        // Teams emits meeting lifecycle events (call started, meeting
-        // ended, recording exported, transcript ready) into a channel's
-        // chat stream as system-event chat messages whose body.content
-        // is JSON with scopeId + callId. They arrive at the bot as
-        // chat.message envelopes and would otherwise drown the
-        // chat.message/ folder. Route them to a separate
-        // system.meeting_lifecycle/ folder so the chat.message/ folder
-        // contains only real human + bot chat.
-        var folderKind = LooksLikeTeamsMeetingSystemMessage(envelope)
-            ? "system.meeting_lifecycle"
-            : envelope.EventType ?? "event";
-        var safeKind = SanitizePathSegment(folderKind);
-
-        if (!string.IsNullOrWhiteSpace(envelope.TeamId) &&
-            !string.IsNullOrWhiteSpace(envelope.ChannelId))
+        if (envelope.ChannelRef is { } cr)
         {
-            return $"channels/{SanitizePathSegment(envelope.TeamId!)}/{SanitizePathSegment(envelope.ChannelId!)}/{safeKind}/{ts}-{safeId}.txt";
+            return $"channels/{SanitizePathSegment(cr.TeamId)}/{SanitizePathSegment(cr.ChannelId)}/{safeKind}/{ts}-{safeId}.txt";
         }
-        var threadKey = envelope.ChatThreadId ?? "unknown-thread";
-        return $"meetings/{SanitizePathSegment(threadKey)}/{safeKind}/{ts}-{safeId}.txt";
-    }
-
-    /// <summary>
-    /// True iff this is a chat.message envelope whose <c>text</c> payload
-    /// is a Teams meeting system-event JSON blob (scopeId + callId).
-    /// These are noise in the chat.message/ folder; we route them to a
-    /// sibling system.meeting_lifecycle/ folder so the chat.message/
-    /// folder stays clean for human readers.
-    /// </summary>
-    private static bool LooksLikeTeamsMeetingSystemMessage(AlfredEventEnvelope envelope)
-    {
-        if (!string.Equals(envelope.EventType, AlfredEventTypes.ChatMessage, StringComparison.Ordinal))
+        if (envelope.MeetingRef is { } mr)
         {
-            return false;
+            return $"meetings/{SanitizePathSegment(mr.MeetingId)}/{safeKind}/{ts}-{safeId}.txt";
         }
-        if (envelope.Payload is not ChatEventPayload p) return false;
-        var text = p.Text;
-        if (string.IsNullOrWhiteSpace(text)) return false;
-        if (!text.TrimStart().StartsWith("{", StringComparison.Ordinal)) return false;
-        try
-        {
-            using var doc = JsonDocument.Parse(text);
-            if (doc.RootElement.ValueKind != JsonValueKind.Object) return false;
-            return doc.RootElement.TryGetProperty("scopeId", out _) &&
-                   doc.RootElement.TryGetProperty("callId", out _);
-        }
-        catch
-        {
-            return false;
-        }
+        return $"events/{safeKind}/{ts}-{safeId}.txt";
     }
 
     /// <summary>

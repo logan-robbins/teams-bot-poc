@@ -49,16 +49,7 @@ public sealed partial class AzureConversationTranscriber : IRealtimeTranscriber
     private bool _isDisposed;
 
     /// <inheritdoc/>
-    public string? ChatThreadId { get; set; }
-
-    /// <inheritdoc/>
-    public string? TeamId { get; set; }
-
-    /// <inheritdoc/>
-    public string? ChannelId { get; set; }
-
-    /// <inheritdoc/>
-    public string? ChannelThreadId { get; set; }
+    public MeetingRef? MeetingRef { get; set; }
 
     /// <summary>
     /// Source-generated regex to extract speaker number from "Guest-1", "Guest-2", etc.
@@ -335,10 +326,19 @@ public sealed partial class AzureConversationTranscriber : IRealtimeTranscriber
     }
 
     /// <summary>
-    /// Publishes a transcript event asynchronously without blocking.
+    /// Publishes a transcript envelope asynchronously without blocking.
+    /// STT lifecycle events (session_started, session_stopped, error) are dropped.
     /// </summary>
     private void PublishEventAsync(string eventType, string? text, string? speakerId, EventError? error = null)
     {
+        var envelopeType = eventType switch
+        {
+            "partial" => AlfredEventTypes.MeetingTranscriptPartial,
+            "final" => AlfredEventTypes.MeetingTranscriptFinal,
+            _ => null,
+        };
+        if (envelopeType is null || MeetingRef is null) return;
+
         // E3: stamp the contemporaneous Teams MediaSourceId hint (if any).
         uint? dominantMsi = null;
         uint[]? activeMsis = null;
@@ -356,24 +356,26 @@ public sealed partial class AzureConversationTranscriber : IRealtimeTranscriber
             }
         }
 
-        var transcriptEvent = new TranscriptEvent(
-            EventType: eventType,
-            Text: text,
-            TimestampUtc: DateTime.UtcNow.ToString("O"),
-            ChatThreadId: ChatThreadId,
-            SpeakerId: speakerId,
-            Metadata: new EventMetadata(Provider: "azure_speech", Model: null, SessionId: _sessionId),
-            Error: error,
-            DominantMediaSourceId: dominantMsi,
-            ActiveMediaSourceIds: activeMsis,
-            TeamId: TeamId,
-            ChannelId: ChannelId,
-            ChannelThreadId: ChannelThreadId
-        );
+        var ts = DateTime.UtcNow.ToString("O");
+        var payload = new MeetingTranscriptPayload
+        {
+            Text = text ?? string.Empty,
+            TimestampUtc = ts,
+            Speaker = speakerId is null ? null : new SpeakerRef { Id = speakerId },
+            MediaSource = (dominantMsi is not null || activeMsis is not null)
+                ? new MediaSourceSnapshot { DominantId = dominantMsi, ActiveIds = activeMsis }
+                : null,
+            Provider = new TranscriptProvider { Name = "azure_speech", SessionId = _sessionId },
+        };
 
-        // Non-blocking: dispatcher enqueues to per-consumer bounded
-        // queues internally and returns immediately.
-        _ = _dispatcher.PublishTranscriptAsync(transcriptEvent);
+        _ = _dispatcher.PublishAsync(new AlfredEventEnvelope
+        {
+            EventType = envelopeType,
+            EventId = Guid.NewGuid().ToString("N"),
+            Ts = ts,
+            MeetingRef = MeetingRef,
+            Payload = payload,
+        });
     }
 
     /// <inheritdoc/>
