@@ -81,7 +81,34 @@ enables channel-wide rollups without joins.
 
 ---
 
-## 2. Where the code lives
+## 2. Two tenants — read this before debugging permissions
+
+This deployment straddles two Entra / Teams tenants with very
+different control:
+
+| Tenant | What lives here | Our role |
+|---|---|---|
+| **`plutosdoghouse.com`** (id `38387f0b-...`) — the **Sandbox** Teams + Entra tenant where Alfred is installed as a Teams app, where meetings happen, and where chat flows | Teams manifest install, RSC grants on each install, the actual Teams meetings + channels the bot listens to | **Tenant member only** — we are **not** Entra / Teams admins here. We **cannot** run `Grant-CsApplicationAccessPolicy`, `New-CsApplicationAccessPolicy`, or grant any tenant-wide Entra app permissions. Everything we get is RSC-scoped at install time. |
+| **`disney.com` → WDI R&D subscription `e02c0038-...`** — the Azure subscription where the **infrastructure** runs | C# bot VM, Container Apps (sink + UI), ACR, Azure OpenAI, Speech Services, Storage account `stalfreddisney`, Bot Service registration | **Subscription Contributors.** We can deploy anything, change env vars, build images, restart services. **No** Entra-admin rights even here — Azure AD app-registration **Owners** can edit the Alfred app registration (`207a38a4-...`); other Entra-admin actions need a separate principal. |
+
+Concrete consequences:
+- **Anything that needs a tenant policy grant in Sandbox is out of
+  reach.** That includes `CsApplicationAccessPolicy` (the
+  7504/7505 unlock) and `OnlineMeetingTranscript.Read.All`. We
+  always have to find an RSC-only path or work around it.
+- **The bot's App Registration owner** in WDI Entra determines the
+  "via {UPN}" parenthetical Teams shows next to Alfred's chat
+  messages. Change it via Azure Portal → Entra ID → App
+  registrations → Owners (WDI admins can; Sandbox admins cannot).
+- **Manifest upload + admin consent** happens in the **Sandbox**
+  tenant. We submit the zip; a Sandbox admin (e.g., Michael
+  Barron) approves it. Re-uploading a new manifest version
+  requires that same admin's approval. Adding a new RSC further
+  requires every existing team installation to **update** the app.
+
+---
+
+## 3. Where the code lives
 
 | Path | Role | Build | Deploys to |
 |---|---|---|---|
@@ -93,37 +120,6 @@ enables channel-wide rollups without joins.
 | `manifest/` | Teams app manifest (currently **v1.0.11**, 16 RSCs) | `cd manifest && zip alfred-sandbox.zip manifest.json color.png outline.png` | Teams Admin Center / Developer Portal |
 | `scripts/deploy-azure-vm.sh` | One-shot bot VM deploy (Phase 1: bootstrap, Phase 2: publish + restart) | — | — |
 | `docs/` | Reference docs ([event-contract](docs/event-contract.md), [retrieving-transcripts](docs/retrieving-transcripts.md), STT comparisons, auto-invite setup) | — | — |
-
----
-
-## 3. Critical paths in each component
-
-### Bot (`src/`)
-
-- **`Services/AlfredBot.cs`** — Bot Framework activity handler. `OnMessageActivityAsync` is the inbound chat hot path. Calls `EnsureChannelAttachedAsync` (idempotent channel attach + display-name enrichment via Graph), `TryHandleMeetingLinkCommandAsync` (`@Alfred link to <channel-name>`), and dispatches a `chat.message` envelope. Auto-join is fire-and-forget inside `TryAutoJoinMeetingChatAsync`.
-- **`Services/EventFanoutDispatcher.cs`** — the single outbound path. `PublishAsync(envelope)` stamps meeting links, fires audit → blob → per-consumer queue. Partial-throttle (`EventDispatch:PartialThrottleSeconds`, default 60) caps STT partials per `(thread, speaker)`.
-- **`Services/BlobEventArchive.cs`** — anonymous-read blob mirror of every event. System payloads (Teams meeting lifecycle JSON / `<URIObject>`) route to `system.meeting_lifecycle/`; everything else to `{eventKind}/`.
-- **`Services/GraphNotificationProcessor.cs`** — handles `teams/{teamId}/channels/{channelId}/messages` notifications. `MaybeAutoJoinChannelMeeting` (call-started detection) and `MaybeFetchPostMeetingTranscript` (transcript-ready trigger from JSON + URIObject system payloads) both live here.
-- **`Services/OfficialTranscriptFetcher.cs`** — polls Graph for the post-meeting Microsoft transcript. **Beta endpoint only**; pinned to `https://graph.microsoft.com/beta/appCatalogs/teamsApps/{appId}/installedToOnlineMeetings/...`. Writes `_official-transcript.txt` (clean speaker-per-line) + `_official-transcript.vtt` (raw).
-- **`Services/ChannelAttachmentStore.cs`** + **`MeetingChannelLinkStore.cs`** — file-backed registries on the VM (`C:\teams-bot-poc\state\*.json`), reloaded as IHostedServices on startup.
-- **`Controllers/CallingController.cs`** — `POST /api/calling/join` (any meeting URL), `/api/calling/health`.
-- **`Controllers/DebugController.cs`** — read-only NDJSON tail + `POST /api/debug/fetch-transcript` for manual transcript backfill.
-
-### Sink (`python/`)
-
-- **`transcript_sink.py`** — FastAPI app. `POST /events` is the single ingress; routes by `event_type`. `GET /m/{chat_thread_id}/{status|ledger|dossier|events(SSE)}`. `GET /c/{teamId}/{channelId}/events` is the unified channel timeline.
-- **`meeting_agent/session.py`** — `InterviewSessionManager` per `chat_thread_id`. Owns the working ledger + raw audit + dossier.
-- **`meeting_agent/agent.py`** — `AlfredAnalyzer`, instantiated per session. One `AlfredExtraction` per debounced tick.
-- **`meeting_agent/tools.py`** — `send_to_meeting_chat` (sole outbound) + `fetch_meeting_transcript` (reads `_official-transcript.txt` from the blob archive on demand).
-- **`meeting_agent/debounce.py`** — `DEFAULT_QUIET_WINDOW_SECONDS=1.5`, `DEFAULT_MAX_BATCH=8`.
-
-### UI (`web/`)
-
-- **`src/App.tsx`** — routes (`/`, `/m/*`, `/channels`, `/channels/inspect/*`, `/archive`, `/debug`).
-- **`src/components/ChannelsAdmin.tsx`** — channel CRUD + join-by-URL panel.
-- **`src/components/ChannelCommandCenter.tsx`** — per-channel status, Live chat + Live transcripts + Official transcripts panels.
-- **`src/components/ArchiveBrowser.tsx`** — anonymous blob LIST against `stalfreddisney/alfred-events`. Resolves team/channel GUIDs to display names via `bot.listChannels()`.
-- **`src/lib/bot.ts`** — typed client for the C# bot's operator API.
 
 ---
 
@@ -233,41 +229,55 @@ az containerapp update --subscription e02c0038-82c8-4655-9647-38083f301099 \
 
 ## 7. Debug
 
+### 7.1 Call-join failures (the most common, most-frustrating bug)
+
+When a join attempt fails, the error code tells you which **tier** is
+blocking. There are three layers in order of likelihood for our
+Sandbox-tenant constraints:
+
+| Error / code | Tier blocked | What it actually means | What to do |
+|---|---|---|---|
+| `502 CALL_JOIN_FAILED_7504_OR_7505` | **Tenant calling policy** | `CsApplicationAccessPolicy` does not allow Alfred's AppId (`207a38a4-...`) to act on Graph Communications calls. This is the most common failure mode in Sandbox. | **Out of reach for us.** Requires a Sandbox Teams admin to run `New-CsApplicationAccessPolicy` + `Grant-CsApplicationAccessPolicy`. Until granted, no bot can join any call on this tenant. |
+| `403 GRAPH_PERMISSION_MISSING` | **RSC scope** | Either the manifest version on the team is older than the one with the needed scope, OR the team hasn't been re-installed since a new RSC was added. | Verify manifest version on the install: Teams Admin Center → Manage apps → Alfred Sandbox. If old, click **Update** on every team install. Confirm with `curl $BOT/api/channels` — the `auto_join_enabled` row will show. |
+| `403 TENANT_NOT_ENABLED_FOR_MODE` | **Tenant meeting policy** | `CsTeamsMeetingPolicy` blocks the requested join mode (most commonly app-as-attendee `invite_and_graph_join` is disabled). | Sandbox admin must allow the mode. Workaround: switch to `policy_auto_invite` join mode if the bot is on the meeting invite. |
+| `400 BOT_NOT_INVITED` | **App-as-attendee invariant** | The C# join workflow's `BotAttendeePresent=true` assertion failed — no service-account row in the meeting roster matching the bot. | Either set `BotAttendeePresent=false` (relies purely on Graph join), or actually invite the bot's service account to the meeting. |
+| `200` then no audio frames arrive | **Microsoft RTM media allowlist** | The bot reaches the meeting via Graph but Teams refuses to wire the media socket. The Real-Time Media SDK requires per-bot allowlisting by Microsoft. | Submit at `https://aka.ms/teams-rtm-onboarding` with Alfred's AppId. Tail VM logs: `Call added` then no `Established` / no `audio frame` lines = waiting on Microsoft. |
+| `Audio socket up`, `PeakSample=0`, no transcript | **Meeting silence** | Bot joined cleanly, Teams is sending frames, but the audio buffer is silence. Speaker may be muted client-side, or meeting options suppress app audio. | Confirm Alfred is in the roster; have a human unmute and speak; consider removing + re-adding Alfred. Not a code bug. |
+
+### 7.2 Why a channel meeting transcript never lands
+
+Microsoft documents `OnlineMeetingTranscript.Read.Chat` as
+"**applies only to scheduled private chat meetings, not to channel
+meetings.**" There is no public GET endpoint that consumes our
+`ChannelMeetingTranscript.Read.Group` RSC alone. Workaround: schedule
+the meeting as a **private** meeting (not channel), add Alfred to the
+meeting chat via `+ Apps`, then post `@Alfred link to <channel-name>`
+in the meeting chat. From then on every event from that meeting
+rolls up under the named channel.
+
+### 7.3 General health probes
+
 ```bash
 BOT=https://alfred-disney-bot.eastus.cloudapp.azure.com
 SINK=https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io
 
-# Health
-curl -sS $BOT/api/calling/health | jq
-curl -sS $SINK/health
+curl -sS $BOT/api/calling/health | jq            # bot media readiness
+curl -sS $SINK/health                            # sink
 
-# Operator API
-curl -sS $BOT/api/channels | jq                    # attachments
-curl -sS $BOT/api/debug/transcripts | jq           # NDJSON audit listing
-curl -sS "$BOT/api/debug/transcripts/<sanitized_id>?kind=chat&tail=50" | jq
+curl -sS $BOT/api/channels | jq                  # attachments + last_auto_join_attempt
+curl -sS $BOT/api/debug/transcripts | jq         # per-thread NDJSON audit listing
 
-# Per-meeting routes (UI uses these — chat_thread_id keyed)
 curl -sS "$SINK/m/<chat_thread_id>/status"  | jq
 curl -sS "$SINK/m/<chat_thread_id>/ledger"  | jq
-curl -sS "$SINK/m/<chat_thread_id>/dossier" | jq
 
-# Manual transcript backfill
+# Manual transcript backfill (when the auto-trigger missed a meeting)
 curl -sS -X POST "$BOT/api/debug/fetch-transcript" -H 'Content-Type: application/json' \
   -d '{"call_id":"...","organizer_oid":"...","team_id":"...","channel_id":"...","channel_thread_id":"..."}'
 ```
 
-**Channel meeting transcripts:** Microsoft documents
-`OnlineMeetingTranscript.Read.Chat` as "applies only to scheduled
-private chat meetings, not to channel meetings." There is no public
-GET endpoint that consumes `ChannelMeetingTranscript.Read.Group`
-under RSC alone. To get a transcript for a channel meeting without
-org-wide consent: schedule it as a **private** meeting, install
-Alfred in the meeting chat, and use `@Alfred link to <channel-name>`
-to roll the resulting events up under the channel.
-
 **See `AGENTS.md` §7** for the full symptom→fix index (auto-join
-tiers, `vmAgent: null` ARM lag, stale `dotnet publish`, `7504/7505`
-calling policy, etc.).
+tiers, `vmAgent: null` ARM lag, stale `dotnet publish`, run-command
+name caching, etc.).
 
 ---
 
@@ -321,8 +331,5 @@ calling policy, etc.).
   `alfred-events-v1` envelope schema + per-`event_type` payload.
 - [`docs/retrieving-transcripts.md`](docs/retrieving-transcripts.md) —
   blob archive layout + Python / curl / az recipes.
-- [`docs/STT-PROVIDER-COMPARISON.md`](docs/STT-PROVIDER-COMPARISON.md) /
-  [`docs/STT-SHORTLIST.md`](docs/STT-SHORTLIST.md) — provider tradeoffs.
 - [`docs/TEAMS-AUTO-INVITE-SETUP.md`](docs/TEAMS-AUTO-INVITE-SETUP.md) —
-  one-time tenant setup for auto-invite mode.
-- `PROD.md` — productionalization tracker.
+  one-time Sandbox-tenant admin setup for auto-invite mode.
