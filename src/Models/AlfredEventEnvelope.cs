@@ -3,27 +3,28 @@ using System.Text.Json.Serialization;
 namespace TeamsMediaBot.Models;
 
 /// <summary>
-/// Versioned envelope POSTed to every registered consumer for a
-/// <c>(team_id, channel_id)</c>. Stable contract: additive-only within
-/// <c>alfred-events-v1</c>; breaking changes ship as <c>v2</c>.
+/// alfred-v2 event envelope. POSTed to every registered consumer URL
+/// and mirrored to the blob archive. Stable contract: additive-only
+/// within v2; breaking changes ship as v3.
 ///
-/// <para>
-/// Routing keys live at the top level so a consumer can route on
-/// <c>(team_id, channel_id)</c> or <c>chat_thread_id</c> without parsing
-/// <see cref="Payload"/>. Payload shape varies by <see cref="EventType"/>
-/// and is documented in <c>docs/event-contract.md</c>.
-/// </para>
+/// Every envelope is unambiguously either a channel event or a
+/// meeting event. Exactly one of <see cref="ChannelRef"/> and
+/// <see cref="MeetingRef"/> is populated, decided by the event type:
+/// <c>channel.*</c> events populate <see cref="ChannelRef"/>;
+/// <c>meeting.*</c> events populate <see cref="MeetingRef"/>.
+///
+/// Full schema in <c>docs/event-contract.md</c>.
 /// </summary>
 public sealed record AlfredEventEnvelope
 {
     [JsonPropertyName("schema_version")]
-    public string SchemaVersion { get; init; } = "alfred-events-v1";
+    public string SchemaVersion { get; init; } = "alfred-v2";
 
-    /// <summary>One of the <see cref="AlfredEventTypes"/> string constants.</summary>
+    /// <summary>One of the <see cref="AlfredEventTypes"/> constants.</summary>
     [JsonPropertyName("event_type")]
     public required string EventType { get; init; }
 
-    /// <summary>Stable per-event id. Consumers may use it to dedupe on retry.</summary>
+    /// <summary>Stable per-event id. Consumers dedupe on retry by this.</summary>
     [JsonPropertyName("event_id")]
     public required string EventId { get; init; }
 
@@ -31,81 +32,56 @@ public sealed record AlfredEventEnvelope
     [JsonPropertyName("ts")]
     public required string Ts { get; init; }
 
-    [JsonPropertyName("team_id")]
-    public string? TeamId { get; init; }
+    /// <summary>Populated iff <see cref="EventType"/> starts with <c>channel.</c>.</summary>
+    [JsonPropertyName("channel_ref")]
+    public ChannelRef? ChannelRef { get; init; }
 
-    [JsonPropertyName("channel_id")]
-    public string? ChannelId { get; init; }
-
-    /// <summary>
-    /// Canonical session key. <c>19:meeting_xxx@thread.v2</c> for a
-    /// meeting; <c>19:{channelId}@thread.tacv2</c> for a channel post.
-    /// Always present.
-    /// </summary>
-    [JsonPropertyName("chat_thread_id")]
-    public required string ChatThreadId { get; init; }
-
-    /// <summary>Parent channel's conversation id when known.</summary>
-    [JsonPropertyName("channel_thread_id")]
-    public string? ChannelThreadId { get; init; }
+    /// <summary>Populated iff <see cref="EventType"/> starts with <c>meeting.</c>.</summary>
+    [JsonPropertyName("meeting_ref")]
+    public MeetingRef? MeetingRef { get; init; }
 
     /// <summary>
-    /// Bot Framework conversation reference id. Echo this back to
+    /// Bot Framework conversation reference id. Echo back to
     /// <c>POST $BOT/api/send-chat</c> to post into the same chat.
+    /// Null on system events that are not chat-bound.
     /// </summary>
     [JsonPropertyName("conversation_reference_id")]
     public string? ConversationReferenceId { get; init; }
 
-    /// <summary>Event-type-specific payload. See docs/event-contract.md.</summary>
+    /// <summary>Event-type-specific payload. See docs/event-contract.md §3.</summary>
     [JsonPropertyName("payload")]
     public required object Payload { get; init; }
 }
 
 /// <summary>
-/// String constants for <see cref="AlfredEventEnvelope.EventType"/>.
+/// All <see cref="AlfredEventEnvelope.EventType"/> string constants.
+/// Names mirror the Graph URL hierarchy.
 /// </summary>
 public static class AlfredEventTypes
 {
-    /// <summary>STT interim hypothesis. Payload: <see cref="TranscriptEvent"/>.</summary>
-    public const string TranscriptPartial = "transcript.partial";
+    // Channel lifecycle
+    public const string ChannelAttached = "channel.attached";
+    public const string ChannelDetached = "channel.detached";
 
-    /// <summary>STT finalized utterance. Payload: <see cref="TranscriptEvent"/>.</summary>
-    public const string TranscriptFinal = "transcript.final";
+    // Channel chat
+    public const string ChannelMessageCreated = "channel.message.created";
+    public const string ChannelMessageUpdated = "channel.message.updated";
+    public const string ChannelMessageDeleted = "channel.message.deleted";
 
-    /// <summary>
-    /// User chat message in a meeting chat or attached channel.
-    /// Payload mirrors today's <c>ChatMessageRequest</c> wire shape.
-    /// </summary>
-    public const string ChatMessage = "chat.message";
+    // Meeting lifecycle
+    public const string MeetingCreated   = "meeting.created";
+    public const string MeetingEnded     = "meeting.ended";
+    public const string MeetingLinked    = "meeting.linked";
+    public const string MeetingCallJoined = "meeting.call.joined";
+    public const string MeetingCallLeft   = "meeting.call.left";
 
-    /// <summary>
-    /// Bot just learned this <c>chat_thread_id</c> belongs to
-    /// <c>(team_id, channel_id)</c>. Payload includes <c>source</c>.
-    /// </summary>
-    public const string SessionLinked = "system.session_linked";
+    // Meeting chat
+    public const string MeetingChatCreated = "meeting.chat.created";
+    public const string MeetingChatUpdated = "meeting.chat.updated";
+    public const string MeetingChatDeleted = "meeting.chat.deleted";
 
-    /// <summary>Channel attachment created. Payload: attachment record.</summary>
-    public const string ChannelAttached = "system.channel_attached";
-
-    /// <summary>Channel attachment removed. Payload: attachment record.</summary>
-    public const string ChannelDetached = "system.channel_detached";
-
-    /// <summary>
-    /// Teams-generated meeting lifecycle message (call started, call
-    /// ended, recording exported, transcript ready). Payload mirrors
-    /// the chat envelope shape, but the body's <c>text</c> is JSON
-    /// describing the meeting event rather than human chat. These are
-    /// emitted by Teams into the channel chat stream; the bot detects
-    /// them on inbound and routes them to this dedicated event type so
-    /// the <c>chat.message</c> stream is pure human + bot chat.
-    /// </summary>
-    public const string MeetingLifecycle = "system.meeting_lifecycle";
-
-    /// <summary>
-    /// Microsoft's own meeting transcript (the "Record and Transcribe"
-    /// product feature), retrieved from Graph after a meeting ends.
-    /// Payload: <see cref="OfficialTranscriptPayload"/> — VTT raw text
-    /// plus parsed cues with speaker names + timestamps.
-    /// </summary>
-    public const string TranscriptOfficial = "transcript.official";
+    // Meeting transcripts
+    public const string MeetingTranscriptPartial  = "meeting.transcript.partial";
+    public const string MeetingTranscriptFinal    = "meeting.transcript.final";
+    public const string MeetingTranscriptOfficial = "meeting.transcript.official";
 }

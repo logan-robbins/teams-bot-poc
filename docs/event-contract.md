@@ -1,334 +1,396 @@
-# Alfred Event Contract — `alfred-events-v1`
+# Alfred Event Contract — `alfred-v2`
 
-This is the canonical contract published by the Alfred bot's
-`EventFanoutDispatcher`. The bot is a Teams platform that captures
-audio + chat for every channel it is attached to, and POSTs every
-event as a versioned JSON envelope to every consumer URL registered
-against that channel.
+The canonical contract published by the Alfred bot. The bot is a
+Teams platform that captures **channel chat** (team → channel →
+thread → message) and **meetings** (audio + chat in private meetings
+the bot is added to). Every event POSTs as a versioned JSON envelope.
 
-If you are building a backend for an internal team that wants to
-consume Alfred data:
+This contract mirrors **the Microsoft Graph URL hierarchy**. The
+shape of every event tells you exactly which Graph resource it
+belongs to. No flat keyspace, no overloaded ids, no nullable
+routing fields that you have to interpret.
 
-1. Pick a URL on your internal network (any HTTP server, any
-   language, any framework).
-2. Register it against your channel via the bot's
-   `POST /api/channels/{teamId}/{channelId}/consumers` endpoint.
-3. Accept the envelope shape below at that URL.
-4. To talk back into the channel, `POST $BOT/api/send-chat`.
+If you are building a consumer:
 
-That is the entire contract. The bot does not care what you do with
-the data.
+1. Pick a URL on your network.
+2. Register it via `POST $BOT/api/channels/{teamId}/{channelId}/consumers`
+   (channel scope) or `POST $BOT/api/meetings/{meetingId}/consumers`
+   (meeting scope), or use the read-only blob archive
+   ([`docs/retrieving-transcripts.md`](retrieving-transcripts.md)).
+3. Accept the envelope shape in §2.
+4. To post back into chat, `POST $BOT/api/send-chat` (§5).
 
 ---
 
 ## 1. Versioning
 
-- The current schema version is **`alfred-events-v1`**. Every
-  envelope carries `"schema_version": "alfred-events-v1"`.
-- **Within v1: additive only.** New optional fields may appear at any
-  time. New event types may appear at any time. Existing fields
-  never change shape, semantics, or required-ness inside v1.
-- **Breaking changes ship as `v2`.** The bot will continue posting
-  v1 to v1-registered consumers in parallel during any migration
-  window.
-- Consumers should:
-  - Ignore unknown top-level fields silently.
-  - Ignore unknown `event_type` values silently (or 200-OK them).
-  - Not enforce that `schema_version == "alfred-events-v1"` exactly,
-    but DO log if it differs from what they were written against.
+- Current schema version: **`alfred-v2`**. Every envelope carries
+  `"schema_version": "alfred-v2"`.
+- v1 (`alfred-events-v1`) is **dead**. The bot does not emit v1. No
+  back-compat shims exist on the sink. If you have v1 code, replace
+  it.
+- Within v2: additive only. New optional fields may appear; new
+  event types may appear. Existing fields never change shape inside
+  v2. Breaking changes ship as `v3`.
 
 ---
 
-## 2. Envelope shape
-
-Every event POSTed to a consumer URL has this top-level shape:
+## 2. Envelope
 
 ```jsonc
 {
-  "schema_version": "alfred-events-v1",
+  "schema_version": "alfred-v2",
+  "event_type":     "meeting.transcript.final",
+  "event_id":       "8a3f1c0e2b9d4a7e9f12bb0001020304",
+  "ts":             "2026-05-14T16:34:12.184Z",
 
-  // What kind of event this is. Routes the consumer's logic.
-  "event_type": "transcript.final",
+  // EXACTLY ONE of these two blocks is populated. Which one tells
+  // you whether this event belongs to channel chat or to a meeting.
+  "channel_ref":    null,
+  "meeting_ref":    { /* see §2.2 */ },
 
-  // Stable per-event id. Use it to dedupe on retry.
-  "event_id": "8a3f1c0e2b9d4a7e9f12bb0001020304",
-
-  // ISO-8601 UTC timestamp. May be the source event's time
-  // (e.g. transcript ts) rather than dispatch time.
-  "ts": "2026-05-07T16:34:12.184Z",
-
-  // Routing keys. team_id + channel_id are populated whenever the
-  // bot knows them. chat_thread_id is ALWAYS populated.
-  "team_id":          "<team AAD group id>",   // string | null
-  "channel_id":       "19:abc@thread.tacv2",   // string | null
-  "chat_thread_id":   "19:meeting_xxx@thread.v2",
-  "channel_thread_id":"19:abc@thread.tacv2",   // string | null
-  "conversation_reference_id": "<...>",        // see §4
+  // Optional. Echo to /api/send-chat to reply into the source thread.
+  "conversation_reference_id": "<bot-framework conv ref id>",
 
   // Event-type-specific payload. See §3.
-  "payload": { ... }
+  "payload":        { /* ... */ }
 }
 ```
 
-### Routing keys
+Rules:
+- `channel_ref` is populated iff `event_type` starts with `channel.`.
+- `meeting_ref` is populated iff `event_type` starts with `meeting.`.
+- Both blocks are never populated on the same envelope.
 
-- `chat_thread_id` is the canonical session key. For meetings it is
-  `19:meeting_xxx@thread.v2`. For posts in an attached channel it is
-  `19:{channelId}@thread.tacv2`. Always present.
-- `(team_id, channel_id)` is populated whenever the bot can determine
-  it. For channel posts that's always; for meeting threads that
-  haven't been linked to a parent channel yet, both will be null.
-- `channel_thread_id` is the parent channel's conversation id when
-  this event is from a meeting that was spawned from a channel. It
-  lets you roll meetings up under their channel offline. For events
-  in the channel itself, it equals `chat_thread_id`.
-- `conversation_reference_id` is the Bot Framework conversation
-  reference id. Echo it to `POST $BOT/api/send-chat` to reply (§4).
+### 2.1 `channel_ref`
 
-### Transport
+Mirrors `/teams/{team_id}/channels/{channel_id}/messages/{thread_id}/replies/{message_id}`.
 
-- Method: `POST`
-- Content type: `application/json`
-- Body: a single envelope (NOT an array; one POST per event).
-- Auth: by default none; the bot is internal-only and protects
-  consumer URLs at the network layer. Optional headers can be
-  configured per-consumer in `ConsumerConfig.headers` if a consumer
-  wants e.g. a shared bearer.
-- The bot expects 2xx for success. Any 4xx (except 408/429) is
-  treated as a permanent failure for that envelope and the bot will
-  drop it without retry. 5xx, 408, and 429 trigger up to 3 attempts
-  with exponential backoff (250ms, 1s, 4s) before drop.
-- Slow consumers do not block fast ones — the bot maintains a
-  bounded per-consumer queue (capacity 1000) with drop-oldest
-  semantics.
+```jsonc
+{
+  "team_id":              "d3f5f412-2abf-4300-ac73-019e892c2a05",
+  "team_display_name":    "Engineering",
+  "channel_id":           "19:abc@thread.tacv2",
+  "channel_display_name": "general",
+  "thread_id":            "1700000000000",   // root message id; required
+  "message_id":           "1700000000123"    // present on *.message.* events; null on system events
+}
+```
+
+Display names are **best-effort, populated when the bot knows them**.
+Resolution happens via `GET /teams/{id}` and `GET /teams/{id}/channels/{id}`
+on first sighting and is cached. Consumers should not rely on display
+names being present; they should fall back to ids and call the sink's
+`/v2/resolve` endpoint if a name is needed.
+
+### 2.2 `meeting_ref`
+
+Mirrors `/me/onlineMeetings/{meeting_id}` (the canonical resource)
+plus the meeting's separate `/chats/{thread_id}` chat container.
+
+```jsonc
+{
+  "meeting_id":             "MSpkYzE3NjY0Mi0...",        // Graph onlineMeeting id; canonical
+  "meeting_chat_thread_id": "19:meeting_xxx@thread.v2",  // chat container id
+  "call_id":                "abc-123-def",                // present only while bot is in-call
+
+  // Best-effort human-readable metadata (populated when known).
+  "subject":                "Sprint planning",
+  "organizer": {
+    "aad_id":               "accf88ee-...",
+    "display_name":         "Jane Doe"
+  },
+  "scheduled_start_utc":    "2026-05-14T16:00:00Z",
+  "scheduled_end_utc":      "2026-05-14T16:30:00Z",
+
+  // Optional channel link (set after the bot learns this meeting
+  // belongs to a channel — see meeting.linked event).
+  "channel_link": {
+    "team_id":              "...",
+    "team_display_name":    "Engineering",
+    "channel_id":           "19:abc@thread.tacv2",
+    "channel_display_name": "general",
+    "thread_id":            "1700000000000",  // optional thread granularity
+    "linked_at_utc":        "2026-05-14T16:01:30Z",
+    "linked_source":        "bot_framework_channeldata"
+  }
+}
+```
+
+`meeting_id` is the stable key — it survives across the meeting chat
+thread, the call instance, and the post-meeting transcript fetch.
+
+### 2.3 Transport
+
+- `POST application/json`, one envelope per request (not batched).
+- 2xx = accepted. 5xx / 408 / 429 = retry (up to 3 attempts, exponential
+  backoff 250ms / 1s / 4s). 4xx (other) = permanent drop.
+- Per-consumer queue: bounded 1000 entries, drop-oldest.
 
 ---
 
 ## 3. Event types
 
-### `transcript.partial`
+### Channel events (`channel.*`)
 
-In-progress STT hypothesis. Often updated mid-utterance.
+Requires `channel_ref` with `team_id` + `channel_id` + `thread_id`
+populated. `message_id` is required for `.message.*` events.
 
-`payload` shape: see [§3.1 Transcript payload](#31-transcript-payload).
+| Event type                  | Required `channel_ref` fields                          | Payload §  |
+|-----------------------------|--------------------------------------------------------|------------|
+| `channel.attached`          | `team_id`, `channel_id`                                | §3.1       |
+| `channel.detached`          | `team_id`, `channel_id`                                | §3.1       |
+| `channel.message.created`   | `team_id`, `channel_id`, `thread_id`, `message_id`     | §3.2       |
+| `channel.message.updated`   | `team_id`, `channel_id`, `thread_id`, `message_id`     | §3.2       |
+| `channel.message.deleted`   | `team_id`, `channel_id`, `thread_id`, `message_id`     | §3.2       |
 
-### `transcript.final`
+### Meeting events (`meeting.*`)
 
-Finalized STT utterance. The canonical truth for "someone said X".
+Requires `meeting_ref` with `meeting_id` populated.
 
-`payload` shape: see [§3.1 Transcript payload](#31-transcript-payload).
+| Event type                       | Required `meeting_ref` fields                          | Payload § |
+|----------------------------------|--------------------------------------------------------|-----------|
+| `meeting.created`                | `meeting_id`, `meeting_chat_thread_id`                 | §3.3      |
+| `meeting.linked`                 | `meeting_id`, `channel_link`                           | §3.4      |
+| `meeting.call.joined`            | `meeting_id`, `call_id`                                | §3.5      |
+| `meeting.call.left`              | `meeting_id`, `call_id`                                | §3.5      |
+| `meeting.chat.created`           | `meeting_id`, `meeting_chat_thread_id`                 | §3.6      |
+| `meeting.chat.updated`           | `meeting_id`, `meeting_chat_thread_id`                 | §3.6      |
+| `meeting.chat.deleted`           | `meeting_id`, `meeting_chat_thread_id`                 | §3.6      |
+| `meeting.transcript.partial`     | `meeting_id`                                           | §3.7      |
+| `meeting.transcript.final`       | `meeting_id`                                           | §3.7      |
+| `meeting.transcript.official`    | `meeting_id`                                           | §3.8      |
+| `meeting.ended`                  | `meeting_id`                                           | §3.3      |
 
-### `chat.message`
+> **Channel meetings have no audio.** The bot lacks `Calls.AccessMedia`
+> at team scope and cannot join the call. A meeting that happens
+> inside a channel surfaces as `channel.message.*` events on the
+> channel thread only — no `meeting.*` events are emitted for it.
+> The `meeting.*` event family exists only for **private meetings the
+> bot was added to via `+ Apps` in the meeting chat**.
 
-A user (or bot) chat message in a meeting chat or attached channel.
-
-`payload` shape: see [§3.2 Chat payload](#32-chat-payload).
-
-### `system.session_linked`
-
-The bot just learned that a meeting `chat_thread_id` belongs to
-`(team_id, channel_id)`. Useful for backfilling prior events under
-the parent channel.
-
-`payload`:
-```json
-{
-  "chat_thread_id":   "19:meeting_xxx@thread.v2",
-  "team_id":          "<team AAD group id>",
-  "channel_id":       "19:abc@thread.tacv2",
-  "channel_thread_id":"19:abc@thread.tacv2",
-  "source":           "bot_framework_channeldata"
-}
-```
-
-### `system.channel_attached` *(reserved)*
-
-Fired when the bot is attached to a channel. May be empty or
-informational; no consumer logic should depend on it.
-
-### `system.channel_detached` *(reserved)*
-
-Fired when the bot is detached from a channel.
-
-### `transcript.session_*`, `transcript.error`
-
-STT-internal lifecycle events are intentionally **not** emitted as
-envelopes in v1. They are infrastructure noise; consumers receive
-only `transcript.partial` and `transcript.final`.
-
----
-
-### 3.1 Transcript payload
+### 3.1 `channel.attached` / `channel.detached`
 
 ```jsonc
 {
-  // "partial" | "final" — duplicates the envelope event_type for
-  // ergonomic consumer code that operates on the payload alone.
-  "event_type": "final",
-  "text":       "the actual transcribed text",
-  "timestamp_utc":   "2026-05-07T16:34:12.184Z",
-  "chat_thread_id":  "19:meeting_xxx@thread.v2",
-
-  // Diarization (if STT provider supports it, otherwise null).
-  "speaker_id":      "speaker_0",
-  "audio_start_ms":  1234.5,
-  "audio_end_ms":    5678.9,
-  "confidence":      0.94,
-  "words":           [ /* word details with timestamps */ ],
-
-  // Routing context (also on the envelope).
-  "team_id":           "...",
-  "channel_id":        "...",
-  "channel_thread_id": "...",
-
-  // E3 identity hints (Teams MediaSourceId at publish time).
-  "dominant_media_source_id":  4096,
-  "active_media_source_ids":   [4096, 4112],
-
-  // Provider metadata.
-  "metadata": { "provider": "azure_speech", "model": null,
-                "session_id": "..." }
+  "installed_by":         "<aad object id>",
+  "installation_id":      "<teams app installation id>",
+  "membership_type":      "standard"   // | "private" | "shared"
 }
 ```
 
-Stable: `event_type`, `text`, `timestamp_utc`, `chat_thread_id`,
-`speaker_id`, routing-key fields. Everything else is best-effort and
-may be null depending on STT provider + media path.
-
-### 3.2 Chat payload
+### 3.2 `channel.message.*`
 
 ```jsonc
 {
-  // "chat_created" | "chat_updated" | "chat_deleted"
-  "event_type":        "chat_created",
-  "chat_thread_id":    "19:meeting_xxx@thread.v2",
-  "message_id":        "<bot-framework-activity-id>",
-  "text":              "plain text body",
-  "html":              "<div>...</div>",   // when available
-  "sender_id":         "<aad object id or app id>",
-  "sender_display_name":"Jane Doe",
-  "timestamp_utc":     "2026-05-07T16:34:00.000Z",
-
-  "conversation_reference_id": "<echo to /api/send-chat>",
-  "reply_to_message_id":       "<id, when this is a reply>",
-  "from_bot":                  false,
-
-  "attachments": [ /* raw Bot Framework attachments */ ],
-  "mentions":    [ /* raw Bot Framework mentions */ ],
-  "raw":         { /* full source payload — best effort */ },
-
-  // Source classification.
-  "conversation_kind": "meeting_chat",  // | "channel" | "group_chat" | "personal"
-
-  // Routing context (also on envelope).
-  "team_id":           "...",
-  "channel_id":        "...",
-  "channel_thread_id": "..."
+  "sender": {
+    "aad_id":             "accf88ee-...",
+    "display_name":       "Logan Robbins",
+    "kind":               "user"   // | "bot" | "application"
+  },
+  "text":                 "plain text body",
+  "html":                 "<div>...</div>",
+  "timestamp_utc":        "2026-05-14T18:23:45.401Z",
+  "reply_to_message_id":  null,            // populated if this is a reply within the thread
+  "is_root":              true,            // true iff message_id == thread_id (this is the thread's root post)
+  "from_bot":             false,
+  "attachments":          [ /* see §3.9 */ ],
+  "mentions":             [ /* raw Bot Framework / Graph mentions */ ],
+  "raw":                  { /* full source payload, best-effort */ }
 }
 ```
 
+For `channel.message.updated`: same shape; `text` / `html` reflect
+the latest version.
+
+For `channel.message.deleted`: `text` and `html` may be null;
+`timestamp_utc` is the deletion time.
+
+### 3.3 `meeting.created` / `meeting.ended`
+
+Emitted when the bot first sees a meeting (`created`) and when it
+detects the meeting ended (`ended`, via Graph or call-state).
+
+```jsonc
+{
+  "subject":              "Sprint planning",
+  "organizer": {
+    "aad_id":             "...",
+    "display_name":       "..."
+  },
+  "scheduled_start_utc":  "2026-05-14T16:00:00Z",
+  "scheduled_end_utc":    "2026-05-14T16:30:00Z",
+  "actual_start_utc":     "2026-05-14T16:01:12Z",   // ended only
+  "actual_end_utc":       "2026-05-14T16:34:55Z"    // ended only
+}
+```
+
+### 3.4 `meeting.linked`
+
+The bot learned this meeting belongs to a channel (and optionally a
+specific thread within it). The `channel_link` block on `meeting_ref`
+is now populated. Consumers should treat this as authoritative and
+backfill any prior `meeting.*` events for this `meeting_id` under
+the linked channel.
+
+```jsonc
+{
+  "linked_source":        "bot_framework_channeldata"   // | "manual_command" | "auto_detect"
+}
+```
+
+### 3.5 `meeting.call.joined` / `meeting.call.left`
+
+```jsonc
+{
+  "join_url":             "https://teams.microsoft.com/l/meetup-join/...",
+  "join_mode":            "graph_join"   // | "policy_auto_invite" | "invite_and_graph_join"
+}
+```
+
+### 3.6 `meeting.chat.*`
+
+Same payload shape as `channel.message.*` (§3.2) **without** the
+`is_root` field — meeting chat has no thread-root concept.
+
+### 3.7 `meeting.transcript.partial` / `meeting.transcript.final`
+
+Real-time STT output from the bot's media stream.
+
+```jsonc
+{
+  "text":                 "the transcribed text",
+  "timestamp_utc":        "2026-05-14T16:34:12.184Z",
+  "speaker": {
+    "id":                 "speaker_0",         // STT-provider speaker label
+    "aad_id":             "accf88ee-...",      // resolved when MSI ↔ AAD lookup succeeds
+    "display_name":       "Jane Doe"
+  },
+  "audio_start_ms":       1234.5,
+  "audio_end_ms":         5678.9,
+  "confidence":           0.94,
+  "words":                [ /* word-level detail with timestamps */ ],
+  "media_source": {
+    "dominant_id":        4096,
+    "active_ids":         [4096, 4112]
+  },
+  "provider": {
+    "name":               "azure_speech",
+    "model":              null,
+    "session_id":         "..."
+  }
+}
+```
+
+### 3.8 `meeting.transcript.official`
+
+Microsoft's post-meeting transcript, fetched via Graph after the
+meeting ends. **Private chat meetings only** —
+`OnlineMeetingTranscript.Read.Chat` does not apply to channel
+meetings per Microsoft.
+
+```jsonc
+{
+  "fetched_at_utc":       "2026-05-14T16:36:42Z",
+  "vtt_url":              "meetings/<meeting_id>/transcripts/official.vtt",
+  "cues": [
+    {
+      "start_ms":         1200,
+      "end_ms":           3450,
+      "speaker": {
+        "aad_id":         "...",
+        "display_name":   "..."
+      },
+      "text":             "..."
+    }
+  ]
+}
+```
+
+The raw WebVTT is in the blob archive at the `vtt_url` path. `cues`
+is the parsed form for consumers that prefer JSON.
+
+### 3.9 Attachment shape (channel + meeting chat)
+
+```jsonc
+{
+  "attachment_id":        "<graph drive item id | bot framework id>",
+  "name":                 "design.pdf",
+  "content_type":         "application/pdf",
+  "size_bytes":           184320,
+  "graph_drive_item_id":  "01XYZ...",
+  "download_url":         "https://...",
+  "blob_archive_path":    "teams/{tid}/channels/{cid}/threads/{thrid}/attachments/01XYZ...pdf"
+}
+```
+
+The bot fetches and mirrors attachments to the blob archive when
+possible; `blob_archive_path` is populated after the mirror succeeds.
+
 ---
 
-## 4. Posting back to the channel
+## 4. Routing tables (quick reference for consumers)
 
-When your consumer wants Alfred (or anyone) to post a message into
-the chat, `POST` to the bot's send-chat endpoint:
+```
+event_type prefix      → present block       → archive root
+─────────────────────────────────────────────────────────────────────────────────
+channel.attached       → channel_ref          → teams/{tid}/channels/{cid}/
+channel.detached       → channel_ref          → teams/{tid}/channels/{cid}/
+channel.message.*      → channel_ref          → teams/{tid}/channels/{cid}/threads/{thrid}/messages/
+meeting.created        → meeting_ref          → meetings/{meeting_id}/
+meeting.ended          → meeting_ref          → meetings/{meeting_id}/
+meeting.linked         → meeting_ref          → meetings/{meeting_id}/
+meeting.call.*         → meeting_ref          → meetings/{meeting_id}/system/
+meeting.chat.*         → meeting_ref          → meetings/{meeting_id}/chat/messages/
+meeting.transcript.*   → meeting_ref          → meetings/{meeting_id}/transcripts/{partial|final|official}/
+```
+
+See [`docs/retrieving-transcripts.md`](retrieving-transcripts.md) for
+the full blob path layout.
+
+---
+
+## 5. Posting back to chat
+
+`POST $BOT/api/send-chat`. The send-chat surface is unchanged from
+v1; it takes a `conversation_reference_id` (echoed from any envelope)
+and the message text. See `src/Controllers/SendChatController.cs` for
+the canonical request/response shape.
+
+---
+
+## 6. Registering consumers
+
+Two scopes:
+
+**Channel scope** — receives all `channel.*` events for that channel
+and all `meeting.*` events for meetings linked to that channel:
 
 ```bash
-BOT=https://alfred-disney-bot.eastus.cloudapp.azure.com
-
-curl -sS -X POST $BOT/api/send-chat \
+curl -X POST $BOT/api/channels/$TEAM/$CHAN/consumers \
   -H "Content-Type: application/json" \
-  -d "$(jq -n \
-        --arg ref "$CONVERSATION_REFERENCE_ID_FROM_ENVELOPE" \
-        --arg text "$YOUR_MESSAGE" \
-        '{conversation_reference_id:$ref, text:$text}')"
+  -d '{"name":"team-a","url":"https://...","event_types":["*"],"enabled":true}'
 ```
 
-Body:
-
-```jsonc
-{
-  // Required. Echo the envelope's conversation_reference_id.
-  "conversation_reference_id": "...",
-
-  // Required. The message text.
-  "text": "Hello from Team A's backend",
-
-  // Optional.
-  "reply_to_message_id": "<message id to reply to>",
-  "rationale":           "free-form audit string",
-  "session_id":          "your internal id",
-  "product_id":          "your product id",
-  "instance_id":         "your instance id",
-  "action":              "tag for de-dupe key (e.g. 'summary')"
-}
-```
-
-Notes:
-- The bot must have seen at least one chat activity in that thread
-  before this works (otherwise it has no `ConversationReference` for
-  it). For attached channels and active meetings this is always
-  true.
-- The bot rate-limits to 8 RPS per chat thread server-side.
-  Duplicate `(text, action, reply_to_message_id)` within 20 seconds
-  is silently de-duplicated.
-
-This endpoint pre-dates the envelope contract and is unchanged.
-
----
-
-## 5. Registering your URL
-
-You manage your channel's consumer list directly on the bot:
+**Meeting scope** — receives all `meeting.*` events for one specific
+meeting (rare; intended for ephemeral consumers):
 
 ```bash
-BOT=https://alfred-disney-bot.eastus.cloudapp.azure.com
-TEAM=<team AAD group id>
-CHAN=19:abc@thread.tacv2
-ENC_CHAN=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$CHAN")
-
-# List
-curl -sS "$BOT/api/channels/$TEAM/$ENC_CHAN/consumers"
-
-# Replace
-curl -sS -X PUT "$BOT/api/channels/$TEAM/$ENC_CHAN/consumers" \
+curl -X POST $BOT/api/meetings/$MEETING_ID/consumers \
   -H "Content-Type: application/json" \
-  -d '{
-    "consumers": [
-      {
-        "name": "team-a",
-        "url": "https://team-a.internal/alfred-events",
-        "event_kinds": ["*"],
-        "enabled": true
-      }
-    ]
-  }'
-
-# Add or replace one by name
-curl -sS -X POST "$BOT/api/channels/$TEAM/$ENC_CHAN/consumers" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "team-b-summarizer",
-    "url": "https://team-b.internal/sink",
-    "event_kinds": ["transcript.final", "chat.message"],
-    "headers": {"X-Team": "B"},
-    "enabled": true
-  }'
-
-# Remove one by name
-curl -sS -X DELETE "$BOT/api/channels/$TEAM/$ENC_CHAN/consumers/team-a"
+  -d '{"name":"transcript-watcher","url":"https://...","event_types":["meeting.transcript.final"],"enabled":true}'
 ```
 
-`event_kinds: ["*"]` accepts every event. To narrow, list specific
-event types: `["transcript.final", "chat.message"]`.
+`event_types: ["*"]` accepts everything. Otherwise filter to specific
+event types (no wildcards inside a type).
 
 ---
 
-## 6. Reference consumer
+## 7. Reference consumer
 
-This repo's Python sink (`python/transcript_sink.py`) implements the
-contract at its `POST /events` endpoint. Use it as a reference if
-you want to see the contract exercised end-to-end. Other teams'
-backends are free to ignore that implementation entirely — only the
-envelope shape and `/api/send-chat` are stable.
+The Python sink at `python/transcript_sink.py` consumes this contract
+at `POST /v2/events` and exposes the hierarchical query API
+described in [`docs/retrieving-transcripts.md §3`](retrieving-transcripts.md).
+Other teams' backends are free to implement their own consumer —
+only the envelope shape and the consumer-registration / send-chat
+surfaces are stable.
