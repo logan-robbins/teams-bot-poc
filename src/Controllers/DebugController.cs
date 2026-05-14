@@ -41,18 +41,29 @@ public sealed class DebugController : ControllerBase
     /// Manually schedules an <see cref="OfficialTranscriptFetcher"/> run
     /// for a specific meeting. Useful for backfilling transcripts of
     /// meetings whose system-message notification arrived before the
-    /// bot was taught to recognize that shape (e.g. URIObject XML payloads
-    /// pre-b059810). Idempotent on <c>callId</c>.
+    /// bot was taught to recognize that shape, or when the auto-trigger
+    /// missed a meeting.
+    ///
+    /// <para>
+    /// Accepts <c>meeting_id</c> (the canonical Graph <c>onlineMeeting.id</c>,
+    /// preferred) OR <c>call_id</c> (the ephemeral in-call id, legacy).
+    /// At least one must be provided plus <c>organizer_oid</c>. The
+    /// supplied key is the idempotency token for the background poll.
+    /// </para>
     /// </summary>
     [HttpPost("fetch-transcript")]
     public IActionResult ManualFetchTranscript([FromBody] ManualFetchRequest request)
     {
-        if (string.IsNullOrWhiteSpace(request.CallId) ||
+        var idempotencyKey = !string.IsNullOrWhiteSpace(request.MeetingId)
+            ? request.MeetingId!
+            : request.CallId;
+
+        if (string.IsNullOrWhiteSpace(idempotencyKey) ||
             string.IsNullOrWhiteSpace(request.OrganizerOid))
         {
             return BadRequest(new
             {
-                error = "call_id and organizer_oid are required",
+                error = "(meeting_id OR call_id) and organizer_oid are required",
             });
         }
 
@@ -62,11 +73,11 @@ public sealed class DebugController : ControllerBase
         var registeredAt = request.RegisteredAtUtc ?? DateTimeOffset.UtcNow.AddHours(-24);
 
         _logger.LogInformation(
-            "Manual transcript fetch registered call_id={CallId} organizer={Oid} meetingChatThreadId={MeetingChatThreadId} since={Since}",
-            request.CallId, request.OrganizerOid, request.MeetingChatThreadId, registeredAt);
+            "Manual transcript fetch registered key={Key} (meeting_id={MeetingId} call_id={CallId}) organizer={Oid} meetingChatThreadId={MeetingChatThreadId} since={Since}",
+            idempotencyKey, request.MeetingId, request.CallId, request.OrganizerOid, request.MeetingChatThreadId, registeredAt);
 
         _transcriptFetcher.Register(
-            botCallId: request.CallId!,
+            botCallId: idempotencyKey!,
             organizerOid: request.OrganizerOid!,
             meetingChatThreadId: request.MeetingChatThreadId ?? string.Empty,
             registeredAtUtc: registeredAt);
@@ -74,7 +85,7 @@ public sealed class DebugController : ControllerBase
         return Ok(new
         {
             ok = true,
-            registered_call_id = request.CallId,
+            registered_key = idempotencyKey,
             registered_at_utc = registeredAt,
             note = "Fetcher polls Graph for up to ~30 minutes. Watch meetings/<meeting_id>/transcripts/ in blob storage.",
         });
@@ -82,6 +93,9 @@ public sealed class DebugController : ControllerBase
 
     public sealed class ManualFetchRequest
     {
+        [JsonProperty("meeting_id")]
+        public string? MeetingId { get; set; }
+
         [JsonProperty("call_id")]
         public string? CallId { get; set; }
 

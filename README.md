@@ -297,9 +297,11 @@ curl -sS $BOT/api/channels | jq                  # channel attachments + last_au
 curl -sS $SINK/v2/index | jq                     # what the sink knows about
 
 # Manual transcript backfill (when the auto-trigger missed a meeting)
-# meeting_chat_thread_id is optional; call_id and organizer_oid are required
+# Accepts meeting_id (canonical Graph onlineMeeting.id, preferred) OR
+# call_id (ephemeral). organizer_oid is required.
+# meeting_chat_thread_id is optional.
 curl -sS -X POST "$BOT/api/debug/fetch-transcript" -H 'Content-Type: application/json' \
-  -d '{"call_id":"...","organizer_oid":"...","meeting_chat_thread_id":"..."}'
+  -d '{"meeting_id":"MSpkYzE3...","organizer_oid":"...","meeting_chat_thread_id":"..."}'
 ```
 
 **See `AGENTS.md` §7** for the full symptom→fix index (auto-join

@@ -26,6 +26,7 @@ public sealed partial class GraphNotificationProcessor
     private readonly TeamsCallingBotService _botService;
     private readonly TranscriberFactory _transcriberFactory;
     private readonly OfficialTranscriptFetcher _transcriptFetcher;
+    private readonly GraphMetadataResolver _metadataResolver;
     private readonly ILogger<GraphNotificationProcessor> _logger;
 
     /// <summary>
@@ -48,6 +49,7 @@ public sealed partial class GraphNotificationProcessor
         TeamsCallingBotService botService,
         TranscriberFactory transcriberFactory,
         OfficialTranscriptFetcher transcriptFetcher,
+        GraphMetadataResolver metadataResolver,
         ILogger<GraphNotificationProcessor> logger)
     {
         _dispatcher = dispatcher;
@@ -61,6 +63,7 @@ public sealed partial class GraphNotificationProcessor
         _botService = botService;
         _transcriberFactory = transcriberFactory;
         _transcriptFetcher = transcriptFetcher;
+        _metadataResolver = metadataResolver;
         _logger = logger;
     }
 
@@ -207,6 +210,20 @@ public sealed partial class GraphNotificationProcessor
                         ? AlfredEventTypes.MeetingChatDeleted
                         : AlfredEventTypes.MeetingChatCreated;
 
+                // Contract: meeting_id is the Graph onlineMeeting.id, never the
+                // chat thread id. Resolve via /chats/{tid} → joinWebUrl → /users/
+                // {org}/onlineMeetings. Falls back to the thread id if Graph
+                // can't bridge (private meetings only — channel meetings don't
+                // hit this branch anyway).
+                var canonicalMeetingId = await _metadataResolver.ResolveCanonicalMeetingIdAsync(
+                    ctx.Value.ChatThreadId, cancellationToken);
+                if (string.IsNullOrWhiteSpace(canonicalMeetingId))
+                {
+                    _logger.LogWarning(
+                        "Could not resolve canonical meeting_id for ChatThreadId={ChatThreadId}; emitting with thread id as fallback. Consumer dossiers may split.",
+                        ctx.Value.ChatThreadId);
+                }
+
                 var meetingPayload = new MeetingChatPayload
                 {
                     MessageId = ctx.Value.MessageId,
@@ -226,7 +243,7 @@ public sealed partial class GraphNotificationProcessor
                         Ts = ctx.Value.TimestampUtc,
                         MeetingRef = new MeetingRef
                         {
-                            MeetingId = ctx.Value.ChatThreadId,
+                            MeetingId = canonicalMeetingId ?? ctx.Value.ChatThreadId,
                             MeetingChatThreadId = ctx.Value.ChatThreadId,
                         },
                         ConversationReferenceId = ctx.Value.ChatThreadId,

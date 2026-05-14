@@ -35,6 +35,7 @@ public sealed class AlfredBot : TeamsActivityHandler
     private readonly TranscriberFactory _transcriberFactory;
     private readonly BotConfiguration _botConfig;
     private readonly GraphApiClient _graph;
+    private readonly GraphMetadataResolver _metadataResolver;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _publishedLinks =
         new(StringComparer.Ordinal);
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTimeOffset> _meetingJoinAttempts =
@@ -51,6 +52,7 @@ public sealed class AlfredBot : TeamsActivityHandler
         TranscriberFactory transcriberFactory,
         BotConfiguration botConfig,
         GraphApiClient graph,
+        GraphMetadataResolver metadataResolver,
         ILogger<AlfredBot> logger)
     {
         _references = references;
@@ -62,6 +64,7 @@ public sealed class AlfredBot : TeamsActivityHandler
         _transcriberFactory = transcriberFactory;
         _botConfig = botConfig;
         _graph = graph;
+        _metadataResolver = metadataResolver;
         _logger = logger;
     }
 
@@ -448,6 +451,11 @@ public sealed class AlfredBot : TeamsActivityHandler
         }
         else
         {
+            // Contract: meeting_id is the Graph onlineMeeting.id, not the chat
+            // thread id. Resolve once per chat thread (cached).
+            var canonicalMeetingId = await _metadataResolver.ResolveCanonicalMeetingIdAsync(
+                chatThreadId, cancellationToken) ?? chatThreadId;
+
             var meetingPayload = new MeetingChatPayload
             {
                 MessageId = messageId,
@@ -466,7 +474,7 @@ public sealed class AlfredBot : TeamsActivityHandler
                     Ts = ts,
                     MeetingRef = new MeetingRef
                     {
-                        MeetingId = chatThreadId,
+                        MeetingId = canonicalMeetingId,
                         MeetingChatThreadId = chatThreadId,
                     },
                     ConversationReferenceId = chatThreadId,
@@ -499,7 +507,7 @@ public sealed class AlfredBot : TeamsActivityHandler
                             Ts = DateTimeOffset.UtcNow.ToString("O"),
                             MeetingRef = new MeetingRef
                             {
-                                MeetingId = chatThreadId,
+                                MeetingId = canonicalMeetingId,
                                 MeetingChatThreadId = chatThreadId,
                                 ChannelLink = channelLink,
                             },
@@ -677,6 +685,8 @@ public sealed class AlfredBot : TeamsActivityHandler
             LinkedAtUtc = DateTimeOffset.UtcNow.ToString("O"),
             LinkedSource = "manual_command",
         };
+        var canonicalMeetingId = await _metadataResolver.ResolveCanonicalMeetingIdAsync(
+            chatThreadId, cancellationToken) ?? chatThreadId;
         await _dispatcher.PublishAsync(
             new AlfredEventEnvelope
             {
@@ -685,7 +695,7 @@ public sealed class AlfredBot : TeamsActivityHandler
                 Ts = DateTimeOffset.UtcNow.ToString("O"),
                 MeetingRef = new MeetingRef
                 {
-                    MeetingId = chatThreadId,
+                    MeetingId = canonicalMeetingId,
                     MeetingChatThreadId = chatThreadId,
                     ChannelLink = channelLink,
                 },

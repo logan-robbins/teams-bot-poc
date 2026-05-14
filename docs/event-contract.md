@@ -120,6 +120,18 @@ plus the meeting's separate `/chats/{thread_id}` chat container.
 `meeting_id` is the stable key — it survives across the meeting chat
 thread, the call instance, and the post-meeting transcript fetch.
 
+> **Implementation note.** The bot resolves the canonical Graph
+> `onlineMeeting.id` via `GET /chats/{thread_id}` → `joinWebUrl` →
+> `GET /users/{organizer}/onlineMeetings?$filter=joinWebUrl eq '...'`.
+> When that two-hop resolution fails (organizer not visible to the
+> app, expired meeting, Graph transient), the bot falls back to using
+> the chat thread id as `meeting_id` and **logs a warning**. Consumers
+> that group strictly by `meeting_id` will see two buckets for the
+> same meeting in that case. The fallback is observable: a `meeting.*`
+> envelope whose `meeting_id` starts with `19:` and `@thread.v2`
+> instead of being URL-safe base64. The blob layout under
+> `meetings/{meeting_id}/` reflects the same id used in the envelope.
+
 ### 2.3 Transport
 
 - `POST application/json`, one envelope per request (not batched).
@@ -162,12 +174,19 @@ Requires `meeting_ref` with `meeting_id` populated.
 | `meeting.transcript.official`    | `meeting_id`                                           | §3.8      |
 | `meeting.ended`                  | `meeting_id`                                           | §3.3      |
 
-> **Channel meetings have no audio.** The bot lacks `Calls.AccessMedia`
-> at team scope and cannot join the call. A meeting that happens
-> inside a channel surfaces as `channel.message.*` events on the
-> channel thread only — no `meeting.*` events are emitted for it.
-> The `meeting.*` event family exists only for **private meetings the
-> bot was added to via `+ Apps` in the meeting chat**.
+> **Channel meetings have no separate chat container.** A channel
+> meeting's "chat" IS the channel thread — Microsoft Graph does not
+> create a `chatType: "meeting"` chat for channel meetings (the
+> `chatType` enum is `oneOnOne | group | meeting`, and meeting-type
+> chats only exist for private meetings). Channel meetings surface
+> exclusively as `channel.message.*` events on the parent channel
+> thread. No `meeting.chat.*` events are emitted for them, and the
+> `meeting.*` family as a whole exists only for **private meetings
+> the bot was added to via `+ Apps` in the meeting chat**. Consumers
+> that want "the chat from a channel meeting" should read the channel
+> thread's `channel.message.*` events for the time window of the
+> meeting (use `meeting.created` / `meeting.ended` on linked meetings
+> as a cue) — there is no separate stream.
 
 ### 3.1 `channel.attached` / `channel.detached`
 
@@ -287,7 +306,18 @@ Real-time STT output from the bot's media stream.
 Microsoft's post-meeting transcript, fetched via Graph after the
 meeting ends. **Private chat meetings only** —
 `OnlineMeetingTranscript.Read.Chat` does not apply to channel
-meetings per Microsoft.
+meetings per Microsoft (confirmed in MS Learn v1.0 docs for
+`Get callTranscript`, `List transcripts`, and all
+`/transcripts` change-notification subscription pages).
+
+> **Channel-meeting transcript escape hatch.** Microsoft v1.0 docs
+> note that `GET /me/onlineMeetings/{meeting_id}/transcripts` is
+> *also* available to "users who are part of the meeting calendar
+> invite, which applies to both private chat meetings AND channel
+> meetings." That is a **delegated user-token** path — it does not
+> use our RSC app permission, so this bot cannot call it on its own.
+> A downstream consumer that has a calendar-invitee's delegated
+> token can fetch channel-meeting transcripts directly from Graph.
 
 ```jsonc
 {

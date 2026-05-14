@@ -44,6 +44,15 @@ not invent surrogate keys.
 resource* of the meeting, not a substitute for `meeting_id`. Never
 key on the chat thread when you mean the meeting.
 
+> **Canonical-id fallback.** If you see a `meeting_id` that starts
+> with `19:` and ends with `@thread.v2`, the bot couldn't resolve
+> the chat thread to a canonical Graph `onlineMeeting.id` and fell
+> back to the thread id. The blob layout under
+> `meetings/{meeting_id}/` reflects whatever id the envelope carried.
+> Consumers that build dossiers should index by **both** the
+> canonical id AND the `meeting_chat_thread_id` from `meeting_ref`
+> so the two buckets can be merged after the fact.
+
 The event contract — envelope shape, every `event_type`, every
 payload — is in [`docs/event-contract.md`](event-contract.md).
 
@@ -202,9 +211,15 @@ meetings/{meeting_id}/transcripts/official.vtt   # raw WebVTT (start/end cues, <
 `official.txt` is the file an exec opens. `official.vtt` is the file a
 parser opens.
 
-> **Channel meetings produce no official transcript.** Microsoft's
-> `OnlineMeetingTranscript.Read.Chat` permission only applies to
-> private chat meetings, not channel meetings — see README §7.2.
+> **Channel meetings produce no official transcript** via this bot.
+> Microsoft's `OnlineMeetingTranscript.Read.Chat` permission only
+> applies to private chat meetings, not channel meetings — see
+> README §7.2. **Escape hatch:** `GET /me/onlineMeetings/{meeting_id}
+> /transcripts` *is* available to a calendar-invitee's delegated
+> token for both private and channel meetings (per MS Graph v1.0
+> docs for `Get callTranscript`). That path bypasses this bot
+> entirely — a consumer with the right user token can fetch
+> channel-meeting transcripts directly from Microsoft Graph.
 
 ### 2.3 Blob body shape
 
@@ -263,6 +278,14 @@ Every per-event blob is the v2 envelope, pretty-printed:
 
 ### 2.4 Recipes — direct from blob storage
 
+> **Pagination warning.** Azure Blob `?restype=container&comp=list`
+> returns at most **5000 blob names per page**. A busy meeting can
+> exceed that. If the response XML contains a non-empty
+> `<NextMarker>...</NextMarker>` element, you MUST repeat the
+> request with `&marker=<value>` until `<NextMarker>` is empty.
+> The §2.5 Python helper does this; the curl recipes below show
+> how. Skipping pagination silently truncates results.
+
 ```bash
 SA="https://stalfreddisney.blob.core.windows.net/alfred-events"
 
@@ -273,21 +296,31 @@ curl -sS "$SA/meetings/$MID/transcripts/official.txt"
 # I have meeting_id, give me the transcript (WebVTT, with cue timings)
 curl -sS "$SA/meetings/$MID/transcripts/official.vtt"
 
+# List every blob under a prefix, honoring <NextMarker> pagination.
+# Define once, reuse below.
+list_prefix() {
+  local prefix="$1" marker=""
+  while :; do
+    local body
+    body=$(curl -sS "$SA?restype=container&comp=list&maxresults=5000&prefix=$(printf %s "$prefix" | jq -sRr @uri)${marker:+&marker=$(printf %s "$marker" | jq -sRr @uri)}")
+    echo "$body" | xmllint --xpath '//Blob/Name/text()' - 2>/dev/null | tr ' ' '\n'
+    marker=$(echo "$body" | xmllint --xpath 'string(//NextMarker)' - 2>/dev/null)
+    [ -z "$marker" ] && break
+  done
+}
+
 # I have meeting_id, list every event the bot ever published for it
-curl -sS "$SA?restype=container&comp=list&prefix=meetings/$MID/" \
-  | xmllint --xpath '//Blob/Name/text()' - 2>/dev/null
+list_prefix "meetings/$MID/"
 
 # I have meeting_id, give me every live-STT final chunk in order
-curl -sS "$SA?restype=container&comp=list&prefix=meetings/$MID/meeting.transcript.final/" \
-  | xmllint --xpath '//Blob/Name/text()' - 2>/dev/null \
-  | tr ' ' '\n' \
+list_prefix "meetings/$MID/meeting.transcript.final/" \
   | sort \
   | while read name; do curl -sS "$SA/$name" | jq -r '"\(.ts)  \(.payload.speaker.display_name // .payload.speaker.id // "?"):  \(.payload.text)"'; done
 
 # I have team_id + channel_id, list every chat message
 TID="d3f5f412-2abf-4300-ac73-019e892c2a05"
 CID_SAN="19_abc_thread.tacv2"
-curl -sS "$SA?restype=container&comp=list&prefix=teams/$TID/channels/$CID_SAN/channel.message.created/"
+list_prefix "teams/$TID/channels/$CID_SAN/channel.message.created/"
 ```
 
 ### 2.5 Python — zero deps
@@ -397,6 +430,51 @@ print(subject, "—", meta.get("organizer", {}).get("display_name"))
 print(transcript_text[:1000], "...")
 print(f"{len(ledger)} events in the meeting ledger")
 ```
+
+---
+
+## 3.5 Live processing — register a consumer URL, don't poll
+
+The sink + blob archive are **read-after-the-fact** stores. If you
+want low-latency processing of meeting audio chunks (e.g. "react
+the moment the meeting transcribes something interesting"), do
+**not** poll `/v2/meetings/{mid}/events` in a tight loop. Register
+a push consumer instead — the bot will POST every envelope to your
+URL as it's emitted.
+
+```bash
+BOT="https://alfred-disney-bot.eastus.cloudapp.azure.com"
+
+# Channel scope: receive all channel.* events for the channel
+# AND all meeting.* events for meetings linked to that channel.
+curl -X POST "$BOT/api/channels/$TID/$CID/consumers" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"my-consumer","url":"https://my-service/v2/events",
+       "event_types":["meeting.transcript.final","meeting.chat.created"],
+       "enabled":true}'
+
+# Meeting scope: receive only this one meeting's meeting.* events.
+curl -X POST "$BOT/api/meetings/$MID/consumers" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"watch-one","url":"https://my-service/v2/events",
+       "event_types":["meeting.transcript.final"],"enabled":true}'
+```
+
+Pick **`meeting.transcript.final`** (3–5/min/speaker) for live
+transcript chunks. `meeting.transcript.partial` is throttled to
+1/speaker/60s by default — it is a "progress indicator," not a
+real-time stream. See [event-contract.md §6](event-contract.md) for
+the full consumer-registration surface, transport retry rules
+(2xx accept, 5xx/408/429 retry x3, bounded-1000 drop-oldest queue),
+and event filter syntax.
+
+For an agent that "listens silently until something interesting
+happens": consume `meeting.transcript.final` envelopes, run your
+analysis on each chunk (or on a debounced batch), and stay silent
+unless a threshold is crossed or the bot is directly mentioned. The
+canonical Alfred prompt (`python/batcave_platform/specs/alfred.yaml`)
+encodes this policy — read it as a reference if you're writing a
+sibling agent.
 
 ---
 

@@ -34,6 +34,7 @@ public sealed class GraphMetadataResolver
     private readonly ConcurrentDictionary<string, CacheEntry<GraphChatMeta>> _chats = new();
     private readonly ConcurrentDictionary<string, CacheEntry<GraphOnlineMeetingMeta>> _meetings = new();
     private readonly ConcurrentDictionary<string, CacheEntry<GraphChannelMessage>> _channelMessages = new();
+    private readonly ConcurrentDictionary<string, CacheEntry<string>> _chatToMeetingId = new();
 
     public GraphMetadataResolver(GraphApiClient graph, ILogger<GraphMetadataResolver> logger)
     {
@@ -94,11 +95,19 @@ public sealed class GraphMetadataResolver
             root =>
             {
                 string? joinWebUrl = null;
+                string? organizerOid = null;
                 if (root.TryGetProperty("onlineMeetingInfo", out var omi) &&
-                    omi.ValueKind != JsonValueKind.Null &&
-                    omi.TryGetProperty("joinWebUrl", out var jwu))
+                    omi.ValueKind != JsonValueKind.Null)
                 {
-                    joinWebUrl = jwu.GetString();
+                    if (omi.TryGetProperty("joinWebUrl", out var jwu))
+                    {
+                        joinWebUrl = jwu.GetString();
+                    }
+                    if (omi.TryGetProperty("organizer", out var org) &&
+                        org.ValueKind == JsonValueKind.Object)
+                    {
+                        organizerOid = TryGetString(org, "id");
+                    }
                 }
                 return new GraphChatMeta
                 {
@@ -106,11 +115,43 @@ public sealed class GraphMetadataResolver
                     ChatType = TryGetString(root, "chatType"),
                     Topic = TryGetString(root, "topic"),
                     JoinWebUrl = joinWebUrl,
+                    OrganizerAadId = organizerOid,
                 };
             },
             ct);
 
         return Cache(_chats, chatId, meta);
+    }
+
+    /// <summary>
+    /// Bridge a meeting chat thread id (<c>19:meeting_xxx@thread.v2</c>) to
+    /// the canonical Graph <c>onlineMeeting.id</c> (URL-safe base64). Per
+    /// MS Graph v1.0 (Microsoft.Graph 5.92), <c>chatInfo.threadId</c> and
+    /// <c>onlineMeeting.id</c> are distinct keys; the contract requires
+    /// <c>meeting_id</c> on every published envelope to be the latter.
+    /// Two-hop resolution: <c>GET /chats/{id}</c> → <c>joinWebUrl</c> +
+    /// organizer → <c>GET /users/{org}/onlineMeetings?$filter=joinWebUrl
+    /// eq '...'</c>. Cached.
+    /// </summary>
+    public async Task<string?> ResolveCanonicalMeetingIdAsync(
+        string chatThreadId, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(chatThreadId)) return null;
+        if (TryGetCached(_chatToMeetingId, chatThreadId, out var cached)) return cached;
+
+        var chat = await GetChatAsync(chatThreadId, ct);
+        if (chat?.JoinWebUrl is null || chat.OrganizerAadId is null)
+        {
+            return null;
+        }
+
+        var meeting = await GetOnlineMeetingByJoinUrlAsync(chat.OrganizerAadId, chat.JoinWebUrl, ct);
+        if (string.IsNullOrWhiteSpace(meeting?.Id))
+        {
+            return null;
+        }
+
+        return Cache(_chatToMeetingId, chatThreadId, meeting!.Id);
     }
 
     /// <summary>
@@ -208,6 +249,7 @@ public sealed class GraphMetadataResolver
         _chats.Clear();
         _meetings.Clear();
         _channelMessages.Clear();
+        _chatToMeetingId.Clear();
     }
 
     private async Task<T?> FetchAsync<T>(string resource, Func<JsonElement, T> parse, CancellationToken ct)
@@ -310,6 +352,7 @@ public sealed record GraphChatMeta
     public string? ChatType { get; init; }
     public string? Topic { get; init; }
     public string? JoinWebUrl { get; init; }
+    public string? OrganizerAadId { get; init; }
 }
 
 public sealed record GraphOnlineMeetingMeta
