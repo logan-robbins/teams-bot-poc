@@ -238,7 +238,7 @@ public sealed record EventDispatchConfiguration
     /// CRUD API once a real consumer is registered. Leave null to
     /// require explicit consumer registration on every channel.
     /// </summary>
-    /// <example>https://ca-alfred-api.example.com/events</example>
+    /// <example>https://ca-alfred-api.example.com/v2/events</example>
     public string? BootstrapConsumerUrl { get; init; }
 
     /// <summary>

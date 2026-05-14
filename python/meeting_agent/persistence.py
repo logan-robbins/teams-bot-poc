@@ -210,6 +210,61 @@ CREATE TABLE IF NOT EXISTS dossier_items (
 );
 CREATE INDEX IF NOT EXISTS idx_dossier_items_session
     ON dossier_items(session_id, kind);
+
+-- alfred-v2: canonical Graph onlineMeeting registry. Populated from
+-- meeting.* events; the meeting_id here is the Graph onlineMeeting id
+-- (URL-safe base64), NOT the chat thread id. ``meeting_chat_thread_id``
+-- is the sub-resource chat container (``19:meeting_xxx@thread.v2``);
+-- channel_link.* mirrors the bot's MeetingChannelLink. Best-effort
+-- subject / organizer / scheduled times are stamped from MeetingRef
+-- on each event so reads after restart still get the latest values.
+CREATE TABLE IF NOT EXISTS meetings (
+    meeting_id TEXT PRIMARY KEY,
+    meeting_chat_thread_id TEXT,
+    subject TEXT,
+    organizer_aad_id TEXT,
+    organizer_display_name TEXT,
+    scheduled_start_utc TEXT,
+    scheduled_end_utc TEXT,
+    actual_start_utc TEXT,
+    actual_end_utc TEXT,
+    channel_team_id TEXT,
+    channel_team_display_name TEXT,
+    channel_id TEXT,
+    channel_display_name TEXT,
+    channel_thread_id TEXT,
+    channel_linked_at_utc TEXT,
+    channel_linked_source TEXT,
+    last_event_utc TEXT,
+    created_at_utc TEXT NOT NULL,
+    updated_at_utc TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_meetings_chat_thread
+    ON meetings(meeting_chat_thread_id);
+CREATE INDEX IF NOT EXISTS idx_meetings_channel
+    ON meetings(channel_team_id, channel_id);
+
+-- alfred-v2: raw envelope archive. One row per inbound POST to
+-- /v2/events so we can always replay the wire history without
+-- re-deriving from the per-session ledger.
+CREATE TABLE IF NOT EXISTS raw_ingest_envelopes (
+    envelope_id        TEXT PRIMARY KEY,
+    schema_version     TEXT NOT NULL,
+    event_type         TEXT NOT NULL,
+    ts                 TEXT NOT NULL,
+    received_at_utc    TEXT NOT NULL,
+    meeting_id         TEXT,
+    team_id            TEXT,
+    channel_id         TEXT,
+    thread_id          TEXT,
+    raw_json           TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_raw_ingest_envelopes_meeting
+    ON raw_ingest_envelopes(meeting_id, ts);
+CREATE INDEX IF NOT EXISTS idx_raw_ingest_envelopes_channel
+    ON raw_ingest_envelopes(team_id, channel_id, ts);
+CREATE INDEX IF NOT EXISTS idx_raw_ingest_envelopes_event_type
+    ON raw_ingest_envelopes(event_type, ts);
 """
 
 
@@ -1104,6 +1159,274 @@ class SessionStore:
             row["arguments"] = json.loads(row.pop("arguments_json") or "{}")
             row["result"] = json.loads(row.pop("result_json") or "{}")
         return rows
+
+
+    # -- alfred-v2 meetings registry -------------------------------------
+
+    def upsert_meeting_metadata(
+        self,
+        meeting_id: str,
+        *,
+        meeting_chat_thread_id: Optional[str] = None,
+        subject: Optional[str] = None,
+        organizer_aad_id: Optional[str] = None,
+        organizer_display_name: Optional[str] = None,
+        scheduled_start_utc: Optional[str] = None,
+        scheduled_end_utc: Optional[str] = None,
+        actual_start_utc: Optional[str] = None,
+        actual_end_utc: Optional[str] = None,
+        channel_team_id: Optional[str] = None,
+        channel_team_display_name: Optional[str] = None,
+        channel_id: Optional[str] = None,
+        channel_display_name: Optional[str] = None,
+        channel_thread_id: Optional[str] = None,
+        channel_linked_at_utc: Optional[str] = None,
+        channel_linked_source: Optional[str] = None,
+        last_event_utc: Optional[str] = None,
+    ) -> None:
+        """Upsert a meeting record. Only non-null fields replace existing values.
+
+        ``meeting_id`` is the canonical Graph onlineMeeting id and is the
+        sole primary key. Channel link fields are populated when a
+        ``meeting.linked`` event arrives (or when the meeting's payload
+        already carries a ``channel_link`` block).
+        """
+        now = _iso_now()
+        with self._lock, self._connect() as conn:
+            existing = conn.execute(
+                "SELECT * FROM meetings WHERE meeting_id = ?",
+                (meeting_id,),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO meetings (
+                        meeting_id, meeting_chat_thread_id, subject,
+                        organizer_aad_id, organizer_display_name,
+                        scheduled_start_utc, scheduled_end_utc,
+                        actual_start_utc, actual_end_utc,
+                        channel_team_id, channel_team_display_name,
+                        channel_id, channel_display_name, channel_thread_id,
+                        channel_linked_at_utc, channel_linked_source,
+                        last_event_utc, created_at_utc, updated_at_utc
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        meeting_id,
+                        meeting_chat_thread_id,
+                        subject,
+                        organizer_aad_id,
+                        organizer_display_name,
+                        scheduled_start_utc,
+                        scheduled_end_utc,
+                        actual_start_utc,
+                        actual_end_utc,
+                        channel_team_id,
+                        channel_team_display_name,
+                        channel_id,
+                        channel_display_name,
+                        channel_thread_id,
+                        channel_linked_at_utc,
+                        channel_linked_source,
+                        last_event_utc,
+                        now,
+                        now,
+                    ),
+                )
+                return
+
+            row = dict(existing)
+            updates = {
+                "meeting_chat_thread_id": meeting_chat_thread_id or row.get("meeting_chat_thread_id"),
+                "subject": subject or row.get("subject"),
+                "organizer_aad_id": organizer_aad_id or row.get("organizer_aad_id"),
+                "organizer_display_name": organizer_display_name or row.get("organizer_display_name"),
+                "scheduled_start_utc": scheduled_start_utc or row.get("scheduled_start_utc"),
+                "scheduled_end_utc": scheduled_end_utc or row.get("scheduled_end_utc"),
+                "actual_start_utc": actual_start_utc or row.get("actual_start_utc"),
+                "actual_end_utc": actual_end_utc or row.get("actual_end_utc"),
+                "channel_team_id": channel_team_id or row.get("channel_team_id"),
+                "channel_team_display_name": channel_team_display_name or row.get("channel_team_display_name"),
+                "channel_id": channel_id or row.get("channel_id"),
+                "channel_display_name": channel_display_name or row.get("channel_display_name"),
+                "channel_thread_id": channel_thread_id or row.get("channel_thread_id"),
+                "channel_linked_at_utc": channel_linked_at_utc or row.get("channel_linked_at_utc"),
+                "channel_linked_source": channel_linked_source or row.get("channel_linked_source"),
+                "last_event_utc": last_event_utc or row.get("last_event_utc"),
+                "updated_at_utc": now,
+            }
+            conn.execute(
+                """
+                UPDATE meetings SET
+                    meeting_chat_thread_id = :meeting_chat_thread_id,
+                    subject = :subject,
+                    organizer_aad_id = :organizer_aad_id,
+                    organizer_display_name = :organizer_display_name,
+                    scheduled_start_utc = :scheduled_start_utc,
+                    scheduled_end_utc = :scheduled_end_utc,
+                    actual_start_utc = :actual_start_utc,
+                    actual_end_utc = :actual_end_utc,
+                    channel_team_id = :channel_team_id,
+                    channel_team_display_name = :channel_team_display_name,
+                    channel_id = :channel_id,
+                    channel_display_name = :channel_display_name,
+                    channel_thread_id = :channel_thread_id,
+                    channel_linked_at_utc = :channel_linked_at_utc,
+                    channel_linked_source = :channel_linked_source,
+                    last_event_utc = :last_event_utc,
+                    updated_at_utc = :updated_at_utc
+                WHERE meeting_id = :meeting_id
+                """,
+                {**updates, "meeting_id": meeting_id},
+            )
+
+    def get_meeting(self, meeting_id: str) -> Optional[dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM meetings WHERE meeting_id = ?",
+                (meeting_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_meeting_by_chat_thread_id(self, chat_thread_id: str) -> Optional[dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM meetings WHERE meeting_chat_thread_id = ?",
+                (chat_thread_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_meetings_v2(
+        self,
+        limit: Optional[int] = None,
+        team_id: Optional[str] = None,
+        channel_id: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        clauses = []
+        params: list[Any] = []
+        if team_id:
+            clauses.append("channel_team_id = ?")
+            params.append(team_id)
+        if channel_id:
+            clauses.append("channel_id = ?")
+            params.append(channel_id)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        query = (
+            "SELECT * FROM meetings"
+            + where
+            + " ORDER BY COALESCE(last_event_utc, scheduled_start_utc, created_at_utc) DESC"
+        )
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(int(limit))
+        with self._connect() as conn:
+            cur = conn.execute(query, params)
+            return [dict(row) for row in cur.fetchall()]
+
+    def search_meetings_by_subject(
+        self,
+        query: str,
+        limit: int = 25,
+    ) -> list[dict[str, Any]]:
+        """Case-insensitive substring match against ``subject``.
+
+        Empty / whitespace-only queries return the most recent meetings —
+        the agent uses this as a "list_meetings" fallback.
+        """
+        normalized = (query or "").strip().lower()
+        if not normalized:
+            return self.list_meetings_v2(limit=limit)
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT * FROM meetings"
+                " WHERE LOWER(COALESCE(subject, '')) LIKE ?"
+                " ORDER BY COALESCE(last_event_utc, scheduled_start_utc, created_at_utc) DESC"
+                " LIMIT ?",
+                (f"%{normalized}%", int(limit)),
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+    def record_envelope(
+        self,
+        envelope_id: str,
+        *,
+        schema_version: str,
+        event_type: str,
+        ts: str,
+        raw_json: str,
+        meeting_id: Optional[str] = None,
+        team_id: Optional[str] = None,
+        channel_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+    ) -> None:
+        """Append a raw v2 envelope row. Idempotent on ``envelope_id``."""
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO raw_ingest_envelopes (
+                    envelope_id, schema_version, event_type, ts, received_at_utc,
+                    meeting_id, team_id, channel_id, thread_id, raw_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    envelope_id,
+                    schema_version,
+                    event_type,
+                    ts,
+                    _iso_now(),
+                    meeting_id,
+                    team_id,
+                    channel_id,
+                    thread_id,
+                    raw_json,
+                ),
+            )
+
+    def list_thread_messages(
+        self,
+        team_id: str,
+        channel_id: str,
+        thread_id: str,
+        limit: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        query = (
+            "SELECT * FROM meeting_events"
+            " WHERE team_id = ? AND channel_id = ?"
+            "   AND (channel_thread_id = ? OR reply_to_message_id = ? OR message_id = ?)"
+            " ORDER BY timestamp_utc ASC"
+        )
+        params: list[Any] = [team_id, channel_id, thread_id, thread_id, thread_id]
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(int(limit))
+        with self._connect() as conn:
+            cur = conn.execute(query, params)
+            return [dict(row) for row in cur.fetchall()]
+
+    def list_threads_in_channel(
+        self,
+        team_id: str,
+        channel_id: str,
+        limit: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        """Distinct thread heads observed in this channel ordered by most recent."""
+        query = (
+            "SELECT"
+            "   COALESCE(channel_thread_id, message_id) AS thread_id,"
+            "   MAX(timestamp_utc) AS last_activity_utc,"
+            "   COUNT(*) AS message_count"
+            " FROM meeting_events"
+            " WHERE team_id = ? AND channel_id = ? AND kind = 'chat'"
+            " GROUP BY thread_id"
+            " ORDER BY last_activity_utc DESC"
+        )
+        params: list[Any] = [team_id, channel_id]
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(int(limit))
+        with self._connect() as conn:
+            cur = conn.execute(query, params)
+            return [dict(row) for row in cur.fetchall() if row["thread_id"]]
 
 
 def build_store(db_path: str | Path) -> SessionStore:

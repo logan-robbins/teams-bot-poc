@@ -1,17 +1,143 @@
-# Blob archive — `alfred-v2` layout
+# Consuming Alfred data — `alfred-v2`
 
-The Alfred bot mirrors every event into Azure Blob Storage as
-individual JSON blobs, organized as a **direct mirror of the
-Microsoft Graph URL hierarchy**. Anyone with the team's group id
-(or a meeting's id) can read events directly with HTTP GET — no
-API key, no SDK, no per-team auth.
+Alfred captures every meeting transcript, meeting chat, and team-channel
+message Microsoft Teams routes through it, and persists each event two
+ways. **Pick whichever path fits your consumer**:
 
-This document is the contract for the read path. The event schema
-itself is in [`docs/event-contract.md`](event-contract.md).
+| Path | Auth | Best for |
+|------|------|----------|
+| **Sink API** — [`https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io`](https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io) | None (public for now) | "I want one HTTP call → JSON" — list / lookup / proxy reads |
+| **Blob archive** — [`https://stalfreddisney.blob.core.windows.net/alfred-events/`](https://stalfreddisney.blob.core.windows.net/alfred-events/) | Anonymous read | "I want the raw event stream forever" — replay, bulk, offline |
+
+Both serve the **same `alfred-v2` envelopes**. The sink is a thin SQLite
++ HTTP layer over the blob archive; the blob archive is the source of
+truth.
+
+> **AI coding agent shortcut:** if all you need is "list meetings, get
+> a transcript by meeting id, get chat for a channel", use the sink —
+> §1.1 below. If you need the entire event stream, use the blob
+> archive — §2.
 
 ---
 
-## 1. Where the data lives
+## 0. Mental model
+
+Two canonical keys, mirroring Microsoft Graph:
+
+```
+Team (team_id)
+  └── Channel (team_id, channel_id)
+        └── Thread (thread_id = root message id)
+              └── Messages
+
+Meeting (meeting_id = Graph onlineMeeting id)
+  ├── Chat (meeting_chat_thread_id) → Messages
+  ├── Transcripts (live partial/final + post-meeting official VTT)
+  └── channel_link?  (optional back-reference to a channel + thread)
+```
+
+`meeting_id` and `(team_id, channel_id, thread_id)` are URL-safe
+strings you can drop straight into any sink or blob URL — Alfred does
+not invent surrogate keys.
+
+`meeting_chat_thread_id` (`19:meeting_xxx@thread.v2`) is a *sub-
+resource* of the meeting, not a substitute for `meeting_id`. Never
+key on the chat thread when you mean the meeting.
+
+The event contract — envelope shape, every `event_type`, every
+payload — is in [`docs/event-contract.md`](event-contract.md).
+
+---
+
+## 1. Sink API (the easy path)
+
+Base URL (Disney sandbox):
+
+```
+SINK="https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io"
+```
+
+Everything under `/v2/*` is the canonical consumer surface. JSON in,
+JSON out. No auth in the sandbox.
+
+### 1.1 Endpoints
+
+| Endpoint | Returns |
+|----------|---------|
+| `GET /v2/index` | top-level discovery — counts, recent meetings, blob archive prefixes |
+| `GET /v2/meetings?limit=&team_id=&channel_id=` | list meetings (subject, organizer, scheduled / actual times, optional channel link) |
+| `GET /v2/meetings/{meeting_id}` | one meeting — subject, organizer, channel_link, etc. |
+| `GET /v2/meetings/{meeting_id}/events?kinds=speech,chat&limit=` | the meeting's combined ledger (chat + transcript chunks + system) |
+| `GET /v2/meetings/{meeting_id}/transcript` | proxy of the official post-meeting transcript (TXT + VTT URLs, body inline when available) |
+| `GET /v2/teams/{team_id}/channels/{channel_id}` | one channel — distinct threads + linked meetings |
+| `GET /v2/teams/{team_id}/channels/{channel_id}/events?since=&until=&kinds=&limit=` | every event the channel has seen (channel posts + linked meeting events) |
+| `GET /v2/teams/{team_id}/channels/{channel_id}/threads/{thread_id}/messages?limit=` | every chat message in a specific thread |
+| `GET /v2/resolve?kind=meeting&subject=...&limit=` | name → `meeting_id` resolver (case-insensitive substring) |
+
+### 1.2 Recipes
+
+```bash
+SINK="https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io"
+
+# What's in the system?
+curl -sS "$SINK/v2/index" | jq
+
+# All known meetings, newest first
+curl -sS "$SINK/v2/meetings?limit=50" | jq '.meetings[] | {meeting_id, subject, scheduled_start_utc, channel:.channel_link.channel_display_name}'
+
+# A specific meeting (e.g. fetched from the list above)
+MID="MSpkYzE3NjY0Mi0..."
+curl -sS "$SINK/v2/meetings/$MID" | jq
+
+# Its official post-meeting transcript (plaintext, inline)
+curl -sS "$SINK/v2/meetings/$MID/transcript" | jq -r '.text'
+
+# Its live-STT + chat ledger (most recent 200)
+curl -sS "$SINK/v2/meetings/$MID/events?limit=200" \
+  | jq '.events[] | {ts:.timestamp_utc, kind, who:.display_name, text:(.text // .raw)}'
+
+# A channel by id
+TID="d3f5f412-2abf-4300-ac73-019e892c2a05"
+CID="19:abc@thread.tacv2"
+curl -sS "$SINK/v2/teams/$TID/channels/$CID" | jq
+
+# A specific thread's messages
+THRID="1700000000000"
+curl -sS "$SINK/v2/teams/$TID/channels/$CID/threads/$THRID/messages" | jq
+
+# I only know the subject — give me the meeting_id
+curl -sS "$SINK/v2/resolve?kind=meeting&subject=sprint%20planning" | jq '.matches[] | {meeting_id, subject}'
+```
+
+### 1.3 Python helper
+
+```python
+import httpx
+
+SINK = "https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io"
+
+with httpx.Client(base_url=SINK, timeout=10.0) as c:
+    # 1. Resolve subject → meeting_id
+    matches = c.get("/v2/resolve", params={"kind": "meeting", "subject": "sprint planning"}).json()["matches"]
+    meeting_id = matches[0]["meeting_id"]
+
+    # 2. Get the official transcript
+    t = c.get(f"/v2/meetings/{meeting_id}/transcript").json()
+    print(t["text"] if t["available"] else f"not available yet — try {t['official_transcript_txt_url']}")
+
+    # 3. Walk the ledger
+    events = c.get(f"/v2/meetings/{meeting_id}/events", params={"limit": 500}).json()["events"]
+    for e in events:
+        print(e["timestamp_utc"], e["kind"], (e.get("display_name") or "?"), e.get("text", ""))
+```
+
+---
+
+## 2. Blob archive (the raw event stream)
+
+```
+SA="https://stalfreddisney.blob.core.windows.net/alfred-events"
+```
 
 |                  |                                                                  |
 |------------------|------------------------------------------------------------------|
@@ -19,155 +145,78 @@ itself is in [`docs/event-contract.md`](event-contract.md).
 | Container        | `alfred-events`                                                  |
 | Endpoint         | `https://stalfreddisney.blob.core.windows.net/alfred-events/`    |
 | Auth (read)      | Anonymous public read (container ACL = `container`)              |
-| Auth (write)     | Bot / sink managed identities only                               |
+| Auth (write)     | Bot managed identity only                                        |
 | Region           | `eastus`                                                         |
 | Subscription     | `e02c0038-82c8-4655-9647-38083f301099` (WDI R&D)                 |
 
-Anonymous read works from any browser, any region. If that ever
-changes you'll see `403 AuthenticationFailed`; access then requires
-the WDI VNet.
+If anonymous read is ever turned off you'll see `403
+AuthenticationFailed`. Switch to AAD auth at that point (any
+`DefaultAzureCredential`-capable identity in the subscription works).
 
----
+### 2.1 Path layout
 
-## 2. Path layout
-
-### 2.1 Channel side — mirrors `/teams/{tid}/channels/{cid}/messages/{thrid}/replies/{mid}`
-
-```
-teams/{team_id}/meta.json
-teams/{team_id}/channels/{sanitized_channel_id}/meta.json
-teams/{team_id}/channels/{sanitized_channel_id}/threads/{thread_id}/meta.json
-teams/{team_id}/channels/{sanitized_channel_id}/threads/{thread_id}/messages/{utc_ts}-{message_id}.json
-teams/{team_id}/channels/{sanitized_channel_id}/threads/{thread_id}/attachments/{attachment_id}.{ext}
-teams/{team_id}/channels/{sanitized_channel_id}/system/{utc_ts}-{event_id}.json
-```
-
-`system/` holds `channel.attached` / `channel.detached` envelopes.
-
-### 2.2 Meeting side — mirrors `/me/onlineMeetings/{meeting_id}` + the meeting chat container
+Every per-event blob is a **single alfred-v2 envelope** as pretty-
+printed JSON. No preamble, no markers — `jq` works on every file.
 
 ```
-meetings/{meeting_id}/meta.json
-meetings/{meeting_id}/chat/messages/{utc_ts}-{message_id}.json
-meetings/{meeting_id}/chat/attachments/{attachment_id}.{ext}
-meetings/{meeting_id}/system/{utc_ts}-{event_id}.json
-meetings/{meeting_id}/transcripts/partial/{utc_ts}-{event_id}.json
-meetings/{meeting_id}/transcripts/final/{utc_ts}-{event_id}.json
+teams/{team_id}/channels/{channel_id_sanitized}/channel.attached/{utcTs}-{event_id}.json
+teams/{team_id}/channels/{channel_id_sanitized}/channel.detached/{utcTs}-{event_id}.json
+teams/{team_id}/channels/{channel_id_sanitized}/channel.message.created/{utcTs}-{event_id}.json
+teams/{team_id}/channels/{channel_id_sanitized}/channel.message.updated/{utcTs}-{event_id}.json
+teams/{team_id}/channels/{channel_id_sanitized}/channel.message.deleted/{utcTs}-{event_id}.json
+
+meetings/{meeting_id}/meeting.created/{utcTs}-{event_id}.json
+meetings/{meeting_id}/meeting.ended/{utcTs}-{event_id}.json
+meetings/{meeting_id}/meeting.linked/{utcTs}-{event_id}.json
+meetings/{meeting_id}/meeting.call.joined/{utcTs}-{event_id}.json
+meetings/{meeting_id}/meeting.call.left/{utcTs}-{event_id}.json
+meetings/{meeting_id}/meeting.chat.created/{utcTs}-{event_id}.json
+meetings/{meeting_id}/meeting.chat.updated/{utcTs}-{event_id}.json
+meetings/{meeting_id}/meeting.chat.deleted/{utcTs}-{event_id}.json
+meetings/{meeting_id}/meeting.transcript.partial/{utcTs}-{event_id}.json
+meetings/{meeting_id}/meeting.transcript.final/{utcTs}-{event_id}.json
+meetings/{meeting_id}/meeting.transcript.official/{utcTs}-{event_id}.json
+
+meetings/{meeting_id}/transcripts/official.txt
 meetings/{meeting_id}/transcripts/official.vtt
-meetings/{meeting_id}/transcripts/official.json
 ```
 
-`system/` holds `meeting.created`, `meeting.ended`, `meeting.linked`,
-`meeting.call.joined`, `meeting.call.left` envelopes.
+- `{utcTs}` is `yyyyMMddTHHmmssfffZ` — lexicographic order ≡ time order.
+- `{event_id}` is the 32-char hex id from the envelope; use it for dedup.
+- `{channel_id_sanitized}` replaces `:` `@` `;` `%` with `_` (the
+  sanitizer is `re.sub(r"[^a-zA-Z0-9\-_.]", "_", raw)`).
+- `{meeting_id}` and `{team_id}` are URL-safe already and are not
+  sanitized.
 
-### 2.3 Indexes — the name → id lookup surface
+### 2.2 The two well-known transcript files
+
+For any meeting where Record-and-Transcribe was on, the **post-meeting
+official Microsoft transcript** lands at exactly two paths (overwriting
+on each re-fetch):
 
 ```
-indexes/teams.json        # { team_id: { display_name, last_seen_utc } }
-indexes/channels.json     # { channel_id: { team_id, display_name, membership_type, last_seen_utc } }
-indexes/meetings.json     # { meeting_id: { subject, organizer, scheduled_start_utc, scheduled_end_utc,
-                          #                 actual_start_utc, actual_end_utc, channel_link? } }
+meetings/{meeting_id}/transcripts/official.txt   # clean speaker-per-line plaintext
+meetings/{meeting_id}/transcripts/official.vtt   # raw WebVTT (start/end cues, <v> markup)
 ```
 
-These are **rewritten in full** on every change (small files, low
-cadence — single-digit kB each at our scale). They are the
-authoritative answer to "what's in this archive, by name". An AI
-agent doing first-time discovery should GET `indexes/meetings.json`,
-not list the container.
+`official.txt` is the file an exec opens. `official.vtt` is the file a
+parser opens.
 
-### 2.4 Per-entity `meta.json`
+> **Channel meetings produce no official transcript.** Microsoft's
+> `OnlineMeetingTranscript.Read.Chat` permission only applies to
+> private chat meetings, not channel meetings — see README §7.2.
 
-Each `meta.json` is the human-readable face of an id:
+### 2.3 Blob body shape
+
+Every per-event blob is the v2 envelope, pretty-printed:
 
 ```jsonc
-// teams/{team_id}/meta.json
-{
-  "team_id":          "d3f5f412-...",
-  "display_name":     "Engineering",
-  "first_seen_utc":   "2026-05-01T00:00:00Z",
-  "last_seen_utc":    "2026-05-14T18:00:00Z"
-}
-
-// teams/{team_id}/channels/{sanitized_channel_id}/meta.json
-{
-  "team_id":          "d3f5f412-...",
-  "channel_id":       "19:abc@thread.tacv2",
-  "display_name":     "general",
-  "membership_type":  "standard",
-  "first_seen_utc":   "...",
-  "last_seen_utc":    "..."
-}
-
-// teams/{team_id}/channels/{cid}/threads/{thread_id}/meta.json
-{
-  "thread_id":        "1700000000000",
-  "root_message_preview":  "Anyone seen the deploy logs?",
-  "started_at_utc":   "...",
-  "last_activity_utc":"..."
-}
-
-// meetings/{meeting_id}/meta.json
-{
-  "meeting_id":             "MSpkYzE3...",
-  "meeting_chat_thread_id": "19:meeting_xxx@thread.v2",
-  "subject":                "Sprint planning",
-  "organizer": {
-    "aad_id":               "...",
-    "display_name":         "Jane Doe"
-  },
-  "scheduled_start_utc":    "2026-05-14T16:00:00Z",
-  "scheduled_end_utc":      "2026-05-14T16:30:00Z",
-  "actual_start_utc":       "2026-05-14T16:01:12Z",
-  "actual_end_utc":         "2026-05-14T16:34:55Z",
-  "channel_link": {
-    "team_id":              "...",
-    "channel_id":           "...",
-    "thread_id":            null,
-    "linked_at_utc":        "...",
-    "linked_source":        "manual_command"
-  }
-}
-```
-
-### 2.5 Sanitization
-
-| Token                    | Format                                  | Sanitize?  |
-|--------------------------|-----------------------------------------|------------|
-| `team_id`                | AAD group GUID, lowercase, dashes       | No         |
-| `channel_id`             | `19:{guid}@thread.tacv2`                | Yes — `:`, `@` → `_` |
-| `thread_id`              | Numeric string (root message id)        | No         |
-| `message_id`             | Numeric string                          | No         |
-| `meeting_id`             | URL-safe base64                         | No         |
-| `meeting_chat_thread_id` | `19:meeting_xxx@thread.v2`              | Not used in paths (we key by `meeting_id`) |
-| `utc_ts`                 | `yyyyMMddTHHmmssfffZ`                   | n/a        |
-| `event_id`               | 32-char hex                             | No         |
-
-Sanitization rule, in Python:
-
-```python
-import re
-def sanitize(raw: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9\-_.]", "_", raw)
-```
-
----
-
-## 3. Blob bodies
-
-Each event blob is a single pretty-printed `alfred-v2` envelope.
-Every blob is one envelope. Folders are pure prefixes — Azure Blob
-has no real folders.
-
-Example — a finalized transcript chunk:
-
-```jsonc
-// meetings/MSpkYzE3.../transcripts/final/20260514T163412184Z-8a3f1c0e2b9d4a7e9f12bb0001020304.json
+// meetings/MSpkYzE3.../meeting.transcript.final/20260514T163412184Z-8a3f...0304.json
 {
   "schema_version": "alfred-v2",
   "event_type":     "meeting.transcript.final",
   "event_id":       "8a3f1c0e2b9d4a7e9f12bb0001020304",
   "ts":             "2026-05-14T16:34:12.184Z",
-  "channel_ref":    null,
   "meeting_ref": {
     "meeting_id":             "MSpkYzE3...",
     "meeting_chat_thread_id": "19:meeting_xxx@thread.v2",
@@ -176,9 +225,9 @@ Example — a finalized transcript chunk:
     "channel_link":           null
   },
   "payload": {
-    "text":          "Let's start with the deploy retro.",
-    "timestamp_utc": "2026-05-14T16:34:12.184Z",
-    "speaker":       { "id": "speaker_0", "display_name": "Jane Doe" },
+    "text":           "Let's start with the deploy retro.",
+    "timestamp_utc":  "2026-05-14T16:34:12.184Z",
+    "speaker":        { "id": "speaker_0", "display_name": "Jane Doe" },
     "audio_start_ms": 1234.5,
     "audio_end_ms":   5678.9,
     "confidence":     0.94,
@@ -187,10 +236,8 @@ Example — a finalized transcript chunk:
 }
 ```
 
-Example — a channel message:
-
 ```jsonc
-// teams/d3f5f412-.../channels/19_abc_thread.tacv2/threads/1700000000000/messages/20260514T182345401Z-1700000000123.json
+// teams/d3f5f412-.../channels/19_abc_thread.tacv2/channel.message.created/20260514T182345401Z-...json
 {
   "schema_version": "alfred-v2",
   "event_type":     "channel.message.created",
@@ -204,7 +251,6 @@ Example — a channel message:
     "thread_id":            "1700000000000",
     "message_id":           "1700000000123"
   },
-  "meeting_ref":    null,
   "payload": {
     "sender":        { "aad_id": "...", "display_name": "Logan Robbins", "kind": "user" },
     "text":          "Anyone seen the deploy logs?",
@@ -215,106 +261,39 @@ Example — a channel message:
 }
 ```
 
----
-
-## 4. Recipes for an AI agent
-
-### 4.1 "Give me every meeting Alfred has ever seen"
+### 2.4 Recipes — direct from blob storage
 
 ```bash
 SA="https://stalfreddisney.blob.core.windows.net/alfred-events"
-curl -s "$SA/indexes/meetings.json" | jq 'to_entries | map({id:.key, subject:.value.subject, start:.value.scheduled_start_utc})'
+
+# I have meeting_id, give me the transcript (plaintext)
+MID="MSpkYzE3..."
+curl -sS "$SA/meetings/$MID/transcripts/official.txt"
+
+# I have meeting_id, give me the transcript (WebVTT, with cue timings)
+curl -sS "$SA/meetings/$MID/transcripts/official.vtt"
+
+# I have meeting_id, list every event the bot ever published for it
+curl -sS "$SA?restype=container&comp=list&prefix=meetings/$MID/" \
+  | xmllint --xpath '//Blob/Name/text()' - 2>/dev/null
+
+# I have meeting_id, give me every live-STT final chunk in order
+curl -sS "$SA?restype=container&comp=list&prefix=meetings/$MID/meeting.transcript.final/" \
+  | xmllint --xpath '//Blob/Name/text()' - 2>/dev/null \
+  | tr ' ' '\n' \
+  | sort \
+  | while read name; do curl -sS "$SA/$name" | jq -r '"\(.ts)  \(.payload.speaker.display_name // .payload.speaker.id // "?"):  \(.payload.text)"'; done
+
+# I have team_id + channel_id, list every chat message
+TID="d3f5f412-2abf-4300-ac73-019e892c2a05"
+CID_SAN="19_abc_thread.tacv2"
+curl -sS "$SA?restype=container&comp=list&prefix=teams/$TID/channels/$CID_SAN/channel.message.created/"
 ```
 
-### 4.2 "Find the meeting where the subject contains 'sprint planning'"
-
-```bash
-curl -s "$SA/indexes/meetings.json" \
-  | jq -r 'to_entries[] | select(.value.subject | test("sprint planning"; "i")) | .key'
-```
-
-Then for each meeting id:
-
-```bash
-MID=<from-above>
-curl -s "$SA/meetings/$MID/meta.json" | jq
-curl -s "$SA/meetings/$MID/transcripts/official.vtt"
-```
-
-### 4.3 "Resolve channel name 'engineering / general' to its ids"
-
-```bash
-curl -s "$SA/indexes/channels.json" \
-  | jq -r --arg t "Engineering" --arg c "general" '
-      to_entries[]
-      | select(.value.display_name == $c)
-      | . as $entry
-      | $teams[.value.team_id] as $tname
-      | select($tname == $t)
-      | "\(.value.team_id) \(.key)"
-    ' --slurpfile teams "$SA/indexes/teams.json"
-```
-
-(Or just hit the sink's `GET /v2/resolve?kind=channel&team=Engineering&channel=general` —
-the sink keeps a SQLite-indexed copy of these maps.)
-
-### 4.4 "Get the live transcript chunks for the most recent meeting"
-
-```bash
-LATEST=$(curl -s "$SA/indexes/meetings.json" \
-  | jq -r 'to_entries | sort_by(.value.actual_start_utc) | reverse | .[0].key')
-
-curl -s "$SA?restype=container&comp=list&prefix=meetings/$LATEST/transcripts/final/"
-```
-
-### 4.5 "Get every channel message in a specific thread"
-
-```bash
-curl -s "$SA?restype=container&comp=list&prefix=teams/$TID/channels/$SAN_CID/threads/$THRID/messages/"
-```
-
-Listing returns blob names in lexicographic order, which by
-construction is time order (paths embed `yyyyMMddTHHmmssfffZ` first).
-
-### 4.6 Pagination
-
-Azure Blob list returns up to 5000 entries per page; for more, parse
-`<NextMarker>` from the XML and pass `&marker=<value>`.
-
----
-
-## 5. Python helpers
-
-### 5.1 With `azure-storage-blob`
+### 2.5 Python — zero deps
 
 ```python
-from azure.storage.blob import ContainerClient
-import json, re
-
-URL = "https://stalfreddisney.blob.core.windows.net/alfred-events"
-c = ContainerClient.from_container_url(URL, credential=None)
-
-def get_json(name: str):
-    return json.loads(c.download_blob(name).readall().decode())
-
-# All meetings, newest first
-meetings = get_json("indexes/meetings.json")
-sorted_meetings = sorted(meetings.items(),
-                         key=lambda kv: kv[1].get("actual_start_utc") or "",
-                         reverse=True)
-
-# Latest meeting's final transcript chunks
-latest_mid = sorted_meetings[0][0]
-prefix = f"meetings/{latest_mid}/transcripts/final/"
-for b in sorted(c.list_blobs(name_starts_with=prefix), key=lambda b: b.name):
-    env = get_json(b.name)
-    print(env["ts"], env["payload"]["speaker"].get("display_name", "?"), env["payload"]["text"])
-```
-
-### 5.2 Zero-deps
-
-```python
-import urllib.request, json
+import urllib.request, urllib.parse, json
 from xml.etree import ElementTree as ET
 
 SA = "https://stalfreddisney.blob.core.windows.net/alfred-events"
@@ -322,55 +301,147 @@ SA = "https://stalfreddisney.blob.core.windows.net/alfred-events"
 def get(name: str) -> bytes:
     return urllib.request.urlopen(f"{SA}/{name}").read()
 
-def list_prefix(prefix: str):
-    xml = urllib.request.urlopen(
-        f"{SA}?restype=container&comp=list&prefix={prefix}"
-    ).read()
-    root = ET.fromstring(xml)
-    for b in root.iter("Blob"):
-        yield b.findtext("Name")
+def get_json(name: str) -> dict:
+    return json.loads(get(name).decode("utf-8"))
 
-meetings = json.loads(get("indexes/meetings.json").decode())
+def list_prefix(prefix: str):
+    """Yield blob names under `prefix`, ascending order = time order."""
+    marker = ""
+    while True:
+        qs = urllib.parse.urlencode({
+            "restype": "container",
+            "comp": "list",
+            "prefix": prefix,
+            "maxresults": "5000",
+            **({"marker": marker} if marker else {}),
+        })
+        xml = urllib.request.urlopen(f"{SA}?{qs}").read()
+        root = ET.fromstring(xml)
+        for b in root.iter("Blob"):
+            yield b.findtext("Name") or ""
+        marker = (root.findtext("NextMarker") or "").strip()
+        if not marker:
+            return
+
+# Example: print every transcript final chunk for one meeting
+meeting_id = "MSpkYzE3..."
+for name in list_prefix(f"meetings/{meeting_id}/meeting.transcript.final/"):
+    env = get_json(name)
+    speaker = (env["payload"].get("speaker") or {}).get("display_name") or "?"
+    print(env["ts"], speaker + ":", env["payload"]["text"])
+
+# Example: dump the official transcript
+print(get(f"meetings/{meeting_id}/transcripts/official.txt").decode("utf-8"))
+```
+
+### 2.6 Python — with `azure-storage-blob`
+
+```python
+from azure.storage.blob import ContainerClient
+import json
+
+URL = "https://stalfreddisney.blob.core.windows.net/alfred-events"
+c = ContainerClient.from_container_url(URL, credential=None)
+
+def get_json(name: str) -> dict:
+    return json.loads(c.download_blob(name).readall().decode("utf-8"))
+
+meeting_id = "MSpkYzE3..."
+
+# Walk every event for a meeting, chronologically
+for b in sorted(
+    c.list_blobs(name_starts_with=f"meetings/{meeting_id}/"),
+    key=lambda b: b.name,
+):
+    if not b.name.endswith(".json"):
+        continue
+    env = get_json(b.name)
+    print(env["ts"], env["event_type"])
+```
+
+### 2.7 Listing pagination
+
+Azure Blob list returns up to 5000 entries per page; parse
+`<NextMarker>` from the XML and pass `&marker=<value>` for the next
+page. The Python helper in §2.5 does this automatically.
+
+---
+
+## 3. Putting them together — "build me a meeting dossier"
+
+Given a meeting subject string, build a dossier with the canonical
+transcript, the meeting chat, and any back-linked channel context.
+
+```python
+import httpx
+
+SINK = "https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io"
+SA = "https://stalfreddisney.blob.core.windows.net/alfred-events"
+
+with httpx.Client(timeout=10.0) as c:
+    # 1. Subject → meeting_id
+    r = c.get(f"{SINK}/v2/resolve", params={"kind": "meeting", "subject": "sprint planning"}).json()
+    meeting_id = r["matches"][0]["meeting_id"]
+    subject = r["matches"][0]["subject"]
+
+    # 2. Canonical metadata + channel link (the sink already merged everything)
+    meta = c.get(f"{SINK}/v2/meetings/{meeting_id}").json()
+
+    # 3. Post-meeting transcript (plaintext)
+    transcript_text = c.get(f"{SA}/meetings/{meeting_id}/transcripts/official.txt").text
+
+    # 4. Full ledger (chat + transcript chunks), most recent N
+    ledger = c.get(f"{SINK}/v2/meetings/{meeting_id}/events", params={"limit": 500}).json()["events"]
+
+print(subject, "—", meta.get("organizer", {}).get("display_name"))
+print(transcript_text[:1000], "...")
+print(f"{len(ledger)} events in the meeting ledger")
 ```
 
 ---
 
-## 6. Cadence and volume
+## 4. Idempotency + cadence
 
-Per active meeting:
+- `event_id` (32-char hex) is the natural primary key. Re-runs are
+  exactly-once at the blob layer; same path, same body.
+- Blob timestamps are millisecond-precision (`HHmmssfff`); the
+  `event_id` suffix disambiguates ties.
+- The sink writes the same envelope twice (once into `raw_ingest_envelopes`
+  for replay, once into the per-session ledger for queries) — both are
+  keyed on `event_id`.
 
-| Event type                         | Cadence                                                |
-|------------------------------------|--------------------------------------------------------|
-| `meeting.chat.*`                   | 1 per message                                          |
-| `meeting.transcript.partial`       | throttled to 1/speaker/60s (configurable)              |
-| `meeting.transcript.final`         | ~3–5/min/speaker                                       |
-| `meeting.transcript.official`      | exactly 1, ~1–2 min after meeting ends, only if record-and-transcribe was on |
-| `meeting.system/*`                 | rare (create/end/link/call-joined/left)                |
+Per meeting:
+
+| Event type                          | Cadence                                                                |
+|-------------------------------------|------------------------------------------------------------------------|
+| `meeting.transcript.partial`        | throttled to 1/speaker/60s by default (`PartialThrottleSeconds`)      |
+| `meeting.transcript.final`          | ~3–5 / min / speaker                                                   |
+| `meeting.transcript.official`       | exactly 1, ~1–2 min after meeting ends, if record-and-transcribe was on |
+| `meeting.chat.*`                    | 1 per message                                                          |
+| `meeting.created` / `.ended` / etc. | rare                                                                   |
 
 Per channel:
 
-| Event type                         | Cadence                                                |
-|------------------------------------|--------------------------------------------------------|
-| `channel.message.*`                | 1 per message                                          |
-| `channel.system/*`                 | rare (attached/detached)                               |
+| Event type                          | Cadence                                                                |
+|-------------------------------------|------------------------------------------------------------------------|
+| `channel.message.*`                 | 1 per message                                                          |
+| `channel.attached` / `.detached`    | rare                                                                   |
 
-For content-only consumption, filter to:
-`meeting.transcript.final`, `meeting.transcript.official`,
-`meeting.chat.created`, `channel.message.created`.
-
----
-
-## 7. Idempotency
-
-- `event_id` is stable per event; use it as your primary key.
-- Blobs are written exactly once. Re-runs produce the same paths.
-- Timestamps in path names are millisecond-precision (`HHmmssfff`);
-  the `event_id` suffix disambiguates ties.
+For content-only consumers, filter to `meeting.transcript.final`,
+`meeting.transcript.official`, `meeting.chat.created`,
+`channel.message.created`.
 
 ---
 
-## 8. Built-in UI
+## 5. Built-in UI
 
-The web app's archive browser at `/archive` walks this layout and
-renders human-readable names from `meta.json` + the index files.
-It's a thin client; same data the recipes above produce.
+[`https://ca-alfred-web.gentlewater-5aa74a73.eastus.azurecontainerapps.io`](https://ca-alfred-web.gentlewater-5aa74a73.eastus.azurecontainerapps.io)
+
+- `/` — meeting picker (subject first; hover for `meeting_id`).
+- `/m/<meeting_chat_thread_id>` — per-meeting dossier (live ledger + dossier panel).
+- `/channels` — operator console (attach / consumer admin).
+- `/archive` — blob-archive folder browser; reads the same `.json`
+  envelopes documented above.
+
+This UI is a thin client over the same sink + blob endpoints — nothing
+here is private to the UI.

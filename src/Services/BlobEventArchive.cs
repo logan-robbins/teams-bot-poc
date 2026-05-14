@@ -12,8 +12,8 @@ namespace TeamsMediaBot.Services;
 /// <summary>
 /// Configuration for the per-channel / per-meeting Azure Blob archive.
 /// All Alfred events that flow through <see cref="EventFanoutDispatcher"/>
-/// are also persisted as individual .txt blobs so downstream consumers
-/// don't have to ingest the POST fan-out to retain history.
+/// are also persisted as individual <c>.json</c> blobs so downstream
+/// consumers don't have to ingest the POST fan-out to retain history.
 /// </summary>
 public sealed class BlobArchiveConfiguration
 {
@@ -41,16 +41,24 @@ public sealed class BlobArchiveConfiguration
 
 /// <summary>
 /// Writes Alfred event envelopes and post-meeting official transcripts
-/// to Azure Blob Storage as <c>.txt</c> files keyed by team / channel
-/// (or chat thread) and event kind. Sits parallel to the
-/// <see cref="EventFanoutDispatcher"/>'s HTTP fan-out path: every event
-/// the dispatcher publishes to a Python sink is also persisted here.
+/// to Azure Blob Storage. Per-event blobs are pure JSON keyed by
+/// team / channel / meeting and event type; the official transcript is
+/// dual-written as clean plaintext and raw WebVTT. Sits parallel to
+/// the <see cref="EventFanoutDispatcher"/>'s HTTP fan-out path: every
+/// event the dispatcher publishes to a Python sink is also persisted
+/// here so any consumer can replay history without a live HTTP listener.
 /// </summary>
 /// <remarks>
-/// Path layout (all lowercase, slash-prefixed virtual folders):
-///   channels/{teamId}/{sanitizedChannelId}/{eventKind}/{utcTs}-{eventId}.txt
-///   meetings/{sanitizedChatThreadId}/{eventKind}/{utcTs}-{eventId}.txt
-///   meetings/{sanitizedChatThreadId}/_official-transcript.txt
+/// Path layout (mirrors the Microsoft Graph URL hierarchy):
+///   teams/{team_id}/channels/{channel_id}/{event_type}/{utcTs}-{eventId}.json
+///   meetings/{meeting_id}/{event_type}/{utcTs}-{eventId}.json
+///   meetings/{meeting_id}/transcripts/official.txt   (clean speaker-per-line plaintext)
+///   meetings/{meeting_id}/transcripts/official.vtt   (raw WebVTT)
+///
+/// Every <c>.json</c> blob is a pure alfred-v2 envelope — no preamble,
+/// no markers, just <c>{ … }</c>. Consumers can <c>jq</c> them
+/// directly. See <c>docs/retrieving-transcripts.md</c> for the
+/// consumer contract.
 ///
 /// Auth: prefers <see cref="BlobArchiveConfiguration.ConnectionString"/>
 /// when set (account-key path, current sandbox state) and falls back to
@@ -121,8 +129,8 @@ public sealed class BlobEventArchive
             try
             {
                 var path = BuildEnvelopePath(envelope);
-                var body = BuildHumanReadableBody(envelope);
-                await UploadAsync(path, body, "text/plain", cancellationToken);
+                var body = JsonSerializer.Serialize(envelope, EnvelopeJsonOptions);
+                await UploadAsync(path, body, "application/json", cancellationToken);
             }
             catch (Exception ex)
             {
@@ -131,80 +139,6 @@ public sealed class BlobEventArchive
                     envelope.EventType, envelope.EventId);
             }
         }, cancellationToken);
-    }
-
-    /// <summary>
-    /// Renders an envelope into a two-part blob body: a small human-
-    /// readable preamble (timestamp + sender + summary) followed by the
-    /// full machine-parseable JSON envelope under <c>---ENVELOPE---</c>.
-    /// </summary>
-    private static string BuildHumanReadableBody(AlfredEventEnvelope envelope)
-    {
-        var sb = new StringBuilder();
-        sb.Append("# ").AppendLine(BuildHumanSummary(envelope));
-        sb.AppendLine();
-        sb.AppendLine("---ENVELOPE---");
-        sb.Append(JsonSerializer.Serialize(envelope, EnvelopeJsonOptions));
-        return sb.ToString();
-    }
-
-    private static string BuildHumanSummary(AlfredEventEnvelope envelope)
-    {
-        var ts = envelope.Ts ?? string.Empty;
-        return envelope.EventType switch
-        {
-            AlfredEventTypes.ChannelMessageCreated or
-            AlfredEventTypes.ChannelMessageUpdated or
-            AlfredEventTypes.ChannelMessageDeleted => SummarizeChannelMessage(envelope, ts),
-            AlfredEventTypes.MeetingChatCreated or
-            AlfredEventTypes.MeetingChatUpdated or
-            AlfredEventTypes.MeetingChatDeleted => SummarizeMeetingChat(envelope, ts),
-            AlfredEventTypes.MeetingTranscriptPartial => SummarizeTranscript(envelope, ts, "partial"),
-            AlfredEventTypes.MeetingTranscriptFinal => SummarizeTranscript(envelope, ts, "final"),
-            AlfredEventTypes.MeetingTranscriptOfficial => $"[{ts}] official transcript fetched (event_id={envelope.EventId})",
-            AlfredEventTypes.ChannelAttached => $"[{ts}] channel attached (team={envelope.ChannelRef?.TeamId} channel={envelope.ChannelRef?.ChannelId})",
-            AlfredEventTypes.ChannelDetached => $"[{ts}] channel detached (team={envelope.ChannelRef?.TeamId} channel={envelope.ChannelRef?.ChannelId})",
-            AlfredEventTypes.MeetingLinked => $"[{ts}] meeting linked (meetingId={envelope.MeetingRef?.MeetingId} team={envelope.MeetingRef?.ChannelLink?.TeamId} channel={envelope.MeetingRef?.ChannelLink?.ChannelId})",
-            _ => $"[{ts}] {envelope.EventType} (event_id={envelope.EventId})",
-        };
-    }
-
-    private static string SummarizeChannelMessage(AlfredEventEnvelope envelope, string ts)
-    {
-        if (envelope.Payload is ChannelMessagePayload p)
-        {
-            var sender = string.IsNullOrWhiteSpace(p.Sender.DisplayName) ? (p.Sender.AadId ?? "?") : p.Sender.DisplayName!;
-            var botTag = p.FromBot ? " (bot)" : string.Empty;
-            var text = (p.Text ?? string.Empty).Replace('\n', ' ');
-            if (text.Length > 400) text = text.Substring(0, 400) + "…";
-            return $"[{ts}] {sender}{botTag} (channel): {text}";
-        }
-        return $"[{ts}] {envelope.EventType} (event_id={envelope.EventId})";
-    }
-
-    private static string SummarizeMeetingChat(AlfredEventEnvelope envelope, string ts)
-    {
-        if (envelope.Payload is MeetingChatPayload p)
-        {
-            var sender = string.IsNullOrWhiteSpace(p.Sender.DisplayName) ? (p.Sender.AadId ?? "?") : p.Sender.DisplayName!;
-            var botTag = p.FromBot ? " (bot)" : string.Empty;
-            var text = (p.Text ?? string.Empty).Replace('\n', ' ');
-            if (text.Length > 400) text = text.Substring(0, 400) + "…";
-            return $"[{ts}] {sender}{botTag} (meeting_chat): {text}";
-        }
-        return $"[{ts}] {envelope.EventType} (event_id={envelope.EventId})";
-    }
-
-    private static string SummarizeTranscript(AlfredEventEnvelope envelope, string ts, string kind)
-    {
-        if (envelope.Payload is MeetingTranscriptPayload p)
-        {
-            var speaker = p.Speaker?.Id ?? p.Speaker?.DisplayName ?? "?";
-            var text = (p.Text ?? string.Empty).Replace('\n', ' ');
-            if (text.Length > 400) text = text.Substring(0, 400) + "…";
-            return $"[{ts}] {speaker} ({kind}): {text}";
-        }
-        return $"[{ts}] transcript.{kind} (event_id={envelope.EventId})";
     }
 
     /// <summary>
@@ -346,13 +280,13 @@ public sealed class BlobEventArchive
 
         if (envelope.ChannelRef is { } cr)
         {
-            return $"channels/{SanitizePathSegment(cr.TeamId)}/{SanitizePathSegment(cr.ChannelId)}/{safeKind}/{ts}-{safeId}.txt";
+            return $"teams/{SanitizePathSegment(cr.TeamId)}/channels/{SanitizePathSegment(cr.ChannelId)}/{safeKind}/{ts}-{safeId}.json";
         }
         if (envelope.MeetingRef is { } mr)
         {
-            return $"meetings/{SanitizePathSegment(mr.MeetingId)}/{safeKind}/{ts}-{safeId}.txt";
+            return $"meetings/{SanitizePathSegment(mr.MeetingId)}/{safeKind}/{ts}-{safeId}.json";
         }
-        return $"events/{safeKind}/{ts}-{safeId}.txt";
+        return $"events/{safeKind}/{ts}-{safeId}.json";
     }
 
     /// <summary>

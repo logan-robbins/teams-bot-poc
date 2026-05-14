@@ -24,6 +24,7 @@ import hashlib
 import json as _json_mod
 import logging
 import os
+import re
 import uuid as _uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -33,6 +34,7 @@ from pathlib import Path
 from typing import Annotated, Any, AsyncIterator, TypedDict
 
 import aiofiles
+import httpx
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -2876,120 +2878,470 @@ async def link_session_to_channel(
 
 
 # =============================================================================
-# /events — versioned envelope ingress (alfred-events-v1 contract)
+# /v2/events — alfred-v2 envelope ingress
+#
+# See docs/event-contract.md for the canonical wire spec.
+#
+# Every envelope carries EXACTLY ONE of `channel_ref` (for ``channel.*``
+# events) or `meeting_ref` (for ``meeting.*`` events). Routing keys are
+# derived from those blocks, not from flat envelope fields — the bot
+# never emits v1 envelopes anymore.
 # =============================================================================
 
 
-class AlfredEventEnvelopeRequest(BaseModel):
-    """Versioned envelope contract published by the C# bot's
-    EventFanoutDispatcher to every registered consumer URL.
+class AlfredEventTypes:
+    """Mirror of ``src/Models/AlfredEventEnvelope.cs::AlfredEventTypes``."""
 
-    See ``docs/event-contract.md`` for the canonical spec. This
-    Python sink is one reference consumer; other teams may publish
-    their own ``/events`` handlers behind their own URLs.
-    """
+    CHANNEL_ATTACHED = "channel.attached"
+    CHANNEL_DETACHED = "channel.detached"
+    CHANNEL_MESSAGE_CREATED = "channel.message.created"
+    CHANNEL_MESSAGE_UPDATED = "channel.message.updated"
+    CHANNEL_MESSAGE_DELETED = "channel.message.deleted"
+    MEETING_CREATED = "meeting.created"
+    MEETING_ENDED = "meeting.ended"
+    MEETING_LINKED = "meeting.linked"
+    MEETING_CALL_JOINED = "meeting.call.joined"
+    MEETING_CALL_LEFT = "meeting.call.left"
+    MEETING_CHAT_CREATED = "meeting.chat.created"
+    MEETING_CHAT_UPDATED = "meeting.chat.updated"
+    MEETING_CHAT_DELETED = "meeting.chat.deleted"
+    MEETING_TRANSCRIPT_PARTIAL = "meeting.transcript.partial"
+    MEETING_TRANSCRIPT_FINAL = "meeting.transcript.final"
+    MEETING_TRANSCRIPT_OFFICIAL = "meeting.transcript.official"
 
-    schema_version: str = Field(default="alfred-events-v1")
+
+class V2SenderRef(BaseModel):
+    aad_id: str | None = None
+    display_name: str | None = None
+    kind: str | None = None
+    model_config = {"extra": "ignore"}
+
+
+class V2ChannelLink(BaseModel):
+    team_id: str
+    team_display_name: str | None = None
+    channel_id: str
+    channel_display_name: str | None = None
+    thread_id: str | None = None
+    linked_at_utc: str
+    linked_source: str
+    model_config = {"extra": "ignore"}
+
+
+class V2ChannelRef(BaseModel):
+    team_id: str
+    team_display_name: str | None = None
+    channel_id: str
+    channel_display_name: str | None = None
+    thread_id: str | None = None
+    message_id: str | None = None
+    model_config = {"extra": "ignore"}
+
+
+class V2MeetingRef(BaseModel):
+    meeting_id: str = Field(..., min_length=1)
+    meeting_chat_thread_id: str | None = None
+    call_id: str | None = None
+    subject: str | None = None
+    organizer: V2SenderRef | None = None
+    scheduled_start_utc: str | None = None
+    scheduled_end_utc: str | None = None
+    channel_link: V2ChannelLink | None = None
+    model_config = {"extra": "ignore"}
+
+
+class AlfredV2Envelope(BaseModel):
+    """alfred-v2 envelope. The bot emits exactly this shape — see
+    ``docs/event-contract.md`` §2."""
+
+    schema_version: str = Field(default="alfred-v2")
     event_type: str = Field(..., min_length=1)
     event_id: str = Field(..., min_length=1)
     ts: str = Field(..., min_length=1)
-    team_id: str | None = None
-    channel_id: str | None = None
-    chat_thread_id: str = Field(..., min_length=1)
-    channel_thread_id: str | None = None
+    channel_ref: V2ChannelRef | None = None
+    meeting_ref: V2MeetingRef | None = None
     conversation_reference_id: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
 
     model_config = {"extra": "ignore"}
 
 
-@app.post("/events")
-async def receive_event_envelope(
-    envelope: AlfredEventEnvelopeRequest,
+def _internal_chat_thread_key(envelope: AlfredV2Envelope) -> str | None:
+    """Resolve the chat_thread_id used by the internal session registry.
+
+    The registry is keyed by chat_thread_id because the agent's tick model
+    is per-conversation. For v2:
+
+    - ``meeting.*`` events use ``meeting_chat_thread_id`` (the Teams chat
+      container, ``19:meeting_xxx@thread.v2``) when present so the chat /
+      transcript / official-transcript paths all land in the same session;
+      we fall back to the canonical ``meeting_id`` so the session still
+      exists before any chat arrives.
+    - ``channel.*`` events use the ``thread_id`` (root message id) when
+      present (so threaded discussions stay together) and otherwise the
+      ``channel_id`` for channel-lifecycle events.
+    """
+    if envelope.meeting_ref is not None:
+        return envelope.meeting_ref.meeting_chat_thread_id or envelope.meeting_ref.meeting_id
+    if envelope.channel_ref is not None:
+        return envelope.channel_ref.thread_id or envelope.channel_ref.channel_id
+    return None
+
+
+def _stamp_meeting_metadata(
+    store: "SessionStore",
+    envelope: AlfredV2Envelope,
+    *,
+    last_event_utc: str | None,
+) -> None:
+    if envelope.meeting_ref is None:
+        return
+    mr = envelope.meeting_ref
+    link = mr.channel_link
+    store.upsert_meeting_metadata(
+        meeting_id=mr.meeting_id,
+        meeting_chat_thread_id=mr.meeting_chat_thread_id,
+        subject=mr.subject,
+        organizer_aad_id=mr.organizer.aad_id if mr.organizer else None,
+        organizer_display_name=mr.organizer.display_name if mr.organizer else None,
+        scheduled_start_utc=mr.scheduled_start_utc,
+        scheduled_end_utc=mr.scheduled_end_utc,
+        channel_team_id=link.team_id if link else None,
+        channel_team_display_name=link.team_display_name if link else None,
+        channel_id=link.channel_id if link else None,
+        channel_display_name=link.channel_display_name if link else None,
+        channel_thread_id=link.thread_id if link else None,
+        channel_linked_at_utc=link.linked_at_utc if link else None,
+        channel_linked_source=link.linked_source if link else None,
+        last_event_utc=last_event_utc,
+    )
+
+
+def _channel_event_to_chat_request(
+    envelope: AlfredV2Envelope,
+    chat_thread_id: str,
+) -> ChatMessageRequest:
+    """Translate a v2 ``channel.message.*`` envelope into the internal
+    ``ChatMessageRequest`` shape consumed by ``receive_chat_message``.
+
+    Internal chat_thread_id = the thread root message id (from the
+    channel_ref) so every reply in the same thread feeds one session.
+    """
+    assert envelope.channel_ref is not None
+    cr = envelope.channel_ref
+    payload = envelope.payload
+    sender = payload.get("sender") or {}
+
+    event_type_map = {
+        "channel.message.created": "chat_created",
+        "channel.message.updated": "chat_updated",
+        "channel.message.deleted": "chat_deleted",
+    }
+    internal_event_type = event_type_map.get(envelope.event_type, "chat_created")
+
+    return ChatMessageRequest(
+        event_type=internal_event_type,
+        chat_thread_id=chat_thread_id,
+        message_id=cr.message_id or envelope.event_id,
+        text=payload.get("text"),
+        html=payload.get("html"),
+        sender_id=sender.get("aad_id"),
+        sender_display_name=sender.get("display_name"),
+        timestamp_utc=payload.get("timestamp_utc") or envelope.ts,
+        conversation_reference_id=envelope.conversation_reference_id,
+        attachments=list(payload.get("attachments") or []),
+        mentions=list(payload.get("mentions") or []),
+        reply_to_message_id=payload.get("reply_to_message_id"),
+        from_bot=bool(payload.get("from_bot")),
+        raw=payload.get("raw"),
+        conversation_kind="channel",
+        team_id=cr.team_id,
+        channel_id=cr.channel_id,
+        channel_thread_id=cr.thread_id,
+    )
+
+
+def _meeting_chat_event_to_chat_request(
+    envelope: AlfredV2Envelope,
+    chat_thread_id: str,
+) -> ChatMessageRequest:
+    """Translate a v2 ``meeting.chat.*`` envelope into ``ChatMessageRequest``.
+
+    ``chat_thread_id`` is the meeting chat container
+    (``19:meeting_xxx@thread.v2``). When the meeting has been linked to a
+    channel we ALSO stamp the channel ids so the unified channel ledger
+    rolls the meeting up.
+    """
+    assert envelope.meeting_ref is not None
+    mr = envelope.meeting_ref
+    payload = envelope.payload
+    sender = payload.get("sender") or {}
+
+    event_type_map = {
+        "meeting.chat.created": "chat_created",
+        "meeting.chat.updated": "chat_updated",
+        "meeting.chat.deleted": "chat_deleted",
+    }
+    internal_event_type = event_type_map.get(envelope.event_type, "chat_created")
+
+    link = mr.channel_link
+    return ChatMessageRequest(
+        event_type=internal_event_type,
+        chat_thread_id=chat_thread_id,
+        message_id=payload.get("message_id") or envelope.event_id,
+        text=payload.get("text"),
+        html=payload.get("html"),
+        sender_id=sender.get("aad_id"),
+        sender_display_name=sender.get("display_name"),
+        timestamp_utc=payload.get("timestamp_utc") or envelope.ts,
+        conversation_reference_id=envelope.conversation_reference_id,
+        attachments=list(payload.get("attachments") or []),
+        mentions=list(payload.get("mentions") or []),
+        reply_to_message_id=payload.get("reply_to_message_id"),
+        from_bot=bool(payload.get("from_bot")),
+        raw=payload.get("raw"),
+        conversation_kind="meeting_chat",
+        team_id=link.team_id if link else None,
+        channel_id=link.channel_id if link else None,
+        channel_thread_id=link.thread_id if link else None,
+    )
+
+
+def _meeting_transcript_to_transcript_request(
+    envelope: AlfredV2Envelope,
+    chat_thread_id: str,
+) -> TranscriptEventRequest:
+    """Translate ``meeting.transcript.partial`` / ``meeting.transcript.final``
+    into the internal ``TranscriptEventRequest`` shape."""
+    assert envelope.meeting_ref is not None
+    mr = envelope.meeting_ref
+    payload = envelope.payload
+    speaker = payload.get("speaker") or {}
+    media_source = payload.get("media_source") or {}
+    provider = payload.get("provider") or {}
+    link = mr.channel_link
+
+    internal_event_type = "partial" if envelope.event_type.endswith(".partial") else "final"
+
+    metadata: dict[str, Any] = {}
+    if isinstance(provider, dict) and provider.get("name"):
+        metadata["provider"] = provider["name"]
+    if mr.meeting_id:
+        metadata["meeting_id"] = mr.meeting_id
+    if mr.call_id:
+        metadata["call_id"] = mr.call_id
+
+    return TranscriptEventRequest(
+        event_type=internal_event_type,
+        text=payload.get("text"),
+        timestamp_utc=payload.get("timestamp_utc") or envelope.ts,
+        chat_thread_id=chat_thread_id,
+        speaker_id=speaker.get("id") or speaker.get("aad_id"),
+        audio_start_ms=payload.get("audio_start_ms"),
+        audio_end_ms=payload.get("audio_end_ms"),
+        confidence=payload.get("confidence"),
+        metadata=metadata or None,
+        dominant_media_source_id=media_source.get("dominant_id"),
+        active_media_source_ids=list(media_source.get("active_ids") or []) or None,
+        team_id=link.team_id if link else None,
+        channel_id=link.channel_id if link else None,
+        channel_thread_id=link.thread_id if link else None,
+    )
+
+
+@app.post("/v2/events")
+async def receive_v2_event_envelope(
+    envelope: AlfredV2Envelope,
     state: AppStateDep,
 ) -> dict[str, Any]:
-    """Single ingress for the alfred-events-v1 contract.
+    """Single ingress for the alfred-v2 contract.
 
-    Routes by ``event_type`` to existing handlers:
+    Routes by ``event_type`` prefix. Always:
+    1. Records the raw envelope in ``raw_ingest_envelopes``.
+    2. Upserts meeting metadata for ``meeting.*`` events.
+    3. Dispatches to the appropriate internal handler.
 
-    - ``transcript.partial`` / ``transcript.final`` → /transcript path
-    - ``chat.message``                              → /chat path
-    - ``system.session_linked``                     → /session/link path
-    - ``system.channel_attached`` / ``system.channel_detached`` → logged
-
-    This handler is the reference consumer for the published contract;
-    every team's own backend implements its own ``/events`` and
-    interprets envelopes however it wants.
+    See ``docs/event-contract.md`` for the canonical event-type table.
     """
+    store: SessionStore = state["store"]
+
+    chat_thread_id = _internal_chat_thread_key(envelope)
+    meeting_id = envelope.meeting_ref.meeting_id if envelope.meeting_ref else None
+    team_id = (
+        envelope.channel_ref.team_id if envelope.channel_ref
+        else (envelope.meeting_ref.channel_link.team_id if envelope.meeting_ref and envelope.meeting_ref.channel_link else None)
+    )
+    channel_id = (
+        envelope.channel_ref.channel_id if envelope.channel_ref
+        else (envelope.meeting_ref.channel_link.channel_id if envelope.meeting_ref and envelope.meeting_ref.channel_link else None)
+    )
+    thread_id = (
+        envelope.channel_ref.thread_id if envelope.channel_ref
+        else (envelope.meeting_ref.channel_link.thread_id if envelope.meeting_ref and envelope.meeting_ref.channel_link else None)
+    )
+
+    raw_envelope_json = _stable_json(envelope.model_dump(mode="json", exclude_none=True))
+    await asyncio.to_thread(
+        store.record_envelope,
+        envelope.event_id,
+        schema_version=envelope.schema_version,
+        event_type=envelope.event_type,
+        ts=envelope.ts,
+        raw_json=raw_envelope_json,
+        meeting_id=meeting_id,
+        team_id=team_id,
+        channel_id=channel_id,
+        thread_id=thread_id,
+    )
+
+    # Stamp every meeting.* event's metadata on the meetings registry so
+    # subject / organizer / channel link survive bot restarts.
+    if envelope.meeting_ref is not None:
+        await asyncio.to_thread(
+            _stamp_meeting_metadata,
+            store,
+            envelope,
+            last_event_utc=envelope.ts,
+        )
+
     et = envelope.event_type
 
-    # Stamp envelope-level routing keys onto the payload so the
-    # existing handlers see them even if the producer left them off
-    # the inner payload.
-    payload = dict(envelope.payload)
-    if envelope.chat_thread_id and not payload.get("chat_thread_id"):
-        payload["chat_thread_id"] = envelope.chat_thread_id
-    if envelope.team_id and not payload.get("team_id"):
-        payload["team_id"] = envelope.team_id
-    if envelope.channel_id and not payload.get("channel_id"):
-        payload["channel_id"] = envelope.channel_id
-    if envelope.channel_thread_id and not payload.get("channel_thread_id"):
-        payload["channel_thread_id"] = envelope.channel_thread_id
-
-    if et in ("transcript.partial", "transcript.final"):
-        request = TranscriptEventRequest(**payload)
-        result = await receive_transcript(request, state)
-        return result.model_dump()
-
-    if et == "chat.message":
-        if envelope.conversation_reference_id and not payload.get("conversation_reference_id"):
-            payload["conversation_reference_id"] = envelope.conversation_reference_id
-        request = ChatMessageRequest(**payload)
+    if et == AlfredEventTypes.CHANNEL_MESSAGE_CREATED \
+       or et == AlfredEventTypes.CHANNEL_MESSAGE_UPDATED \
+       or et == AlfredEventTypes.CHANNEL_MESSAGE_DELETED:
+        if chat_thread_id is None or envelope.channel_ref is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"channel_ref required for {et}",
+            )
+        request = _channel_event_to_chat_request(envelope, chat_thread_id)
         result = await receive_chat_message(request, state)
-        return result.model_dump()
+        return {**result.model_dump(), "event_id": envelope.event_id}
 
-    if et == "system.session_linked":
-        request = SessionChannelLinkRequest(**payload)
-        return await link_session_to_channel(request, state)
+    if et == AlfredEventTypes.MEETING_CHAT_CREATED \
+       or et == AlfredEventTypes.MEETING_CHAT_UPDATED \
+       or et == AlfredEventTypes.MEETING_CHAT_DELETED:
+        if chat_thread_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"meeting_ref required for {et}",
+            )
+        request = _meeting_chat_event_to_chat_request(envelope, chat_thread_id)
+        result = await receive_chat_message(request, state)
+        return {**result.model_dump(), "event_id": envelope.event_id}
 
-    if et == "transcript.official":
-        return await _handle_official_transcript(envelope, payload, state)
+    if et in (AlfredEventTypes.MEETING_TRANSCRIPT_PARTIAL, AlfredEventTypes.MEETING_TRANSCRIPT_FINAL):
+        if chat_thread_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"meeting_ref required for {et}",
+            )
+        request = _meeting_transcript_to_transcript_request(envelope, chat_thread_id)
+        result = await receive_transcript(request, state)
+        return {**result.model_dump(), "event_id": envelope.event_id}
 
-    if et in ("system.channel_attached", "system.channel_detached"):
+    if et == AlfredEventTypes.MEETING_TRANSCRIPT_OFFICIAL:
+        return await _handle_official_transcript_v2(envelope, state)
+
+    if et == AlfredEventTypes.MEETING_LINKED:
+        # The link itself is already persisted on the meetings table via
+        # _stamp_meeting_metadata above; mirror it onto the legacy
+        # session_channel_links so the existing per-meeting ledger picks
+        # up the team/channel back-references on prior events.
+        if envelope.meeting_ref is None or envelope.meeting_ref.channel_link is None:
+            return {"ok": True, "event_id": envelope.event_id, "action": "noop"}
+        link = envelope.meeting_ref.channel_link
+        chat_thread = envelope.meeting_ref.meeting_chat_thread_id
+        backfill: dict[str, Any] = {}
+        if chat_thread:
+            try:
+                backfill = await asyncio.to_thread(
+                    store.link_session_to_channel,
+                    chat_thread,
+                    link.team_id,
+                    link.channel_id,
+                    link.thread_id,
+                    link.linked_source,
+                ) or {}
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to link session_channel_links: %s", exc)
+        return {
+            "ok": True,
+            "event_id": envelope.event_id,
+            "action": "linked",
+            "backfill": backfill,
+        }
+
+    if et in (AlfredEventTypes.MEETING_CREATED, AlfredEventTypes.MEETING_ENDED):
+        # actual_start_utc / actual_end_utc live on the payload only for
+        # the corresponding lifecycle event; back-fill onto the registry.
+        payload = envelope.payload
+        if envelope.meeting_ref is not None and (
+            payload.get("actual_start_utc") or payload.get("actual_end_utc")
+        ):
+            await asyncio.to_thread(
+                store.upsert_meeting_metadata,
+                meeting_id=envelope.meeting_ref.meeting_id,
+                actual_start_utc=payload.get("actual_start_utc"),
+                actual_end_utc=payload.get("actual_end_utc"),
+                last_event_utc=envelope.ts,
+            )
+        return {"ok": True, "event_id": envelope.event_id, "action": "lifecycle"}
+
+    if et in (
+        AlfredEventTypes.MEETING_CALL_JOINED,
+        AlfredEventTypes.MEETING_CALL_LEFT,
+        AlfredEventTypes.CHANNEL_ATTACHED,
+        AlfredEventTypes.CHANNEL_DETACHED,
+    ):
         logger.info(
-            "Received %s envelope team=%s channel=%s; reference sink does not act on attach lifecycle.",
-            et,
-            envelope.team_id,
-            envelope.channel_id,
+            "Recorded %s: meeting=%s team=%s channel=%s",
+            et, meeting_id, team_id, channel_id,
         )
-        return {"ok": True, "action": "logged"}
+        return {"ok": True, "event_id": envelope.event_id, "action": "logged"}
 
-    logger.warning("Unsupported event_type on /events: %s", et)
+    logger.warning("Unsupported event_type on /v2/events: %s", et)
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
         detail=f"Unsupported event_type: {et}",
     )
 
 
-async def _handle_official_transcript(
-    envelope: "AlfredEventEnvelopeRequest",
-    payload: dict[str, Any],
+# Alias so existing C# bot deployments configured for /events keep working
+# without a VM redeploy. The handler is identical — v2 envelope only.
+@app.post("/events")
+async def receive_event_envelope_alias(
+    envelope: AlfredV2Envelope,
+    state: AppStateDep,
+) -> dict[str, Any]:
+    return await receive_v2_event_envelope(envelope, state)
+
+
+async def _handle_official_transcript_v2(
+    envelope: AlfredV2Envelope,
     state: dict[str, Any],
 ) -> dict[str, Any]:
-    """Persist Microsoft's official meeting transcript alongside live STT.
+    """Persist Microsoft's official transcript cues from a v2 envelope.
 
-    Each VTT cue lands as a ``MeetingEvent`` with ``kind="speech"`` and
-    ``source="official_transcript"`` so it shows up in the same per-meeting
-    and per-channel rollups as live transcripts. The envelope's
-    ``meeting_id`` / ``transcript_id`` are stamped on every row so consumers
-    can group by them.
+    Each cue lands as a ``MeetingEvent`` keyed on the meeting's internal
+    session (chat thread or meeting_id). The raw VTT is already in the
+    blob archive at ``meetings/{meeting_id}/transcripts/official.vtt`` —
+    we mirror the parsed cues into the per-session ledger so the agent
+    sees them via the same path as live STT.
     """
+    if envelope.meeting_ref is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="meeting.transcript.official requires meeting_ref",
+        )
+
     store: SessionStore = state["store"]
     session_registry: SessionRegistry = state["session_registry"]
 
-    chat_thread_id = envelope.chat_thread_id
+    chat_thread_id = envelope.meeting_ref.meeting_chat_thread_id or envelope.meeting_ref.meeting_id
+    meeting_id = envelope.meeting_ref.meeting_id
+    payload = envelope.payload
     cues = payload.get("cues") or []
-    meeting_id = payload.get("meeting_id") or ""
     transcript_id = payload.get("transcript_id") or ""
 
     manager, chat_thread_id = resolve_manager_for_inbound(
@@ -2998,10 +3350,9 @@ async def _handle_official_transcript(
     if manager is None or manager.session is None:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Could not resolve a session for transcript.official",
+            detail="Could not resolve a session for meeting.transcript.official",
         )
 
-    # FK on meeting_events.session_id requires the row to exist first.
     await asyncio.to_thread(store.upsert_session, manager.session)
 
     persisted = 0
@@ -3009,16 +3360,16 @@ async def _handle_official_transcript(
         text = (cue.get("text") or "").strip()
         if not text:
             continue
-        speaker = cue.get("speaker") or "unknown"
+        speaker_obj = cue.get("speaker") or {}
+        speaker_name = (
+            speaker_obj.get("display_name") if isinstance(speaker_obj, dict) else None
+        ) or "unknown"
         event = MeetingEvent(
             event_id=str(_uuid.uuid4()),
             kind="speech",
-            # The bot fetches this via Graph after meeting ends, so it
-            # belongs to graph_notification by source. Distinguish from
-            # live STT via transcript_provider below.
             source="graph_notification",
             timestamp_utc=envelope.ts,
-            display_name=speaker,
+            display_name=speaker_name,
             text=text,
             transcript_provider="official_teams_transcript",
             raw={
@@ -3028,9 +3379,6 @@ async def _handle_official_transcript(
                 "start_ms": int(cue.get("start_ms") or 0),
                 "end_ms": int(cue.get("end_ms") or 0),
             },
-            team_id=envelope.team_id,
-            channel_id=envelope.channel_id,
-            channel_thread_id=envelope.channel_thread_id,
         )
         await asyncio.to_thread(
             store.append_meeting_event, manager.session.session_id, event
@@ -3038,14 +3386,334 @@ async def _handle_official_transcript(
         persisted += 1
 
     logger.info(
-        "Persisted official transcript: meeting=%s transcript=%s cues=%s chat_thread_id=%s",
-        meeting_id, transcript_id, persisted, chat_thread_id,
+        "Persisted v2 official transcript: meeting=%s transcript=%s cues=%s",
+        meeting_id, transcript_id, persisted,
     )
     return {
         "ok": True,
         "meeting_id": meeting_id,
         "transcript_id": transcript_id,
         "persisted": persisted,
+    }
+
+
+# =============================================================================
+# /v2/* — hierarchical query endpoints mirroring the Graph URL hierarchy
+# =============================================================================
+
+
+_BLOB_ARCHIVE_URL_DEFAULT_V2 = "https://stalfreddisney.blob.core.windows.net/alfred-events"
+_BLOB_PATH_UNSAFE_RE = re.compile(r"[^a-zA-Z0-9\-_.]")
+
+
+def _blob_archive_url() -> str:
+    return (os.environ.get("BLOB_ARCHIVE_URL") or _BLOB_ARCHIVE_URL_DEFAULT_V2).rstrip("/")
+
+
+def _http_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(timeout=10.0)
+
+
+def _meeting_to_v2_dict(row: dict[str, Any]) -> dict[str, Any]:
+    """Render a sqlite meetings row into the v2 wire shape from the docs."""
+    channel_link: dict[str, Any] | None = None
+    if row.get("channel_team_id") and row.get("channel_id"):
+        channel_link = {
+            "team_id": row["channel_team_id"],
+            "team_display_name": row.get("channel_team_display_name"),
+            "channel_id": row["channel_id"],
+            "channel_display_name": row.get("channel_display_name"),
+            "thread_id": row.get("channel_thread_id"),
+            "linked_at_utc": row.get("channel_linked_at_utc"),
+            "linked_source": row.get("channel_linked_source"),
+        }
+    organizer: dict[str, Any] | None = None
+    if row.get("organizer_aad_id") or row.get("organizer_display_name"):
+        organizer = {
+            "aad_id": row.get("organizer_aad_id"),
+            "display_name": row.get("organizer_display_name"),
+        }
+    return {
+        "meeting_id": row["meeting_id"],
+        "meeting_chat_thread_id": row.get("meeting_chat_thread_id"),
+        "subject": row.get("subject"),
+        "organizer": organizer,
+        "scheduled_start_utc": row.get("scheduled_start_utc"),
+        "scheduled_end_utc": row.get("scheduled_end_utc"),
+        "actual_start_utc": row.get("actual_start_utc"),
+        "actual_end_utc": row.get("actual_end_utc"),
+        "channel_link": channel_link,
+        "last_event_utc": row.get("last_event_utc"),
+        "created_at_utc": row.get("created_at_utc"),
+        "updated_at_utc": row.get("updated_at_utc"),
+    }
+
+
+@app.get("/v2/meetings")
+async def v2_list_meetings(
+    state: AppStateDep,
+    limit: int | None = None,
+    team_id: str | None = None,
+    channel_id: str | None = None,
+) -> dict[str, Any]:
+    """List meetings tracked in the v2 meetings registry.
+
+    Each entry includes the canonical ``meeting_id``, best-effort
+    ``subject`` / organizer, scheduled / actual times, and the optional
+    ``channel_link`` (team_id + channel_id) once the meeting has been
+    linked to a channel.
+
+    Filter with ``team_id`` / ``channel_id`` to scope to a single
+    channel's linked meetings.
+    """
+    store: SessionStore = state["store"]
+    rows = await asyncio.to_thread(
+        store.list_meetings_v2,
+        limit,
+        team_id,
+        channel_id,
+    )
+    return {
+        "schema_version": "alfred-v2",
+        "count": len(rows),
+        "meetings": [_meeting_to_v2_dict(r) for r in rows],
+    }
+
+
+@app.get("/v2/meetings/{meeting_id}")
+async def v2_get_meeting(
+    meeting_id: str,
+    state: AppStateDep,
+) -> dict[str, Any]:
+    """Return canonical meeting metadata + linked channel.
+
+    ``meeting_id`` is the Graph ``onlineMeeting`` id — never a chat
+    thread id and never a session id.
+    """
+    store: SessionStore = state["store"]
+    row = await asyncio.to_thread(store.get_meeting, meeting_id)
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"meeting_id {meeting_id} not found",
+        )
+    return _meeting_to_v2_dict(row)
+
+
+@app.get("/v2/meetings/{meeting_id}/events")
+async def v2_get_meeting_events(
+    meeting_id: str,
+    state: AppStateDep,
+    kinds: str | None = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """Return the combined event ledger (chat + transcript) for this meeting.
+
+    Events are pulled from the internal per-session ledger that was
+    populated as ``meeting.*`` envelopes streamed in. ``kinds`` accepts a
+    comma-separated list of {speech, chat, system}.
+    """
+    store: SessionStore = state["store"]
+    meeting = await asyncio.to_thread(store.get_meeting, meeting_id)
+    if meeting is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"meeting_id {meeting_id} not found",
+        )
+
+    parsed_kinds = [k.strip() for k in kinds.split(",") if k.strip()] if kinds else None
+    chat_thread_id = meeting.get("meeting_chat_thread_id") or meeting_id
+
+    registry: SessionRegistry = state["session_registry"]
+    manager = registry.get(chat_thread_id)
+    events: list[dict[str, Any]] = []
+    if manager is not None and manager.session is not None:
+        session_id = manager.session.session_id
+        ledger = await asyncio.to_thread(store.get_ledger, session_id, limit)
+        for row in ledger:
+            if parsed_kinds and row.get("kind") not in parsed_kinds:
+                continue
+            events.append(row)
+
+    return {
+        "schema_version": "alfred-v2",
+        "meeting_id": meeting_id,
+        "count": len(events),
+        "events": events,
+    }
+
+
+@app.get("/v2/meetings/{meeting_id}/transcript")
+async def v2_get_meeting_transcript(
+    meeting_id: str,
+    state: AppStateDep,
+) -> dict[str, Any]:
+    """Proxy the official meeting transcript from blob storage.
+
+    The C# bot writes the post-meeting Record-and-Transcribe transcript
+    to ``meetings/{meeting_id}/transcripts/official.txt`` (clean,
+    speaker-per-line plaintext) and ``official.vtt`` (raw WebVTT).
+    Both URLs are returned so consumers can pick.
+    """
+    archive = _blob_archive_url()
+    safe = _BLOB_PATH_UNSAFE_RE.sub("_", meeting_id)
+    txt_url = f"{archive}/meetings/{safe}/transcripts/official.txt"
+    vtt_url = f"{archive}/meetings/{safe}/transcripts/official.vtt"
+    text: str | None = None
+    found = False
+    try:
+        async with _http_client() as client:
+            response = await client.get(txt_url)
+            if response.status_code == 200:
+                text = response.text
+                found = True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("v2 transcript fetch failed: %s", exc)
+    return {
+        "schema_version": "alfred-v2",
+        "meeting_id": meeting_id,
+        "official_transcript_txt_url": txt_url,
+        "official_transcript_vtt_url": vtt_url,
+        "available": found,
+        "text": text,
+    }
+
+
+@app.get("/v2/teams/{team_id}/channels/{channel_id}")
+async def v2_get_channel(
+    team_id: str,
+    channel_id: str,
+    state: AppStateDep,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """Describe a channel: list distinct threads + linked meetings."""
+    store: SessionStore = state["store"]
+    threads = await asyncio.to_thread(
+        store.list_threads_in_channel, team_id, channel_id, limit
+    )
+    meetings = await asyncio.to_thread(
+        store.list_meetings_v2, None, team_id, channel_id
+    )
+    return {
+        "schema_version": "alfred-v2",
+        "team_id": team_id,
+        "channel_id": channel_id,
+        "thread_count": len(threads),
+        "threads": threads,
+        "meeting_count": len(meetings),
+        "meetings": [_meeting_to_v2_dict(m) for m in meetings],
+    }
+
+
+@app.get("/v2/teams/{team_id}/channels/{channel_id}/events")
+async def v2_get_channel_events(
+    team_id: str,
+    channel_id: str,
+    state: AppStateDep,
+    since: str | None = None,
+    until: str | None = None,
+    kinds: str | None = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """Return every event tagged with this channel.
+
+    Aggregates the channel's own session AND every linked meeting,
+    ordered by ``timestamp_utc``. See ``GET /c/{team}/{channel}/events``
+    for the same data under the legacy URL.
+    """
+    store: SessionStore = state["store"]
+    parsed_kinds = [k.strip() for k in kinds.split(",") if k.strip()] if kinds else None
+    events = await asyncio.to_thread(
+        store.get_channel_ledger,
+        channel_id,
+        team_id=team_id,
+        since=since,
+        until=until,
+        kinds=parsed_kinds,
+        limit=limit,
+    )
+    return {
+        "schema_version": "alfred-v2",
+        "team_id": team_id,
+        "channel_id": channel_id,
+        "count": len(events),
+        "events": events,
+    }
+
+
+@app.get("/v2/teams/{team_id}/channels/{channel_id}/threads/{thread_id}/messages")
+async def v2_get_thread_messages(
+    team_id: str,
+    channel_id: str,
+    thread_id: str,
+    state: AppStateDep,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """Return every chat message stored for this channel thread."""
+    store: SessionStore = state["store"]
+    messages = await asyncio.to_thread(
+        store.list_thread_messages, team_id, channel_id, thread_id, limit
+    )
+    return {
+        "schema_version": "alfred-v2",
+        "team_id": team_id,
+        "channel_id": channel_id,
+        "thread_id": thread_id,
+        "count": len(messages),
+        "messages": messages,
+    }
+
+
+@app.get("/v2/resolve")
+async def v2_resolve(
+    state: AppStateDep,
+    kind: str = "meeting",
+    subject: str | None = None,
+    limit: int = 25,
+) -> dict[str, Any]:
+    """Name → canonical-id resolver.
+
+    Currently supports ``kind=meeting`` with case-insensitive substring
+    match on ``subject``. The agent calls this when a user asks about a
+    meeting by name (e.g. ``"summarize the sprint planning"``).
+    """
+    if kind != "meeting":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"unsupported resolve kind: {kind} (only 'meeting' supported today)",
+        )
+    store: SessionStore = state["store"]
+    rows = await asyncio.to_thread(store.search_meetings_by_subject, subject or "", limit)
+    return {
+        "schema_version": "alfred-v2",
+        "kind": kind,
+        "query": subject or "",
+        "matches": [_meeting_to_v2_dict(r) for r in rows],
+    }
+
+
+@app.get("/v2/index")
+async def v2_index(state: AppStateDep) -> dict[str, Any]:
+    """High-level index: counts + blob archive URL.
+
+    AI coding agents can use this as a starting point to understand what's
+    in the system before drilling into specific meetings / channels.
+    """
+    store: SessionStore = state["store"]
+    meetings = await asyncio.to_thread(store.list_meetings_v2, None, None, None)
+    channel_links = await asyncio.to_thread(store.list_channel_links)
+    archive = _blob_archive_url()
+    return {
+        "schema_version": "alfred-v2",
+        "blob_archive_url": archive,
+        "blob_archive_index_meetings": f"{archive}/indexes/meetings.json",
+        "blob_archive_meetings_prefix": f"{archive}/meetings/",
+        "blob_archive_channels_prefix": f"{archive}/teams/",
+        "counts": {
+            "meetings": len(meetings),
+            "channels": len({(c["team_id"], c["channel_id"]) for c in channel_links}),
+        },
+        "recent_meetings": [_meeting_to_v2_dict(m) for m in meetings[:10]],
     }
 
 

@@ -1,17 +1,23 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { Moon } from "lucide-react";
-import { sink, type MeetingListEntry } from "../lib/sink";
+import { sink, type V2Meeting } from "../lib/sink";
 
 /**
- * Meeting picker shown at the root path.
+ * Meeting picker shown at the root path (alfred-v2).
  *
- * The dossier UI requires a chat_thread_id in the URL — there is no
- * "current meeting" fallback. This page polls ``/m`` every 2 seconds and
- * lists active meetings the operator can click into.
+ * Lists every meeting the sink knows about by canonical Graph
+ * ``meeting_id``. The display surface shows the meeting's subject
+ * first (with organizer / scheduled time) and the canonical
+ * ``meeting_id`` appears on hover so an operator can copy it for
+ * tooling without leaving the UI.
+ *
+ * Clicking a row opens the dossier at
+ * ``/m/<meeting_chat_thread_id>`` — the chat thread id is the
+ * internal session key the dossier reads from.
  */
 export function MeetingList() {
-  const [meetings, setMeetings] = useState<MeetingListEntry[]>([]);
+  const [meetings, setMeetings] = useState<V2Meeting[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -20,7 +26,7 @@ export function MeetingList() {
 
     async function tick() {
       try {
-        const body = await sink.listMeetings();
+        const body = await sink.v2ListMeetings({ limit: 100 });
         if (!cancelled) {
           setMeetings(body.meetings ?? []);
           setError(null);
@@ -60,9 +66,9 @@ export function MeetingList() {
         <div className="mx-auto max-w-3xl">
           <h2 className="font-serif text-xl text-ink-100">Open a meeting</h2>
           <p className="mt-1 text-sm text-ink-300">
-            The dossier requires a <code className="font-mono">chat_thread_id</code> in
-            the URL. Pick a live meeting below, or open
-            <code className="ml-1 font-mono">/m/&lt;chat_thread_id&gt;</code> directly.
+            alfred-v2 — meetings keyed by Graph{" "}
+            <code className="font-mono">meeting_id</code>. Hover a row to see
+            the canonical id.
           </p>
 
           {error ? (
@@ -79,37 +85,88 @@ export function MeetingList() {
               </li>
             ) : null}
             {meetings.map((m) => (
-              <li key={m.chat_thread_id}>
-                <Link
-                  to={`/m/${encodeURIComponent(m.chat_thread_id)}`}
-                  className="flex items-center justify-between rounded-md border border-ink-800 bg-ink-900/40 px-4 py-3 transition hover:border-gold-500/40 hover:bg-ink-900"
-                >
-                  <div className="min-w-0">
-                    <div className="truncate text-sm font-medium text-ink-100">
-                      {m.candidate_name || m.chat_thread_id}
-                    </div>
-                    <div className="truncate font-mono text-[11px] text-ink-400">
-                      {m.chat_thread_id}
-                    </div>
-                  </div>
-                  <div className="flex flex-col items-end text-right">
-                    <span
-                      className={`font-mono text-[10px] uppercase tracking-widest ${
-                        m.active ? "text-emerald-400" : "text-ink-500"
-                      }`}
-                    >
-                      {m.active ? "live" : "ended"}
-                    </span>
-                    <span className="text-[11px] text-ink-400">
-                      {m.total_events} events
-                    </span>
-                  </div>
-                </Link>
-              </li>
+              <MeetingRow key={m.meeting_id} meeting={m} />
             ))}
           </ul>
         </div>
       </main>
     </div>
   );
+}
+
+function MeetingRow({ meeting }: { meeting: V2Meeting }) {
+  // Dossier UI is still keyed by chat_thread_id internally; the meeting
+  // chat thread id is the right surrogate. Fall back to meeting_id when
+  // a meeting has never had a chat (rare).
+  const linkKey = meeting.meeting_chat_thread_id || meeting.meeting_id;
+  const subject =
+    (meeting.subject && meeting.subject.trim()) ||
+    meeting.organizer?.display_name ||
+    meeting.meeting_id;
+  const start = meeting.actual_start_utc || meeting.scheduled_start_utc;
+  const end = meeting.actual_end_utc || meeting.scheduled_end_utc;
+  const isLive = Boolean(meeting.actual_start_utc) && !meeting.actual_end_utc;
+  return (
+    <li>
+      <Link
+        to={`/m/${encodeURIComponent(linkKey)}`}
+        title={`meeting_id: ${meeting.meeting_id}`}
+        className="flex items-center justify-between rounded-md border border-ink-800 bg-ink-900/40 px-4 py-3 transition hover:border-gold-500/40 hover:bg-ink-900"
+      >
+        <div className="min-w-0">
+          <div className="truncate text-sm font-medium text-ink-100">
+            {subject}
+          </div>
+          <div className="truncate font-mono text-[11px] text-ink-400">
+            {meeting.organizer?.display_name ? (
+              <>
+                <span>{meeting.organizer.display_name}</span>
+                <span className="mx-1.5 text-ink-600">·</span>
+              </>
+            ) : null}
+            {start ? <span>{formatTime(start)}</span> : null}
+            {end ? (
+              <>
+                <span className="mx-1.5 text-ink-600">→</span>
+                <span>{formatTime(end)}</span>
+              </>
+            ) : null}
+            {meeting.channel_link?.channel_display_name ? (
+              <>
+                <span className="mx-1.5 text-ink-600">·</span>
+                <span>#{meeting.channel_link.channel_display_name}</span>
+              </>
+            ) : null}
+          </div>
+          <div className="truncate font-mono text-[10px] text-ink-500" title={meeting.meeting_id}>
+            id: {meeting.meeting_id}
+          </div>
+        </div>
+        <div className="flex flex-col items-end text-right">
+          <span
+            className={`font-mono text-[10px] uppercase tracking-widest ${
+              isLive ? "text-emerald-400" : "text-ink-500"
+            }`}
+          >
+            {isLive ? "live" : "ended"}
+          </span>
+        </div>
+      </Link>
+    </li>
+  );
+}
+
+function formatTime(iso: string): string {
+  try {
+    const date = new Date(iso);
+    if (Number.isNaN(date.valueOf())) return iso;
+    return date.toLocaleString(undefined, {
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return iso;
+  }
 }

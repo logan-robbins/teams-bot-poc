@@ -331,22 +331,41 @@ possible; `blob_archive_path` is populated after the mirror succeeds.
 
 ## 4. Routing tables (quick reference for consumers)
 
+Every event lands at exactly one blob path. The path embeds the
+canonical id from the ref block + the verbatim `event_type` as the
+last folder, so an LS of the meeting / channel prefix is a complete
+manifest.
+
 ```
-event_type prefix      → present block       → archive root
-─────────────────────────────────────────────────────────────────────────────────
-channel.attached       → channel_ref          → teams/{tid}/channels/{cid}/
-channel.detached       → channel_ref          → teams/{tid}/channels/{cid}/
-channel.message.*      → channel_ref          → teams/{tid}/channels/{cid}/threads/{thrid}/messages/
-meeting.created        → meeting_ref          → meetings/{meeting_id}/
-meeting.ended          → meeting_ref          → meetings/{meeting_id}/
-meeting.linked         → meeting_ref          → meetings/{meeting_id}/
-meeting.call.*         → meeting_ref          → meetings/{meeting_id}/system/
-meeting.chat.*         → meeting_ref          → meetings/{meeting_id}/chat/messages/
-meeting.transcript.*   → meeting_ref          → meetings/{meeting_id}/transcripts/{partial|final|official}/
+event_type                        → present block  → blob path
+─────────────────────────────────────────────────────────────────────────────────────────────────
+channel.attached                  → channel_ref     → teams/{tid}/channels/{cid_sanitized}/channel.attached/{ts}-{eid}.json
+channel.detached                  → channel_ref     → teams/{tid}/channels/{cid_sanitized}/channel.detached/{ts}-{eid}.json
+channel.message.created           → channel_ref     → teams/{tid}/channels/{cid_sanitized}/channel.message.created/{ts}-{eid}.json
+channel.message.updated           → channel_ref     → teams/{tid}/channels/{cid_sanitized}/channel.message.updated/{ts}-{eid}.json
+channel.message.deleted           → channel_ref     → teams/{tid}/channels/{cid_sanitized}/channel.message.deleted/{ts}-{eid}.json
+meeting.created                   → meeting_ref     → meetings/{meeting_id}/meeting.created/{ts}-{eid}.json
+meeting.ended                     → meeting_ref     → meetings/{meeting_id}/meeting.ended/{ts}-{eid}.json
+meeting.linked                    → meeting_ref     → meetings/{meeting_id}/meeting.linked/{ts}-{eid}.json
+meeting.call.joined               → meeting_ref     → meetings/{meeting_id}/meeting.call.joined/{ts}-{eid}.json
+meeting.call.left                 → meeting_ref     → meetings/{meeting_id}/meeting.call.left/{ts}-{eid}.json
+meeting.chat.created              → meeting_ref     → meetings/{meeting_id}/meeting.chat.created/{ts}-{eid}.json
+meeting.chat.updated              → meeting_ref     → meetings/{meeting_id}/meeting.chat.updated/{ts}-{eid}.json
+meeting.chat.deleted              → meeting_ref     → meetings/{meeting_id}/meeting.chat.deleted/{ts}-{eid}.json
+meeting.transcript.partial        → meeting_ref     → meetings/{meeting_id}/meeting.transcript.partial/{ts}-{eid}.json
+meeting.transcript.final          → meeting_ref     → meetings/{meeting_id}/meeting.transcript.final/{ts}-{eid}.json
+meeting.transcript.official       → meeting_ref     → meetings/{meeting_id}/meeting.transcript.official/{ts}-{eid}.json
+```
+
+Plus the two flat post-meeting transcript files (overwritten on each fetch):
+
+```
+meetings/{meeting_id}/transcripts/official.txt   (clean speaker-per-line plaintext)
+meetings/{meeting_id}/transcripts/official.vtt   (raw WebVTT)
 ```
 
 See [`docs/retrieving-transcripts.md`](retrieving-transcripts.md) for
-the full blob path layout.
+recipes + Python helpers.
 
 ---
 

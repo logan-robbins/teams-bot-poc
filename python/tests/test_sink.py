@@ -26,59 +26,137 @@ from tests.mock_data import (
 
 
 # =============================================================================
-# Envelope helpers — POST /events is the only ingress. These wrap the
-# inner payload each test constructs into an alfred-events-v1 envelope
-# so call sites stay readable.
+# Envelope helpers — POST /v2/events is the only ingress. These wrap the
+# inner payload each test constructs into an alfred-v2 envelope so the
+# call sites stay readable. Tests treat ``chat_thread_id`` as a synthetic
+# ``meeting_id`` for backward compatibility with the existing test bodies.
 # =============================================================================
+
+
+def _meeting_ref_for(payload: dict[str, Any]) -> dict[str, Any]:
+    """Build a MeetingRef block from a flat test payload.
+
+    Tests pre-date alfred-v2 and use ``chat_thread_id`` as the meeting
+    key. v2 carries the canonical Graph ``meeting_id`` separately, so
+    we promote ``chat_thread_id`` into ``meeting_id`` here and stamp the
+    chat container id alongside. If the test populated channel context
+    we surface it as a ``channel_link`` so the sink can derive
+    ``team_id`` / ``channel_id``.
+    """
+    meeting_id = payload.get("chat_thread_id") or "test-meeting"
+    ref: dict[str, Any] = {
+        "meeting_id": meeting_id,
+        "meeting_chat_thread_id": payload.get("chat_thread_id"),
+    }
+    team = payload.get("team_id")
+    channel = payload.get("channel_id")
+    if team and channel:
+        ref["channel_link"] = {
+            "team_id": team,
+            "channel_id": channel,
+            "thread_id": payload.get("channel_thread_id"),
+            "linked_at_utc": "2026-01-01T00:00:00Z",
+            "linked_source": "test",
+        }
+    return ref
 
 
 def _envelope_for_transcript(payload: dict[str, Any]) -> dict[str, Any]:
     inner_kind = payload.get("event_type") or payload.get("Kind") or "final"
-    if inner_kind in ("recognizing",):
-        envelope_kind = "transcript.partial"
-    elif inner_kind in ("partial",):
-        envelope_kind = "transcript.partial"
+    if inner_kind in ("recognizing", "partial"):
+        event_type = "meeting.transcript.partial"
     else:
-        envelope_kind = "transcript.final"
+        event_type = "meeting.transcript.final"
     return {
-        "schema_version": "alfred-events-v1",
-        "event_type": envelope_kind,
+        "schema_version": "alfred-v2",
+        "event_type": event_type,
         "event_id": _uuid.uuid4().hex,
         "ts": payload.get("timestamp_utc") or payload.get("TsUtc") or "2026-01-01T00:00:00Z",
-        "team_id": payload.get("team_id"),
-        "channel_id": payload.get("channel_id"),
-        "chat_thread_id": payload.get("chat_thread_id") or "test-thread",
-        "channel_thread_id": payload.get("channel_thread_id"),
-        "payload": payload,
+        "meeting_ref": _meeting_ref_for(payload),
+        "payload": {
+            "text": payload.get("text") or payload.get("Text") or "",
+            "timestamp_utc": payload.get("timestamp_utc") or payload.get("TsUtc"),
+            "speaker": {"id": payload.get("speaker_id")} if payload.get("speaker_id") else None,
+            "audio_start_ms": payload.get("audio_start_ms"),
+            "audio_end_ms": payload.get("audio_end_ms"),
+            "confidence": payload.get("confidence"),
+            "media_source": {
+                "dominant_id": payload.get("dominant_media_source_id"),
+                "active_ids": payload.get("active_media_source_ids"),
+            } if (payload.get("dominant_media_source_id") or payload.get("active_media_source_ids")) else None,
+            "provider": {"name": "azure_speech"},
+        },
     }
 
 
 def _envelope_for_chat(payload: dict[str, Any]) -> dict[str, Any]:
+    # Tests treat the chat as meeting-chat by default (the original v1
+    # path). When channel context is present we route as a channel
+    # message instead so the v2 ingest stamps team_id / channel_id.
+    is_channel = bool(payload.get("team_id") and payload.get("channel_id"))
+    inner_event = payload.get("event_type", "chat_created")
+    op = inner_event.replace("chat_", "")  # "created" | "updated" | "deleted"
+    sender = {
+        "aad_id": payload.get("sender_id"),
+        "display_name": payload.get("sender_display_name"),
+    }
+    inner = {
+        "sender": sender,
+        "text": payload.get("text"),
+        "html": payload.get("html"),
+        "timestamp_utc": payload.get("timestamp_utc"),
+        "from_bot": bool(payload.get("from_bot")),
+        "reply_to_message_id": payload.get("reply_to_message_id"),
+        "message_id": payload["message_id"],
+        "attachments": payload.get("attachments") or [],
+        "mentions": payload.get("mentions") or [],
+        "raw": payload.get("raw"),
+    }
+    if is_channel:
+        return {
+            "schema_version": "alfred-v2",
+            "event_type": f"channel.message.{op}",
+            "event_id": _uuid.uuid4().hex,
+            "ts": payload.get("timestamp_utc") or "2026-01-01T00:00:00Z",
+            "channel_ref": {
+                "team_id": payload["team_id"],
+                "channel_id": payload["channel_id"],
+                "thread_id": payload.get("channel_thread_id") or payload["chat_thread_id"],
+                "message_id": payload["message_id"],
+            },
+            "conversation_reference_id": payload.get("conversation_reference_id"),
+            "payload": {**inner, "is_root": True},
+        }
     return {
-        "schema_version": "alfred-events-v1",
-        "event_type": "chat.message",
+        "schema_version": "alfred-v2",
+        "event_type": f"meeting.chat.{op}",
         "event_id": _uuid.uuid4().hex,
         "ts": payload.get("timestamp_utc") or "2026-01-01T00:00:00Z",
-        "team_id": payload.get("team_id"),
-        "channel_id": payload.get("channel_id"),
-        "chat_thread_id": payload["chat_thread_id"],
-        "channel_thread_id": payload.get("channel_thread_id"),
+        "meeting_ref": _meeting_ref_for(payload),
         "conversation_reference_id": payload.get("conversation_reference_id"),
-        "payload": payload,
+        "payload": inner,
     }
 
 
 def _envelope_for_link(payload: dict[str, Any]) -> dict[str, Any]:
+    meeting_id = payload["chat_thread_id"]
     return {
-        "schema_version": "alfred-events-v1",
-        "event_type": "system.session_linked",
+        "schema_version": "alfred-v2",
+        "event_type": "meeting.linked",
         "event_id": _uuid.uuid4().hex,
         "ts": "2026-01-01T00:00:00Z",
-        "team_id": payload["team_id"],
-        "channel_id": payload["channel_id"],
-        "chat_thread_id": payload["chat_thread_id"],
-        "channel_thread_id": payload.get("channel_thread_id"),
-        "payload": payload,
+        "meeting_ref": {
+            "meeting_id": meeting_id,
+            "meeting_chat_thread_id": meeting_id,
+            "channel_link": {
+                "team_id": payload["team_id"],
+                "channel_id": payload["channel_id"],
+                "thread_id": payload.get("channel_thread_id"),
+                "linked_at_utc": "2026-01-01T00:00:00Z",
+                "linked_source": payload.get("source") or "manual_command",
+            },
+        },
+        "payload": {"linked_source": payload.get("source") or "manual_command"},
     }
 
 
@@ -472,22 +550,6 @@ class TestTranscriptEndpoint:
         assert stats_response.json()["stats"]["partial_transcripts"] >= 1
 
     @pytest.mark.asyncio
-    async def test_receive_v1_recognized_transcript(self, client: AsyncClient) -> None:
-        """Receiving v1 format (legacy) transcript."""
-        event_data = generate_v1_event_dict(
-            kind="recognized",
-            text="This is a v1 format transcript.",
-        )
-
-        response = await client.post("/events", json=_envelope_for_transcript(event_data))
-
-        assert response.status_code == 200
-
-        # Check v1 events counter
-        stats_response = await client.get("/stats")
-        assert stats_response.json()["stats"]["v1_events"] >= 1
-
-    @pytest.mark.asyncio
     async def test_transcript_updates_stats(self, client: AsyncClient) -> None:
         """Transcripts update statistics counters."""
         # Send multiple transcripts
@@ -529,24 +591,6 @@ class TestTranscriptEndpoint:
 
         assert data["session"]["total_events"] >= 1
 
-    @pytest.mark.asyncio
-    async def test_transcript_v1_normalization(self, client: AsyncClient) -> None:
-        """V1 format is correctly normalized to v2."""
-        # Send v1 format
-        v1_event = {
-            "Kind": "recognizing",
-            "Text": "Partial v1 text",
-            "TsUtc": "2026-01-31T10:00:00.000Z",
-        }
-
-        response = await client.post("/events", json=_envelope_for_transcript(v1_event))
-        assert response.status_code == 200
-
-        # Should be counted as partial (recognizing -> partial)
-        stats_response = await client.get("/stats")
-        data = stats_response.json()
-        assert data["stats"]["v1_events"] >= 1
-        assert data["stats"]["partial_transcripts"] >= 1
 
 
 # =============================================================================
@@ -625,15 +669,6 @@ class TestIntegrationFlow:
             json={"speaker_id": "speaker_1", "role": "candidate"},
         )
 
-        # 3. Send session started event
-        await client.post(
-            "/events",
-            json=_envelope_for_transcript({
-                "event_type": "session_started",
-                "timestamp_utc": "2026-01-31T10:00:00.000Z",
-            }),
-        )
-
         # 4. Send interview transcripts
         transcripts = [
             ("speaker_0", "Can you tell me about your experience with Python?"),
@@ -657,15 +692,6 @@ class TestIntegrationFlow:
             response = await client.post("/events", json=_envelope_for_transcript(event_data))
             assert response.status_code == 200
 
-        # 5. Send session stopped event
-        await client.post(
-            "/events",
-            json=_envelope_for_transcript({
-                "event_type": "session_stopped",
-                "timestamp_utc": "2026-01-31T10:30:00.000Z",
-            }),
-        )
-
         # 6. Check session state
         session_response = await client.get("/session")
         session_data = session_response.json()
@@ -680,7 +706,6 @@ class TestIntegrationFlow:
         stats_data = stats_response.json()
 
         assert stats_data["stats"]["final_transcripts"] >= 4
-        assert stats_data["stats"]["session_events"] >= 2  # Both start and stop
 
         # 8. End session
         end_response = await client.post("/session/end")
@@ -1462,223 +1487,206 @@ class TestChannelLinkAndRollup:
 
 
 class TestEnvelopeIngress:
-    """Verify the alfred-events-v1 envelope ingress on /events.
+    """Verify the alfred-v2 envelope ingress on /events (and /v2/events).
 
     The Python sink is the reference consumer for the published
-    contract. /events is a thin router over /transcript, /chat, and
-    /session/link, so each event_type's behavior must match its
-    legacy direct-POST equivalent.
+    contract. The ingress routes by ``event_type`` prefix to internal
+    handlers, so each event family's behavior must match its expected
+    surface (chat into the per-meeting/per-channel ledger, transcripts
+    into the meeting ledger, channel link into the meetings registry).
     """
 
     @pytest.mark.asyncio
-    async def test_envelope_chat_message_routes_to_chat_handler(
+    async def test_envelope_channel_message_routes_to_chat_handler(
         self, client: AsyncClient
     ) -> None:
         team = "team-env"
         channel = "19:chan-env@thread.tacv2"
+        thread = "1700000000001"
 
         r = await client.post(
-            "/events",
+            "/v2/events",
             json={
-                "schema_version": "alfred-events-v1",
-                "event_type": "chat.message",
+                "schema_version": "alfred-v2",
+                "event_type": "channel.message.created",
                 "event_id": "evt-1",
                 "ts": "2026-04-22T16:00:00Z",
-                "team_id": team,
-                "channel_id": channel,
-                "chat_thread_id": channel,
-                "channel_thread_id": channel,
+                "channel_ref": {
+                    "team_id": team,
+                    "channel_id": channel,
+                    "thread_id": thread,
+                    "message_id": "m-env-1",
+                },
                 "conversation_reference_id": channel,
                 "payload": {
-                    "chat_thread_id": channel,
-                    "message_id": "m-env-1",
+                    "sender": {"display_name": "Logan"},
                     "text": "via envelope",
                     "timestamp_utc": "2026-04-22T16:00:00Z",
-                    "conversation_kind": "channel",
+                    "from_bot": False,
+                    "is_root": True,
                 },
             },
         )
         assert r.status_code == 200, r.text
         assert r.json()["ok"] is True
 
-        events = (await client.get(f"/c/{team}/{channel}/events")).json()["events"]
+        events = (await client.get(f"/v2/teams/{team}/channels/{channel}/events")).json()["events"]
         texts = {e["text"]: e for e in events}
         assert "via envelope" in texts
         assert texts["via envelope"]["channel_id"] == channel
 
     @pytest.mark.asyncio
-    async def test_envelope_transcript_final_routes_to_transcript_handler(
+    async def test_envelope_meeting_transcript_final_routes_to_transcript_handler(
         self, client: AsyncClient
     ) -> None:
-        meeting = "19:meeting_env_tr@thread.v2"
+        meeting = "graph-meeting-tr-001"
+        chat_thread = "19:meeting_env_tr@thread.v2"
 
         r = await client.post(
-            "/events",
+            "/v2/events",
             json={
-                "schema_version": "alfred-events-v1",
-                "event_type": "transcript.final",
+                "schema_version": "alfred-v2",
+                "event_type": "meeting.transcript.final",
                 "event_id": "evt-tr-1",
                 "ts": "2026-04-22T16:00:00Z",
-                "chat_thread_id": meeting,
+                "meeting_ref": {
+                    "meeting_id": meeting,
+                    "meeting_chat_thread_id": chat_thread,
+                    "subject": "Sprint planning",
+                },
                 "payload": {
-                    "event_type": "final",
                     "text": "envelope-final-utterance",
                     "timestamp_utc": "2026-04-22T16:00:00Z",
-                    "chat_thread_id": meeting,
+                    "speaker": {"id": "speaker_0"},
+                    "provider": {"name": "azure_speech"},
                 },
             },
         )
         assert r.status_code == 200, r.text
         assert r.json()["ok"] is True
 
-        ledger = (await client.get(f"/m/{meeting}/ledger")).json()["events"]
+        events = (await client.get(f"/v2/meetings/{meeting}/events")).json()["events"]
         assert any(
-            (e.get("text") or "") == "envelope-final-utterance" for e in ledger
-        ), ledger
+            (e.get("text") or "") == "envelope-final-utterance" for e in events
+        ), events
 
     @pytest.mark.asyncio
-    async def test_envelope_session_linked_backfills(
+    async def test_envelope_meeting_linked_backfills(
         self, client: AsyncClient
     ) -> None:
         team = "team-env-link"
         channel = "19:chan-env-link@thread.tacv2"
-        meeting = "19:meeting_env_link@thread.v2"
+        meeting_id = "graph-meeting-env-link"
+        chat_thread = "19:meeting_env_link@thread.v2"
 
-        # Land a chat with no channel context first.
+        # Land a chat for the meeting with no channel context yet.
         await client.post(
-            "/events",
-            json=_envelope_for_chat({
-                "chat_thread_id": meeting,
-                "message_id": "m-pre-env",
-                "text": "pre-envelope-link",
-                "timestamp_utc": "2026-04-22T16:00:00Z",
-            }),
+            "/v2/events",
+            json={
+                "schema_version": "alfred-v2",
+                "event_type": "meeting.chat.created",
+                "event_id": "evt-pre-link",
+                "ts": "2026-04-22T16:00:00Z",
+                "meeting_ref": {
+                    "meeting_id": meeting_id,
+                    "meeting_chat_thread_id": chat_thread,
+                },
+                "payload": {
+                    "message_id": "m-pre-env",
+                    "sender": {"display_name": "Alex"},
+                    "text": "pre-envelope-link",
+                    "timestamp_utc": "2026-04-22T16:00:00Z",
+                    "from_bot": False,
+                },
+            },
         )
 
-        # Send the link as an envelope.
+        # Send the link as a v2 envelope.
         r = await client.post(
-            "/events",
+            "/v2/events",
             json={
-                "schema_version": "alfred-events-v1",
-                "event_type": "system.session_linked",
+                "schema_version": "alfred-v2",
+                "event_type": "meeting.linked",
                 "event_id": "evt-link-1",
                 "ts": "2026-04-22T16:01:00Z",
-                "team_id": team,
-                "channel_id": channel,
-                "chat_thread_id": meeting,
-                "channel_thread_id": channel,
-                "payload": {
-                    "chat_thread_id": meeting,
-                    "team_id": team,
-                    "channel_id": channel,
-                    "channel_thread_id": channel,
-                    "source": "test_envelope_link",
+                "meeting_ref": {
+                    "meeting_id": meeting_id,
+                    "meeting_chat_thread_id": chat_thread,
+                    "channel_link": {
+                        "team_id": team,
+                        "channel_id": channel,
+                        "thread_id": channel,
+                        "linked_at_utc": "2026-04-22T16:01:00Z",
+                        "linked_source": "test_envelope_link",
+                    },
                 },
+                "payload": {"linked_source": "test_envelope_link"},
             },
         )
         assert r.status_code == 200, r.text
 
-        events = (await client.get(f"/c/{team}/{channel}/events")).json()["events"]
-        texts = {e["text"]: e for e in events}
-        assert "pre-envelope-link" in texts
-        assert texts["pre-envelope-link"]["channel_id"] == channel
+        meeting = (await client.get(f"/v2/meetings/{meeting_id}")).json()
+        assert meeting["channel_link"] is not None
+        assert meeting["channel_link"]["team_id"] == team
+        assert meeting["channel_link"]["channel_id"] == channel
 
     @pytest.mark.asyncio
     async def test_envelope_unsupported_event_type_returns_400(
         self, client: AsyncClient
     ) -> None:
         r = await client.post(
-            "/events",
+            "/v2/events",
             json={
-                "schema_version": "alfred-events-v1",
+                "schema_version": "alfred-v2",
                 "event_type": "totally.unknown.kind",
                 "event_id": "evt-bad",
                 "ts": "2026-04-22T16:00:00Z",
-                "chat_thread_id": "19:meeting_bad@thread.v2",
+                "meeting_ref": {"meeting_id": "graph-meeting-bad"},
                 "payload": {},
             },
         )
         assert r.status_code == 400
 
     @pytest.mark.asyncio
-    async def test_envelope_routing_keys_filled_into_payload(
-        self, client: AsyncClient
-    ) -> None:
-        """Envelope-level team_id/channel_id stamp onto the inner payload
-        when the producer left them off, so downstream is happy either
-        way."""
-        team = "team-env-stamp"
-        channel = "19:chan-env-stamp@thread.tacv2"
-
-        await client.post(
-            "/events",
-            json={
-                "schema_version": "alfred-events-v1",
-                "event_type": "chat.message",
-                "event_id": "evt-stamp",
-                "ts": "2026-04-22T16:00:00Z",
-                "team_id": team,
-                "channel_id": channel,
-                "chat_thread_id": channel,
-                "channel_thread_id": channel,
-                "payload": {
-                    # Note: payload omits team_id/channel_id; envelope
-                    # supplies them.
-                    "chat_thread_id": channel,
-                    "message_id": "m-stamp",
-                    "text": "stamped from envelope",
-                    "timestamp_utc": "2026-04-22T16:00:00Z",
-                    "conversation_kind": "channel",
-                },
-            },
-        )
-
-        events = (await client.get(f"/c/{team}/{channel}/events")).json()["events"]
-        texts = {e["text"]: e for e in events}
-        assert "stamped from envelope" in texts
-        assert texts["stamped from envelope"]["channel_id"] == channel
-
-    @pytest.mark.asyncio
     async def test_envelope_official_transcript_persists_cues(
         self, client: AsyncClient
     ) -> None:
-        """transcript.official envelope persists every cue as a speech event."""
-        meeting = "19:meeting_off@thread.v2"
-        team = "team-off"
-        channel = "19:chan-off@thread.tacv2"
+        """meeting.transcript.official envelope persists every cue as a speech event."""
+        meeting_id = "graph-meeting-off-001"
+        chat_thread = "19:meeting_off@thread.v2"
 
         r = await client.post(
-            "/events",
+            "/v2/events",
             json={
-                "schema_version": "alfred-events-v1",
-                "event_type": "transcript.official",
+                "schema_version": "alfred-v2",
+                "event_type": "meeting.transcript.official",
                 "event_id": "evt-off-1",
                 "ts": "2026-04-22T16:30:00Z",
-                "team_id": team,
-                "channel_id": channel,
-                "chat_thread_id": meeting,
-                "channel_thread_id": channel,
+                "meeting_ref": {
+                    "meeting_id": meeting_id,
+                    "meeting_chat_thread_id": chat_thread,
+                    "subject": "Sprint planning",
+                },
                 "payload": {
-                    "meeting_id": "graph-meeting-xyz",
                     "transcript_id": "graph-transcript-abc",
                     "organizer_oid": "00000000-0000-0000-0000-000000000001",
-                    "created_at_utc": "2026-04-22T16:30:01Z",
+                    "fetched_at_utc": "2026-04-22T16:30:01Z",
+                    "vtt_url": f"meetings/{meeting_id}/transcripts/official.vtt",
                     "cue_count": 2,
                     "cues": [
                         {
-                            "speaker": "Logan Robbins",
+                            "speaker": {"display_name": "Logan Robbins"},
                             "text": "Hello team, welcome to the meeting.",
                             "start_ms": 1000,
                             "end_ms": 4000,
                         },
                         {
-                            "speaker": "Logan Robbins",
+                            "speaker": {"display_name": "Logan Robbins"},
                             "text": "Today we will discuss the new feature.",
                             "start_ms": 4500,
                             "end_ms": 8200,
                         },
                     ],
-                    "vtt_raw": "WEBVTT\n\n00:00:01.000 --> 00:00:04.000\n<v Logan Robbins>Hello.</v>\n",
                 },
             },
         )
@@ -1687,11 +1695,11 @@ class TestEnvelopeIngress:
         assert body["ok"] is True
         assert body["persisted"] == 2
 
-        ledger = (await client.get(f"/m/{meeting}/ledger")).json()["events"]
+        events = (await client.get(f"/v2/meetings/{meeting_id}/events")).json()["events"]
         # Both cues land as speech events from graph_notification with the
         # Teams-rendered speaker name in display_name.
         from_graph = [
-            e for e in ledger
+            e for e in events
             if e.get("source") == "graph_notification"
             and e.get("display_name") == "Logan Robbins"
         ]

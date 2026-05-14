@@ -29,10 +29,15 @@ from .session import InterviewSessionManager
 
 __all__ = [
     "AlfredAgentContext",
+    "MeetingListEntry",
+    "MeetingListResult",
+    "MeetingResolveResult",
     "SendResult",
     "TranscriptResult",
     "build_alfred_tools",
     "fetch_meeting_transcript_impl",
+    "list_meetings_impl",
+    "resolve_meeting_by_name_impl",
     "send_to_meeting_chat_impl",
 ]
 
@@ -41,6 +46,11 @@ __all__ = [
 # event + post-meeting transcript into. Override at deploy time with
 # BLOB_ARCHIVE_URL if the storage account changes.
 _BLOB_ARCHIVE_URL_DEFAULT = "https://stalfreddisney.blob.core.windows.net/alfred-events"
+
+# Sink base URL used by the v2 query tools below. Falls back to the
+# in-cluster URL the C# bot already targets so this works the same way
+# Alfred reads its own ledger.
+_SINK_URL_DEFAULT = "https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io"
 
 _BLOB_PATH_UNSAFE = re.compile(r"[^a-zA-Z0-9\-_.]")
 
@@ -143,16 +153,51 @@ class TranscriptResult(BaseModel):
 
     On success, ``transcript`` is Microsoft's official Record-and-Transcribe
     output rendered as speaker-per-line plaintext (the same content the
-    C# bot wrote to ``_official-transcript.txt`` in the blob archive).
-    On failure, ``reason`` is a short error code the LLM can surface.
+    C# bot wrote to ``meetings/{meeting_id}/transcripts/official.txt`` in
+    the blob archive). On failure, ``reason`` is a short error code.
     """
 
     ok: bool
     transcript: str | None = None
-    meeting_thread_id_sanitized: str | None = None
+    meeting_id: str | None = None
+    subject: str | None = None
     blob_url: str | None = None
     last_modified: str | None = None
     bytes: int | None = None
+    reason: str | None = None
+
+
+class MeetingListEntry(BaseModel):
+    """One meeting in a ``list_meetings`` / ``resolve_meeting_by_name`` result."""
+
+    meeting_id: str
+    subject: str | None = None
+    organizer_display_name: str | None = None
+    scheduled_start_utc: str | None = None
+    scheduled_end_utc: str | None = None
+    actual_start_utc: str | None = None
+    actual_end_utc: str | None = None
+    channel_team_id: str | None = None
+    channel_team_display_name: str | None = None
+    channel_id: str | None = None
+    channel_display_name: str | None = None
+
+
+class MeetingListResult(BaseModel):
+    """What the ``list_meetings`` tool returns."""
+
+    ok: bool
+    count: int = 0
+    meetings: list[MeetingListEntry] = Field(default_factory=list)
+    reason: str | None = None
+
+
+class MeetingResolveResult(BaseModel):
+    """What the ``resolve_meeting_by_name`` tool returns."""
+
+    ok: bool
+    query: str = ""
+    matches: list[MeetingListEntry] = Field(default_factory=list)
     reason: str | None = None
 
 
@@ -333,6 +378,11 @@ def _archive_url() -> str:
     return raw.rstrip("/")
 
 
+def _sink_url() -> str:
+    raw = (os.environ.get("SINK_URL") or _SINK_URL_DEFAULT).strip()
+    return raw.rstrip("/")
+
+
 def _sanitize_blob_segment(raw: str) -> str:
     """Mirror of ``BlobEventArchive.SanitizePathSegment`` in the C# bot.
 
@@ -343,130 +393,179 @@ def _sanitize_blob_segment(raw: str) -> str:
     return _BLOB_PATH_UNSAFE.sub("_", raw)
 
 
-def _resolve_channel_id(
-    session_channel_id: str | None,
-    session_channel_thread_id: str | None,
-    session_chat_thread_id: str | None,
-    explicit: str | None,
-) -> str | None:
-    """Pick the most specific channel id available for the transcript lookup.
-
-    Order: explicit arg > ``channel_thread_id`` (channel meetings stamp
-    the parent here) > ``channel_id`` (raw channel install) > the
-    session's own ``chat_thread_id`` (which, for a channel install, IS
-    the channel thread id). Strips a ``;messageid=...`` suffix when
-    present so the prefix matches the blob's sanitized channel folder.
-    """
-    candidate = (
-        (explicit or "").strip()
-        or (session_channel_thread_id or "").strip()
-        or (session_channel_id or "").strip()
-        or (session_chat_thread_id or "").strip()
+def _meeting_entry_from_v2(row: dict[str, Any]) -> MeetingListEntry:
+    channel_link = row.get("channel_link") or {}
+    return MeetingListEntry(
+        meeting_id=row.get("meeting_id") or "",
+        subject=row.get("subject"),
+        organizer_display_name=(row.get("organizer") or {}).get("display_name")
+            if isinstance(row.get("organizer"), dict)
+            else row.get("organizer_display_name"),
+        scheduled_start_utc=row.get("scheduled_start_utc"),
+        scheduled_end_utc=row.get("scheduled_end_utc"),
+        actual_start_utc=row.get("actual_start_utc"),
+        actual_end_utc=row.get("actual_end_utc"),
+        channel_team_id=(channel_link or {}).get("team_id"),
+        channel_team_display_name=(channel_link or {}).get("team_display_name"),
+        channel_id=(channel_link or {}).get("channel_id"),
+        channel_display_name=(channel_link or {}).get("channel_display_name"),
     )
-    if not candidate:
-        return None
-    semi = candidate.find(";")
-    if semi >= 0:
-        candidate = candidate[:semi]
-    return candidate
+
+
+async def list_meetings_impl(
+    context: AlfredAgentContext,
+    limit: int = 25,
+) -> MeetingListResult:
+    """List meetings the sink knows about via ``GET /v2/meetings``.
+
+    Used when a user asks "what meetings do you have?" or as a discovery
+    step before calling ``fetch_meeting_transcript``.
+    """
+    sink = _sink_url()
+    url = f"{sink}/v2/meetings?limit={int(limit)}"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            data = response.json()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("list_meetings failed: %s", exc)
+        result = MeetingListResult(ok=False, reason=f"http_error: {exc!r}")
+        context.record("list_meetings", {"limit": limit}, result.model_dump(), ok=False, error=str(exc))
+        return result
+
+    meetings = [_meeting_entry_from_v2(m) for m in (data.get("meetings") or [])]
+    result = MeetingListResult(ok=True, count=len(meetings), meetings=meetings)
+    context.record("list_meetings", {"limit": limit}, result.model_dump(), ok=True)
+    return result
+
+
+async def resolve_meeting_by_name_impl(
+    context: AlfredAgentContext,
+    subject: str,
+    limit: int = 10,
+) -> MeetingResolveResult:
+    """Resolve a meeting subject substring → canonical ``meeting_id`` matches.
+
+    Calls ``GET /v2/resolve?kind=meeting&subject=...``.
+    """
+    sink = _sink_url()
+    query = (subject or "").strip()
+    url = f"{sink}/v2/resolve?kind=meeting&subject={httpx.QueryParams({'q': query}).get('q')}&limit={int(limit)}"
+    # httpx QueryParams above is just to URL-encode; rebuild cleanly:
+    params = {"kind": "meeting", "subject": query, "limit": int(limit)}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(f"{sink}/v2/resolve", params=params)
+            response.raise_for_status()
+            data = response.json()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("resolve_meeting_by_name failed: %s", exc)
+        result = MeetingResolveResult(ok=False, query=query, reason=f"http_error: {exc!r}")
+        context.record(
+            "resolve_meeting_by_name", {"subject": query}, result.model_dump(),
+            ok=False, error=str(exc),
+        )
+        return result
+
+    matches = [_meeting_entry_from_v2(m) for m in (data.get("matches") or [])]
+    result = MeetingResolveResult(ok=True, query=query, matches=matches)
+    context.record("resolve_meeting_by_name", {"subject": query}, result.model_dump(), ok=True)
+    return result
 
 
 async def fetch_meeting_transcript_impl(
     context: AlfredAgentContext,
-    channel_id: str | None = None,
+    meeting_id: str | None = None,
 ) -> TranscriptResult:
-    """Fetch the most recent meeting's official transcript from the blob archive.
+    """Fetch a meeting's official transcript by canonical Graph meeting_id.
 
-    The C# bot writes one ``_official-transcript.txt`` per meeting at
-    ``meetings/{sanitizedChatThreadId}/_official-transcript.txt`` in the
-    public-read alfred-events container. For channel meetings, the
-    sanitized chat thread id starts with the sanitized channel id (with
-    ``_messageid_xxx`` appended), so a prefix list scoped to the current
-    channel finds every meeting that happened in that channel.
+    Calls ``GET /v2/meetings/{meeting_id}/transcript`` which proxies the
+    transcript text from the blob archive
+    (``meetings/{meeting_id}/transcripts/official.txt``). If no
+    ``meeting_id`` is provided, falls back to the most recent meeting in
+    the sink's meetings registry (``GET /v2/meetings?limit=1``) so the
+    agent can still answer "summarize the last meeting" without being
+    told a meeting_id.
 
-    The newest such transcript wins. The transcript body is returned to
-    the LLM so it can read it and answer the user's question — no
-    summarization happens inside this tool.
+    The transcript body is returned to the LLM so it can READ it and
+    answer the user's question — no summarization happens here.
     """
-    session = context.session_manager.session
-    resolved_channel = _resolve_channel_id(
-        session_channel_id=getattr(session, "channel_id", None) if session is not None else None,
-        session_channel_thread_id=getattr(session, "channel_thread_id", None) if session is not None else None,
-        session_chat_thread_id=getattr(session, "chat_thread_id", None) if session is not None else None,
-        explicit=channel_id,
-    )
-    if not resolved_channel:
-        return TranscriptResult(ok=False, reason="no_channel_context")
+    sink = _sink_url()
+    resolved_meeting_id = (meeting_id or "").strip() or None
+    subject: str | None = None
 
-    archive = _archive_url()
-    list_prefix = f"meetings/{_sanitize_blob_segment(resolved_channel)}"
-    list_url = (
-        f"{archive}?restype=container&comp=list&prefix={list_prefix}&maxresults=500"
-    )
+    if resolved_meeting_id is None:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(f"{sink}/v2/meetings", params={"limit": 1})
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("fetch_meeting_transcript list failed: %s", exc)
+            return TranscriptResult(ok=False, reason=f"list_failed: {exc!r}")
+        meetings = data.get("meetings") or []
+        if not meetings:
+            return TranscriptResult(ok=False, reason="no_meetings_known")
+        first = meetings[0]
+        resolved_meeting_id = first.get("meeting_id")
+        subject = first.get("subject")
 
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            list_response = await client.get(list_url)
-            list_response.raise_for_status()
-            xml_text = list_response.text
-    except Exception as e:
-        logger.warning("fetch_meeting_transcript list failed: %s", e)
-        return TranscriptResult(ok=False, reason=f"list_failed: {e!r}")
-
-    try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError as e:
-        logger.warning("fetch_meeting_transcript list parse failed: %s", e)
-        return TranscriptResult(ok=False, reason=f"parse_failed: {e!r}")
-
-    candidates: list[tuple[str, str]] = []
-    for blob in root.iter("Blob"):
-        name = blob.findtext("Name") or ""
-        if not name.endswith("/_official-transcript.txt"):
-            continue
-        last_modified = blob.findtext("Properties/Last-Modified") or ""
-        candidates.append((last_modified, name))
-
-    if not candidates:
-        return TranscriptResult(ok=False, reason="no_transcript_found")
-
-    candidates.sort(reverse=True)
-    last_modified, blob_name = candidates[0]
-    blob_url = f"{archive}/{blob_name}"
+    if not resolved_meeting_id:
+        return TranscriptResult(ok=False, reason="no_meeting_id")
 
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
-            get_response = await client.get(blob_url)
-            get_response.raise_for_status()
-            transcript_text = get_response.text
-    except Exception as e:
-        logger.warning("fetch_meeting_transcript download failed: %s", e)
-        return TranscriptResult(ok=False, reason=f"download_failed: {e!r}")
+            resp = await client.get(f"{sink}/v2/meetings/{resolved_meeting_id}/transcript")
+            resp.raise_for_status()
+            payload = resp.json()
+    except httpx.HTTPStatusError as exc:
+        logger.warning("fetch_meeting_transcript fetch failed: %s", exc)
+        if exc.response.status_code == 404:
+            return TranscriptResult(ok=False, meeting_id=resolved_meeting_id, reason="meeting_not_found")
+        return TranscriptResult(ok=False, meeting_id=resolved_meeting_id, reason=f"http_error: {exc!r}")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("fetch_meeting_transcript fetch failed: %s", exc)
+        return TranscriptResult(ok=False, meeting_id=resolved_meeting_id, reason=f"http_error: {exc!r}")
 
-    # blob_name = meetings/{sanitized}/_official-transcript.txt
-    parts = blob_name.split("/")
-    meeting_thread_id_sanitized = parts[1] if len(parts) >= 3 else None
+    if not payload.get("available"):
+        result = TranscriptResult(
+            ok=False,
+            meeting_id=resolved_meeting_id,
+            subject=subject,
+            blob_url=payload.get("official_transcript_txt_url"),
+            reason="no_transcript_found",
+        )
+        context.record(
+            "fetch_meeting_transcript",
+            {"meeting_id": resolved_meeting_id},
+            result.model_dump(),
+            ok=False,
+            error="no_transcript_found",
+        )
+        return result
 
+    transcript_text = payload.get("text") or ""
+    blob_url = payload.get("official_transcript_txt_url")
+    result = TranscriptResult(
+        ok=True,
+        transcript=transcript_text,
+        meeting_id=resolved_meeting_id,
+        subject=subject,
+        blob_url=blob_url,
+        bytes=len(transcript_text),
+    )
     context.record(
         "fetch_meeting_transcript",
-        {"channel_id": resolved_channel},
+        {"meeting_id": resolved_meeting_id},
         {
             "blob_url": blob_url,
-            "last_modified": last_modified,
             "bytes": len(transcript_text),
-            "meeting_thread_id_sanitized": meeting_thread_id_sanitized,
+            "subject": subject,
         },
         ok=True,
     )
-
-    return TranscriptResult(
-        ok=True,
-        transcript=transcript_text,
-        meeting_thread_id_sanitized=meeting_thread_id_sanitized,
-        blob_url=blob_url,
-        last_modified=last_modified,
-        bytes=len(transcript_text),
-    )
+    return result
 
 
 def build_alfred_tools() -> tuple[Any, ...]:
@@ -501,30 +600,67 @@ def build_alfred_tools() -> tuple[Any, ...]:
     @function_tool
     async def fetch_meeting_transcript(
         ctx: RunContextWrapper[AlfredAgentContext],
-        channel_id: str | None = None,
+        meeting_id: str | None = None,
     ) -> TranscriptResult:
-        """Fetch the most recent meeting's full official transcript so you can READ it and answer questions about what was said.
+        """Fetch a meeting's official transcript so you can READ it and answer questions about what was said.
 
         Call this any time a user explicitly asks you to look up, recap,
-        summarize, or answer a question about a past meeting in this
-        channel ("alfred, get the transcript", "what did the team
-        decide?", "summarize the last meeting", etc.). The returned
-        ``transcript`` is Microsoft's official Record-and-Transcribe
-        output as speaker-per-line plaintext — read it, then answer the
-        user via ``send_to_meeting_chat`` (concise; quote sparingly).
+        summarize, or answer a question about a past meeting ("alfred,
+        get the transcript", "what did the team decide?", "summarize the
+        last meeting", etc.). The returned ``transcript`` is Microsoft's
+        official Record-and-Transcribe output as speaker-per-line
+        plaintext — read it, then answer the user via
+        ``send_to_meeting_chat`` (concise; quote sparingly).
 
         Do NOT call this on a normal silence-default tick. Only call
         when a user is directly addressing you with a question or
         recap request.
 
         Args:
-            channel_id: Optional Teams channel id (``19:...@thread.tacv2``).
-                If omitted, uses the current channel context resolved
-                from this session.
+            meeting_id: Optional canonical Graph onlineMeeting id. If
+                omitted, fetches the most recent meeting. Use
+                ``resolve_meeting_by_name`` first when the user names a
+                meeting by its subject, then pass the canonical id here.
         """
         return await fetch_meeting_transcript_impl(
             context=ctx.context,
-            channel_id=channel_id,
+            meeting_id=meeting_id,
         )
 
-    return (send_to_meeting_chat, fetch_meeting_transcript)
+    @function_tool
+    async def list_meetings(
+        ctx: RunContextWrapper[AlfredAgentContext],
+        limit: int = 25,
+    ) -> MeetingListResult:
+        """List meetings the sink knows about (subject, organizer, times).
+
+        Useful for "what meetings did we have today?" style questions and
+        as a discovery step before ``fetch_meeting_transcript``.
+        """
+        return await list_meetings_impl(ctx.context, limit=limit)
+
+    @function_tool
+    async def resolve_meeting_by_name(
+        ctx: RunContextWrapper[AlfredAgentContext],
+        subject: str,
+        limit: int = 10,
+    ) -> MeetingResolveResult:
+        """Resolve a meeting subject (substring) → canonical ``meeting_id`` matches.
+
+        Use this when a user names a meeting by its subject. The result
+        contains zero or more ``MeetingListEntry`` rows; pick the most
+        likely match and pass its ``meeting_id`` to
+        ``fetch_meeting_transcript``.
+
+        Args:
+            subject: Plain-text subject substring (case-insensitive).
+            limit: Maximum number of matches to return.
+        """
+        return await resolve_meeting_by_name_impl(ctx.context, subject=subject, limit=limit)
+
+    return (
+        send_to_meeting_chat,
+        fetch_meeting_transcript,
+        list_meetings,
+        resolve_meeting_by_name,
+    )

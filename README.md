@@ -50,13 +50,17 @@ ship in this repo as the canonical consumer.
                        ▼
   ┌──────────────────────────────────────────────────────────────────┐
   │   PYTHON SINK   python/   ·   ca-alfred-api Container App        │
-  │   (⚠ in-progress rewrite to v2 — currently running v1 schema)    │
   │                                                                  │
   │   POST /v2/events  →  single ingest for all event types          │
-  │   GET  /v2/teams/{tid}/channels/{cid}/threads/…  hierarchical    │
-  │   GET  /v2/meetings/{mid}/…                       reads          │
+  │   GET  /v2/index                                  discovery      │
+  │   GET  /v2/meetings                               list meetings  │
+  │   GET  /v2/meetings/{meeting_id}                  one meeting    │
+  │   GET  /v2/meetings/{mid}/events                  ledger         │
+  │   GET  /v2/meetings/{mid}/transcript              official text  │
+  │   GET  /v2/teams/{tid}/channels/{cid}             one channel    │
+  │   GET  /v2/teams/{tid}/channels/{cid}/events      channel ledger │
+  │   GET  /v2/teams/{tid}/channels/{cid}/threads/{thrid}/messages   │
   │   GET  /v2/resolve?kind=meeting&subject=…         name lookup    │
-  │   GET  /v2/index                                  index files    │
   │                                                                  │
   │   AlfredAnalyzer (claude-haiku-4-5, Anthropic Agents SDK):       │
   │     · runs on every debounced tick                               │
@@ -68,9 +72,9 @@ ship in this repo as the canonical consumer.
                        ▼
   ┌──────────────────────────────────────────────────────────────────┐
   │   REACT UI   web/   ·   ca-alfred-web Container App              │
-  │   (⚠ in-progress rewrite to v2 — currently pointing at v1 API)   │
-  │     /                    → meeting picker (by subject)           │
-  │     /m/<meeting_id>      → per-meeting dossier (read-only)       │
+  │     /                    → meeting picker (subject; meeting_id   │
+  │                            on hover)                             │
+  │     /m/<meeting_chat_thread_id> → per-meeting dossier            │
   │     /channels            → consumer admin + join-any-meeting     │
   │     /channels/inspect/.. → per-channel command center            │
   │     /archive             → blob-archive folder browser           │
@@ -289,15 +293,8 @@ SA=https://stalfreddisney.blob.core.windows.net/alfred-events
 
 curl -sS $BOT/api/calling/health | jq            # bot media readiness
 curl -sS $SINK/health                            # sink
-
 curl -sS $BOT/api/channels | jq                  # channel attachments + last_auto_join_attempt
-
-# Blob archive index — what meetings Alfred has ever seen
-curl -sS "$SA/indexes/meetings.json" | jq 'to_entries | map({id:.key,subject:.value.subject})'
-
-# Meeting transcript (official VTT after meeting ends)
-MID="<meeting_id>"
-curl -sS "$SA/meetings/$MID/transcripts/official.vtt"
+curl -sS $SINK/v2/index | jq                     # what the sink knows about
 
 # Manual transcript backfill (when the auto-trigger missed a meeting)
 # meeting_chat_thread_id is optional; call_id and organizer_oid are required
@@ -308,6 +305,66 @@ curl -sS -X POST "$BOT/api/debug/fetch-transcript" -H 'Content-Type: application
 **See `AGENTS.md` §7** for the full symptom→fix index (auto-join
 tiers, `vmAgent: null` ARM lag, stale `dotnet publish`, run-command
 name caching, etc.).
+
+---
+
+## 7.4 Consuming captured data (the part downstream teams care about)
+
+Everything Alfred captures lives in two places. **Pick whichever path
+fits your consumer; both serve the same `alfred-v2` envelopes**.
+
+| Path | Best for |
+|------|----------|
+| **Sink API** — `$SINK/v2/*` | "I want one HTTP call → JSON" — list / lookup / proxy reads |
+| **Blob archive** — `$SA/...` | "I want the raw event stream forever" — replay, bulk, offline |
+
+Full contract + recipes: [`docs/retrieving-transcripts.md`](docs/retrieving-transcripts.md).
+
+```bash
+SINK=https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io
+SA=https://stalfreddisney.blob.core.windows.net/alfred-events
+
+# What meetings are in the system?
+curl -sS "$SINK/v2/meetings?limit=20" | jq '.meetings[] | {meeting_id, subject, scheduled_start_utc}'
+
+# Subject → meeting_id (case-insensitive substring)
+curl -sS "$SINK/v2/resolve?kind=meeting&subject=sprint%20planning" | jq
+
+# Official Microsoft transcript for a meeting (plaintext, inline)
+MID="MSpkYzE3..."
+curl -sS "$SINK/v2/meetings/$MID/transcript" | jq -r '.text'
+# Or grab the raw blob directly:
+curl -sS "$SA/meetings/$MID/transcripts/official.txt"
+curl -sS "$SA/meetings/$MID/transcripts/official.vtt"
+
+# Full ledger (live STT + chat) for a meeting
+curl -sS "$SINK/v2/meetings/$MID/events?limit=500" | jq
+
+# Channel messages by team + channel
+TID="d3f5f412-..." CID="19:abc@thread.tacv2"
+curl -sS "$SINK/v2/teams/$TID/channels/$CID" | jq
+curl -sS "$SINK/v2/teams/$TID/channels/$CID/events?kinds=chat&limit=200" | jq
+```
+
+**Blob path layout** (mirrors Microsoft Graph URLs):
+
+```
+teams/{team_id}/channels/{channel_id_sanitized}/{event_type}/{utcTs}-{event_id}.json
+meetings/{meeting_id}/{event_type}/{utcTs}-{event_id}.json
+meetings/{meeting_id}/transcripts/official.txt       (clean speaker-per-line)
+meetings/{meeting_id}/transcripts/official.vtt       (raw WebVTT)
+```
+
+Every `.json` blob is a **pure `alfred-v2` envelope** — no preamble,
+just `{ … }`. `jq` it directly.
+
+> **Channel meetings have no audio.** They surface only as
+> `channel.message.*` events. The `meeting.*` family exists for
+> private meetings the bot was added to via `+ Apps`.
+
+> **`meeting_id` is canonical.** It's the Graph `onlineMeeting` id
+> (URL-safe base64). The chat thread id (`19:meeting_xxx@thread.v2`)
+> is a sub-resource; never key on it when you mean the meeting.
 
 ---
 
