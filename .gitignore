@@ -82,3 +82,4 @@ Thumbs.db
 # Package restores
 node_modules/
 packages/
+PAT.txt
