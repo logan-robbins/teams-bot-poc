@@ -80,8 +80,19 @@ async function listAll(prefix: string): Promise<{ blobs: BlobEntry[]; prefixes: 
     safetyHops += 1;
     if (safetyHops > 50) break; // 50 * 200 = 10k entries; plenty for a debug view
   } while (marker);
-  // Sort blobs newest-first, prefixes alphabetical
-  blobs.sort((a, b) => b.lastModified.localeCompare(a.lastModified));
+  // Sort blobs newest-first. Azure returns Last-Modified as RFC 1123
+  // ("Mon, 18 May 2026 18:31:21 GMT") which does NOT sort lexicographically
+  // (any "Thu, …" string > any "Mon, …" string). Parse to epoch ms first;
+  // fall back to the blob name (ISO yyyyMMddTHHmmssfffZ prefix is sortable)
+  // if Date parsing returns NaN.
+  const ts = (b: BlobEntry) => {
+    const n = new Date(b.lastModified).getTime();
+    return Number.isFinite(n) ? n : 0;
+  };
+  blobs.sort((a, b) => {
+    const diff = ts(b) - ts(a);
+    return diff !== 0 ? diff : b.name.localeCompare(a.name);
+  });
   prefixes.sort((a, b) => a.name.localeCompare(b.name));
   return { blobs, prefixes };
 }
