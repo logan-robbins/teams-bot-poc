@@ -142,6 +142,10 @@ function buildAttachmentMaps(attachments: ChannelAttachment[]) {
  * Maps a slash-delimited folder segment within an /archive prefix to a
  * human-friendly display name. Returns the original segment if no
  * lookup matches (so unknown ids still render).
+ *
+ * Handles both the legacy v1 layout (channels/{teamId}/{cid}/…) and the
+ * canonical alfred-v2 layout (teams/{teamId}/channels/{cid}/…) so the
+ * archive browser stays readable across the cutover.
  */
 function friendlyLabel(
   segment: string,
@@ -149,12 +153,21 @@ function friendlyLabel(
   fullPath: string[],
   maps: { teamMap: Map<string, string>; channelMap: Map<string, string> },
 ): string {
-  // Pattern: channels/{teamId}/{sanitizedChannelId}/...
+  // v1: channels/{teamId}/{sanitizedChannelId}/{event_type}/...
   if (fullPath[0] === "channels") {
     if (positionInPath === 1) {
       return maps.teamMap.get(segment) ?? segment;
     }
     if (positionInPath === 2) {
+      return maps.channelMap.get(segment) ?? segment;
+    }
+  }
+  // v2: teams/{teamId}/channels/{sanitizedChannelId}/{event_type}/...
+  if (fullPath[0] === "teams") {
+    if (positionInPath === 1) {
+      return maps.teamMap.get(segment) ?? segment;
+    }
+    if (positionInPath === 3) {
       return maps.channelMap.get(segment) ?? segment;
     }
   }

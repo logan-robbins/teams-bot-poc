@@ -57,8 +57,8 @@ export function ChannelCommandCenter() {
   const [joinMessage, setJoinMessage] = useState<string | null>(null);
 
   const sanitizedThreadId = useMemo(
-    () => sanitizeForAuditDir(channelId),
-    [channelId],
+    () => sanitizeForAuditDir(teamId, channelId),
+    [teamId, channelId],
   );
 
   useEffect(() => {
@@ -658,7 +658,10 @@ function fmtTs(ts?: string): string {
  * illegal path chars in the channel thread id so we can open the
  * matching audit directory.
  */
-function sanitizeForAuditDir(chatThreadId: string): string {
+function sanitizeForAuditDir(teamId: string, channelId: string): string {
+  // Must mirror EventFanoutDispatcher's audit key for channel events:
+  //   auditKey = $"{TeamId}|{ChannelId}"
+  // …then MeetingAuditLogger replaces Windows-invalid chars with `_`.
   // Windows invalid: < > : " / \ | ? *
-  return chatThreadId.replace(/[<>:"/\\|?*]/g, "_");
+  return `${teamId}|${channelId}`.replace(/[<>:"/\\|?*]/g, "_");
 }

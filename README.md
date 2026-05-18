@@ -253,6 +253,23 @@ az containerapp update --subscription e02c0038-82c8-4655-9647-38083f301099 \
 - VM caps at **25 managed Run Commands**. Prune Succeeded ones
   periodically — full deploys silently fail with `BadRequest` then
   appear as `ResourceNotFound` on the new name.
+- The bot's live config is `C:/teams-bot-poc/src/Config/appsettings.production.json`
+  (not `appsettings.json`). The deploy script reads the file from
+  `src/Config/`; `dotnet publish` copies it into the publish dir. Set
+  `reloadOnChange:true` is on, so config-only changes (e.g. flipping
+  `BlobArchive:V1CompatEnabled`) don't require a redeploy — just edit
+  the file via Run Command.
+- The VM's git remote is `origin`, not `private` — the deploy script
+  falls back through `private` → `origin`. Pushes to `private/main`
+  reach the VM's `origin` because `origin` mirrors from it.
+- The `IConversationReferenceStore` is in-memory; a bot restart wipes
+  it, and `/api/send-chat` will 404 until a fresh chat activity
+  re-populates the reference for that thread.
+
+**Before deploying a schema change that downstream consumers
+depend on:** see §7.5 V1 compatibility dual-write if any pre-v2
+polling consumer needs to keep working through the cutover, and
+§7.6 Rollback for the one-command revert path.
 
 ---
 
@@ -386,9 +403,77 @@ unconditionally, independent of consumer registration. Use the
 placeholder trick to silence push-based sinks; pull-based ones keep
 working because the blob is the source of truth.
 
+### 7.5 V1 compatibility dual-write (keep a pre-v2 consumer working)
+
+A polling consumer written against the pre-v2 blob layout
+(`channels/{team}/{cid_sanitized}/chat.message/{ts}-{eid}.txt`, with
+the human header + `---ENVELOPE---` separator + flat
+`payload.sender_display_name`) breaks the moment the bot starts
+writing only the v2 layout
+(`teams/{team_id}/channels/{cid_sanitized}/channel.message.created/{ts}-{eid}.json`).
+
+The bot has a scoped dual-write to bridge that for one or more
+specific channels. When the feature flag is on and an envelope's
+channel id is in the allow-list, the bot writes the v2 blob at its
+canonical v2 path **and** a v1-format blob at the legacy v1 path for
+the same event. The pre-v2 consumer keeps polling the v1 path and
+sees the same shape it always did.
+
+Config lives in `appsettings.production.json` (`reloadOnChange:true` —
+no redeploy needed to flip):
+
+```json
+"BlobArchive": {
+  "V1CompatEnabled": true,
+  "V1CompatChannelIds": [
+    "19:abc@thread.tacv2"
+  ]
+}
+```
+
+- `V1CompatEnabled` (bool, default `false`) — master switch.
+- `V1CompatChannelIds` (list, default `[]`) — exact channel ids
+  (e.g. `19:abc@thread.tacv2`) that get the extra write. Empty list
+  = no compat writes (zero overhead).
+- Only `channel.message.{created,updated,deleted}` events get
+  compat-written — that's the only family pre-v2 polling bridges
+  consumed. Transcripts, meeting events, etc. stay v2-only even
+  for allow-listed channels.
+
+Lookup is `O(1)` per envelope (HashSet), and the v2 write is
+unchanged — compat is additive. When the downstream consumer
+migrates to read v2, set `V1CompatEnabled: false` (or empty the
+list) and the extra write goes away. See
+`src/Services/BlobEventArchive.cs` (`BuildV1CompatChannelMessage`)
+for the exact v1 body format.
+
+Pair with the consumer-isolation trick in §7.4 if you also need to
+prevent your sink's AlfredAnalyzer from posting into the same
+channel while the pre-v2 consumer is the active responder there.
+
+### 7.6 Rollback after a bad deploy
+
+Every full-stack deploy pushes tags `deployed-{bot,sink,web}-YYYY-MM-DD`
+to the `private` remote pinning the SHAs that were live before the
+cutover. ACR retention keeps the prior container images
+(`disney-sandbox-{sha}`). Rollback is therefore one Run Command per
+component:
+
+```bash
+# Bot
+az vm run-command create --subscription <sub> \
+  --vm-name vm-alfred-disney -g rg-alfred-disney \
+  --run-command-name alfred-rollback-$(date +%s) --location eastus \
+  --script 'Set-Location C:/teams-bot-poc; git fetch origin --tags; git reset --hard deployed-bot-2026-05-13; Stop-Service TeamsMediaBot -Force; rm -r src/bin,src/obj -ErrorAction SilentlyContinue; dotnet publish src --configuration Release --output src/bin/Release/net8.0/publish; Start-Service TeamsMediaBot'
+
+# Sink / Web — just point Container App back to the old image tag
+az containerapp update -n ca-alfred-api -g rg-alfred-disney --image acralfreddisneye02c0038.azurecr.io/ca-alfred-api:disney-sandbox-0baf2af
+az containerapp update -n ca-alfred-web -g rg-alfred-disney --image acralfreddisneye02c0038.azurecr.io/ca-alfred-web:disney-sandbox-4026981
+```
+
 ---
 
-## 7.5 Consuming captured data (the part downstream teams care about)
+## 7.7 Consuming captured data (the part downstream teams care about)
 
 Everything Alfred captures lives in two places. **Pick whichever path
 fits your consumer; both serve the same `alfred-v2` envelopes**.
