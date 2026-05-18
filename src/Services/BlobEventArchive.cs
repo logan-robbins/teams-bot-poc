@@ -34,6 +34,26 @@ public sealed class BlobArchiveConfiguration
     /// <summary>Container that holds every Alfred archive blob.</summary>
     public string ContainerName { get; set; } = "alfred-events";
 
+    /// <summary>
+    /// Master switch for the v1-compat dual-write. When true and a v2
+    /// envelope's channel id matches an entry in
+    /// <see cref="V1CompatChannelIds"/>, the bot writes the v2 blob at
+    /// its canonical v2 path AND a v1-format blob at the legacy v1 path
+    /// so pre-v2 polling consumers (e.g. a Python bridge that polls
+    /// <c>channels/{team}/{cid_sanitized}/chat.message/</c>) keep
+    /// working through the cutover.
+    /// </summary>
+    public bool V1CompatEnabled { get; set; }
+
+    /// <summary>
+    /// Allow-list of channel ids that should receive the v1-compat
+    /// dual-write while <see cref="V1CompatEnabled"/> is true. Empty
+    /// list = no compat writes (zero overhead). Each entry is the raw
+    /// Teams channel id (e.g. <c>19:abc@thread.tacv2</c>) — same
+    /// format as what <c>ChannelRef.ChannelId</c> carries.
+    /// </summary>
+    public List<string> V1CompatChannelIds { get; set; } = new();
+
     public bool IsConfigured =>
         !string.IsNullOrWhiteSpace(ConnectionString) ||
         !string.IsNullOrWhiteSpace(AccountUrl);
@@ -79,10 +99,17 @@ public sealed class BlobEventArchive
 
     private readonly BlobContainerClient? _container;
     private readonly ILogger<BlobEventArchive> _logger;
+    private readonly bool _v1CompatEnabled;
+    private readonly HashSet<string> _v1CompatChannelIds;
 
     public BlobEventArchive(BlobArchiveConfiguration config, ILogger<BlobEventArchive> logger)
     {
         _logger = logger;
+        _v1CompatEnabled = config.V1CompatEnabled;
+        _v1CompatChannelIds = new HashSet<string>(
+            config.V1CompatChannelIds ?? new List<string>(),
+            StringComparer.OrdinalIgnoreCase);
+
         if (!config.IsConfigured)
         {
             _logger.LogInformation(
@@ -102,8 +129,9 @@ public sealed class BlobEventArchive
 
         _container = service.GetBlobContainerClient(config.ContainerName);
         _logger.LogInformation(
-            "BlobEventArchive ready: container={Container} endpoint={Endpoint}",
-            config.ContainerName, _container.Uri);
+            "BlobEventArchive ready: container={Container} endpoint={Endpoint} V1Compat={V1Compat} V1CompatChannels={V1Channels}",
+            config.ContainerName, _container.Uri,
+            _v1CompatEnabled, _v1CompatChannelIds.Count);
     }
 
     public bool IsEnabled => _container is not null;
@@ -138,7 +166,133 @@ public sealed class BlobEventArchive
                     "BlobEventArchive envelope write failed EventType={EventType} EventId={EventId}",
                     envelope.EventType, envelope.EventId);
             }
+
+            // V1-compat dual write: for channels explicitly listed in
+            // BlobArchive:V1CompatChannelIds, also persist the envelope in
+            // the legacy alfred-events-v1 shape at the legacy v1 path so
+            // pre-v2 polling consumers (e.g. server.py bridges that watch
+            // channels/{team}/{cid}/chat.message/) keep working through
+            // the cutover. Only channel.message.* events are compat-written
+            // because that's the only event family v1 bridges read.
+            if (_v1CompatEnabled
+                && envelope.ChannelRef is { } cref
+                && !string.IsNullOrWhiteSpace(cref.ChannelId)
+                && _v1CompatChannelIds.Contains(cref.ChannelId)
+                && IsV1CompatChannelMessageEvent(envelope.EventType))
+            {
+                try
+                {
+                    var (v1Path, v1Body) = BuildV1CompatChannelMessage(envelope, cref);
+                    await UploadAsync(v1Path, v1Body, "text/plain", cancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex,
+                        "BlobEventArchive v1-compat write failed EventType={EventType} EventId={EventId} ChannelId={ChannelId}",
+                        envelope.EventType, envelope.EventId, cref.ChannelId);
+                }
+            }
         }, cancellationToken);
+    }
+
+    private static bool IsV1CompatChannelMessageEvent(string? eventType) =>
+        eventType == AlfredEventTypes.ChannelMessageCreated
+        || eventType == AlfredEventTypes.ChannelMessageUpdated
+        || eventType == AlfredEventTypes.ChannelMessageDeleted;
+
+    /// <summary>
+    /// Build the legacy alfred-events-v1 blob (path + body) from a v2
+    /// channel.message.* envelope. Matches the exact shape the bot was
+    /// writing pre-v2 so polling consumers don't have to change. Body
+    /// is a human-readable header line + <c>---ENVELOPE---</c> separator
+    /// + v1-format JSON with flat top-level fields and flat payload
+    /// sender_id / sender_display_name.
+    /// </summary>
+    private static (string Path, string Body) BuildV1CompatChannelMessage(
+        AlfredEventEnvelope envelope, ChannelRef cref)
+    {
+        var ts = DateTimeOffset.TryParse(envelope.Ts, CultureInfo.InvariantCulture,
+            DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+            out var parsed)
+            ? parsed.ToString("yyyyMMddTHHmmssfffZ", CultureInfo.InvariantCulture)
+            : DateTimeOffset.UtcNow.ToString("yyyyMMddTHHmmssfffZ", CultureInfo.InvariantCulture);
+        var safeId = SanitizePathSegment(envelope.EventId ?? Guid.NewGuid().ToString("N"));
+        var cidSanitized = SanitizePathSegment(cref.ChannelId);
+        var teamSanitized = SanitizePathSegment(cref.TeamId);
+
+        // Legacy v1 path used "channels/" (not "teams/") and a flat
+        // "chat.message" event-type folder regardless of created/updated/
+        // deleted. Match that exactly.
+        var path = $"channels/{teamSanitized}/{cidSanitized}/chat.message/{ts}-{safeId}.txt";
+
+        // Derive v1-equivalent fields.
+        var payload = envelope.Payload as ChannelMessagePayload;
+        var messageId = cref.MessageId ?? string.Empty;
+        var channelThreadId = cref.ChannelId;
+        var chatThreadId = string.IsNullOrEmpty(messageId)
+            ? channelThreadId
+            : $"{channelThreadId};messageid={messageId}";
+        var convRefId = envelope.ConversationReferenceId ?? chatThreadId;
+        var senderId = payload?.Sender?.AadId ?? string.Empty;
+        var senderName = payload?.Sender?.DisplayName ?? string.Empty;
+        var text = payload?.Text ?? string.Empty;
+        var html = payload?.Html;
+        var timestampUtc = payload?.TimestampUtc ?? envelope.Ts ?? string.Empty;
+        var fromBot = payload?.FromBot ?? false;
+        var v1InnerEventType = envelope.EventType switch
+        {
+            AlfredEventTypes.ChannelMessageUpdated => "chat_updated",
+            AlfredEventTypes.ChannelMessageDeleted => "chat_deleted",
+            _ => "chat_created",
+        };
+
+        // v1 envelope shape — flat top-level fields, flat payload.
+        // Use sorted keys via a dictionary so JSON output is deterministic.
+        var v1Envelope = new Dictionary<string, object?>
+        {
+            ["schema_version"] = "alfred-events-v1",
+            ["event_type"] = "chat.message",
+            ["event_id"] = envelope.EventId,
+            ["ts"] = envelope.Ts,
+            ["team_id"] = cref.TeamId,
+            ["channel_id"] = cref.ChannelId,
+            ["chat_thread_id"] = chatThreadId,
+            ["channel_thread_id"] = channelThreadId,
+            ["conversation_reference_id"] = convRefId,
+            ["payload"] = new Dictionary<string, object?>
+            {
+                ["event_type"] = v1InnerEventType,
+                ["chat_thread_id"] = chatThreadId,
+                ["message_id"] = messageId,
+                ["text"] = text,
+                ["html"] = html,
+                ["sender_id"] = senderId,
+                ["sender_display_name"] = senderName,
+                ["timestamp_utc"] = timestampUtc,
+                ["conversation_reference_id"] = convRefId,
+                ["attachments"] = Array.Empty<object>(),
+                ["mentions"] = Array.Empty<object>(),
+                ["from_bot"] = fromBot,
+                ["conversation_kind"] = "channel",
+                ["team_id"] = cref.TeamId,
+                ["channel_id"] = cref.ChannelId,
+                ["channel_thread_id"] = channelThreadId,
+            },
+        };
+
+        // Human-readable header line (matches the pre-v2 format byte-for-byte).
+        var senderTag = string.IsNullOrEmpty(senderName)
+            ? (fromBot ? "Alfred (bot)" : "?")
+            : (fromBot ? $"{senderName} (bot)" : senderName);
+        var headerText = (text ?? string.Empty).Replace("\r\n", " ").Replace('\n', ' ').Replace('\r', ' ');
+        var header = $"# [{timestampUtc}] {senderTag} (channel): {headerText}";
+
+        var sb = new StringBuilder();
+        sb.AppendLine(header);
+        sb.AppendLine();
+        sb.AppendLine("---ENVELOPE---");
+        sb.Append(JsonSerializer.Serialize(v1Envelope, EnvelopeJsonOptions));
+        return (path, sb.ToString());
     }
 
     /// <summary>

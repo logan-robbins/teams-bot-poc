@@ -260,18 +260,49 @@ az containerapp update --subscription e02c0038-82c8-4655-9647-38083f301099 \
 
 ### 7.1 Call-join failures (the most common, most-frustrating bug)
 
-When a join attempt fails, the error code tells you which **tier** is
-blocking. There are three layers in order of likelihood for our
-Sandbox-tenant constraints:
+For org-internal calling bots there are **two real authorization gates**.
+Both must be in place before any join can succeed; once both are in
+place, real-time audio flows. There is **no separate Microsoft "RTM
+allowlist" review** for org-internal bots — verified empirically against
+a parallel Alfred deployment in another tenant (`qmachina.com`) where
+audio works with zero Microsoft submissions. The historical
+`aka.ms/teams-rtm-onboarding` process applies to AppSource publication,
+not to org-internal use.
 
-| Error / code | Tier blocked | What it actually means | What to do |
-|---|---|---|---|
-| `502 CALL_JOIN_FAILED_7504_OR_7505` | **Tenant calling policy** | `CsApplicationAccessPolicy` does not allow Alfred's AppId (`207a38a4-...`) to act on Graph Communications calls. This is the most common failure mode in Sandbox. | **Out of reach for us.** Requires a Sandbox Teams admin to run `New-CsApplicationAccessPolicy` + `Grant-CsApplicationAccessPolicy`. Until granted, no bot can join any call on this tenant. |
-| `403 GRAPH_PERMISSION_MISSING` | **RSC scope** | Either the manifest version on the team is older than the one with the needed scope, OR the team hasn't been re-installed since a new RSC was added. | Verify manifest version on the install: Teams Admin Center → Manage apps → Alfred Sandbox. If old, click **Update** on every team install. Confirm with `curl $BOT/api/channels` — the `auto_join_enabled` row will show. |
-| `403 TENANT_NOT_ENABLED_FOR_MODE` | **Tenant meeting policy** | `CsTeamsMeetingPolicy` blocks the requested join mode (most commonly app-as-attendee `invite_and_graph_join` is disabled). | Sandbox admin must allow the mode. Workaround: switch to `policy_auto_invite` join mode if the bot is on the meeting invite. |
-| `400 BOT_NOT_INVITED` | **App-as-attendee invariant** | The C# join workflow's `BotAttendeePresent=true` assertion failed — no service-account row in the meeting roster matching the bot. | Either set `BotAttendeePresent=false` (relies purely on Graph join), or actually invite the bot's service account to the meeting. |
-| `200` then no audio frames arrive | **Microsoft RTM media allowlist** | The bot reaches the meeting via Graph but Teams refuses to wire the media socket. The Real-Time Media SDK requires per-bot allowlisting by Microsoft. | Submit at `https://aka.ms/teams-rtm-onboarding` with Alfred's AppId. Tail VM logs: `Call added` then no `Established` / no `audio frame` lines = waiting on Microsoft. |
-| `Audio socket up`, `PeakSample=0`, no transcript | **Meeting silence** | Bot joined cleanly, Teams is sending frames, but the audio buffer is silence. Speaker may be muted client-side, or meeting options suppress app audio. | Confirm Alfred is in the roster; have a human unmute and speak; consider removing + re-adding Alfred. Not a code bug. |
+**Gate 1 — Bot channel calling config (in the Azure Bot resource).**
+`MsTeamsChannel.incomingCallRoute` must be `graphPma`. With it `null`,
+the Teams calling backbone never registers the bot for the Graph PMA
+route. Fixable by anyone with Contributor on the Bot Service:
+
+```bash
+az rest --method PATCH \
+  --uri "https://management.azure.com/subscriptions/e02c0038-82c8-4655-9647-38083f301099/resourceGroups/rg-alfred-disney/providers/Microsoft.BotService/botServices/bot-alfred-disney/channels/MsTeamsChannel?api-version=2022-09-15" \
+  --body '{"location":"global","properties":{"channelName":"MsTeamsChannel","properties":{"enableCalling":true,"incomingCallRoute":"graphPma","callingWebhook":"https://alfred-disney-bot.eastus.cloudapp.azure.com/api/calling","deploymentEnvironment":"CommercialDeployment","isEnabled":true,"isTeamsIvrEnabled":false,"acceptedTerms":false}}}'
+```
+
+**Gate 2 — Tenant calling policy (`CsApplicationAccessPolicy`) in the
+*meeting* tenant.** Must be granted in **Sandbox** (`plutosdoghouse.com`),
+not WDI. The policy is enforced by Teams in the tenant whose users /
+meetings the bot acts on; granting it in WDI is a no-op because no
+Teams meetings happen there. Requires a Sandbox Teams admin:
+
+```powershell
+Connect-MicrosoftTeams -TenantId 38387f0b-9a6f-46e2-8373-67422f8c2cb0
+New-CsApplicationAccessPolicy -Identity "AlfredOnlineMeetingsPolicy" `
+  -AppIds "207a38a4-67c5-4ef9-ada8-ea7998734d59" `
+  -Description "Allow Alfred to join online meetings via Graph"
+Grant-CsApplicationAccessPolicy -PolicyName "AlfredOnlineMeetingsPolicy" -Global
+```
+
+When a join attempt fails, the error code maps to a specific cause:
+
+| Error / code | Cause | What to do |
+|---|---|---|
+| `502 CALL_JOIN_FAILED_7504_OR_7505` | **Sandbox `CsApplicationAccessPolicy` not granted** for AppId `207a38a4-...`. Most common failure mode today. Same code surfaces if Gate 1's `incomingCallRoute` is `null` — check both. | Verify Gate 1 via `az rest --method GET .../channels/MsTeamsChannel`. If that's correct, the remaining cause is the policy — Sandbox admin (Michael Barron) runs the PowerShell above. |
+| `403 GRAPH_PERMISSION_MISSING` | RSC scope: manifest on the team is older than the one with the needed scope, OR the team hasn't been re-installed since a new RSC was added. | Verify manifest version on the install: Teams Admin Center → Manage apps → Alfred Sandbox. If old, click **Update** on every team install. Confirm with `curl $BOT/api/channels`. |
+| `403 TENANT_NOT_ENABLED_FOR_MODE` | `CsTeamsMeetingPolicy` blocks the requested join mode (commonly `invite_and_graph_join` is disabled). | Sandbox admin allows the mode. Workaround: switch to `policy_auto_invite` if the bot is on the meeting invite. |
+| `400 BOT_NOT_INVITED` | C# join workflow's `BotAttendeePresent=true` assertion failed — no service-account row in the meeting roster matching the bot. | Either set `BotAttendeePresent=false` (relies purely on Graph join), or actually invite the bot's service account to the meeting. |
+| `Audio socket up`, `PeakSample=0`, no transcript | Bot joined cleanly, Teams is sending frames, but the audio buffer is silence. Speaker muted client-side or meeting options suppress app audio. | Confirm Alfred is in the roster; have a human unmute and speak; consider removing + re-adding Alfred. Not a code bug. |
 
 ### 7.2 Why a channel meeting transcript never lands
 
@@ -308,9 +339,56 @@ curl -sS -X POST "$BOT/api/debug/fetch-transcript" -H 'Content-Type: application
 tiers, `vmAgent: null` ARM lag, stale `dotnet publish`, run-command
 name caching, etc.).
 
+### 7.4 Consumer routing — bootstrap fallback and isolation
+
+`EventFanoutDispatcher` has a **bootstrap fallback consumer**
+(`BotConfiguration.BootstrapConsumerUrl` →
+`EventFanoutDispatcher.cs:92-104`) that fires whenever a channel's
+per-channel consumer list is empty. Per the dispatcher logic at
+`EventFanoutDispatcher.cs:257-262`:
+
+```csharp
+if (record is not null && record.Consumers.Count > 0)
+    return record.Consumers;        // per-channel wins
+return _fallbackConsumers;          // else bootstrap URL fires
+```
+
+The bootstrap URL is wired to the sink in this deployment. **Deleting
+a channel's consumer registration does NOT silence the sink** — the
+fallback path takes over and delivers events to the same URL. The
+default `bootstrap-default` consumer name you'll see at
+`GET /api/channels/{tid}/{cid}/consumers` is the bot auto-recording the
+fallback target on each channel; deleting it just routes through the
+real fallback in code.
+
+**To truly isolate a sink** from a channel (e.g. to confirm which agent
+is actually replying when two are running), register a placeholder
+consumer with `enabled: false`. `Count > 0` suppresses the fallback;
+`enabled: false` suppresses the placeholder itself. Net: zero POSTs
+for that channel.
+
+```bash
+TEAM=d3f5f412-2abf-4300-ac73-019e892c2a05
+CHAN_ENC=$(printf %s "19:abc@thread.tacv2" | jq -sRr @uri)
+curl -X POST "$BOT/api/channels/$TEAM/$CHAN_ENC/consumers" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"isolation-placeholder","url":"https://disabled.invalid/events",
+       "event_kinds":["*"],"enabled":false}'
+
+# To restore, delete the placeholder — the bootstrap fallback kicks in again:
+curl -X DELETE "$BOT/api/channels/$TEAM/$CHAN_ENC/consumers/isolation-placeholder"
+```
+
+A pull-based consumer that polls the blob archive directly (e.g. a
+custom bridge that lists `channels/{tid}/{cid_sanitized}/chat.message/`)
+is **unaffected by either path** — the C# bot writes blobs
+unconditionally, independent of consumer registration. Use the
+placeholder trick to silence push-based sinks; pull-based ones keep
+working because the blob is the source of truth.
+
 ---
 
-## 7.4 Consuming captured data (the part downstream teams care about)
+## 7.5 Consuming captured data (the part downstream teams care about)
 
 Everything Alfred captures lives in two places. **Pick whichever path
 fits your consumer; both serve the same `alfred-v2` envelopes**.
