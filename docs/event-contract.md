@@ -14,8 +14,9 @@ If you are building a consumer:
 
 1. Pick a URL on your network.
 2. Register it via `POST $BOT/api/channels/{teamId}/{channelId}/consumers`
-   (channel scope) or `POST $BOT/api/meetings/{meetingId}/consumers`
-   (meeting scope), or use the read-only blob archive
+   (the only scope the bot currently implements — channel-scope
+   consumers also receive `meeting.*` events for meetings linked to
+   that channel), or use the read-only blob archive
    ([`docs/retrieving-transcripts.md`](retrieving-transcripts.md)).
 3. Accept the envelope shape in §2.
 4. To post back into chat, `POST $BOT/api/send-chat` (§5).
@@ -269,8 +270,30 @@ the linked channel.
 
 ### 3.6 `meeting.chat.*`
 
-Same payload shape as `channel.message.*` (§3.2) **without** the
-`is_root` field — meeting chat has no thread-root concept.
+Almost the same shape as `channel.message.*` (§3.2), but **without
+`is_root`** (meeting chat has no thread-root concept) and **with a
+top-level `message_id` on the payload** (channel messages carry
+their `message_id` on `channel_ref` instead — meeting chats don't
+have a comparable ref-level slot):
+
+```jsonc
+{
+  "message_id":           "1779129648463",  // required
+  "sender": {
+    "aad_id":             "accf88ee-...",
+    "display_name":       "Jane Doe",
+    "kind":               "user"   // | "bot" | "application"
+  },
+  "text":                 "plain text body",
+  "html":                 "<div>...</div>",
+  "timestamp_utc":        "2026-05-14T18:23:45.401Z",
+  "reply_to_message_id":  null,
+  "from_bot":             false,
+  "attachments":          [ /* see §3.9 */ ],
+  "mentions":             [ /* raw Bot Framework / Graph mentions */ ],
+  "raw":                  { /* full source payload, best-effort */ }
+}
+```
 
 ### 3.7 `meeting.transcript.partial` / `meeting.transcript.final`
 
@@ -321,8 +344,12 @@ meetings per Microsoft (confirmed in MS Learn v1.0 docs for
 
 ```jsonc
 {
-  "fetched_at_utc":       "2026-05-14T16:36:42Z",
-  "vtt_url":              "meetings/<meeting_id>/transcripts/official.vtt",
+  "transcript_id":        "MSMjMCMjOWNlOTU2YjAtY...",  // required — Graph callTranscript id
+  "organizer_oid":        "accf88ee-...",               // optional — AAD id of the organizer scoping the fetch
+  "fetched_at_utc":       "2026-05-14T16:36:42Z",       // required
+  "created_at_utc":       "2026-05-14T16:35:01Z",       // optional — Graph createdDateTime on the transcript
+  "vtt_url":              "meetings/<meeting_id>/transcripts/official.vtt",  // required
+  "cue_count":            142,                          // required — len(cues)
   "cues": [
     {
       "start_ms":         1200,
@@ -410,28 +437,43 @@ the canonical request/response shape.
 
 ## 6. Registering consumers
 
-Two scopes:
-
-**Channel scope** — receives all `channel.*` events for that channel
-and all `meeting.*` events for meetings linked to that channel:
+**Channel scope is the only scope the bot currently implements.** A
+channel-scope consumer receives all `channel.*` events for that
+channel AND all `meeting.*` events for meetings linked to that
+channel (via the `meeting.linked` event or the
+`@Alfred link to <channel-name>` chat command):
 
 ```bash
 curl -X POST $BOT/api/channels/$TEAM/$CHAN/consumers \
   -H "Content-Type: application/json" \
-  -d '{"name":"team-a","url":"https://...","event_types":["*"],"enabled":true}'
+  -d '{"name":"team-a","url":"https://...","event_kinds":["*"],"enabled":true}'
 ```
 
-**Meeting scope** — receives all `meeting.*` events for one specific
-meeting (rare; intended for ephemeral consumers):
+The body field is **`event_kinds`** (matched against
+`AlfredEventEnvelope.event_type` in `EventFanoutDispatcher`).
+`["*"]` accepts everything. Otherwise filter to specific event
+types verbatim — no wildcards inside a type. Sending `event_types`
+instead silently produces an empty filter (matches all by default),
+which is rarely what you want.
 
-```bash
-curl -X POST $BOT/api/meetings/$MEETING_ID/consumers \
-  -H "Content-Type: application/json" \
-  -d '{"name":"transcript-watcher","url":"https://...","event_types":["meeting.transcript.final"],"enabled":true}'
-```
+There is no separate per-meeting consumer endpoint; if you need a
+narrower stream than a channel, register multiple channel-scope
+consumers with disjoint `event_kinds` filters.
 
-`event_types: ["*"]` accepts everything. Otherwise filter to specific
-event types (no wildcards inside a type).
+Management endpoints (all under `/api/channels/{team}/{channel}/consumers`):
+
+| Method | Body / params | Behavior |
+|---|---|---|
+| `GET` | — | List current consumers for the channel |
+| `POST` | `{name, url, event_kinds, enabled, headers?}` | Upsert one consumer by name |
+| `PUT` | `{consumers: [...]}` | Replace the entire list |
+| `DELETE /{consumerName}` | — | Remove one by name |
+
+When the consumer list for a channel is empty, the
+`EventDispatch.BootstrapConsumerUrl` (configured per-deployment)
+receives events as a fallback. To suppress that fallback for a
+specific channel without re-pointing the bootstrap, register a
+placeholder with `enabled:false` (see README §7.4).
 
 ---
 

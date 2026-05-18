@@ -192,10 +192,15 @@ meetings/{meeting_id}/transcripts/official.vtt
 
 - `{utcTs}` is `yyyyMMddTHHmmssfffZ` — lexicographic order ≡ time order.
 - `{event_id}` is the 32-char hex id from the envelope; use it for dedup.
-- `{channel_id_sanitized}` replaces `:` `@` `;` `%` with `_` (the
-  sanitizer is `re.sub(r"[^a-zA-Z0-9\-_.]", "_", raw)`).
-- `{meeting_id}` and `{team_id}` are URL-safe already and are not
-  sanitized.
+- `{channel_id_sanitized}`, `{meeting_id}`, `{team_id}` — **all run
+  through the same sanitizer**: `re.sub(r"[^a-zA-Z0-9\-_.]", "_", raw)`
+  (the bot uses the same regex in C# at `BlobEventArchive.cs`'s
+  `SanitizePathSegment`). For a canonical Graph `onlineMeeting.id`
+  (URL-safe base64) this is a no-op. For a `meeting_id` in the
+  fallback shape `19:meeting_xxx@thread.v2` (when the bot couldn't
+  resolve the canonical id — see §0 canonical-id fallback note), the
+  `:` and `@` are replaced by `_`. Build blob URLs from the sanitized
+  form, not the raw envelope value.
 
 ### 2.2 The two well-known transcript files
 
@@ -447,18 +452,18 @@ BOT="https://alfred-disney-bot.eastus.cloudapp.azure.com"
 
 # Channel scope: receive all channel.* events for the channel
 # AND all meeting.* events for meetings linked to that channel.
+# (Channel scope is the only scope the bot implements — there is
+# no per-meeting consumer endpoint.)
 curl -X POST "$BOT/api/channels/$TID/$CID/consumers" \
   -H "Content-Type: application/json" \
   -d '{"name":"my-consumer","url":"https://my-service/v2/events",
-       "event_types":["meeting.transcript.final","meeting.chat.created"],
+       "event_kinds":["meeting.transcript.final","meeting.chat.created"],
        "enabled":true}'
-
-# Meeting scope: receive only this one meeting's meeting.* events.
-curl -X POST "$BOT/api/meetings/$MID/consumers" \
-  -H "Content-Type: application/json" \
-  -d '{"name":"watch-one","url":"https://my-service/v2/events",
-       "event_types":["meeting.transcript.final"],"enabled":true}'
 ```
+
+The body field is **`event_kinds`** (not `event_types` — the
+dispatcher matches on `event_kinds`; sending the wrong key produces
+an empty filter that silently matches everything).
 
 Pick **`meeting.transcript.final`** (3–5/min/speaker) for live
 transcript chunks. `meeting.transcript.partial` is throttled to

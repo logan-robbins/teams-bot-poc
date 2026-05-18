@@ -574,7 +574,7 @@ just `{ … }`. `jq` it directly.
 - [`AGENTS.md`](AGENTS.md) — deep ops manual (build internals, debug
   recipes, deploy mechanics, gotchas).
 - [`docs/event-contract.md`](docs/event-contract.md) —
-  `alfred-events-v1` envelope schema + per-`event_type` payload.
+  `alfred-v2` envelope schema + per-`event_type` payload.
 - [`docs/retrieving-transcripts.md`](docs/retrieving-transcripts.md) —
   blob archive layout + Python / curl / az recipes.
 - [`docs/TEAMS-AUTO-INVITE-SETUP.md`](docs/TEAMS-AUTO-INVITE-SETUP.md) —
