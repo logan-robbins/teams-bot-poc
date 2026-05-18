@@ -186,21 +186,51 @@ public sealed class DebugController : ControllerBase
         // a missing file vs. a transient error.
         var entries = System.IO.File.Exists(path) ? ReadTail(path, tail) : new List<JsonElement>();
 
-        // Channel reply threads spawn their own audit dir keyed by
-        // chat_thread_id;messageid=... — same channel, different
-        // conversation. When the caller asks for the bare channel id and
-        // the exact match has nothing for this kind, merge in everything
-        // from sibling dirs that start with the same prefix so the
-        // command-center "Live chat" panel sees every channel reply
-        // thread under one view. Sorted by timestamp ascending then
-        // tail-capped so we keep the newest N across all threads.
+        // The audit-key format changed across versions of this bot:
+        //   pre-v2:  {sanitized_channel_id}[;messageid=...]  (per reply-thread)
+        //   v2:      {team_id}_{sanitized_channel_id}        (per channel,
+        //                                                     aggregated)
+        // Plus channel reply threads still spawn their own pre-v2-style
+        // ";messageid=..." sibling dirs for some message classes.
+        //
+        // Build the set of dir-name patterns we should aggregate so the
+        // command-center "Live chat" panel sees the full channel history
+        // regardless of which key format wrote which event. Match any of:
+        //   - exact: sanitizedChatThreadId
+        //   - prefix: sanitizedChatThreadId + ";"
+        //   - exact: channelIdOnly  (strip the team-uuid_ prefix if present)
+        //   - prefix: channelIdOnly + ";"
+        // Sorted by timestamp ascending then tail-capped so we keep the
+        // newest N across all matching threads.
         if (entries.Count < tail && Directory.Exists(_audit.BaseDir))
         {
-            var prefix = sanitizedChatThreadId + ";";
+            var exactMatches = new HashSet<string>(StringComparer.Ordinal) { sanitizedChatThreadId };
+            var prefixMatches = new HashSet<string>(StringComparer.Ordinal) { sanitizedChatThreadId + ";" };
+
+            // Detect the v2 {team-uuid}_{channelId} format and add the
+            // channel-only portion so pre-v2 audit dirs match too.
+            var underscoreIdx = sanitizedChatThreadId.IndexOf('_');
+            if (underscoreIdx > 0)
+            {
+                var teamCandidate = sanitizedChatThreadId.Substring(0, underscoreIdx);
+                if (Guid.TryParse(teamCandidate, out _))
+                {
+                    var channelIdOnly = sanitizedChatThreadId.Substring(underscoreIdx + 1);
+                    if (channelIdOnly.Length > 0)
+                    {
+                        exactMatches.Add(channelIdOnly);
+                        prefixMatches.Add(channelIdOnly + ";");
+                    }
+                }
+            }
+
             foreach (var siblingDir in Directory.EnumerateDirectories(_audit.BaseDir))
             {
                 var name = Path.GetFileName(siblingDir);
-                if (!name.StartsWith(prefix, StringComparison.Ordinal)) continue;
+                if (name == sanitizedChatThreadId) continue; // already read above
+                var isMatch = exactMatches.Contains(name)
+                    || prefixMatches.Any(p => name.StartsWith(p, StringComparison.Ordinal));
+                if (!isMatch) continue;
                 var siblingPath = Path.Combine(siblingDir, $"{kind}.ndjson");
                 if (!System.IO.File.Exists(siblingPath)) continue;
                 entries.AddRange(ReadTail(siblingPath, tail));
