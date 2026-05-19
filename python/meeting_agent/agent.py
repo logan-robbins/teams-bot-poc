@@ -235,10 +235,21 @@ class AlfredAnalyzer:
     ) -> str:
         """Build the per-turn input for Runner.run.
 
-        When ``chaining=True`` the Responses API chain already holds full
-        history and Alfred's prior state, so we send only the delta + flags.
-        When ``chaining=False`` (Tick 1 or after chain recovery) we include
-        the canonical session snapshot so the model has full context.
+        Both chaining and non-chaining branches now include the
+        authoritative dossier snapshot from the session. Why: the
+        session-side merge layer (``apply_extraction`` →
+        ``_merge_*``) is the source of truth, and the model's chain
+        memory of its own prior emissions diverges from session
+        truth in several real cases — stale-chain recovery, 200-item
+        prune cap, bot restart, future human edits via the UI. Sending
+        the compact snapshot every tick keeps the model anchored to
+        reality so it can correctly reuse existing ``id``s to update,
+        mark superseded, answer open questions, etc.
+
+        The system instructions (alfred.yaml prompt_template) ride
+        on the Agent ``instructions=`` field, which is cached
+        independently from this per-turn input — so adding dynamic
+        dossier state here doesn't degrade prompt caching.
         """
         ctx = context or {}
         stable_prefix = dict(ctx.get("stable_prefix") or {})
@@ -253,6 +264,31 @@ class AlfredAnalyzer:
                 parts.append("alfred_muted: true  ← do NOT call send_to_meeting_chat")
             if direct_address:
                 parts.append("direct_address: true  ← silence-default is overridden; act on the trigger")
+            # Authoritative dossier snapshot — the model MUST reuse these ids
+            # when updating existing items. This is the session-side merge
+            # result; trust it over your own chain memory of prior emissions.
+            parts.extend(
+                [
+                    "",
+                    "## Current Dossier (authoritative — reuse these `id`s when updating)",
+                    f"running_summary:\n{stable_prefix.get('running_summary') or '(empty)'}",
+                    "",
+                    f"topics: {', '.join(stable_prefix.get('topics') or []) or '(none)'}",
+                    "",
+                    self._format_dossier_block(
+                        "decisions", stable_prefix.get("decisions") or []
+                    ),
+                    self._format_dossier_block(
+                        "open_questions", stable_prefix.get("open_questions") or []
+                    ),
+                    self._format_dossier_block(
+                        "action_items", stable_prefix.get("action_items") or []
+                    ),
+                    self._format_dossier_block(
+                        "risks", stable_prefix.get("risks") or []
+                    ),
+                ]
+            )
         else:
             parts = [
                 "# Alfred Meeting Context",
