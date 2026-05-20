@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { Moon } from "lucide-react";
 import { sink, type V2Meeting } from "../lib/sink";
+import { TopNav } from "./TopNav";
 
 /**
  * Meeting picker shown at the root path (alfred-v2).
@@ -48,6 +49,22 @@ export function MeetingList() {
     };
   }, []);
 
+  // Most recent first. Prefer actual_start_utc (real join), fall back to
+  // scheduled_start_utc, then meeting_id (stable but arbitrary). Unparseable
+  // timestamps sink to the bottom.
+  const sorted = useMemo(() => {
+    const ts = (m: V2Meeting): number => {
+      const raw = m.actual_start_utc || m.scheduled_start_utc;
+      if (!raw) return 0;
+      const n = new Date(raw).getTime();
+      return Number.isFinite(n) ? n : 0;
+    };
+    return [...meetings].sort((a, b) => {
+      const diff = ts(b) - ts(a);
+      return diff !== 0 ? diff : (b.meeting_id || "").localeCompare(a.meeting_id || "");
+    });
+  }, [meetings]);
+
   return (
     <div className="flex h-screen flex-col bg-ink-950 text-ink-50">
       <header className="flex items-center gap-3 border-b border-ink-800 bg-ink-950/80 px-6 py-3 backdrop-blur">
@@ -60,6 +77,7 @@ export function MeetingList() {
             Meeting Selector
           </span>
         </div>
+        <TopNav />
       </header>
 
       <main className="flex-1 overflow-auto px-6 py-8">
@@ -67,8 +85,8 @@ export function MeetingList() {
           <h2 className="font-serif text-xl text-ink-100">Open a meeting</h2>
           <p className="mt-1 text-sm text-ink-300">
             alfred-v2 — meetings keyed by Graph{" "}
-            <code className="font-mono">meeting_id</code>. Hover a row to see
-            the canonical id.
+            <code className="font-mono">meeting_id</code>. Most recent first.
+            Hover a row to see the canonical id.
           </p>
 
           {error ? (
@@ -78,13 +96,13 @@ export function MeetingList() {
           ) : null}
 
           <ul className="mt-6 space-y-2">
-            {meetings.length === 0 && !error ? (
+            {sorted.length === 0 && !error ? (
               <li className="rounded-md border border-ink-800 bg-ink-900/40 px-4 py-3 text-sm italic text-ink-300">
                 No meetings yet, sir. The dossier will appear when the bot
                 joins a Teams meeting.
               </li>
             ) : null}
-            {meetings.map((m) => (
+            {sorted.map((m) => (
               <MeetingRow key={m.meeting_id} meeting={m} />
             ))}
           </ul>

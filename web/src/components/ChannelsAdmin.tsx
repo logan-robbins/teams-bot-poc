@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { Moon, Plus, Trash2, Save, RefreshCw, Phone, ExternalLink, Link2 } from "lucide-react";
+import { Moon, Plus, Trash2, Save, Phone, ExternalLink, Link2 } from "lucide-react";
+import { TopNav } from "./TopNav";
 import {
   bot,
   type ChannelAttachment,
@@ -56,23 +57,7 @@ export function ChannelsAdmin() {
             alfred-events-v1 · per-channel routing
           </span>
         </div>
-        <div className="ml-auto flex items-center gap-2">
-          <Link
-            to="/archive"
-            className="rounded-md border border-ink-700 bg-ink-900 px-3 py-1.5 text-xs text-ink-200 hover:bg-ink-800"
-            title="Browse the per-channel / per-meeting blob archive"
-          >
-            Archive
-          </Link>
-          <button
-            type="button"
-            onClick={() => void refresh()}
-            className="flex items-center gap-1 rounded-md border border-ink-700 bg-ink-900 px-3 py-1.5 text-xs text-ink-200 hover:bg-ink-800"
-          >
-            <RefreshCw size={12} />
-            Refresh
-          </button>
-        </div>
+        <TopNav onRefresh={() => void refresh()} />
       </header>
 
       <main className="flex-1 overflow-auto px-6 py-8">

@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import { ChevronRight, Folder, FileText, ExternalLink, RefreshCw, Moon } from "lucide-react";
+import { ChevronRight, Folder, FileText, ExternalLink, Moon } from "lucide-react";
 import { bot, type ChannelAttachment } from "../lib/bot";
 import { sink, type V2Meeting } from "../lib/sink";
+import { TopNav } from "./TopNav";
 
 /**
  * Read-only browser for the Azure Blob archive that mirrors every
@@ -151,15 +152,28 @@ function buildAttachmentMaps(attachments: ChannelAttachment[]) {
 }
 
 /**
- * meeting_id GUID -> human-readable subject. Built from
- * sink.v2ListMeetings() so the meetings/{meeting_id}/... layout in the
- * archive can render the meeting's subject instead of the raw GUID.
+ * Any-id-the-bot-might-have-written → human-readable subject. Built from
+ * sink.v2ListMeetings(). Indexes BOTH:
+ *   - canonical Graph onlineMeeting.id (post-canonicalization-fix writes)
+ *   - sanitized meeting_chat_thread_id (pre-fix fallback writes, where the
+ *     bot used the chat thread id as the meeting_id; folder names sanitize
+ *     `:` and `@` to `_` per BlobEventArchive.SanitizePathSegment)
+ * So a meetings/{folder-name} segment that matches either form renders as
+ * the subject.
  */
 function buildMeetingMap(meetings: V2Meeting[]) {
   const meetingMap = new Map<string, string>();
+  const sanitize = (raw: string) => raw.replace(/[^a-zA-Z0-9\-_.]/g, "_");
   for (const m of meetings) {
-    if (m.meeting_id && m.subject) {
-      meetingMap.set(m.meeting_id, m.subject);
+    const subject = (m.subject || "").trim();
+    if (!subject) continue;
+    if (m.meeting_id) {
+      meetingMap.set(m.meeting_id, subject);
+      meetingMap.set(sanitize(m.meeting_id), subject);
+    }
+    if (m.meeting_chat_thread_id) {
+      meetingMap.set(m.meeting_chat_thread_id, subject);
+      meetingMap.set(sanitize(m.meeting_chat_thread_id), subject);
     }
   }
   return meetingMap;
@@ -320,22 +334,7 @@ export function ArchiveBrowser() {
             stalfreddisney / alfred-events · public read
           </span>
         </div>
-        <div className="ml-auto flex items-center gap-2">
-          <Link
-            to="/channels"
-            className="rounded-md border border-ink-700 bg-ink-900 px-3 py-1.5 text-xs text-ink-200 hover:bg-ink-800"
-          >
-            Channels
-          </Link>
-          <button
-            type="button"
-            onClick={() => void refresh()}
-            className="flex items-center gap-1 rounded-md border border-ink-700 bg-ink-900 px-3 py-1.5 text-xs text-ink-200 hover:bg-ink-800"
-          >
-            <RefreshCw size={12} />
-            Refresh
-          </button>
-        </div>
+        <TopNav onRefresh={() => void refresh()} />
       </header>
 
       <main className="flex-1 overflow-auto px-6 py-6">
