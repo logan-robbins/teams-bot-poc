@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { ChevronRight, Folder, FileText, ExternalLink, RefreshCw, Moon } from "lucide-react";
 import { bot, type ChannelAttachment } from "../lib/bot";
+import { sink, type V2Meeting } from "../lib/sink";
 
 /**
  * Read-only browser for the Azure Blob archive that mirrors every
@@ -150,6 +151,21 @@ function buildAttachmentMaps(attachments: ChannelAttachment[]) {
 }
 
 /**
+ * meeting_id GUID -> human-readable subject. Built from
+ * sink.v2ListMeetings() so the meetings/{meeting_id}/... layout in the
+ * archive can render the meeting's subject instead of the raw GUID.
+ */
+function buildMeetingMap(meetings: V2Meeting[]) {
+  const meetingMap = new Map<string, string>();
+  for (const m of meetings) {
+    if (m.meeting_id && m.subject) {
+      meetingMap.set(m.meeting_id, m.subject);
+    }
+  }
+  return meetingMap;
+}
+
+/**
  * Maps a slash-delimited folder segment within an /archive prefix to a
  * human-friendly display name. Returns the original segment if no
  * lookup matches (so unknown ids still render).
@@ -162,7 +178,11 @@ function friendlyLabel(
   segment: string,
   positionInPath: number,
   fullPath: string[],
-  maps: { teamMap: Map<string, string>; channelMap: Map<string, string> },
+  maps: {
+    teamMap: Map<string, string>;
+    channelMap: Map<string, string>;
+    meetingMap: Map<string, string>;
+  },
 ): string {
   // v1: channels/{teamId}/{sanitizedChannelId}/{event_type}/...
   if (fullPath[0] === "channels") {
@@ -182,6 +202,12 @@ function friendlyLabel(
       return maps.channelMap.get(segment) ?? segment;
     }
   }
+  // meetings/{meeting_id}/{event_type}/...
+  if (fullPath[0] === "meetings") {
+    if (positionInPath === 1) {
+      return maps.meetingMap.get(segment) ?? segment;
+    }
+  }
   return segment;
 }
 
@@ -191,10 +217,15 @@ export function ArchiveBrowser() {
   const [blobs, setBlobs] = useState<BlobEntry[]>([]);
   const [prefixes, setPrefixes] = useState<PrefixEntry[]>([]);
   const [attachments, setAttachments] = useState<ChannelAttachment[]>([]);
+  const [meetings, setMeetings] = useState<V2Meeting[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const maps = useMemo(() => buildAttachmentMaps(attachments), [attachments]);
+  const maps = useMemo(() => {
+    const { teamMap, channelMap } = buildAttachmentMaps(attachments);
+    const meetingMap = buildMeetingMap(meetings);
+    return { teamMap, channelMap, meetingMap };
+  }, [attachments, meetings]);
 
   async function refresh() {
     setLoading(true);
@@ -226,6 +257,24 @@ export function ArchiveBrowser() {
         if (!cancelled) setAttachments(body.attachments ?? []);
       } catch {
         // No friendly names available — fall back to raw ids in the UI.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Fetch the meeting metadata map once. Used to label otherwise-
+  // opaque meeting GUIDs in the meetings/{meeting_id}/... layout with
+  // their human-readable subject. Idempotent and silently best-effort.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const body = await sink.v2ListMeetings({ limit: 200 });
+        if (!cancelled) setMeetings(body.meetings ?? []);
+      } catch {
+        // No subjects available — fall back to raw meeting ids in the UI.
       }
     })();
     return () => {
