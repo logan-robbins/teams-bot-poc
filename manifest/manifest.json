@@ -1,7 +1,7 @@
 {
   "$schema": "https://developer.microsoft.com/json-schemas/teams/v1.21/MicrosoftTeams.schema.json",
   "manifestVersion": "1.21",
-  "version": "1.0.11",
+  "version": "1.0.12",
   "id": "207a38a4-67c5-4ef9-ada8-ea7998734d59",
   "developer": {
     "name": "The Walt Disney Company",
@@ -45,8 +45,8 @@
   "authorization": {
     "permissions": {
       "resourceSpecific": [
+        { "name": "OnlineMeeting.ReadBasic.Chat", "type": "Application" },
         { "name": "ChatMessage.Read.Chat", "type": "Application" },
-        { "name": "ChatMessageReadReceipt.Read.Chat", "type": "Application" },
         { "name": "OnlineMeetingParticipant.Read.Chat", "type": "Application" },
         { "name": "OnlineMeetingTranscript.Read.Chat", "type": "Application" },
         { "name": "OnlineMeetingRecording.Read.Chat", "type": "Application" },

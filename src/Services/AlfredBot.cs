@@ -81,6 +81,226 @@ public sealed class AlfredBot : TeamsActivityHandler
         await base.OnConversationUpdateActivityAsync(turnContext, cancellationToken);
     }
 
+    /// <summary>
+    /// Meeting-start event. Fires when a meeting where Alfred is
+    /// installed starts. Requires manifest RSC
+    /// <c>OnlineMeeting.ReadBasic.Chat</c> (consented at "+Apps" install).
+    /// Payload <c>MeetingStartEventDetails</c> carries the meeting subject
+    /// (<c>Title</c>), join URL, start time, and meeting id directly —
+    /// no TeamsInfo lookup needed for the subject. Per Microsoft docs
+    /// (apps-in-teams-meetings/meeting-apps-apis): "Get meeting ID from
+    /// turnContext.ChannelData. Do not use meeting ID from meeting
+    /// events payload turncontext.activity.value." We follow that.
+    /// </summary>
+    protected override async Task OnTeamsMeetingStartAsync(
+        MeetingStartEventDetails meeting,
+        ITurnContext<IEventActivity> turnContext,
+        CancellationToken cancellationToken)
+    {
+        var activity = turnContext.Activity;
+        var chatThreadId = activity.Conversation?.Id;
+        if (string.IsNullOrWhiteSpace(chatThreadId))
+        {
+            await base.OnTeamsMeetingStartAsync(meeting, turnContext, cancellationToken);
+            return;
+        }
+
+        // Canonical Graph meeting id, per docs: read from
+        // ChannelData.meeting.id (NOT from activity.value).
+        var channelData = TryGetChannelData(activity);
+        var canonicalMeetingId = channelData?.Meeting?.Id ?? meeting?.Id?.ToString();
+        var subject = meeting?.Title?.Trim();
+        var joinUrl = meeting?.JoinUrl?.ToString();
+        var startTime = meeting?.StartTime.ToString("O");
+
+        SenderRef? organizer = null;
+        try
+        {
+            var info = await TeamsInfo.GetMeetingInfoAsync(turnContext, cancellationToken: cancellationToken);
+            var orgAad = info?.Organizer?.AadObjectId;
+            if (!string.IsNullOrWhiteSpace(orgAad))
+            {
+                organizer = new SenderRef
+                {
+                    AadId = orgAad,
+                    DisplayName = info!.Organizer.Name,
+                };
+            }
+            // Prefer TeamsInfo MsGraphResourceId if available — it's the
+            // resolved canonical form Graph's transcripts endpoint wants.
+            var infoMid = info?.Details?.MsGraphResourceId;
+            if (!string.IsNullOrWhiteSpace(infoMid))
+            {
+                canonicalMeetingId = infoMid;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex,
+                "TeamsInfo.GetMeetingInfoAsync inside OnTeamsMeetingStartAsync failed (non-fatal) for ChatThreadId={ChatThreadId}",
+                chatThreadId);
+        }
+
+        _logger.LogInformation(
+            "OnTeamsMeetingStartAsync ChatThreadId={ChatThreadId} CanonicalMeetingId={MeetingId} Subject={Subject} Organizer={Organizer} JoinUrl={JoinUrl}",
+            chatThreadId,
+            canonicalMeetingId ?? "(null)",
+            subject ?? "(null)",
+            organizer?.DisplayName ?? "(null)",
+            joinUrl ?? "(null)");
+
+        if (_publishedMeetingCreated.TryAdd(chatThreadId, 1))
+        {
+            try
+            {
+                await _dispatcher.PublishAsync(
+                    new AlfredEventEnvelope
+                    {
+                        EventType = AlfredEventTypes.MeetingCreated,
+                        EventId = Guid.NewGuid().ToString("N"),
+                        Ts = DateTimeOffset.UtcNow.ToString("O"),
+                        MeetingRef = new MeetingRef
+                        {
+                            MeetingId = canonicalMeetingId ?? chatThreadId,
+                            MeetingChatThreadId = chatThreadId,
+                            Subject = subject,
+                            Organizer = organizer,
+                            ScheduledStartUtc = startTime,
+                        },
+                        ConversationReferenceId = chatThreadId,
+                        Payload = new MeetingLifecyclePayload
+                        {
+                            Subject = subject,
+                            Organizer = organizer,
+                            ScheduledStartUtc = startTime,
+                        },
+                    },
+                    cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "Failed to publish meeting.created from OnTeamsMeetingStartAsync ChatThreadId={ChatThreadId}",
+                    chatThreadId);
+                _publishedMeetingCreated.TryRemove(chatThreadId, out _);
+            }
+        }
+
+        await base.OnTeamsMeetingStartAsync(meeting, turnContext, cancellationToken);
+    }
+
+    /// <summary>
+    /// Meeting-end event. Fires when a meeting where Alfred is installed
+    /// ends. Mirrors Microsoft's meetings-transcription sample at
+    /// <c>OfficeDev/Microsoft-Teams-Samples/samples/meetings-transcription/csharp</c>:
+    /// use <see cref="TeamsInfo.GetMeetingInfoAsync"/> to grab the
+    /// canonical Graph onlineMeeting.id (<c>MsGraphResourceId</c>) and
+    /// the organizer's AAD oid, then register the transcript fetcher
+    /// to poll <c>/users/{organizerOid}/onlineMeetings/{meetingId}/transcripts</c>
+    /// until Microsoft's post-meeting transcript materializes.
+    /// </summary>
+    protected override async Task OnTeamsMeetingEndAsync(
+        MeetingEndEventDetails meeting,
+        ITurnContext<IEventActivity> turnContext,
+        CancellationToken cancellationToken)
+    {
+        var activity = turnContext.Activity;
+        var chatThreadId = activity.Conversation?.Id;
+        if (string.IsNullOrWhiteSpace(chatThreadId))
+        {
+            await base.OnTeamsMeetingEndAsync(meeting, turnContext, cancellationToken);
+            return;
+        }
+
+        string? canonicalMeetingId = TryGetChannelData(activity)?.Meeting?.Id ?? meeting?.Id?.ToString();
+        string? organizerOid = null;
+        string? subject = meeting?.Title?.Trim();
+        string? organizerName = null;
+
+        try
+        {
+            var info = await TeamsInfo.GetMeetingInfoAsync(turnContext, cancellationToken: cancellationToken);
+            organizerOid = info?.Organizer?.AadObjectId;
+            organizerName = info?.Organizer?.Name;
+            var infoMid = info?.Details?.MsGraphResourceId;
+            if (!string.IsNullOrWhiteSpace(infoMid)) canonicalMeetingId = infoMid;
+            if (string.IsNullOrWhiteSpace(subject)) subject = info?.Details?.Title;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "TeamsInfo.GetMeetingInfoAsync failed inside OnTeamsMeetingEndAsync for ChatThreadId={ChatThreadId}",
+                chatThreadId);
+        }
+
+        _logger.LogInformation(
+            "OnTeamsMeetingEndAsync ChatThreadId={ChatThreadId} CanonicalMeetingId={MeetingId} Subject={Subject} OrganizerOid={OrganizerOid}",
+            chatThreadId,
+            canonicalMeetingId ?? "(null)",
+            subject ?? "(null)",
+            organizerOid ?? "(null)");
+
+        // Emit meeting.ended envelope.
+        try
+        {
+            await _dispatcher.PublishAsync(
+                new AlfredEventEnvelope
+                {
+                    EventType = AlfredEventTypes.MeetingEnded,
+                    EventId = Guid.NewGuid().ToString("N"),
+                    Ts = DateTimeOffset.UtcNow.ToString("O"),
+                    MeetingRef = new MeetingRef
+                    {
+                        MeetingId = canonicalMeetingId ?? chatThreadId,
+                        MeetingChatThreadId = chatThreadId,
+                        Subject = subject,
+                        Organizer = !string.IsNullOrWhiteSpace(organizerOid)
+                            ? new SenderRef { AadId = organizerOid, DisplayName = organizerName }
+                            : null,
+                    },
+                    ConversationReferenceId = chatThreadId,
+                    Payload = new MeetingLifecyclePayload
+                    {
+                        Subject = subject,
+                        ActualEndUtc = meeting?.EndTime.ToString("O"),
+                    },
+                },
+                cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "Failed to publish meeting.ended for ChatThreadId={ChatThreadId}",
+                chatThreadId);
+        }
+
+        // Register transcript fetcher with the canonical IDs. Without
+        // both, Graph returns 404 "3004: Specified meeting is not found".
+        if (!string.IsNullOrWhiteSpace(canonicalMeetingId)
+            && !string.IsNullOrWhiteSpace(organizerOid))
+        {
+            _transcriptFetcher.Register(
+                botCallId: canonicalMeetingId!,
+                organizerOid: organizerOid!,
+                meetingChatThreadId: chatThreadId,
+                // Look back briefly — transcripts typically land within a
+                // few minutes of meeting end. -1h is generous.
+                registeredAtUtc: DateTimeOffset.UtcNow.AddHours(-1));
+            _logger.LogInformation(
+                "Registered transcript fetcher from OnTeamsMeetingEndAsync MeetingId={MeetingId} OrganizerOid={OrganizerOid}",
+                canonicalMeetingId, organizerOid);
+        }
+        else
+        {
+            _logger.LogWarning(
+                "Cannot register transcript fetcher from OnTeamsMeetingEndAsync — missing CanonicalMeetingId={MeetingId} or OrganizerOid={OrganizerOid}",
+                canonicalMeetingId ?? "(null)",
+                organizerOid ?? "(null)");
+        }
+
+        await base.OnTeamsMeetingEndAsync(meeting, turnContext, cancellationToken);
+    }
+
     protected override async Task OnMembersAddedAsync(
         IList<ChannelAccount> membersAdded,
         ITurnContext<IConversationUpdateActivity> turnContext,
