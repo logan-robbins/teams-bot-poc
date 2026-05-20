@@ -34,17 +34,19 @@ export function Header({ session, muted, chatThreadId, onEnd, onTranscriptUpload
     event.target.value = "";
     if (!file || !chatThreadId) return;
 
-    // Prompt for a meeting title when we have no candidate_name to use as
-    // the meeting subject. Skip the prompt if the dossier already knows
-    // who the meeting is with.
-    const inferredSubject = session?.candidate_name?.trim();
-    const subject =
-      inferredSubject && inferredSubject.length > 0
-        ? inferredSubject
-        : window.prompt(
-            "Optional: give this meeting a title so it shows up by name in the UI (leave blank to skip):",
-            "",
-          ) || undefined;
+    // Always prompt for a title so the resolver's substring matcher
+    // can find the meeting by name later. Seed the prompt with whatever
+    // we already have (candidate_name or empty); operator can confirm
+    // or override.
+    const seed = session?.candidate_name?.trim() ?? "";
+    const promptResult = window.prompt(
+      "Give this meeting a title so the agent can find it by name (e.g. 'Supermemory Meeting').\n\nThis becomes the meeting subject Alfred matches against when asked to pull this meeting's transcript.",
+      seed,
+    );
+    // Browser prompt returns null when the user cancels (treat as
+    // "don't change subject"), empty string when they cleared the
+    // field (also no change), or the actual title.
+    const subject = promptResult?.trim() ? promptResult.trim() : undefined;
 
     setUploadState({ kind: "uploading" });
     try {

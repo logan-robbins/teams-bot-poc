@@ -1284,11 +1284,60 @@ async def agent_processing_loop(
                         )
 
                     tool_call_count = len(analysis_item.tool_calls or [])
+                    # Per-tool detail so a "silent tick" is debuggable.
+                    # When an operator says "Alfred didn't respond" we need
+                    # to see exactly which tools fired, what they returned,
+                    # and — crucially — whether send_to_meeting_chat was
+                    # called at all. The earlier line just said "tool_calls=N"
+                    # with no visibility into args, results, or chat-side
+                    # outcome.
+                    sent_to_chat = False
+                    for tc in (analysis_item.tool_calls or []):
+                        # tc is a ToolCallRecord (pydantic). Be defensive
+                        # — different SDK versions expose either model_dump
+                        # or .dict(). Both keys are stable.
+                        try:
+                            tc_dict = tc.model_dump() if hasattr(tc, "model_dump") else dict(tc)
+                        except Exception:
+                            tc_dict = {"raw": repr(tc)[:200]}
+                        name = tc_dict.get("tool_name") or tc_dict.get("name") or "?"
+                        ok = tc_dict.get("ok")
+                        error = tc_dict.get("error")
+                        args = tc_dict.get("arguments") or {}
+                        result = tc_dict.get("result") or {}
+                        # Truncate to keep one-line log lines readable.
+                        def _trunc(obj, n=200):
+                            s = json.dumps(obj, default=str) if not isinstance(obj, str) else obj
+                            return s if len(s) <= n else s[:n] + "…"
+                        logger.info(
+                            "  tool[%d] name=%s ok=%s error=%s args=%s result=%s",
+                            response_counter,
+                            name,
+                            ok,
+                            error or "—",
+                            _trunc(args),
+                            _trunc(result, 300),
+                        )
+                        if name == "send_to_meeting_chat" and ok:
+                            sent_to_chat = True
+                    # Make silence loud in the log.
+                    if tool_call_count > 0 and not sent_to_chat:
+                        # Most likely cause: agent fired info-gathering tools
+                        # (resolve / fetch / list) but no send_to_meeting_chat,
+                        # so the human sees the bot go quiet. Document the
+                        # trigger so the prompt or tool can be tuned.
+                        logger.warning(
+                            "Analysis #%d SILENT after %d tool call(s) — agent did NOT call send_to_meeting_chat. Trigger text: %s",
+                            response_counter,
+                            tool_call_count,
+                            (event.text or "")[:160],
+                        )
                     logger.info(
-                        "Analysis #%d complete: extraction_ok=%s tool_calls=%d",
+                        "Analysis #%d complete: extraction_ok=%s tool_calls=%d sent_to_chat=%s",
                         response_counter,
                         analysis_item.extraction is not None,
                         tool_call_count,
+                        sent_to_chat,
                     )
 
                 except Exception as e:
@@ -3615,6 +3664,44 @@ async def v2_get_meeting_transcript(
         "available": found,
         "text": text,
         "source": source,
+    }
+
+
+class V2MeetingPatchRequest(BaseModel):
+    """Body shape for PATCH /v2/meetings/{meeting_id}. Only fields the
+    operator can override safely. ``subject`` is the common one."""
+    subject: str | None = None
+
+
+@app.patch("/v2/meetings/{meeting_id}")
+async def v2_patch_meeting(
+    meeting_id: str,
+    body: V2MeetingPatchRequest,
+    state: AppStateDep,
+) -> dict[str, Any]:
+    """Operator-set meeting fields (subject mainly).
+
+    Used to rename a meeting after upload — the upload form's title
+    prompt is optional, and the resolver's substring matcher only
+    matches when the meeting subject contains the user's query. So if
+    a meeting is named "Meeting" but the user asks Alfred about
+    "Sprint Planning", the resolver returns nothing. This endpoint
+    lets the UI fix that without re-uploading the .vtt.
+    """
+    store: SessionStore = state["store"]
+    subject = (body.subject or "").strip()
+    if not subject:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="subject is required and must be non-empty",
+        )
+    await asyncio.to_thread(store.set_meeting_subject, meeting_id, subject)
+    row = await asyncio.to_thread(store.get_meeting, meeting_id)
+    return {
+        "schema_version": "alfred-v2",
+        "meeting_id": meeting_id,
+        "ok": True,
+        "subject": row.get("subject") if row else subject,
     }
 
 

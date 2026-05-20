@@ -1351,6 +1351,26 @@ class SessionStore:
                     (meeting_id, meeting_id, subject.strip(), now_iso, now_iso, now_iso),
                 )
 
+    def set_meeting_subject(self, meeting_id: str, subject: str) -> None:
+        """Operator-set the meeting subject. Used to rename a meeting
+        after upload (e.g. when the user didn't get a chance to set a
+        title at upload time, or wants to fix it later). Creates a
+        meetings row if one doesn't exist."""
+        now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO meetings
+                    (meeting_id, meeting_chat_thread_id, subject,
+                     last_event_utc, created_at_utc, updated_at_utc)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(meeting_id) DO UPDATE SET
+                    subject = excluded.subject,
+                    updated_at_utc = excluded.updated_at_utc
+                """,
+                (meeting_id, meeting_id, subject, now_iso, now_iso, now_iso),
+            )
+
     def get_uploaded_transcript(self, meeting_id: str) -> Optional[dict[str, Any]]:
         with self._connect() as conn:
             row = conn.execute(
