@@ -3470,8 +3470,10 @@ async def v2_list_meetings(
     limit: int | None = None,
     team_id: str | None = None,
     channel_id: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
 ) -> dict[str, Any]:
-    """List meetings tracked in the v2 meetings registry.
+    """List meetings tracked in the v2 meetings registry, newest first.
 
     Each entry includes the canonical ``meeting_id``, best-effort
     ``subject`` / organizer, scheduled / actual times, and the optional
@@ -3479,7 +3481,9 @@ async def v2_list_meetings(
     linked to a channel.
 
     Filter with ``team_id`` / ``channel_id`` to scope to a single
-    channel's linked meetings.
+    channel's linked meetings. ``since`` / ``until`` accept ISO 8601 UTC
+    timestamps (e.g. ``2026-05-19T00:00:00Z``) and filter on the
+    meeting's actual_start_utc (falling back to scheduled_start_utc).
     """
     store: SessionStore = state["store"]
     rows = await asyncio.to_thread(
@@ -3487,6 +3491,8 @@ async def v2_list_meetings(
         limit,
         team_id,
         channel_id,
+        since,
+        until,
     )
     return {
         "schema_version": "alfred-v2",
@@ -3684,13 +3690,21 @@ async def v2_resolve(
     state: AppStateDep,
     kind: str = "meeting",
     subject: str | None = None,
+    chat_thread_id: str | None = None,
     limit: int = 25,
 ) -> dict[str, Any]:
-    """Name → canonical-id resolver.
+    """Name / chat-thread → canonical-id resolver.
 
-    Currently supports ``kind=meeting`` with case-insensitive substring
-    match on ``subject``. The agent calls this when a user asks about a
-    meeting by name (e.g. ``"summarize the sprint planning"``).
+    Supports ``kind=meeting`` with two lookup modes:
+      * ``subject`` — case-insensitive substring match (the agent calls
+        this when a user names a meeting like "summarize the sprint
+        planning").
+      * ``chat_thread_id`` — exact match against the meeting's
+        ``meeting_chat_thread_id``. Returns 0 or 1 match. Used to bridge
+        callers that only know the chat thread id to the canonical
+        ``meeting_id``.
+
+    Pass at least one of ``subject`` / ``chat_thread_id``.
     """
     if kind != "meeting":
         raise HTTPException(
@@ -3698,6 +3712,16 @@ async def v2_resolve(
             detail=f"unsupported resolve kind: {kind} (only 'meeting' supported today)",
         )
     store: SessionStore = state["store"]
+    cleaned_thread = (chat_thread_id or "").strip()
+    if cleaned_thread:
+        row = await asyncio.to_thread(store.get_meeting_by_chat_thread_id, cleaned_thread)
+        rows = [row] if row else []
+        return {
+            "schema_version": "alfred-v2",
+            "kind": kind,
+            "query": cleaned_thread,
+            "matches": [_meeting_to_v2_dict(r) for r in rows],
+        }
     rows = await asyncio.to_thread(store.search_meetings_by_subject, subject or "", limit)
     return {
         "schema_version": "alfred-v2",

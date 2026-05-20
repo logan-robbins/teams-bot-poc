@@ -180,13 +180,55 @@ function buildMeetingMap(meetings: V2Meeting[]) {
 }
 
 /**
+ * Human-readable display names for the alfred-v2 category folders.
+ * Blob storage uses machine-readable snake_case (mirrors MS Graph
+ * sub-resources where one exists); the UI renders the labels below.
+ * Legacy raw event_type folder names (e.g. meeting.transcript.final/)
+ * are also mapped so historical blobs render cleanly until they age
+ * out.
+ */
+const CATEGORY_LABELS: Record<string, string> = {
+  // v2 category folders (canonical going forward)
+  messages: "Chat messages",
+  live_transcript: "Live transcript",
+  transcripts: "Official transcript",
+  lifecycle: "Lifecycle",
+
+  // legacy event-type-per-folder names — pre-refactor blobs still
+  // exist at these paths; keep them human-readable too.
+  "channel.message.created": "Chat messages (created)",
+  "channel.message.updated": "Chat messages (updated)",
+  "channel.message.deleted": "Chat messages (deleted)",
+  "channel.attached": "Channel attached",
+  "channel.detached": "Channel detached",
+  "meeting.chat.created": "Chat messages (created)",
+  "meeting.chat.updated": "Chat messages (updated)",
+  "meeting.chat.deleted": "Chat messages (deleted)",
+  "meeting.transcript.partial": "Live transcript (partial)",
+  "meeting.transcript.final": "Live transcript (final)",
+  "meeting.transcript.official": "Official transcript event",
+  "meeting.created": "Meeting created",
+  "meeting.ended": "Meeting ended",
+  "meeting.linked": "Meeting linked to channel",
+  "meeting.call.joined": "Bot joined call",
+  "meeting.call.left": "Bot left call",
+
+  // v1 legacy compat path (server.py polls here) — surface to the
+  // operator so they understand why this older folder exists.
+  "chat.message": "Chat messages (v1 compat)",
+};
+
+/**
  * Maps a slash-delimited folder segment within an /archive prefix to a
  * human-friendly display name. Returns the original segment if no
  * lookup matches (so unknown ids still render).
  *
- * Handles both the legacy v1 layout (channels/{teamId}/{cid}/…) and the
- * canonical alfred-v2 layout (teams/{teamId}/channels/{cid}/…) so the
- * archive browser stays readable across the cutover.
+ * Handles three blob layouts that coexist in the container:
+ *   - v2 canonical:  teams/{teamId}/channels/{cid}/{category}/...
+ *                     meetings/{mid}/{category}/...
+ *   - v2 historical: same prefixes but with raw event_type as the
+ *                     category folder (pre-category-refactor blobs).
+ *   - v1 compat:    channels/{teamId}/{cid}/chat.message/...
  */
 function friendlyLabel(
   segment: string,
@@ -198,7 +240,7 @@ function friendlyLabel(
     meetingMap: Map<string, string>;
   },
 ): string {
-  // v1: channels/{teamId}/{sanitizedChannelId}/{event_type}/...
+  // v1 compat: channels/{teamId}/{sanitizedChannelId}/chat.message/...
   if (fullPath[0] === "channels") {
     if (positionInPath === 1) {
       return maps.teamMap.get(segment) ?? segment;
@@ -206,8 +248,11 @@ function friendlyLabel(
     if (positionInPath === 2) {
       return maps.channelMap.get(segment) ?? segment;
     }
+    if (positionInPath === 3) {
+      return CATEGORY_LABELS[segment] ?? segment;
+    }
   }
-  // v2: teams/{teamId}/channels/{sanitizedChannelId}/{event_type}/...
+  // v2: teams/{teamId}/channels/{sanitizedChannelId}/{category}/...
   if (fullPath[0] === "teams") {
     if (positionInPath === 1) {
       return maps.teamMap.get(segment) ?? segment;
@@ -215,11 +260,17 @@ function friendlyLabel(
     if (positionInPath === 3) {
       return maps.channelMap.get(segment) ?? segment;
     }
+    if (positionInPath === 4) {
+      return CATEGORY_LABELS[segment] ?? segment;
+    }
   }
-  // meetings/{meeting_id}/{event_type}/...
+  // v2: meetings/{meeting_id}/{category}/...
   if (fullPath[0] === "meetings") {
     if (positionInPath === 1) {
       return maps.meetingMap.get(segment) ?? segment;
+    }
+    if (positionInPath === 2) {
+      return CATEGORY_LABELS[segment] ?? segment;
     }
   }
   return segment;

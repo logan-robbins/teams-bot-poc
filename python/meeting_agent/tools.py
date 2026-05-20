@@ -37,8 +37,10 @@ __all__ = [
     "TranscriptResult",
     "build_alfred_tools",
     "fetch_meeting_transcript_impl",
+    "find_meeting_by_chat_thread_id_impl",
     "list_meetings_impl",
     "request_transcript_backfill_impl",
+    "resolve_meeting_by_date_impl",
     "resolve_meeting_by_name_impl",
     "send_to_meeting_chat_impl",
 ]
@@ -414,31 +416,233 @@ def _meeting_entry_from_v2(row: dict[str, Any]) -> MeetingListEntry:
     )
 
 
+def _recency_sort_key(entry: MeetingListEntry) -> str:
+    """Sort key: actual_start > scheduled_start > empty (oldest).
+
+    The sink already sorts newest-first via
+    ``ORDER BY COALESCE(last_event_utc, scheduled_start_utc, created_at_utc) DESC``.
+    Sorting again here is defense-in-depth so the tool's contract holds
+    even against a misbehaving / out-of-order sink response.
+    """
+    return entry.actual_start_utc or entry.scheduled_start_utc or ""
+
+
 async def list_meetings_impl(
     context: AlfredAgentContext,
     limit: int = 25,
+    since: str | None = None,
+    until: str | None = None,
 ) -> MeetingListResult:
     """List meetings the sink knows about via ``GET /v2/meetings``.
 
-    Used when a user asks "what meetings do you have?" or as a discovery
-    step before calling ``fetch_meeting_transcript``.
+    Newest-first ordering. Used when a user asks "what meetings do you
+    have?" or as a discovery step before calling
+    ``fetch_meeting_transcript``. Pass ``since`` / ``until`` (ISO 8601
+    UTC strings) to restrict the result to a date range.
     """
     sink = _sink_url()
-    url = f"{sink}/v2/meetings?limit={int(limit)}"
+    params: dict[str, Any] = {"limit": int(limit)}
+    if since:
+        params["since"] = since
+    if until:
+        params["until"] = until
+    arguments = {"limit": limit, "since": since, "until": until}
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(url)
+            response = await client.get(f"{sink}/v2/meetings", params=params)
             response.raise_for_status()
             data = response.json()
     except Exception as exc:  # noqa: BLE001
         logger.warning("list_meetings failed: %s", exc)
         result = MeetingListResult(ok=False, reason=f"http_error: {exc!r}")
-        context.record("list_meetings", {"limit": limit}, result.model_dump(), ok=False, error=str(exc))
+        context.record("list_meetings", arguments, result.model_dump(), ok=False, error=str(exc))
         return result
 
     meetings = [_meeting_entry_from_v2(m) for m in (data.get("meetings") or [])]
+    meetings.sort(key=_recency_sort_key, reverse=True)
     result = MeetingListResult(ok=True, count=len(meetings), meetings=meetings)
-    context.record("list_meetings", {"limit": limit}, result.model_dump(), ok=True)
+    context.record("list_meetings", arguments, result.model_dump(), ok=True)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Natural-language date-phrase parsing for resolve_meeting_by_date.
+# Kept intentionally narrow: today / yesterday / this week / last week /
+# this month / last month / ISO date / ISO date range. No dateparser dep.
+# ---------------------------------------------------------------------------
+
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_ISO_DATE_RANGE_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2})\s*(?:to|-|\.\.|,)\s*(\d{4}-\d{2}-\d{2})$"
+)
+
+
+def _utc_day_start(d: datetime) -> str:
+    """ISO 8601 Z-suffixed midnight UTC for the date portion of ``d``."""
+    midnight = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+    return midnight.isoformat().replace("+00:00", "Z")
+
+
+def _add_days(d: datetime, n: int) -> datetime:
+    from datetime import timedelta
+    return d + timedelta(days=n)
+
+
+def parse_date_phrase(phrase: str, now: datetime | None = None) -> tuple[str, str] | None:
+    """Translate a natural-language date phrase into ``(since, until)`` ISO
+    UTC strings (half-open: since <= ts < until).
+
+    Returns ``None`` if the phrase isn't recognized — the caller should
+    surface that as a clean error rather than silently matching everything.
+
+    Recognized phrases (case-insensitive):
+      * ``today``, ``yesterday``
+      * ``this week``, ``last week``  (Monday-anchored)
+      * ``this month``, ``last month``
+      * ``YYYY-MM-DD``                 (single day)
+      * ``YYYY-MM-DD to YYYY-MM-DD``   (inclusive range)
+    """
+    if not phrase or not phrase.strip():
+        return None
+    p = phrase.strip().lower()
+    base = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    today = datetime(base.year, base.month, base.day, tzinfo=timezone.utc)
+
+    if p == "today":
+        return _utc_day_start(today), _utc_day_start(_add_days(today, 1))
+    if p == "yesterday":
+        return _utc_day_start(_add_days(today, -1)), _utc_day_start(today)
+
+    if p in ("this week", "current week"):
+        monday = _add_days(today, -today.weekday())
+        return _utc_day_start(monday), _utc_day_start(_add_days(monday, 7))
+    if p in ("last week", "previous week"):
+        monday = _add_days(today, -today.weekday() - 7)
+        return _utc_day_start(monday), _utc_day_start(_add_days(monday, 7))
+
+    if p in ("this month", "current month"):
+        first = datetime(today.year, today.month, 1, tzinfo=timezone.utc)
+        next_month = datetime(
+            today.year + (1 if today.month == 12 else 0),
+            1 if today.month == 12 else today.month + 1,
+            1,
+            tzinfo=timezone.utc,
+        )
+        return _utc_day_start(first), _utc_day_start(next_month)
+    if p in ("last month", "previous month"):
+        last_month_year = today.year - 1 if today.month == 1 else today.year
+        last_month = 12 if today.month == 1 else today.month - 1
+        first_last = datetime(last_month_year, last_month, 1, tzinfo=timezone.utc)
+        first_this = datetime(today.year, today.month, 1, tzinfo=timezone.utc)
+        return _utc_day_start(first_last), _utc_day_start(first_this)
+
+    range_match = _ISO_DATE_RANGE_RE.match(p)
+    if range_match:
+        try:
+            start = datetime.fromisoformat(range_match.group(1)).replace(tzinfo=timezone.utc)
+            end = datetime.fromisoformat(range_match.group(2)).replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+        return _utc_day_start(start), _utc_day_start(_add_days(end, 1))
+
+    if _ISO_DATE_RE.match(p):
+        try:
+            day = datetime.fromisoformat(p).replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+        return _utc_day_start(day), _utc_day_start(_add_days(day, 1))
+
+    return None
+
+
+async def resolve_meeting_by_date_impl(
+    context: AlfredAgentContext,
+    date_phrase: str,
+    limit: int = 25,
+) -> MeetingListResult:
+    """Translate a natural-language date phrase into a meeting list.
+
+    Wraps ``parse_date_phrase`` + ``list_meetings_impl``. The agent calls
+    this when a user references meetings by time ("yesterday's standup",
+    "meetings from last week").
+    """
+    arguments = {"date_phrase": date_phrase, "limit": limit}
+    parsed = parse_date_phrase(date_phrase)
+    if parsed is None:
+        result = MeetingListResult(
+            ok=False,
+            reason=(
+                "unrecognized_date_phrase: try 'today', 'yesterday', "
+                "'this week', 'last week', 'this month', 'last month', "
+                "YYYY-MM-DD, or YYYY-MM-DD to YYYY-MM-DD"
+            ),
+        )
+        context.record(
+            "resolve_meeting_by_date", arguments, result.model_dump(),
+            ok=False, error="unrecognized_date_phrase",
+        )
+        return result
+    since, until = parsed
+    inner = await list_meetings_impl(context, limit=limit, since=since, until=until)
+    # Re-record under this tool's name so the audit trail attributes the
+    # call correctly (list_meetings already recorded internally).
+    context.record(
+        "resolve_meeting_by_date",
+        {**arguments, "resolved_since": since, "resolved_until": until},
+        inner.model_dump(),
+        ok=inner.ok,
+        error=inner.reason if not inner.ok else None,
+    )
+    return inner
+
+
+async def find_meeting_by_chat_thread_id_impl(
+    context: AlfredAgentContext,
+    chat_thread_id: str,
+) -> MeetingResolveResult:
+    """Reverse-lookup: chat_thread_id (``19:xxx@thread.v2``) → canonical
+    meeting via ``GET /v2/resolve?kind=meeting&chat_thread_id=...``.
+
+    Returns 0 or 1 ``MeetingListEntry``. Use when an upstream code path
+    gives you the chat thread id but you need the canonical
+    ``meeting_id`` (e.g. to pass to ``fetch_meeting_transcript``).
+    """
+    sink = _sink_url()
+    cleaned = (chat_thread_id or "").strip()
+    arguments = {"chat_thread_id": cleaned}
+    if not cleaned:
+        result = MeetingResolveResult(
+            ok=False, query="", reason="empty_chat_thread_id",
+        )
+        context.record(
+            "find_meeting_by_chat_thread_id", arguments,
+            result.model_dump(), ok=False, error="empty_chat_thread_id",
+        )
+        return result
+
+    params = {"kind": "meeting", "chat_thread_id": cleaned}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(f"{sink}/v2/resolve", params=params)
+            response.raise_for_status()
+            data = response.json()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("find_meeting_by_chat_thread_id failed: %s", exc)
+        result = MeetingResolveResult(
+            ok=False, query=cleaned, reason=f"http_error: {exc!r}",
+        )
+        context.record(
+            "find_meeting_by_chat_thread_id", arguments,
+            result.model_dump(), ok=False, error=str(exc),
+        )
+        return result
+
+    matches = [_meeting_entry_from_v2(m) for m in (data.get("matches") or [])]
+    result = MeetingResolveResult(ok=True, query=cleaned, matches=matches)
+    context.record(
+        "find_meeting_by_chat_thread_id", arguments,
+        result.model_dump(), ok=True,
+    )
     return result
 
 
@@ -784,13 +988,25 @@ def build_alfred_tools() -> tuple[Any, ...]:
     async def list_meetings(
         ctx: RunContextWrapper[AlfredAgentContext],
         limit: int = 25,
+        since: str | None = None,
+        until: str | None = None,
     ) -> MeetingListResult:
-        """List meetings the sink knows about (subject, organizer, times).
+        """List meetings the sink knows about, newest first (subject, organizer, times).
 
         Useful for "what meetings did we have today?" style questions and
         as a discovery step before ``fetch_meeting_transcript``.
+
+        Args:
+            limit: Maximum number of meetings to return.
+            since: Optional ISO 8601 UTC timestamp ("2026-05-19T00:00:00Z").
+                Meetings whose actual_start_utc (or scheduled_start_utc)
+                is < since are excluded.
+            until: Optional ISO 8601 UTC timestamp. Meetings whose start
+                is >= until are excluded. Pair with ``since`` for a range.
+                Prefer ``resolve_meeting_by_date`` for natural-language
+                phrases like "yesterday" / "last week".
         """
-        return await list_meetings_impl(ctx.context, limit=limit)
+        return await list_meetings_impl(ctx.context, limit=limit, since=since, until=until)
 
     @function_tool
     async def resolve_meeting_by_name(
@@ -810,6 +1026,55 @@ def build_alfred_tools() -> tuple[Any, ...]:
             limit: Maximum number of matches to return.
         """
         return await resolve_meeting_by_name_impl(ctx.context, subject=subject, limit=limit)
+
+    @function_tool
+    async def resolve_meeting_by_date(
+        ctx: RunContextWrapper[AlfredAgentContext],
+        date_phrase: str,
+        limit: int = 25,
+    ) -> MeetingListResult:
+        """Resolve a natural-language date phrase → meetings in that range.
+
+        Use this when a user references meetings by time ("yesterday's
+        standup", "what meetings did we have last week?", "show me
+        2026-05-15 meetings"). Returns the standard meeting list
+        (subject / organizer / times); pick the right one and pass its
+        ``meeting_id`` to ``fetch_meeting_transcript`` if the user
+        wants the transcript.
+
+        Args:
+            date_phrase: One of: ``today``, ``yesterday``, ``this week``,
+                ``last week``, ``this month``, ``last month``, an ISO
+                date ``YYYY-MM-DD``, or an ISO date range
+                ``YYYY-MM-DD to YYYY-MM-DD``. Unrecognized phrases
+                return ``ok: false`` with a hint — re-ask the user.
+            limit: Maximum number of meetings to return.
+        """
+        return await resolve_meeting_by_date_impl(ctx.context, date_phrase=date_phrase, limit=limit)
+
+    @function_tool
+    async def find_meeting_by_chat_thread_id(
+        ctx: RunContextWrapper[AlfredAgentContext],
+        chat_thread_id: str,
+    ) -> MeetingResolveResult:
+        """Reverse-lookup: chat_thread_id → canonical meeting.
+
+        ``chat_thread_id`` is the ``19:xxx@thread.v2`` form that surfaces
+        in conversation references and Graph notifications. This tool
+        bridges to the canonical ``meeting_id`` you need for
+        ``fetch_meeting_transcript`` and ``request_transcript_backfill``.
+
+        Returns 0 or 1 match. Useful primarily for historical data where
+        the bot wrote events under the chat thread id before
+        canonicalization landed; for new events the canonical id is
+        already populated.
+
+        Args:
+            chat_thread_id: The ``19:meeting_xxx@thread.v2`` chat thread id.
+        """
+        return await find_meeting_by_chat_thread_id_impl(
+            ctx.context, chat_thread_id=chat_thread_id,
+        )
 
     @function_tool
     async def request_transcript_backfill(
@@ -848,5 +1113,7 @@ def build_alfred_tools() -> tuple[Any, ...]:
         fetch_meeting_transcript,
         list_meetings,
         resolve_meeting_by_name,
+        resolve_meeting_by_date,
+        find_meeting_by_chat_thread_id,
         request_transcript_backfill,
     )

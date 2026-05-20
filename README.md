@@ -62,10 +62,13 @@ ship in this repo as the canonical consumer.
   │   GET  /v2/teams/{tid}/channels/{cid}/threads/{thrid}/messages   │
   │   GET  /v2/resolve?kind=meeting&subject=…         name lookup    │
   │                                                                  │
-  │   AlfredAnalyzer (claude-haiku-4-5, Anthropic Agents SDK):       │
+  │   AlfredAnalyzer (Azure OpenAI gpt-5-mini, OpenAI Agents SDK):   │
   │     · runs on every debounced tick                               │
   │     · tools: send_to_meeting_chat, fetch_meeting_transcript,     │
-  │              list_meetings, resolve_meeting_by_name              │
+  │              list_meetings, resolve_meeting_by_name,             │
+  │              resolve_meeting_by_date,                            │
+  │              find_meeting_by_chat_thread_id,                     │
+  │              request_transcript_backfill                         │
   │     · spec: python/batcave_platform/specs/alfred.yaml            │
   └────────────────────┬─────────────────────────────────────────────┘
                        │  SSE + JSON
@@ -410,7 +413,8 @@ A polling consumer written against the pre-v2 blob layout
 the human header + `---ENVELOPE---` separator + flat
 `payload.sender_display_name`) breaks the moment the bot starts
 writing only the v2 layout
-(`teams/{team_id}/channels/{cid_sanitized}/channel.message.created/{ts}-{eid}.json`).
+(`teams/{team_id}/channels/{cid_sanitized}/messages/{ts}-{eid}.json` —
+one category folder aggregates `channel.message.{created,updated,deleted}`).
 
 The bot has a scoped dual-write to bridge that for one or more
 specific channels. When the feature flag is on and an envelope's
@@ -511,17 +515,36 @@ curl -sS "$SINK/v2/teams/$TID/channels/$CID" | jq
 curl -sS "$SINK/v2/teams/$TID/channels/$CID/events?kinds=chat&limit=200" | jq
 ```
 
-**Blob path layout** (mirrors Microsoft Graph URLs):
+**Blob path layout** (folder segments are logical *categories*, not
+raw event_types — one folder per data type. `messages/` mirrors
+Graph's `/messages` endpoint; `transcripts/` mirrors Graph's
+`/transcripts` callTranscript resource. `live_transcript/` and
+`lifecycle/` are our own labels — no Graph sub-resource exists):
 
 ```
-teams/{team_id}/channels/{channel_id_sanitized}/{event_type}/{utcTs}-{event_id}.json
-meetings/{meeting_id}/{event_type}/{utcTs}-{event_id}.json
-meetings/{meeting_id}/transcripts/official.txt       (clean speaker-per-line)
-meetings/{meeting_id}/transcripts/official.vtt       (raw WebVTT)
+# Channel scope (channel meetings have no audio → messages + lifecycle only)
+teams/{team_id}/channels/{channel_id_sanitized}/messages/{utcTs}-{event_id}.json
+teams/{team_id}/channels/{channel_id_sanitized}/lifecycle/{utcTs}-{event_id}.json
+
+# Meeting scope
+meetings/{meeting_id}/messages/{utcTs}-{event_id}.json             ← meeting.chat.{created,updated,deleted}
+meetings/{meeting_id}/live_transcript/{utcTs}-{event_id}.json      ← meeting.transcript.{partial,final}  (Alfred's Azure Speech STT)
+meetings/{meeting_id}/transcripts/{utcTs}-{event_id}.json          ← meeting.transcript.official envelope (MS Graph callTranscript)
+meetings/{meeting_id}/transcripts/official.txt                      ← flat plaintext (overwritten on each fetch)
+meetings/{meeting_id}/transcripts/official.vtt                      ← flat WebVTT     (overwritten on each fetch)
+meetings/{meeting_id}/lifecycle/{utcTs}-{event_id}.json            ← meeting.{created,ended,linked,call.joined,call.left}
 ```
+
+The precise `event_type` lives in the envelope JSON, so consumers
+that need `created` vs. `updated` vs. `deleted` read it from there.
 
 Every `.json` blob is a **pure `alfred-v2` envelope** — no preamble,
 just `{ … }`. `jq` it directly.
+
+> **Legacy v1 compat path (preserved):**
+> `channels/{tid}/{cid_sanitized}/chat.message/{ts}-{eid}.txt` is
+> still written for channel ids in `BlobArchive:V1CompatChannelIds`
+> — see §7.5. New consumers must read the v2 category layout above.
 
 > **Channel meetings have no audio.** They surface only as
 > `channel.message.*` events. The `meeting.*` family exists for

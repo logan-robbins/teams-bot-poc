@@ -167,28 +167,44 @@ AuthenticationFailed`. Switch to AAD auth at that point (any
 Every per-event blob is a **single alfred-v2 envelope** as pretty-
 printed JSON. No preamble, no markers — `jq` works on every file.
 
-```
-teams/{team_id}/channels/{channel_id_sanitized}/channel.attached/{utcTs}-{event_id}.json
-teams/{team_id}/channels/{channel_id_sanitized}/channel.detached/{utcTs}-{event_id}.json
-teams/{team_id}/channels/{channel_id_sanitized}/channel.message.created/{utcTs}-{event_id}.json
-teams/{team_id}/channels/{channel_id_sanitized}/channel.message.updated/{utcTs}-{event_id}.json
-teams/{team_id}/channels/{channel_id_sanitized}/channel.message.deleted/{utcTs}-{event_id}.json
+The folder segment is a **logical category** (machine-readable
+snake_case), one per data type. Folder names mirror Microsoft Graph
+sub-resources where one exists (`messages/` → Graph `/messages`,
+`transcripts/` → Graph `/transcripts`); `live_transcript/` and
+`lifecycle/` are our own labels because Graph has no equivalent
+sub-resource. The precise `event_type` stays on the envelope JSON
+so consumers that need to tell `created` from `updated`/`deleted`
+read it from there. There are exactly four categories:
 
-meetings/{meeting_id}/meeting.created/{utcTs}-{event_id}.json
-meetings/{meeting_id}/meeting.ended/{utcTs}-{event_id}.json
-meetings/{meeting_id}/meeting.linked/{utcTs}-{event_id}.json
-meetings/{meeting_id}/meeting.call.joined/{utcTs}-{event_id}.json
-meetings/{meeting_id}/meeting.call.left/{utcTs}-{event_id}.json
-meetings/{meeting_id}/meeting.chat.created/{utcTs}-{event_id}.json
-meetings/{meeting_id}/meeting.chat.updated/{utcTs}-{event_id}.json
-meetings/{meeting_id}/meeting.chat.deleted/{utcTs}-{event_id}.json
-meetings/{meeting_id}/meeting.transcript.partial/{utcTs}-{event_id}.json
-meetings/{meeting_id}/meeting.transcript.final/{utcTs}-{event_id}.json
-meetings/{meeting_id}/meeting.transcript.official/{utcTs}-{event_id}.json
+| Category folder | Aggregates these `event_type` values | Graph mirror |
+|---|---|---|
+| `messages` | `channel.message.{created,updated,deleted}`, `meeting.chat.{created,updated,deleted}` | `/teams/{id}/channels/{id}/messages`, `/chats/{id}/messages` |
+| `live_transcript` | `meeting.transcript.{partial,final}` | none — this bot's Azure Speech STT of the real-time audio stream |
+| `transcripts` | `meeting.transcript.official` (envelope blob sits alongside the flat `official.txt` + `official.vtt`) | `/onlineMeetings/{id}/transcripts` (callTranscript) |
+| `lifecycle` | `channel.{attached,detached}`, `meeting.{created,ended,linked,call.joined,call.left}` | none |
 
-meetings/{meeting_id}/transcripts/official.txt
-meetings/{meeting_id}/transcripts/official.vtt
 ```
+# Channel scope (channel meetings have no audio per RSC limit — messages + lifecycle only)
+teams/{team_id}/channels/{channel_id_sanitized}/messages/{utcTs}-{event_id}.json
+teams/{team_id}/channels/{channel_id_sanitized}/lifecycle/{utcTs}-{event_id}.json
+
+# Meeting scope
+meetings/{meeting_id}/messages/{utcTs}-{event_id}.json
+meetings/{meeting_id}/live_transcript/{utcTs}-{event_id}.json
+meetings/{meeting_id}/transcripts/{utcTs}-{event_id}.json      # meeting.transcript.official envelope
+meetings/{meeting_id}/transcripts/official.txt                  # flat plaintext (overwritten on each fetch)
+meetings/{meeting_id}/transcripts/official.vtt                  # flat WebVTT     (overwritten on each fetch)
+meetings/{meeting_id}/lifecycle/{utcTs}-{event_id}.json
+```
+
+> **Three retrievable data types — one prefix each:**
+> 1. **Chat messages** → `…/messages/`
+> 2. **Real-time transcript** → `meetings/{mid}/live_transcript/`
+>    (Alfred's Azure Speech STT of the audio stream — NOT Microsoft
+>    "live captions")
+> 3. **Official (final) transcript** → `meetings/{mid}/transcripts/`
+>    (event envelope + flat `official.txt` + flat `official.vtt`, all
+>    in the same folder; matches Graph's `callTranscript` resource).
 
 - `{utcTs}` is `yyyyMMddTHHmmssfffZ` — lexicographic order ≡ time order.
 - `{event_id}` is the 32-char hex id from the envelope; use it for dedup.
@@ -201,6 +217,22 @@ meetings/{meeting_id}/transcripts/official.vtt
   resolve the canonical id — see §0 canonical-id fallback note), the
   `:` and `@` are replaced by `_`. Build blob URLs from the sanitized
   form, not the raw envelope value.
+
+> **Legacy v1 compat path (preserved, do not consume from new code).**
+> The bot also writes
+> `channels/{team_id}/{channel_id_sanitized}/chat.message/{utcTs}-{event_id}.txt`
+> for channel ids listed in `BlobArchive:V1CompatChannelIds`. That
+> path uses the legacy `alfred-events-v1` body (text header +
+> `---ENVELOPE---` separator + flat fields) and exists only to keep
+> the pre-v2 `server.py` polling bridge working through the cutover.
+> New consumers must read the v2 category layout above.
+
+> **Historical event-type-per-folder blobs.** Blobs written before
+> the category refactor live at their old `…/{event_type}/…` paths
+> (e.g. `meetings/{mid}/meeting.chat.created/`). They remain readable
+> at those legacy paths; new writes land at the category paths. No
+> backfill — both layouts coexist in the container until the
+> historical blobs age out.
 
 ### 2.2 The two well-known transcript files
 
@@ -231,7 +263,7 @@ parser opens.
 Every per-event blob is the v2 envelope, pretty-printed:
 
 ```jsonc
-// meetings/MSpkYzE3.../meeting.transcript.final/20260514T163412184Z-8a3f...0304.json
+// meetings/MSpkYzE3.../live_transcript/20260514T163412184Z-8a3f...0304.json
 {
   "schema_version": "alfred-v2",
   "event_type":     "meeting.transcript.final",
@@ -257,7 +289,7 @@ Every per-event blob is the v2 envelope, pretty-printed:
 ```
 
 ```jsonc
-// teams/d3f5f412-.../channels/19_abc_thread.tacv2/channel.message.created/20260514T182345401Z-...json
+// teams/d3f5f412-.../channels/19_abc_thread.tacv2/messages/20260514T182345401Z-...json
 {
   "schema_version": "alfred-v2",
   "event_type":     "channel.message.created",
@@ -317,15 +349,20 @@ list_prefix() {
 # I have meeting_id, list every event the bot ever published for it
 list_prefix "meetings/$MID/"
 
-# I have meeting_id, give me every live-STT final chunk in order
-list_prefix "meetings/$MID/meeting.transcript.final/" \
+# I have meeting_id, give me every live-STT chunk in order.
+# (live_transcript/ aggregates partial + final. Filter on event_type
+#  in the envelope if you only want one or the other — final is
+#  "meeting.transcript.final".)
+list_prefix "meetings/$MID/live_transcript/" \
   | sort \
-  | while read name; do curl -sS "$SA/$name" | jq -r '"\(.ts)  \(.payload.speaker.display_name // .payload.speaker.id // "?"):  \(.payload.text)"'; done
+  | while read name; do curl -sS "$SA/$name" \
+      | jq -r 'select(.event_type == "meeting.transcript.final")
+               | "\(.ts)  \(.payload.speaker.display_name // .payload.speaker.id // "?"):  \(.payload.text)"'; done
 
-# I have team_id + channel_id, list every chat message
+# I have team_id + channel_id, list every chat message (created+updated+deleted)
 TID="d3f5f412-2abf-4300-ac73-019e892c2a05"
 CID_SAN="19_abc_thread.tacv2"
-list_prefix "teams/$TID/channels/$CID_SAN/channel.message.created/"
+list_prefix "teams/$TID/channels/$CID_SAN/messages/"
 ```
 
 ### 2.5 Python — zero deps
@@ -361,10 +398,14 @@ def list_prefix(prefix: str):
         if not marker:
             return
 
-# Example: print every transcript final chunk for one meeting
+# Example: print every live-STT final chunk for one meeting.
+# live_transcript/ aggregates partial+final; filter on event_type
+# to get just finals.
 meeting_id = "MSpkYzE3..."
-for name in list_prefix(f"meetings/{meeting_id}/meeting.transcript.final/"):
+for name in list_prefix(f"meetings/{meeting_id}/live_transcript/"):
     env = get_json(name)
+    if env["event_type"] != "meeting.transcript.final":
+        continue
     speaker = (env["payload"].get("speaker") or {}).get("display_name") or "?"
     print(env["ts"], speaker + ":", env["payload"]["text"])
 

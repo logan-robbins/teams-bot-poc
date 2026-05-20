@@ -116,13 +116,13 @@ public sealed class SendChatController : ControllerBase
             gate.Release();
         }
 
-        // Mirror the outbound reply into the same chat.message stream we
-        // publish for inbound activities. Without this, archive +
-        // consumer fan-out see only the human side of the conversation,
-        // not Alfred's replies. Team/channel ids are looked up from the
-        // channel attachment store so the blob lands at
-        // channels/{teamId}/{channelId}/chat.message/... when the chat
-        // is a channel post (matches the inbound path's blob layout).
+        // Mirror the outbound reply into the same channel.message.*
+        // stream we publish for inbound activities. Without this,
+        // archive + consumer fan-out see only the human side of the
+        // conversation, not Alfred's replies. Team/channel ids are
+        // looked up from the channel attachment store so the blob
+        // lands at teams/{teamId}/channels/{channelId}/messages/... when
+        // the chat is a channel post (matches the inbound path).
         await PublishOutboundChatAsync(conversationReferenceId, messageText, sentActivityId, request.ReplyToMessageId, ct);
 
         return Ok(new { ok = true });

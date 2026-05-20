@@ -388,38 +388,67 @@ possible; `blob_archive_path` is populated after the mirror succeeds.
 
 ## 4. Routing tables (quick reference for consumers)
 
-Every event lands at exactly one blob path. The path embeds the
-canonical id from the ref block + the verbatim `event_type` as the
-last folder, so an LS of the meeting / channel prefix is a complete
-manifest.
+Every event lands at exactly one blob path. The folder segment is a
+**logical category** — one folder per data type — not the verbatim
+`event_type`. The precise `event_type` stays on the envelope JSON,
+so consumers that need to distinguish `created` from `updated` /
+`deleted` read it from the envelope.
+
+The four categories collapse the v2 `event_type` variants. Folder
+names mirror Microsoft Graph sub-resources where one exists
+(`messages/` → Graph `/messages`, `transcripts/` → Graph
+`/transcripts`); `live_transcript/` and `lifecycle/` are our own
+labels because Graph has no equivalent sub-resource:
+
+| Category | Aggregates these `event_type` values | Graph mirror |
+|---|---|---|
+| `messages` | `channel.message.{created,updated,deleted}`, `meeting.chat.{created,updated,deleted}` | `/teams/{id}/channels/{id}/messages`, `/chats/{id}/messages` |
+| `live_transcript` | `meeting.transcript.{partial,final}` | none — this bot's Azure Speech STT of the real-time audio stream |
+| `transcripts` | `meeting.transcript.official` (sits alongside the flat `official.txt` / `official.vtt`) | `/onlineMeetings/{id}/transcripts` (callTranscript resource) |
+| `lifecycle` | `channel.{attached,detached}`, `meeting.{created,ended,linked,call.joined,call.left}` | none |
 
 ```
 event_type                        → present block  → blob path
-─────────────────────────────────────────────────────────────────────────────────────────────────
-channel.attached                  → channel_ref     → teams/{tid}/channels/{cid_sanitized}/channel.attached/{ts}-{eid}.json
-channel.detached                  → channel_ref     → teams/{tid}/channels/{cid_sanitized}/channel.detached/{ts}-{eid}.json
-channel.message.created           → channel_ref     → teams/{tid}/channels/{cid_sanitized}/channel.message.created/{ts}-{eid}.json
-channel.message.updated           → channel_ref     → teams/{tid}/channels/{cid_sanitized}/channel.message.updated/{ts}-{eid}.json
-channel.message.deleted           → channel_ref     → teams/{tid}/channels/{cid_sanitized}/channel.message.deleted/{ts}-{eid}.json
-meeting.created                   → meeting_ref     → meetings/{meeting_id}/meeting.created/{ts}-{eid}.json
-meeting.ended                     → meeting_ref     → meetings/{meeting_id}/meeting.ended/{ts}-{eid}.json
-meeting.linked                    → meeting_ref     → meetings/{meeting_id}/meeting.linked/{ts}-{eid}.json
-meeting.call.joined               → meeting_ref     → meetings/{meeting_id}/meeting.call.joined/{ts}-{eid}.json
-meeting.call.left                 → meeting_ref     → meetings/{meeting_id}/meeting.call.left/{ts}-{eid}.json
-meeting.chat.created              → meeting_ref     → meetings/{meeting_id}/meeting.chat.created/{ts}-{eid}.json
-meeting.chat.updated              → meeting_ref     → meetings/{meeting_id}/meeting.chat.updated/{ts}-{eid}.json
-meeting.chat.deleted              → meeting_ref     → meetings/{meeting_id}/meeting.chat.deleted/{ts}-{eid}.json
-meeting.transcript.partial        → meeting_ref     → meetings/{meeting_id}/meeting.transcript.partial/{ts}-{eid}.json
-meeting.transcript.final          → meeting_ref     → meetings/{meeting_id}/meeting.transcript.final/{ts}-{eid}.json
-meeting.transcript.official       → meeting_ref     → meetings/{meeting_id}/meeting.transcript.official/{ts}-{eid}.json
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+channel.attached                  → channel_ref     → teams/{tid}/channels/{cid_sanitized}/lifecycle/{ts}-{eid}.json
+channel.detached                  → channel_ref     → teams/{tid}/channels/{cid_sanitized}/lifecycle/{ts}-{eid}.json
+channel.message.created           → channel_ref     → teams/{tid}/channels/{cid_sanitized}/messages/{ts}-{eid}.json
+channel.message.updated           → channel_ref     → teams/{tid}/channels/{cid_sanitized}/messages/{ts}-{eid}.json
+channel.message.deleted           → channel_ref     → teams/{tid}/channels/{cid_sanitized}/messages/{ts}-{eid}.json
+meeting.created                   → meeting_ref     → meetings/{meeting_id}/lifecycle/{ts}-{eid}.json
+meeting.ended                     → meeting_ref     → meetings/{meeting_id}/lifecycle/{ts}-{eid}.json
+meeting.linked                    → meeting_ref     → meetings/{meeting_id}/lifecycle/{ts}-{eid}.json
+meeting.call.joined               → meeting_ref     → meetings/{meeting_id}/lifecycle/{ts}-{eid}.json
+meeting.call.left                 → meeting_ref     → meetings/{meeting_id}/lifecycle/{ts}-{eid}.json
+meeting.chat.created              → meeting_ref     → meetings/{meeting_id}/messages/{ts}-{eid}.json
+meeting.chat.updated              → meeting_ref     → meetings/{meeting_id}/messages/{ts}-{eid}.json
+meeting.chat.deleted              → meeting_ref     → meetings/{meeting_id}/messages/{ts}-{eid}.json
+meeting.transcript.partial        → meeting_ref     → meetings/{meeting_id}/live_transcript/{ts}-{eid}.json
+meeting.transcript.final          → meeting_ref     → meetings/{meeting_id}/live_transcript/{ts}-{eid}.json
+meeting.transcript.official       → meeting_ref     → meetings/{meeting_id}/transcripts/{ts}-{eid}.json
 ```
 
-Plus the two flat post-meeting transcript files (overwritten on each fetch):
+Plus the two flat post-meeting transcript files (overwritten on each
+fetch — these live alongside the `meeting.transcript.official`
+envelope in the same `transcripts/` folder):
 
 ```
 meetings/{meeting_id}/transcripts/official.txt   (clean speaker-per-line plaintext)
 meetings/{meeting_id}/transcripts/official.vtt   (raw WebVTT)
 ```
+
+> **Legacy v1 compat path (preserved, do not consume from new code):**
+> The bot also writes `channels/{tid}/{cid_sanitized}/chat.message/{ts}-{eid}.txt`
+> for channels listed in `BlobArchive:V1CompatChannelIds`. That path
+> uses the legacy `alfred-events-v1` body (header + `---ENVELOPE---`
+> separator) and exists only to keep the pre-v2 `server.py` polling
+> bridge working through the cutover. New consumers must read the v2
+> category layout above.
+
+> **Historical event-type-per-folder blobs.** Blobs written before
+> this category refactor live at their old `…/{event_type}/…` paths
+> (e.g. `meetings/{mid}/meeting.chat.created/`). They are still
+> readable; new writes land at the category paths. No backfill.
 
 See [`docs/retrieving-transcripts.md`](retrieving-transcripts.md) for
 recipes + Python helpers.

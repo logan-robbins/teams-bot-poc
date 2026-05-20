@@ -69,16 +69,35 @@ public sealed class BlobArchiveConfiguration
 /// here so any consumer can replay history without a live HTTP listener.
 /// </summary>
 /// <remarks>
-/// Path layout (mirrors the Microsoft Graph URL hierarchy):
-///   teams/{team_id}/channels/{channel_id}/{event_type}/{utcTs}-{eventId}.json
-///   meetings/{meeting_id}/{event_type}/{utcTs}-{eventId}.json
-///   meetings/{meeting_id}/transcripts/official.txt   (clean speaker-per-line plaintext)
-///   meetings/{meeting_id}/transcripts/official.vtt   (raw WebVTT)
+/// Path layout (mirrors the Microsoft Graph URL hierarchy where one
+/// exists, with one folder per logical data type instead of per
+/// event_type variant):
+///   teams/{team_id}/channels/{channel_id}/messages/{utcTs}-{eventId}.json
+///   teams/{team_id}/channels/{channel_id}/lifecycle/{utcTs}-{eventId}.json
+///   meetings/{meeting_id}/messages/{utcTs}-{eventId}.json
+///   meetings/{meeting_id}/live_transcript/{utcTs}-{eventId}.json
+///   meetings/{meeting_id}/transcripts/{utcTs}-{eventId}.json   (meeting.transcript.official envelope)
+///   meetings/{meeting_id}/transcripts/official.txt             (clean speaker-per-line plaintext)
+///   meetings/{meeting_id}/transcripts/official.vtt             (raw WebVTT)
+///   meetings/{meeting_id}/lifecycle/{utcTs}-{eventId}.json
 ///
 /// Every <c>.json</c> blob is a pure alfred-v2 envelope — no preamble,
 /// no markers, just <c>{ … }</c>. Consumers can <c>jq</c> them
 /// directly. See <c>docs/retrieving-transcripts.md</c> for the
 /// consumer contract.
+///
+/// Categories collapse the v2 <c>event_type</c> variants:
+///   messages        ← channel.message.{created,updated,deleted}, meeting.chat.{created,updated,deleted}
+///                     (mirrors Graph's /teams/{id}/channels/{id}/messages + /chats/{id}/messages)
+///   live_transcript ← meeting.transcript.{partial,final}
+///                     (THIS bot's Azure Speech STT from the real-time audio stream — distinct
+///                      from Microsoft's "live captions" feature; the bot is the producer)
+///   transcripts     ← meeting.transcript.official (envelope sits alongside the flat
+///                     official.txt / official.vtt files; mirrors Graph's
+///                     /onlineMeetings/{id}/transcripts callTranscript resource)
+///   lifecycle       ← channel.{attached,detached}, meeting.{created,ended,linked,call.joined,call.left}
+/// The precise <c>event_type</c> stays on the envelope JSON, so any
+/// consumer that needs the subtype reads it from there.
 ///
 /// Auth: prefers <see cref="BlobArchiveConfiguration.ConnectionString"/>
 /// when set (account-key path, current sandbox state) and falls back to
@@ -419,6 +438,50 @@ public sealed class BlobEventArchive
         return sb.ToString();
     }
 
+    /// <summary>
+    /// Maps every v2 <c>event_type</c> to its logical category folder.
+    /// One category aggregates all the underlying event-type variants
+    /// that represent the same data type (e.g. <c>channel.message.created
+    /// / updated / deleted</c> all land in <c>messages/</c>). The
+    /// precise event type stays on the envelope JSON so any consumer
+    /// that needs to distinguish reads it from there.
+    /// </summary>
+    private static readonly Dictionary<string, string> EventTypeToCategory =
+        new(StringComparer.Ordinal)
+        {
+            // Channel scope
+            { AlfredEventTypes.ChannelMessageCreated,     "messages" },
+            { AlfredEventTypes.ChannelMessageUpdated,     "messages" },
+            { AlfredEventTypes.ChannelMessageDeleted,     "messages" },
+            { AlfredEventTypes.ChannelAttached,           "lifecycle" },
+            { AlfredEventTypes.ChannelDetached,           "lifecycle" },
+
+            // Meeting scope
+            { AlfredEventTypes.MeetingChatCreated,        "messages" },
+            { AlfredEventTypes.MeetingChatUpdated,        "messages" },
+            { AlfredEventTypes.MeetingChatDeleted,        "messages" },
+            { AlfredEventTypes.MeetingTranscriptPartial,  "live_transcript" },
+            { AlfredEventTypes.MeetingTranscriptFinal,    "live_transcript" },
+            { AlfredEventTypes.MeetingTranscriptOfficial, "transcripts" },
+            { AlfredEventTypes.MeetingCreated,            "lifecycle" },
+            { AlfredEventTypes.MeetingEnded,              "lifecycle" },
+            { AlfredEventTypes.MeetingLinked,             "lifecycle" },
+            { AlfredEventTypes.MeetingCallJoined,         "lifecycle" },
+            { AlfredEventTypes.MeetingCallLeft,           "lifecycle" },
+        };
+
+    private static string CategoryFor(string? eventType)
+    {
+        if (eventType is not null && EventTypeToCategory.TryGetValue(eventType, out var cat))
+        {
+            return cat;
+        }
+        // Unknown event_type — fall back to a sanitized version of the
+        // event_type itself so the envelope still lands somewhere
+        // greppable instead of getting silently merged into a default.
+        return SanitizePathSegment(eventType ?? "event");
+    }
+
     private static string BuildEnvelopePath(AlfredEventEnvelope envelope)
     {
         // envelope.Ts is an ISO 8601 string. Compact it into a sortable
@@ -430,17 +493,17 @@ public sealed class BlobEventArchive
             ? parsed.ToString("yyyyMMddTHHmmssfffZ", CultureInfo.InvariantCulture)
             : DateTimeOffset.UtcNow.ToString("yyyyMMddTHHmmssfffZ", CultureInfo.InvariantCulture);
         var safeId = SanitizePathSegment(envelope.EventId ?? Guid.NewGuid().ToString("N"));
-        var safeKind = SanitizePathSegment(envelope.EventType ?? "event");
+        var category = CategoryFor(envelope.EventType);
 
         if (envelope.ChannelRef is { } cr)
         {
-            return $"teams/{SanitizePathSegment(cr.TeamId)}/channels/{SanitizePathSegment(cr.ChannelId)}/{safeKind}/{ts}-{safeId}.json";
+            return $"teams/{SanitizePathSegment(cr.TeamId)}/channels/{SanitizePathSegment(cr.ChannelId)}/{category}/{ts}-{safeId}.json";
         }
         if (envelope.MeetingRef is { } mr)
         {
-            return $"meetings/{SanitizePathSegment(mr.MeetingId)}/{safeKind}/{ts}-{safeId}.json";
+            return $"meetings/{SanitizePathSegment(mr.MeetingId)}/{category}/{ts}-{safeId}.json";
         }
-        return $"events/{safeKind}/{ts}-{safeId}.json";
+        return $"events/{category}/{ts}-{safeId}.json";
     }
 
     /// <summary>

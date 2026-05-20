@@ -1301,7 +1301,14 @@ class SessionStore:
         limit: Optional[int] = None,
         team_id: Optional[str] = None,
         channel_id: Optional[str] = None,
+        since: Optional[str] = None,
+        until: Optional[str] = None,
     ) -> list[dict[str, Any]]:
+        """List meetings, newest first. Optional since/until filter the
+        meeting by its most informative timestamp (actual start when known,
+        scheduled start otherwise, created_at as the last fallback) —
+        matches the ORDER BY column so a range query and a recency-bound
+        query stay consistent."""
         clauses = []
         params: list[Any] = []
         if team_id:
@@ -1310,6 +1317,16 @@ class SessionStore:
         if channel_id:
             clauses.append("channel_id = ?")
             params.append(channel_id)
+        if since:
+            clauses.append(
+                "COALESCE(actual_start_utc, scheduled_start_utc, created_at_utc) >= ?"
+            )
+            params.append(since)
+        if until:
+            clauses.append(
+                "COALESCE(actual_start_utc, scheduled_start_utc, created_at_utc) <= ?"
+            )
+            params.append(until)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         query = (
             "SELECT * FROM meetings"
