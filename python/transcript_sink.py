@@ -3474,6 +3474,62 @@ def _blob_archive_url() -> str:
     return (os.environ.get("BLOB_ARCHIVE_URL") or _BLOB_ARCHIVE_URL_DEFAULT_V2).rstrip("/")
 
 
+# Cached BlobServiceClient. Created on first write. Connection-string
+# path is the secret BLOB_CONNECTION_STRING env var (set on the
+# Container App). If absent, writes raise — caller logs + degrades.
+_BLOB_CONTAINER_NAME = "alfred-events"
+_blob_container_client = None
+
+
+def _get_blob_container_client():
+    """Return a cached azure.storage.blob ContainerClient for writes.
+
+    Reads the storage connection string from the `BLOB_CONNECTION_STRING`
+    env var (set as a Container App secret). Falls back to
+    `AZURE_STORAGE_CONNECTION_STRING` for parity with the Azure SDK
+    conventional name. Returns None when neither is set so callers can
+    degrade gracefully (sqlite-only upload).
+    """
+    global _blob_container_client
+    if _blob_container_client is not None:
+        return _blob_container_client
+    conn = (
+        os.environ.get("BLOB_CONNECTION_STRING")
+        or os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+        or ""
+    ).strip()
+    if not conn:
+        return None
+    from azure.storage.blob import BlobServiceClient  # type: ignore[import-not-found]
+
+    svc = BlobServiceClient.from_connection_string(conn)
+    _blob_container_client = svc.get_container_client(_BLOB_CONTAINER_NAME)
+    return _blob_container_client
+
+
+def _blob_upload_text(path: str, content: str, content_type: str) -> None:
+    """Synchronous blob upload — run via asyncio.to_thread from async code.
+
+    Overwrites the blob if it exists (canonical upload semantics). Content
+    is UTF-8 encoded. Raises on failure so the caller can decide whether
+    to swallow (sqlite still serves the transcript) or fail.
+    """
+    client = _get_blob_container_client()
+    if client is None:
+        raise RuntimeError(
+            "BLOB_CONNECTION_STRING is not configured on the sink Container App; "
+            "set it as a secret env var to enable canonical-path writes."
+        )
+    from azure.storage.blob import ContentSettings  # type: ignore[import-not-found]
+
+    blob = client.get_blob_client(path)
+    blob.upload_blob(
+        content.encode("utf-8"),
+        overwrite=True,
+        content_settings=ContentSettings(content_type=content_type),
+    )
+
+
 def _http_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(timeout=10.0)
 
@@ -3714,15 +3770,22 @@ async def v2_upload_meeting_transcript(
 ) -> dict[str, Any]:
     """Manually upload a transcript for a meeting.
 
-    Used when the bot's Graph-based transcript fetcher can't reach the
-    transcript (e.g. RSC limitations, subscription not set up yet). Takes
-    the .vtt or .txt the operator downloaded from the Teams meeting chat
-    and stores it. Future `GET /v2/meetings/{meeting_id}/transcript`
-    calls return this content with `source="operator_upload"`.
+    Persists to TWO stores so every downstream view sees it:
+      1. **Azure Blob Storage** at the canonical paths the bot would
+         have written if its Graph fetch worked:
+           - meetings/{meeting_id_sanitized}/transcripts/official.txt
+           - meetings/{meeting_id_sanitized}/transcripts/official.vtt
+           - meetings/{meeting_id_sanitized}/transcripts/{original_filename}
+         The first two match the well-known names the agent's
+         `fetch_meeting_transcript` tool and `/v2/meetings/{id}/transcript`
+         already look for. The third preserves the operator's source
+         file (typically Microsoft's `"<meeting subject> Recording.vtt"`)
+         so the archive view shows the upload by name.
+      2. **Sink sqlite** (`transcript_uploads`) for fast inline serve.
 
     Optional `subject` form field also updates the meeting registry —
-    handy when the bot couldn't auto-resolve the subject (e.g. it lacked
-    the RSC for `GET /chats/{id}` and never emitted `meeting.created`).
+    handy when the bot couldn't auto-resolve the subject and never
+    emitted a real `meeting.created`.
     """
     body = await file.read()
     if not body:
@@ -3732,8 +3795,8 @@ async def v2_upload_meeting_transcript(
         )
     text = body.decode("utf-8", errors="replace")
 
-    filename = (file.filename or "").lower()
-    is_vtt = filename.endswith(".vtt") or text.lstrip().startswith("WEBVTT")
+    filename_lower = (file.filename or "").lower()
+    is_vtt = filename_lower.endswith(".vtt") or text.lstrip().startswith("WEBVTT")
     vtt = text if is_vtt else None
     txt = _vtt_to_plaintext(text) if is_vtt else text
 
@@ -3746,6 +3809,37 @@ async def v2_upload_meeting_transcript(
         subject,
     )
 
+    # Write to blob storage at the canonical paths so the archive view
+    # shows it and the agent's existing /v2/meetings/{id}/transcript
+    # (which falls back to blob when sqlite is empty) survives a sink
+    # container restart.
+    blob_writes: list[str] = []
+    blob_error: str | None = None
+    try:
+        safe_meeting_id = _BLOB_PATH_UNSAFE_RE.sub("_", meeting_id)
+        base_prefix = f"meetings/{safe_meeting_id}/transcripts"
+        original_name = (file.filename or "transcript.vtt").strip()
+        # Sanitize the filename too — Azure rejects some chars in blob
+        # names, and we don't want path-traversal anyway.
+        safe_filename = _BLOB_PATH_UNSAFE_RE.sub("_", original_name)
+        blobs_to_write: list[tuple[str, str, str]] = [
+            (f"{base_prefix}/official.txt", txt, "text/plain"),
+        ]
+        if vtt is not None:
+            blobs_to_write.append((f"{base_prefix}/official.vtt", vtt, "text/vtt"))
+            # Preserve the operator's filename (e.g. Microsoft's default
+            # `<subject> Recording.vtt`) at the same prefix so the
+            # archive folder browser shows it under its real name.
+            blobs_to_write.append((f"{base_prefix}/{safe_filename}", vtt, "text/vtt"))
+        for path, content, content_type in blobs_to_write:
+            await asyncio.to_thread(_blob_upload_text, path, content, content_type)
+            blob_writes.append(path)
+    except Exception as exc:  # noqa: BLE001
+        # Don't fail the upload if blob write fails — sqlite path still
+        # serves /v2/meetings/{id}/transcript. Log + report in response.
+        logger.warning("Blob write failed for upload meeting_id=%s: %s", meeting_id, exc)
+        blob_error = f"{type(exc).__name__}: {exc!s}"
+
     return {
         "schema_version": "alfred-v2",
         "meeting_id": meeting_id,
@@ -3754,6 +3848,8 @@ async def v2_upload_meeting_transcript(
         "vtt_bytes": len(vtt) if vtt else 0,
         "subject_updated": subject is not None,
         "filename": file.filename,
+        "blob_writes": blob_writes,
+        "blob_error": blob_error,
     }
 
 

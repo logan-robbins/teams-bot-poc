@@ -34,11 +34,15 @@ __all__ = [
     "MeetingResolveResult",
     "RequestBackfillResult",
     "SendResult",
+    "TranscriptFile",
+    "TranscriptFileSearchResult",
     "TranscriptResult",
     "build_alfred_tools",
     "fetch_meeting_transcript_impl",
+    "fetch_transcript_by_filename_impl",
     "find_meeting_by_chat_thread_id_impl",
     "list_meetings_impl",
+    "list_meeting_transcript_files_impl",
     "request_transcript_backfill_impl",
     "resolve_meeting_by_date_impl",
     "resolve_meeting_by_name_impl",
@@ -925,6 +929,262 @@ async def fetch_meeting_transcript_impl(
     return result
 
 
+class TranscriptFile(BaseModel):
+    """One transcript file present in blob storage."""
+
+    meeting_id: str
+    filename: str
+    blob_path: str
+    blob_url: str
+    size_bytes: int | None = None
+    last_modified_utc: str | None = None
+
+
+class TranscriptFileSearchResult(BaseModel):
+    """List/search result for transcript files in blob storage."""
+
+    ok: bool
+    count: int = 0
+    files: list[TranscriptFile] = Field(default_factory=list)
+    query: str | None = None
+    reason: str | None = None
+
+
+async def list_meeting_transcript_files_impl(
+    context: AlfredAgentContext,
+    query: str | None = None,
+    limit: int = 25,
+) -> TranscriptFileSearchResult:
+    """List every ``meetings/{meeting_id}/transcripts/*.{vtt,txt}`` file in blob storage.
+
+    Optionally filter by substring match on the filename (case-
+    insensitive). Pure blob listing — no sink dependency. Useful when
+    ``resolve_meeting_by_name`` returns no match (the meeting's
+    ``subject`` field is empty) but the transcript file itself carries
+    a recognisable name like ``Supermemory Meeting.vtt`` (Microsoft's
+    default download name).
+    """
+    archive = _archive_url()
+    arguments = {"query": query, "limit": limit}
+    # List ALL blobs under meetings/ (paged). Filter to */transcripts/*.
+    # The archive uses anonymous read so no auth required.
+    files: list[TranscriptFile] = []
+    needle = (query or "").strip().lower() or None
+    try:
+        marker = ""
+        pages = 0
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            while True:
+                params = {
+                    "restype": "container",
+                    "comp": "list",
+                    "prefix": "meetings/",
+                    "maxresults": "5000",
+                }
+                if marker:
+                    params["marker"] = marker
+                resp = await client.get(archive, params=params)
+                resp.raise_for_status()
+                root = ET.fromstring(resp.text)
+                for blob in root.iter("Blob"):
+                    name = blob.findtext("Name") or ""
+                    # We want meetings/{meeting_id}/transcripts/{file}
+                    parts = name.split("/")
+                    if (
+                        len(parts) < 4
+                        or parts[0] != "meetings"
+                        or parts[2] != "transcripts"
+                    ):
+                        continue
+                    filename = parts[3]
+                    if not (filename.endswith(".vtt") or filename.endswith(".txt")):
+                        continue
+                    if needle and needle not in filename.lower():
+                        continue
+                    props = blob.find("Properties")
+                    size_str = (props.findtext("Content-Length") or "0") if props is not None else "0"
+                    last_mod = (props.findtext("Last-Modified") or "") if props is not None else ""
+                    files.append(
+                        TranscriptFile(
+                            meeting_id=parts[1],
+                            filename=filename,
+                            blob_path=name,
+                            blob_url=f"{archive}/{name}",
+                            size_bytes=int(size_str) if size_str.isdigit() else None,
+                            last_modified_utc=last_mod or None,
+                        )
+                    )
+                    if len(files) >= limit:
+                        break
+                if len(files) >= limit:
+                    break
+                marker = (root.findtext("NextMarker") or "").strip()
+                pages += 1
+                if not marker or pages > 20:
+                    break
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("list_meeting_transcript_files failed: %s", exc)
+        result = TranscriptFileSearchResult(
+            ok=False, query=query, reason=f"http_error: {exc!r}",
+        )
+        context.record(
+            "list_meeting_transcript_files", arguments,
+            result.model_dump(), ok=False, error=str(exc),
+        )
+        return result
+
+    # Sort by most recent first when timestamps are present.
+    files.sort(key=lambda f: f.last_modified_utc or "", reverse=True)
+    result = TranscriptFileSearchResult(
+        ok=True, count=len(files), files=files, query=query,
+    )
+    context.record(
+        "list_meeting_transcript_files", arguments,
+        result.model_dump(), ok=True,
+    )
+    return result
+
+
+async def fetch_transcript_by_filename_impl(
+    context: AlfredAgentContext,
+    filename_substring: str,
+) -> TranscriptResult:
+    """Fetch a transcript by filename substring match.
+
+    Searches blob storage for the first
+    ``meetings/{meeting_id}/transcripts/*.{vtt,txt}`` whose filename
+    contains the given substring (case-insensitive), then downloads
+    and returns its plaintext. Use when the user names the meeting by
+    its TRANSCRIPT FILENAME (Microsoft's default download is
+    ``<meeting subject> Recording.vtt`` — so saying "fetch the
+    Supermemory transcript" should match a file like
+    ``Supermemory Meeting.vtt`` even when the sink's ``subject``
+    field is unset.
+    """
+    arguments = {"filename_substring": filename_substring}
+    query = (filename_substring or "").strip()
+    if not query:
+        result = TranscriptResult(ok=False, reason="empty_query")
+        context.record(
+            "fetch_transcript_by_filename", arguments,
+            result.model_dump(), ok=False, error="empty_query",
+        )
+        return result
+
+    search = await list_meeting_transcript_files_impl(context, query=query, limit=10)
+    if not search.ok or not search.files:
+        result = TranscriptResult(
+            ok=False,
+            reason=f"no_match_for: {query}",
+        )
+        context.record(
+            "fetch_transcript_by_filename", arguments,
+            result.model_dump(), ok=False, error="no_match",
+        )
+        return result
+
+    # Prefer .vtt → .txt → first. Within ties take most-recent (already
+    # sorted desc by last_modified).
+    vtts = [f for f in search.files if f.filename.lower().endswith(".vtt")]
+    txts = [f for f in search.files if f.filename.lower().endswith(".txt")]
+    pick = (vtts or txts or search.files)[0]
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.get(pick.blob_url)
+            resp.raise_for_status()
+            body = resp.text
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("fetch_transcript_by_filename download failed: %s", exc)
+        result = TranscriptResult(
+            ok=False,
+            meeting_id=pick.meeting_id,
+            blob_url=pick.blob_url,
+            reason=f"download_failed: {exc!r}",
+        )
+        context.record(
+            "fetch_transcript_by_filename", arguments,
+            result.model_dump(), ok=False, error=str(exc),
+        )
+        return result
+
+    # If it's a VTT, render to clean speaker-per-line plaintext.
+    if pick.filename.lower().endswith(".vtt") or body.lstrip().startswith("WEBVTT"):
+        rendered = _vtt_to_plaintext_local(body)
+    else:
+        rendered = body
+
+    result = TranscriptResult(
+        ok=True,
+        transcript=rendered,
+        meeting_id=pick.meeting_id,
+        blob_url=pick.blob_url,
+        bytes=len(rendered),
+    )
+    context.record(
+        "fetch_transcript_by_filename",
+        arguments,
+        {
+            "meeting_id": pick.meeting_id,
+            "blob_url": pick.blob_url,
+            "bytes": len(rendered),
+            "filename": pick.filename,
+        },
+        ok=True,
+    )
+    return result
+
+
+def _vtt_to_plaintext_local(vtt: str) -> str:
+    """Mirror of the sink's _vtt_to_plaintext. Inlined here so the
+    agent's blob-direct fetch path doesn't depend on a sink endpoint."""
+    out: list[str] = []
+    pending_start: str | None = None
+    body_lines: list[str] = []
+
+    def flush() -> None:
+        nonlocal pending_start, body_lines
+        if not body_lines:
+            return
+        body = "\n".join(body_lines).strip()
+        body_lines = []
+        if not body:
+            pending_start = None
+            return
+        prefix = f"[{pending_start}] " if pending_start else ""
+        speaker = ""
+        text = body
+        open_idx = body.find("<v ")
+        if open_idx >= 0:
+            close_idx = body.find(">", open_idx)
+            end_idx = body.find("</v>")
+            if close_idx > open_idx and end_idx > close_idx:
+                speaker = body[open_idx + 3 : close_idx].strip()
+                text = body[close_idx + 1 : end_idx].strip()
+        if speaker:
+            out.append(f"{prefix}{speaker}: {text}")
+        else:
+            out.append(f"{prefix}{text}")
+        pending_start = None
+
+    for raw_line in vtt.replace("\r\n", "\n").split("\n"):
+        line = raw_line.strip()
+        if not line:
+            flush()
+            continue
+        arrow = line.find(" --> ")
+        if arrow > 0 and len(line) > arrow + 5:
+            start = line[:arrow]
+            dot = start.find(".")
+            pending_start = start[:dot] if dot > 0 else start
+            continue
+        if line.startswith("WEBVTT") or line.startswith("NOTE"):
+            continue
+        body_lines.append(line)
+    flush()
+    return "\n".join(out) + "\n"
+
+
 def build_alfred_tools() -> tuple[Any, ...]:
     """Build the tools tuple wired against ``AlfredAgentContext`` for the SDK."""
 
@@ -1108,6 +1368,54 @@ def build_alfred_tools() -> tuple[Any, ...]:
             organizer_oid=organizer_oid,
         )
 
+    @function_tool
+    async def list_meeting_transcript_files(
+        ctx: RunContextWrapper[AlfredAgentContext],
+        query: str | None = None,
+        limit: int = 25,
+    ) -> TranscriptFileSearchResult:
+        """List transcript files in blob storage, optionally filtered by name.
+
+        Returns every ``meetings/{meeting_id}/transcripts/*.{vtt,txt}``
+        file. Use to find a transcript when the user names the meeting
+        by something close to the FILENAME rather than the canonical
+        subject (e.g. Microsoft's default ``"<subject> Recording.vtt"``).
+
+        Args:
+            query: Optional case-insensitive substring filter on the
+                filename. Empty means "list everything (capped at
+                ``limit``)".
+            limit: Max entries to return.
+        """
+        return await list_meeting_transcript_files_impl(
+            ctx.context, query=query, limit=limit,
+        )
+
+    @function_tool
+    async def fetch_transcript_by_filename(
+        ctx: RunContextWrapper[AlfredAgentContext],
+        filename_substring: str,
+    ) -> TranscriptResult:
+        """Fetch a transcript by filename substring match.
+
+        Searches blob storage for the first
+        ``meetings/{meeting_id}/transcripts/*.vtt`` (preferred) or
+        ``*.txt`` whose filename contains ``filename_substring``
+        (case-insensitive), downloads it, and returns the cleaned
+        speaker-per-line plaintext. Use this when ``resolve_meeting_by_name``
+        returns 0 matches but the transcript file itself has a
+        recognizable name (Microsoft's default download is
+        ``"<subject> Recording.vtt"``).
+
+        Args:
+            filename_substring: e.g. ``"Supermemory"`` or
+                ``"Sprint Planning"`` — substring of the filename, not
+                the meeting subject.
+        """
+        return await fetch_transcript_by_filename_impl(
+            ctx.context, filename_substring=filename_substring,
+        )
+
     return (
         send_to_meeting_chat,
         fetch_meeting_transcript,
@@ -1116,4 +1424,6 @@ def build_alfred_tools() -> tuple[Any, ...]:
         resolve_meeting_by_date,
         find_meeting_by_chat_thread_id,
         request_transcript_backfill,
+        list_meeting_transcript_files,
+        fetch_transcript_by_filename,
     )

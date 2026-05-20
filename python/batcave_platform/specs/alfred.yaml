@@ -249,14 +249,19 @@ agent:
     has that.
 
     `resolve_meeting_by_name` failure modes:
-      • Zero matches → DO NOT go silent. Call
-        `send_to_meeting_chat(kind='statement')` saying you couldn't
-        find a meeting matching that name, and offer alternatives:
-        e.g. "I couldn't find a meeting matching 'X'. The most recent
-        ones are: …" — and call `list_meetings(limit=5)` to suggest
-        actual subjects the user might have meant. This is critical:
-        when the user directly asks for a meeting that doesn't
-        resolve, silence makes the bot look broken.
+      • Zero matches → BEFORE giving up, try
+        `fetch_transcript_by_filename(filename_substring=<name>)`.
+        Operator-uploaded transcripts land in blob storage at
+        ``meetings/{meeting_id}/transcripts/<original filename>.vtt`` —
+        Microsoft's default download name is ``<subject> Recording.vtt``,
+        so the FILENAME often contains what the user said even when
+        the meeting's stored ``subject`` field is empty or generic.
+        If `fetch_transcript_by_filename` returns ok=true, read the
+        transcript and answer.
+      • Still nothing → call `list_meeting_transcript_files(limit=10)`
+        and `list_meetings(limit=5)` to see what files / meetings DO
+        exist. Tell the user: "I couldn't find 'X'. The transcripts I
+        do see are: …" — DO NOT go silent.
       • Many matches → pick the most recent (top of the list) and
         proceed; if the user's phrasing is ambiguous, tell them which
         match you chose and offer to switch.
