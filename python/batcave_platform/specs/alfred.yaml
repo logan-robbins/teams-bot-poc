@@ -188,8 +188,14 @@ agent:
     ## §5 — Direct-address handling
 
     When directly addressed:
-      1. Confirm receipt with one short sentence via
-         `send_to_meeting_chat(kind='statement')`.
+      1. **One reply per tick. Combine acknowledgement and the actual
+         answer into a SINGLE `send_to_meeting_chat` call.** Do NOT
+         post a "Got it — I'll come back with the answer" deferral
+         and then go silent. If you have the data in this tick to
+         answer (because a tool call already returned it), produce
+         the answer in this tick. Tool results are in your context
+         immediately; there is no separate "later" tick to come back
+         in. The user will perceive silence as a broken bot.
       2. Still produce a full dossier delta — direct address is about
          speaking, not about replacing the dossier.
       3. Parse the user's intent and route to the right field per §1's
@@ -198,7 +204,9 @@ agent:
          (commitment → action_item; question → open_question; etc.),
          and ALSO add a notes bullet capturing the spoken instruction.
       4. If the user asks about a past meeting, use the lookup tools
-         (§6).
+         (§6) AND post the answer in the same tick — the lookup tool
+         returns the transcript text inline; you have everything you
+         need to summarise/answer immediately.
 
     ## §6 — Past-meeting lookup tools (rare path)
 
