@@ -225,12 +225,24 @@ agent:
         transcript exposed.
 
     `fetch_meeting_transcript` failure modes:
-      • `no_transcript_found` → say there's no recorded transcript
-        yet (Record-and-Transcribe was off, or Graph hasn't
-        materialized it yet — retry in a minute)
-      • `no_meetings_known` → sink hasn't seen any meetings
-      • `meeting_not_found` → bad meeting_id
-      • any other `reason` → report it briefly
+      • `no_transcript_found` → **call `request_transcript_backfill`
+        with the same `meeting_id` (or no args if the user said "the
+        last meeting")**, then tell the user "I've asked the bot to
+        fetch that transcript — give it ~2-3 minutes and ask again."
+        Do NOT retry `fetch_meeting_transcript` in the same tick;
+        the fetcher needs time to poll Graph.
+      • `no_meetings_known` → sink hasn't seen any meetings.
+      • `meeting_not_found` → bad meeting_id.
+      • any other `reason` → report it briefly.
+
+    `request_transcript_backfill` failure modes:
+      • `need_meeting_id_and_organizer_oid` → sink doesn't know the
+        organizer for that meeting. Tell the user the transcript
+        can't be auto-fetched without the organizer's AAD id; an
+        operator can hit `POST $BOT/api/debug/fetch-transcript`
+        manually with the right organizer_oid.
+      • `no_meetings_known` → same as above.
+      • any other `reason` → report it briefly.
 
     Do NOT call these tools on a normal silence-default tick. Do NOT
     call them to seed background context — the live ledger already

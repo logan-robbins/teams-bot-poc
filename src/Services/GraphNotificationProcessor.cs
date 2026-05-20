@@ -360,6 +360,31 @@ public sealed partial class GraphNotificationProcessor
             _logger.LogInformation(
                 "Emitted meeting.created for ChatThreadId={ChatThreadId} MeetingId={MeetingId} Subject={Subject} Organizer={Organizer}",
                 chatThreadId, resolvedMeetingId, subject ?? "(null)", organizer?.DisplayName ?? "(null)");
+
+            // Also register for post-meeting transcript fetch. The fetcher
+            // polls installedToOnlineMeetings/getAllTranscripts for ~30 min
+            // starting now — long enough to catch transcripts of meetings
+            // that end within that window from our first chat sighting. For
+            // longer meetings, the agent's request_transcript_backfill tool
+            // can re-trigger. Closes the +Apps-meeting auto-fetch gap that
+            // had previously only been wired for channel meetings.
+            if (chat?.OrganizerAadId is not null)
+            {
+                _transcriptFetcher.Register(
+                    botCallId: resolvedMeetingId,
+                    organizerOid: chat.OrganizerAadId,
+                    meetingChatThreadId: chatThreadId,
+                    registeredAtUtc: DateTimeOffset.UtcNow);
+                _logger.LogInformation(
+                    "Registered post-meeting transcript fetcher: ChatThreadId={ChatThreadId} MeetingId={MeetingId} OrganizerOid={OrganizerOid}",
+                    chatThreadId, resolvedMeetingId, chat.OrganizerAadId);
+            }
+            else
+            {
+                _logger.LogInformation(
+                    "Skipping transcript fetcher registration for ChatThreadId={ChatThreadId} — no organizer oid available from /chats/{ChatId}",
+                    chatThreadId, chatThreadId);
+            }
         }
         catch (Exception ex)
         {

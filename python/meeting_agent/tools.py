@@ -32,11 +32,13 @@ __all__ = [
     "MeetingListEntry",
     "MeetingListResult",
     "MeetingResolveResult",
+    "RequestBackfillResult",
     "SendResult",
     "TranscriptResult",
     "build_alfred_tools",
     "fetch_meeting_transcript_impl",
     "list_meetings_impl",
+    "request_transcript_backfill_impl",
     "resolve_meeting_by_name_impl",
     "send_to_meeting_chat_impl",
 ]
@@ -474,6 +476,157 @@ async def resolve_meeting_by_name_impl(
     return result
 
 
+class RequestBackfillResult(BaseModel):
+    """What the request_transcript_backfill tool returns."""
+
+    ok: bool
+    meeting_id: str | None = None
+    registered_key: str | None = None
+    note: str | None = None
+    reason: str | None = None
+
+
+def _bot_base_from_send_chat(send_chat_url: str | None) -> str | None:
+    """Derive the bot's base URL from the configured send-chat URL.
+
+    BOT_SEND_CHAT_URL is conventionally ``<bot-base>/api/send-chat``;
+    strip the ``/api/send-chat`` suffix to get the base. Returns None
+    if we can't figure it out — caller should surface as a clean error.
+    """
+    if not send_chat_url:
+        return None
+    cleaned = send_chat_url.strip().rstrip("/")
+    if cleaned.endswith("/api/send-chat"):
+        return cleaned[: -len("/api/send-chat")]
+    # Tolerate operators who supply just the base URL.
+    if "/api/" not in cleaned:
+        return cleaned
+    return None
+
+
+async def request_transcript_backfill_impl(
+    context: AlfredAgentContext,
+    meeting_id: str | None = None,
+    organizer_oid: str | None = None,
+) -> RequestBackfillResult:
+    """Ask the bot to backfill an official Microsoft transcript.
+
+    Wraps ``POST {BOT}/api/debug/fetch-transcript`` (see
+    DebugController.ManualFetchTranscript). The bot then polls Graph's
+    ``installedToOnlineMeetings/getAllTranscripts`` for ~30 minutes;
+    when the transcript materializes the bot emits
+    ``meeting.transcript.official`` and writes the plaintext to
+    ``meetings/{meeting_id}/transcripts/official.txt``. After ~2-3
+    minutes the agent can call ``fetch_meeting_transcript`` again to
+    read it.
+
+    Args:
+        meeting_id: Canonical Graph onlineMeeting id. Defaults to the
+            most recent meeting if omitted.
+        organizer_oid: AAD object id of the meeting organizer. Required
+            by the bot's transcript fetcher. If omitted, derived from
+            the sink's V2Meeting record when available.
+    """
+    sink = _sink_url()
+    arguments = {"meeting_id": meeting_id, "organizer_oid": organizer_oid}
+
+    resolved_meeting_id = (meeting_id or "").strip() or None
+    resolved_organizer_oid = (organizer_oid or "").strip() or None
+
+    # Pull the most recent meeting if no meeting_id was given.
+    if resolved_meeting_id is None:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(f"{sink}/v2/meetings", params={"limit": 1})
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            result = RequestBackfillResult(ok=False, reason=f"list_failed: {exc!r}")
+            context.record("request_transcript_backfill", arguments,
+                           result.model_dump(), ok=False, error=str(exc))
+            return result
+        meetings = data.get("meetings") or []
+        if not meetings:
+            result = RequestBackfillResult(ok=False, reason="no_meetings_known")
+            context.record("request_transcript_backfill", arguments,
+                           result.model_dump(), ok=False, error="no_meetings_known")
+            return result
+        resolved_meeting_id = meetings[0].get("meeting_id")
+        if not resolved_organizer_oid:
+            org_obj = meetings[0].get("organizer") or {}
+            if isinstance(org_obj, dict):
+                resolved_organizer_oid = org_obj.get("aad_id")
+
+    # If organizer still unknown, look it up from the meeting record.
+    if not resolved_organizer_oid and resolved_meeting_id:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(f"{sink}/v2/meetings/{resolved_meeting_id}")
+                resp.raise_for_status()
+                data = resp.json()
+            org_obj = data.get("organizer") or {}
+            if isinstance(org_obj, dict):
+                resolved_organizer_oid = org_obj.get("aad_id")
+        except Exception:
+            pass
+
+    if not resolved_meeting_id or not resolved_organizer_oid:
+        result = RequestBackfillResult(
+            ok=False,
+            meeting_id=resolved_meeting_id,
+            reason="need_meeting_id_and_organizer_oid",
+        )
+        context.record("request_transcript_backfill", arguments,
+                       result.model_dump(), ok=False,
+                       error="need_meeting_id_and_organizer_oid")
+        return result
+
+    bot_base = _bot_base_from_send_chat(_resolve_send_chat_url(context.send_chat_url))
+    if not bot_base:
+        result = RequestBackfillResult(
+            ok=False,
+            meeting_id=resolved_meeting_id,
+            reason="no_bot_url",
+        )
+        context.record("request_transcript_backfill", arguments,
+                       result.model_dump(), ok=False, error="no_bot_url")
+        return result
+
+    payload = {"meeting_id": resolved_meeting_id, "organizer_oid": resolved_organizer_oid}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{bot_base}/api/debug/fetch-transcript",
+                json=payload,
+            )
+        if resp.status_code >= 400:
+            err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+            result = RequestBackfillResult(
+                ok=False, meeting_id=resolved_meeting_id, reason=err,
+            )
+            context.record("request_transcript_backfill", arguments,
+                           result.model_dump(), ok=False, error=err)
+            return result
+        body = resp.json()
+        result = RequestBackfillResult(
+            ok=True,
+            meeting_id=resolved_meeting_id,
+            registered_key=body.get("registered_key"),
+            note=body.get("note"),
+        )
+        context.record("request_transcript_backfill", arguments,
+                       result.model_dump(), ok=True)
+        return result
+    except Exception as exc:  # noqa: BLE001
+        err = f"transport: {exc!s}"
+        result = RequestBackfillResult(
+            ok=False, meeting_id=resolved_meeting_id, reason=err,
+        )
+        context.record("request_transcript_backfill", arguments,
+                       result.model_dump(), ok=False, error=err)
+        return result
+
+
 async def fetch_meeting_transcript_impl(
     context: AlfredAgentContext,
     meeting_id: str | None = None,
@@ -658,9 +811,42 @@ def build_alfred_tools() -> tuple[Any, ...]:
         """
         return await resolve_meeting_by_name_impl(ctx.context, subject=subject, limit=limit)
 
+    @function_tool
+    async def request_transcript_backfill(
+        ctx: RunContextWrapper[AlfredAgentContext],
+        meeting_id: str | None = None,
+        organizer_oid: str | None = None,
+    ) -> RequestBackfillResult:
+        """Ask the bot to backfill an official Microsoft transcript.
+
+        Call this when ``fetch_meeting_transcript`` returns
+        ``ok: false`` with ``reason: no_transcript_found`` AND a user
+        is actively asking about that meeting. The bot will start
+        polling Graph for the transcript (~30 min); the agent should
+        tell the user to retry in 2-3 minutes.
+
+        Idempotent — calling multiple times for the same meeting_id is
+        cheap (bot dedups on the meeting_id key). Most "+Apps" meetings
+        already have a fetcher running from the time of the first chat
+        event, so this tool is for retry / catch-up cases.
+
+        Args:
+            meeting_id: Canonical Graph onlineMeeting id. Defaults to
+                the most recent meeting if omitted.
+            organizer_oid: AAD object id of the meeting organizer.
+                Required by the bot's fetcher. If omitted, derived
+                from the sink's V2Meeting record when available.
+        """
+        return await request_transcript_backfill_impl(
+            context=ctx.context,
+            meeting_id=meeting_id,
+            organizer_oid=organizer_oid,
+        )
+
     return (
         send_to_meeting_chat,
         fetch_meeting_transcript,
         list_meetings,
         resolve_meeting_by_name,
+        request_transcript_backfill,
     )
