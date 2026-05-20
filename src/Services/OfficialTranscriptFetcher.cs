@@ -166,10 +166,13 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
         }
 
         var canonicalMeetingId = ToCanonicalMeetingId(pending.BotCallId);
+        // NOTE: Graph's per-meeting transcripts endpoint REJECTS $orderby
+        // and $top with `400 Query option 'OrderBy' is not allowed`.
+        // List everything; pick newest in-process below.
         var resource =
             $"https://graph.microsoft.com/v1.0/users/{Uri.EscapeDataString(pending.OrganizerOid)}" +
             $"/onlineMeetings/{Uri.EscapeDataString(canonicalMeetingId)}/transcripts" +
-            "?$orderby=createdDateTime desc&$top=5&useResourceSpecificConsentBasedAuthorization=true";
+            "?useResourceSpecificConsentBasedAuthorization=true";
 
         try
         {
