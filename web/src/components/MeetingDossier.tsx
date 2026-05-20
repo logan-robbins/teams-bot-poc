@@ -36,7 +36,18 @@ export function MeetingDossier({ chatThreadId }: Props) {
     sink.setMuted(chatThreadId, m).catch(() => {});
   }
 
-  const history = session?.meeting_history ?? [];
+  // Filter out Teams system messages from the human-facing ledger.
+  // These are <URIObject> payloads Microsoft posts into the chat for
+  // call-start, recording-complete, transcript-export, etc. They're
+  // valuable to the agent (used as triggers for transcript fetch)
+  // but ugly to read in the UI. Same filter Michael's server.py
+  // bridge applies upstream — keeping the noise out of the UI.
+  const history = (session?.meeting_history ?? []).filter((e) => {
+    const text = e.text || "";
+    if (!text.trim()) return false;
+    if (text.includes("<URIObject") || text.includes("scopeId")) return false;
+    return true;
+  });
 
   return (
     <div className="flex h-screen flex-col bg-ink-950 text-ink-50">
