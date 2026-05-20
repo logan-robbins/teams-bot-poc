@@ -579,3 +579,126 @@ just `{ … }`. `jq` it directly.
   blob archive layout + Python / curl / az recipes.
 - [`docs/TEAMS-AUTO-INVITE-SETUP.md`](docs/TEAMS-AUTO-INVITE-SETUP.md) —
   one-time Sandbox-tenant admin setup for auto-invite mode.
+- [`TODO.md`](TODO.md) — prioritized backlog with code-level paths
+  for the next agent to pick up cold.
+
+---
+
+## 10. Adding Alfred to a Teams meeting (operator guide)
+
+Alfred is one Teams app with two attach surfaces. They grant
+different things; pick based on what you need.
+
+### Surface 1 — "+Apps" in the meeting chat
+
+What it does: installs Alfred per-meeting in the meeting's chat
+container. The manifest's chat-scoped RSCs (`ChatMessage.Read.Chat`,
+`OnlineMeetingTranscript.Read.Chat`, `OnlineMeetingParticipant.Read.Chat`,
+`Calls.AccessMedia.Chat`, etc.) become consented for that one chat.
+
+You get:
+- Real-time chat events (`meeting.chat.created/updated/deleted`)
+  flow into the bot → sink → dossier.
+- Post-meeting transcript fetch via
+  `installedToOnlineMeetings/getAllTranscripts` works *in
+  principle*, but the auto-trigger for "+Apps" meetings is not yet
+  wired (see [`TODO.md`](TODO.md) §P1 items B + A). For now use
+  `POST $BOT/api/debug/fetch-transcript` (see §7.3) to backfill.
+- Alfred can post into the chat via `/api/send-chat` (the agent's
+  `send_to_meeting_chat` tool).
+
+You DON'T get:
+- Live audio / `meeting.transcript.partial` / `meeting.transcript.final`
+  events — the bot is not in the call.
+- The bot in the meeting roster — it's invisible to call participants.
+- Speaker diarization for live notes.
+
+How to add: in the meeting chat, click **+** → **Apps** → search
+"Alfred Sandbox" → Add. Approval may be required from a Sandbox
+admin if the manifest version is newer than the team's installed
+version (per §5).
+
+### Surface 2 — Alfred as a call participant (live audio)
+
+What it does: the bot enters the call as an actual participant. Uses
+the `Calls.JoinGroupCalls.Chat` + `Calls.AccessMedia.Chat` RSCs to
+join via Graph and read the diarized audio stream.
+
+You get everything from Surface 1, PLUS:
+- Live STT events (`meeting.transcript.partial/final`) feeding the
+  dossier in real time.
+- Speaker diarization with AAD ids resolved.
+- Live participant roster events.
+- Alfred visibly in the meeting roster ("Alfred" with the app
+  identity).
+- Real-time interventions (the agent can post "who's owning X?"
+  while the meeting is still happening).
+
+How to add — three paths, in order of automation:
+
+1. **Auto-join for channel meetings.** If the channel is attached
+   (`POST $BOT/api/channels/attach`, see §7.4) and the bot has
+   `auto_join_enabled: true`, the bot joins automatically when
+   Teams posts a `callStartedEventMessageDetail` system message.
+   No per-meeting action needed.
+2. **Manual join via the bot API.** `POST $BOT/api/calling/join`
+   with the meeting's `joinUrl`. Surfaces 502/7504/7505 if the
+   tenant calling policy isn't granted; see §7.1.
+3. **Invite the bot's service account** to the meeting via the
+   organizer's calendar invite. The bot answers the call when it
+   starts. Same `CsApplicationAccessPolicy` gate as above.
+
+All three paths require the Sandbox `CsApplicationAccessPolicy`
+gate to be open (§7.1 Gate 2) — without that, every join attempt
+returns 7504/7505.
+
+### Doing both — and the "double response" concern
+
+**Yes, you can (and often should) do both.** "+Apps" gives the
+chat surface; the call-participant path adds audio on top. They are
+additive, not duplicative.
+
+**No, you don't get double agent responses from doing both.** Here's
+why:
+
+- Alfred is **one bot** with one identity (`AppId 207a38a4-…`,
+  display name "Alfred"). Both surfaces feed events into the SAME
+  `AlfredAnalyzer` instance scoped to the same chat thread.
+- The analyzer is **event-driven and debounced** (`drain-now` per
+  `python/meeting_agent/debounce.py`). Each tick is ONE LLM call
+  that produces AT MOST one `send_to_meeting_chat` invocation.
+- The session-side **merge logic** (`session.apply_extraction`)
+  is idempotent on `id` — if Sarah says "I'll handle deploy" in
+  chat and the audio transcript captures the same statement, both
+  events flow through the SAME action_item id and the second
+  observation just updates (not duplicates) the existing item.
+- The new prompt's **Principle B** ("every tick, re-assess the
+  whole dossier") explicitly tells the model to recognize that a
+  transcript echo of a chat message is the same content, not a new
+  commitment.
+
+What changes when you add both surfaces:
+- The agent has MORE data per tick (chat AND audio), so it ticks
+  more often. Total agent activity goes up, but per-event response
+  rate is unchanged.
+- Total reply volume from the agent goes up only modestly — the
+  silence-default still applies to chat output. You'll see more
+  posts because the agent has more reason to speak (it now knows
+  who said what verbatim, not just what was typed).
+- The dossier becomes richer — direct quotes, owner attribution
+  from speaker diarization, real-time status escalation as the
+  room agrees in audio after a chat proposal.
+
+There are scenarios where you'd want only ONE surface:
+- **"+Apps" only** for meetings where you want post-meeting
+  retrieval + chat presence but find live agent posts intrusive,
+  OR where the tenant policy gate isn't open for call join.
+- **Call-only (no +Apps)** is unusual — chat events come via the
+  chat-resource subscription which requires the +Apps install. You'd
+  effectively be getting audio-only Alfred, which works but loses
+  the chat context that gives the dossier most of its richness.
+
+For the common case (Disney Sandbox internal meetings where you
+want the full Alfred experience): do BOTH. "+Apps" first, then —
+once the calling policy is open — let auto-join handle the audio
+surface, or hit the manual join endpoint.
