@@ -308,34 +308,73 @@ export function ArchiveBrowser() {
     return acc;
   }, [prefix, maps]);
 
-  // Prefix ordering: alphabetical by default, BUT when browsing
-  // meetings/ we want most-recent-first by the matching V2Meeting's
-  // actual/scheduled start time (mirrors MeetingList's sort). Folders
-  // we don't recognize in v2ListMeetings sink down (epoch 0). Outside
-  // meetings/ the order falls back to the alphabetic sort already
-  // applied in listAll().
+  // Folder mtime aggregation: for the current prefix, list ALL blobs
+  // (no delimiter) once, then take each blob's first path-segment-after-
+  // the-current-prefix as a bucket key and remember the max Last-Modified
+  // per bucket. The result lets us sort folders by "most recently
+  // touched" — which is what an operator actually wants when looking at
+  // a date-organized archive. Falls back to alphabetic for any folder
+  // with no observed activity (rare; folders only exist when blobs do).
+  const [folderMtimes, setFolderMtimes] = useState<Map<string, number>>(new Map());
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const mtimes = new Map<string, number>();
+        let marker: string | null = null;
+        let pages = 0;
+        do {
+          const params = new URLSearchParams({
+            restype: "container",
+            comp: "list",
+            maxresults: "5000",
+          });
+          if (prefix) params.set("prefix", prefix);
+          if (marker) params.set("marker", marker);
+          const res = await fetch(`${LIST_URL}?${params.toString()}`);
+          if (!res.ok) break;
+          const text = await res.text();
+          const doc = new DOMParser().parseFromString(text, "application/xml");
+          for (const node of Array.from(doc.querySelectorAll("Blob"))) {
+            const name = node.querySelector("Name")?.textContent ?? "";
+            const lm = node.querySelector("Properties > Last-Modified")?.textContent ?? "";
+            const ts = new Date(lm).getTime();
+            if (!Number.isFinite(ts)) continue;
+            // First path segment after the current prefix.
+            const rest = name.startsWith(prefix) ? name.slice(prefix.length) : name;
+            const slash = rest.indexOf("/");
+            const folder = slash > 0 ? rest.slice(0, slash) : "";
+            if (!folder) continue;
+            const prev = mtimes.get(folder) ?? 0;
+            if (ts > prev) mtimes.set(folder, ts);
+          }
+          marker = (doc.querySelector("NextMarker")?.textContent ?? "").trim() || null;
+          pages += 1;
+          if (pages > 20) break; // 20 * 5000 = 100k blobs; far beyond typical
+        } while (marker);
+        if (!cancelled) setFolderMtimes(mtimes);
+      } catch {
+        // Silent — sort just falls back to alphabetic.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [prefix]);
+
+  // Sort prefixes by newest blob inside them (descending). Folders with
+  // no observed activity sink to the bottom, then alphabetic tiebreak.
   const sortedPrefixes = useMemo(() => {
-    if (!prefix.startsWith("meetings/")) return prefixes;
-    const ts = new Map<string, number>();
-    for (const m of meetings) {
-      const raw = m.actual_start_utc || m.scheduled_start_utc;
-      if (!raw) continue;
-      const n = new Date(raw).getTime();
-      if (!Number.isFinite(n)) continue;
-      // Sanitized form is what the blob folder name uses.
-      const sanitize = (raw: string) => raw.replace(/[^a-zA-Z0-9\-_.]/g, "_");
-      if (m.meeting_id) ts.set(sanitize(m.meeting_id), n);
-      if (m.meeting_chat_thread_id) ts.set(sanitize(m.meeting_chat_thread_id), n);
-    }
+    if (folderMtimes.size === 0) return prefixes;
     const getTs = (entry: PrefixEntry): number => {
       const segment = entry.name.replace(/\/$/, "").split("/").pop() ?? "";
-      return ts.get(segment) ?? 0;
+      return folderMtimes.get(segment) ?? 0;
     };
     return [...prefixes].sort((a, b) => {
       const diff = getTs(b) - getTs(a);
       return diff !== 0 ? diff : a.name.localeCompare(b.name);
     });
-  }, [prefix, prefixes, meetings]);
+  }, [prefixes, folderMtimes]);
 
   function navigateTo(newPrefix: string) {
     if (newPrefix) {
