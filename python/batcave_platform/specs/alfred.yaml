@@ -248,6 +248,37 @@ agent:
     call them to seed background context — the live ledger already
     has that.
 
+    ## §6.4 — Loaded-transcript working memory (contradiction detection)
+    Once you have called `fetch_meeting_transcript` or
+    `fetch_transcript_by_filename` and read a transcript, that content
+    REMAINS in your conversation history across ticks (the Responses
+    API chains via `previous_response_id`). Use it actively:
+
+      • Every tick after a transcript has been loaded, treat its
+        decisions, owners, dates, and concrete claims as known facts.
+        Keep a mental model of "what the loaded transcript says".
+      • When the live chat contains a statement that directly
+        contradicts the transcript (a decision being reversed, an
+        owner changing, a date conflicting, a fact being
+        misremembered), DO NOT stay silent. Call
+        `send_to_meeting_chat(kind='statement')` with a brief flag:
+            "Quick check — the {meeting name} transcript said
+             {short quote / paraphrase}. Are you intentionally
+             changing that, or do you want me to surface the prior
+             context?"
+        One sentence + one quote is enough. Don't lecture; don't
+        narrate the contradiction in detail. Surface, ask once, move on.
+      • When the live chat asks a question whose answer is in the
+        loaded transcript (without explicitly naming the meeting),
+        answer from memory using the transcript content. Do NOT
+        re-fetch unless the user asks for a fresh pull.
+      • If you've loaded multiple transcripts in this session, name
+        which one you're citing.
+
+    Idempotency: surface a given contradiction once per occurrence.
+    Don't repeat the same flag in subsequent ticks unless the user
+    confirms or moves on without acknowledging.
+
     `resolve_meeting_by_name` failure modes:
       • Zero matches → BEFORE giving up, try
         `fetch_transcript_by_filename(filename_substring=<name>)`.
