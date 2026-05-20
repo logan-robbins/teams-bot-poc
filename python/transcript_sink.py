@@ -36,7 +36,7 @@ from typing import Annotated, Any, AsyncIterator, TypedDict
 import aiofiles
 import httpx
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -3569,12 +3569,15 @@ async def v2_get_meeting_transcript(
     meeting_id: str,
     state: AppStateDep,
 ) -> dict[str, Any]:
-    """Proxy the official meeting transcript from blob storage.
+    """Return the meeting transcript.
 
-    The C# bot writes the post-meeting Record-and-Transcribe transcript
-    to ``meetings/{meeting_id}/transcripts/official.txt`` (clean,
-    speaker-per-line plaintext) and ``official.vtt`` (raw WebVTT).
-    Both URLs are returned so consumers can pick.
+    Checks two sources, in order:
+      1. **Operator-uploaded** transcript (sqlite `transcript_uploads`):
+         set via `POST /v2/meetings/{meeting_id}/transcript-upload` when
+         the bot's Graph fetch path can't auto-retrieve. Highest priority
+         because an operator explicitly attached it.
+      2. **Bot-written** blob at `meetings/{sanitized_meeting_id}/transcripts/official.txt`
+         — only present when the bot's transcript fetcher succeeded.
     """
     archive = _blob_archive_url()
     safe = _BLOB_PATH_UNSAFE_RE.sub("_", meeting_id)
@@ -3582,14 +3585,28 @@ async def v2_get_meeting_transcript(
     vtt_url = f"{archive}/meetings/{safe}/transcripts/official.vtt"
     text: str | None = None
     found = False
-    try:
-        async with _http_client() as client:
-            response = await client.get(txt_url)
-            if response.status_code == 200:
-                text = response.text
-                found = True
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("v2 transcript fetch failed: %s", exc)
+    source: str | None = None
+
+    # 1. Operator upload (sqlite).
+    store: SessionStore = state["store"]
+    uploaded = await asyncio.to_thread(store.get_uploaded_transcript, meeting_id)
+    if uploaded is not None:
+        text = uploaded.get("txt")
+        if text:
+            found = True
+            source = "operator_upload"
+
+    # 2. Bot-written blob fallback.
+    if not found:
+        try:
+            async with _http_client() as client:
+                response = await client.get(txt_url)
+                if response.status_code == 200:
+                    text = response.text
+                    found = True
+                    source = "bot_graph_fetch"
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("v2 transcript fetch failed: %s", exc)
     return {
         "schema_version": "alfred-v2",
         "meeting_id": meeting_id,
@@ -3597,7 +3614,115 @@ async def v2_get_meeting_transcript(
         "official_transcript_vtt_url": vtt_url,
         "available": found,
         "text": text,
+        "source": source,
     }
+
+
+@app.post("/v2/meetings/{meeting_id}/transcript-upload")
+async def v2_upload_meeting_transcript(
+    meeting_id: str,
+    state: AppStateDep,
+    file: UploadFile = File(...),
+    subject: str | None = Form(default=None),
+) -> dict[str, Any]:
+    """Manually upload a transcript for a meeting.
+
+    Used when the bot's Graph-based transcript fetcher can't reach the
+    transcript (e.g. RSC limitations, subscription not set up yet). Takes
+    the .vtt or .txt the operator downloaded from the Teams meeting chat
+    and stores it. Future `GET /v2/meetings/{meeting_id}/transcript`
+    calls return this content with `source="operator_upload"`.
+
+    Optional `subject` form field also updates the meeting registry —
+    handy when the bot couldn't auto-resolve the subject (e.g. it lacked
+    the RSC for `GET /chats/{id}` and never emitted `meeting.created`).
+    """
+    body = await file.read()
+    if not body:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="empty file body",
+        )
+    text = body.decode("utf-8", errors="replace")
+
+    filename = (file.filename or "").lower()
+    is_vtt = filename.endswith(".vtt") or text.lstrip().startswith("WEBVTT")
+    vtt = text if is_vtt else None
+    txt = _vtt_to_plaintext(text) if is_vtt else text
+
+    store: SessionStore = state["store"]
+    await asyncio.to_thread(
+        store.upsert_uploaded_transcript,
+        meeting_id,
+        txt,
+        vtt,
+        subject,
+    )
+
+    return {
+        "schema_version": "alfred-v2",
+        "meeting_id": meeting_id,
+        "ok": True,
+        "txt_bytes": len(txt),
+        "vtt_bytes": len(vtt) if vtt else 0,
+        "subject_updated": subject is not None,
+        "filename": file.filename,
+    }
+
+
+def _vtt_to_plaintext(vtt: str) -> str:
+    """Render a WebVTT transcript to clean speaker-per-line plaintext.
+
+    Mirrors the C# bot's `BlobEventArchive.RenderHumanReadableTranscript`
+    so an operator-uploaded VTT renders the same way the bot-fetched one
+    would have. Strips WebVTT timing lines and `<v Speaker>...</v>`
+    markup; emits `[hh:mm:ss] Speaker: text` per cue body.
+    """
+    out: list[str] = []
+    pending_start: str | None = None
+    body_lines: list[str] = []
+
+    def flush() -> None:
+        nonlocal pending_start, body_lines
+        if not body_lines:
+            return
+        body = "\n".join(body_lines).strip()
+        body_lines = []
+        if not body:
+            pending_start = None
+            return
+        prefix = f"[{pending_start}] " if pending_start else ""
+        speaker = ""
+        text = body
+        open_idx = body.find("<v ")
+        if open_idx >= 0:
+            close_idx = body.find(">", open_idx)
+            end_idx = body.find("</v>")
+            if close_idx > open_idx and end_idx > close_idx:
+                speaker = body[open_idx + 3 : close_idx].strip()
+                text = body[close_idx + 1 : end_idx].strip()
+        if speaker:
+            out.append(f"{prefix}{speaker}: {text}")
+        else:
+            out.append(f"{prefix}{text}")
+        pending_start = None
+
+    for raw_line in vtt.replace("\r\n", "\n").split("\n"):
+        line = raw_line.strip()
+        if not line:
+            flush()
+            continue
+        arrow = line.find(" --> ")
+        if arrow > 0 and len(line) > arrow + 5:
+            start = line[:arrow]
+            dot = start.find(".")
+            pending_start = start[:dot] if dot > 0 else start
+            continue
+        if line.startswith("WEBVTT") or line.startswith("NOTE"):
+            continue
+        body_lines.append(line)
+    flush()
+    return "\n".join(out) + "\n"
 
 
 @app.get("/v2/teams/{team_id}/channels/{channel_id}")

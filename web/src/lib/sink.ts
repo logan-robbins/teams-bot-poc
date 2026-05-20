@@ -224,6 +224,39 @@ export const sink = {
       `/v2/meetings/${encodeURIComponent(meetingId)}/transcript`,
     ),
 
+  /**
+   * Operator upload — drop the .vtt or .txt file the user downloaded
+   * from the Teams meeting chat into the meeting registry. The sink
+   * stores it in sqlite and serves it from
+   * `/v2/meetings/{id}/transcript` (which falls back to the bot-written
+   * blob if no upload exists). Optional ``subject`` also patches the
+   * meeting row so the UI can display a friendly name.
+   */
+  v2UploadMeetingTranscript: async (
+    meetingId: string,
+    file: File,
+    subject?: string,
+  ): Promise<{ ok: boolean; txt_bytes: number; vtt_bytes: number; subject_updated: boolean }> => {
+    const form = new FormData();
+    form.append("file", file, file.name);
+    if (subject && subject.trim()) {
+      form.append("subject", subject.trim());
+    }
+    const res = await fetch(
+      `${BASE}/v2/meetings/${encodeURIComponent(meetingId)}/transcript-upload`,
+      { method: "POST", body: form },
+    );
+    if (!res.ok) {
+      throw new Error(`POST /v2/meetings/${meetingId}/transcript-upload → ${res.status} ${await res.text()}`);
+    }
+    return (await res.json()) as {
+      ok: boolean;
+      txt_bytes: number;
+      vtt_bytes: number;
+      subject_updated: boolean;
+    };
+  },
+
   v2GetChannel: (teamId: string, channelId: string, opts: { limit?: number } = {}) => {
     const params = new URLSearchParams();
     if (opts.limit !== undefined) params.set("limit", String(opts.limit));

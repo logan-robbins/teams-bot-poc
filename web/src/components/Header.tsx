@@ -1,5 +1,7 @@
-import { Moon } from "lucide-react";
+import { useRef, useState } from "react";
+import { Moon, Upload } from "lucide-react";
 import { StatusBadge } from "./StatusBadge";
+import { sink } from "../lib/sink";
 import type { SessionSummary } from "../lib/types";
 
 interface Props {
@@ -7,14 +9,61 @@ interface Props {
   muted: boolean;
   chatThreadId?: string;
   onEnd: () => void;
+  /** Called after a successful transcript upload so the dossier refreshes. */
+  onTranscriptUploaded?: () => void;
 }
 
-export function Header({ session, muted, chatThreadId, onEnd }: Props) {
+type UploadState =
+  | { kind: "idle" }
+  | { kind: "uploading" }
+  | { kind: "ok"; subject_updated: boolean; txt_bytes: number }
+  | { kind: "error"; message: string };
+
+export function Header({ session, muted, chatThreadId, onEnd, onTranscriptUploaded }: Props) {
   const active = !!session?.active;
   const label = session?.candidate_name || "Awaiting instruction";
   // Show the URL-bound chat_thread_id so operators can confirm at a
   // glance which meeting the dossier is wired to.
   const threadLabel = chatThreadId || session?.meeting_url || "";
+
+  const fileInput = useRef<HTMLInputElement>(null);
+  const [uploadState, setUploadState] = useState<UploadState>({ kind: "idle" });
+
+  async function handleFile(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file || !chatThreadId) return;
+
+    // Prompt for a meeting title when we have no candidate_name to use as
+    // the meeting subject. Skip the prompt if the dossier already knows
+    // who the meeting is with.
+    const inferredSubject = session?.candidate_name?.trim();
+    const subject =
+      inferredSubject && inferredSubject.length > 0
+        ? inferredSubject
+        : window.prompt(
+            "Optional: give this meeting a title so it shows up by name in the UI (leave blank to skip):",
+            "",
+          ) || undefined;
+
+    setUploadState({ kind: "uploading" });
+    try {
+      const res = await sink.v2UploadMeetingTranscript(chatThreadId, file, subject);
+      setUploadState({
+        kind: "ok",
+        subject_updated: res.subject_updated,
+        txt_bytes: res.txt_bytes,
+      });
+      onTranscriptUploaded?.();
+      // Auto-clear the status after a few seconds.
+      window.setTimeout(() => setUploadState({ kind: "idle" }), 4000);
+    } catch (err) {
+      setUploadState({
+        kind: "error",
+        message: err instanceof Error ? err.message : "Upload failed",
+      });
+    }
+  }
 
   return (
     <header className="flex items-center justify-between border-b border-ink-800 bg-ink-950/80 px-6 py-3 backdrop-blur">
@@ -48,6 +97,44 @@ export function Header({ session, muted, chatThreadId, onEnd }: Props) {
 
       <div className="flex items-center gap-3">
         <StatusBadge active={active} muted={muted} />
+
+        {/* Upload transcript — manual fallback when Microsoft Graph fetch
+            can't auto-retrieve. Accepts the .vtt or .txt the user
+            downloaded from the Teams meeting chat. */}
+        {chatThreadId ? (
+          <>
+            <input
+              ref={fileInput}
+              type="file"
+              accept=".vtt,.txt,text/vtt,text/plain"
+              hidden
+              onChange={handleFile}
+            />
+            <button
+              type="button"
+              onClick={() => fileInput.current?.click()}
+              disabled={uploadState.kind === "uploading"}
+              title="Upload a transcript file (.vtt or .txt) that you downloaded from the Teams meeting chat"
+              className="flex items-center gap-1.5 rounded-md border border-gold-500/40 bg-gold-500/10 px-3 py-1.5 text-xs font-medium text-gold-300 transition hover:bg-gold-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <Upload size={12} />
+              {uploadState.kind === "uploading"
+                ? "Uploading…"
+                : uploadState.kind === "ok"
+                ? "Uploaded ✓"
+                : "Upload transcript"}
+            </button>
+            {uploadState.kind === "error" ? (
+              <span
+                className="font-mono text-[10px] text-crimson-400 max-w-[200px] truncate"
+                title={uploadState.message}
+              >
+                {uploadState.message}
+              </span>
+            ) : null}
+          </>
+        ) : null}
+
         {active ? (
           <button
             type="button"

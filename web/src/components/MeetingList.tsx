@@ -117,10 +117,7 @@ function MeetingRow({ meeting }: { meeting: V2Meeting }) {
   // chat thread id is the right surrogate. Fall back to meeting_id when
   // a meeting has never had a chat (rare).
   const linkKey = meeting.meeting_chat_thread_id || meeting.meeting_id;
-  const subject =
-    (meeting.subject && meeting.subject.trim()) ||
-    meeting.organizer?.display_name ||
-    meeting.meeting_id;
+  const subject = friendlyMeetingTitle(meeting);
   const start = meeting.actual_start_utc || meeting.scheduled_start_utc;
   const end = meeting.actual_end_utc || meeting.scheduled_end_utc;
   const isLive = Boolean(meeting.actual_start_utc) && !meeting.actual_end_utc;
@@ -187,4 +184,40 @@ function formatTime(iso: string): string {
   } catch {
     return iso;
   }
+}
+
+/**
+ * Pick the most human-readable label we can synthesize for a meeting.
+ * Preference order:
+ *   1. Explicit `subject` (set by the bot when Bot Framework's
+ *      Conversation.Name is available, or by an operator via the
+ *      transcript-upload form).
+ *   2. Organizer display name (e.g. "Logan Robbins's meeting") when we
+ *      know who scheduled it.
+ *   3. A date-derived placeholder ("Meeting on May 19") so the list never
+ *      shows the raw `19:meeting_...@thread.v2` id.
+ *   4. The raw meeting_id as the absolute last resort.
+ */
+export function friendlyMeetingTitle(meeting: V2Meeting): string {
+  const subj = meeting.subject?.trim();
+  if (subj) return subj;
+
+  const organizerName = meeting.organizer?.display_name?.trim();
+  if (organizerName) return `${organizerName}'s meeting`;
+
+  const rawTs =
+    meeting.actual_start_utc ||
+    meeting.scheduled_start_utc ||
+    meeting.last_event_utc ||
+    meeting.created_at_utc;
+  if (rawTs) {
+    const date = new Date(rawTs);
+    if (!Number.isNaN(date.valueOf())) {
+      return `Meeting on ${date.toLocaleDateString(undefined, {
+        month: "short",
+        day: "numeric",
+      })}`;
+    }
+  }
+  return meeting.meeting_id;
 }

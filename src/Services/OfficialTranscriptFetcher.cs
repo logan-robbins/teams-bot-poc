@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Globalization;
 using System.Net;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -39,6 +40,10 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
     private readonly ILogger<OfficialTranscriptFetcher> _logger;
     private readonly CancellationTokenSource _cts = new();
     private readonly ConcurrentDictionary<string, Task> _activeFetches = new(StringComparer.Ordinal);
+    // meetingId → organizerOid, so FetchVttAsync can reconstruct the
+    // user-scoped URL after TryFindTranscriptAsync hands off just the
+    // (meetingId, transcriptId) pair.
+    private readonly ConcurrentDictionary<string, string> _activeFetchOrganizers = new(StringComparer.Ordinal);
     private bool _disposed;
 
     public OfficialTranscriptFetcher(
@@ -77,6 +82,7 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
         }
 
         var pending = new PendingFetch(botCallId, organizerOid, meetingChatThreadId, registeredAtUtc);
+        _activeFetchOrganizers[botCallId] = organizerOid;
 
         _activeFetches.GetOrAdd(botCallId, _ => Task.Run(() => RunAsync(pending, _cts.Token)));
     }
@@ -131,25 +137,35 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
         finally
         {
             _activeFetches.TryRemove(pending.BotCallId, out _);
+            _activeFetchOrganizers.TryRemove(pending.BotCallId, out _);
         }
     }
 
     private async Task<(string? MeetingId, string? TranscriptId, string? CreatedAt)>
         TryFindTranscriptAsync(PendingFetch pending, CancellationToken cancellationToken)
     {
-        // ISO 8601 with millisecond precision, no offset (Graph requires UTC `Z`).
-        var sinceIso = pending.RegisteredAtUtc.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ss.fffZ");
-        var encodedSince = WebUtility.UrlEncode(sinceIso);
-        var teamsAppId = _botConfig.AppId ?? string.Empty;
-        // App-scoped endpoint — gated by the OnlineMeetingTranscript.Read.Chat
-        // RSC consented at team install, NOT by any tenant-wide app permission.
-        // appCatalogs/.../installedToOnlineMeetings/getAllTranscripts only
-        // exists on the Graph BETA channel; v1.0 returns 400 "Resource not
-        // found for the segment 'installedToOnlineMeetings'." so build an
-        // absolute URL pinned to /beta/.
+        // List transcripts for the (organizer, onlineMeeting) pair.
+        // Matches the Microsoft sample at OfficeDev/Microsoft-Teams-Samples
+        // (`samples/meetings-transcription/csharp`) — the per-meeting
+        // /users/{userId}/onlineMeetings/{meetingId}/transcripts endpoint
+        // is authorized by either the tenant-wide
+        // OnlineMeetingTranscript.Read.All or our chat-scoped RSC
+        // OnlineMeetingTranscript.Read.Chat (the latter when the bot is
+        // installed in the meeting chat). The previously-used
+        // appCatalogs/.../installedToOnlineMeetings/getAllTranscripts
+        // path is a CHANGE-NOTIFICATION subscription target, NOT a GET
+        // endpoint — calling it as GET returns "404 Requested API is not
+        // supported".
+        if (string.IsNullOrWhiteSpace(pending.OrganizerOid)
+            || string.IsNullOrWhiteSpace(pending.BotCallId))
+        {
+            return (null, null, null);
+        }
+
         var resource =
-            $"https://graph.microsoft.com/beta/appCatalogs/teamsApps/{Uri.EscapeDataString(teamsAppId)}/installedToOnlineMeetings/getAllTranscripts" +
-            $"?$filter=createdDateTime ge {encodedSince}&$orderby=createdDateTime asc&$top=5";
+            $"https://graph.microsoft.com/v1.0/users/{Uri.EscapeDataString(pending.OrganizerOid)}" +
+            $"/onlineMeetings/{Uri.EscapeDataString(pending.BotCallId)}/transcripts" +
+            "?$orderby=createdDateTime desc&$top=5";
 
         try
         {
@@ -158,28 +174,41 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
             {
                 return (null, null, null);
             }
+            // pending.RegisteredAtUtc is our "look back from here" anchor.
+            // Microsoft's transcripts API doesn't filter by createdDateTime
+            // server-side reliably, so we filter client-side: only consider
+            // transcripts created after our register time minus a 24h
+            // grace window (handles transcripts that landed before the
+            // fetcher was registered — see DebugController which defaults
+            // RegisteredAtUtc to 24h back for that reason).
+            var minCreated = pending.RegisteredAtUtc.UtcDateTime.AddHours(-1);
             foreach (var item in arr.EnumerateArray())
             {
-                var meetingId = item.TryGetProperty("meetingId", out var m) ? m.GetString() : null;
                 var transcriptId = item.TryGetProperty("id", out var i) ? i.GetString() : null;
                 var createdAt = item.TryGetProperty("createdDateTime", out var c) ? c.GetString() : null;
-                if (!string.IsNullOrEmpty(meetingId) && !string.IsNullOrEmpty(transcriptId))
+                if (string.IsNullOrEmpty(transcriptId)) continue;
+                if (!string.IsNullOrEmpty(createdAt)
+                    && DateTimeOffset.TryParse(createdAt, CultureInfo.InvariantCulture,
+                        DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                        out var parsed)
+                    && parsed.UtcDateTime < minCreated)
                 {
-                    return (meetingId, transcriptId, createdAt);
+                    continue;
                 }
+                return (pending.BotCallId, transcriptId, createdAt);
             }
         }
         catch (GraphApiException ex) when (ex.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.Forbidden)
         {
             _logger.LogDebug(
-                "getAllTranscripts returned {Status} for app={AppId}; polling will retry.",
-                ex.StatusCode, _botConfig.AppId);
+                "List transcripts returned {Status} for organizer={Oid} meeting={Mid}; polling will retry.",
+                ex.StatusCode, pending.OrganizerOid, pending.BotCallId);
         }
         catch (Exception ex)
         {
             _logger.LogDebug(ex,
-                "getAllTranscripts probe failed for app={AppId}; polling will retry.",
-                _botConfig.AppId);
+                "List transcripts probe failed for organizer={Oid} meeting={Mid}; polling will retry.",
+                pending.OrganizerOid, pending.BotCallId);
         }
 
         return (null, null, null);
@@ -190,12 +219,23 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
         string transcriptId,
         CancellationToken cancellationToken)
     {
-        var teamsAppId = _botConfig.AppId ?? string.Empty;
-        // App-scoped content fetch — same RSC as the list call, same
-        // beta-only endpoint pinning.
+        // The list call returned a meetingId equal to pending.BotCallId
+        // and was scoped to pending.OrganizerOid; reuse those for the
+        // content fetch URL. Caller passes meetingId verbatim from
+        // TryFindTranscriptAsync; we need the organizer too, so look it
+        // up from the active fetch table.
+        var organizerOid = _activeFetchOrganizers.GetValueOrDefault(meetingId);
+        if (string.IsNullOrWhiteSpace(organizerOid))
+        {
+            _logger.LogWarning(
+                "FetchVttAsync: no organizer cached for meetingId={MeetingId}; cannot fetch.",
+                meetingId);
+            return null;
+        }
+
         var resource =
-            $"https://graph.microsoft.com/beta/appCatalogs/teamsApps/{Uri.EscapeDataString(teamsAppId)}/installedToOnlineMeetings/" +
-            $"{Uri.EscapeDataString(meetingId)}/transcripts/{Uri.EscapeDataString(transcriptId)}/content" +
+            $"https://graph.microsoft.com/v1.0/users/{Uri.EscapeDataString(organizerOid)}" +
+            $"/onlineMeetings/{Uri.EscapeDataString(meetingId)}/transcripts/{Uri.EscapeDataString(transcriptId)}/content" +
             "?$format=text/vtt";
         try
         {

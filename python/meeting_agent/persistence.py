@@ -244,6 +244,22 @@ CREATE INDEX IF NOT EXISTS idx_meetings_chat_thread
 CREATE INDEX IF NOT EXISTS idx_meetings_channel
     ON meetings(channel_team_id, channel_id);
 
+-- Operator-uploaded transcript content. Used when the bot's Graph-based
+-- transcript fetcher can't auto-retrieve (e.g. RSC limitations); an
+-- operator drops the file from the Teams meeting chat into the web UI
+-- and POSTs it to /v2/meetings/{meeting_id}/transcript-upload. The
+-- v2/meetings/{id}/transcript endpoint serves this content with
+-- source="operator_upload" when present, falling back to the bot-
+-- written blob otherwise. Keyed on the meeting_id the operator supplied
+-- (which may be the chat thread id when canonical isn't available).
+CREATE TABLE IF NOT EXISTS transcript_uploads (
+    meeting_id      TEXT PRIMARY KEY,
+    txt             TEXT,
+    vtt             TEXT,
+    subject         TEXT,
+    uploaded_at_utc TEXT NOT NULL
+);
+
 -- alfred-v2: raw envelope archive. One row per inbound POST to
 -- /v2/events so we can always replay the wire history without
 -- re-deriving from the per-session ledger.
@@ -1284,6 +1300,62 @@ class SessionStore:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM meetings WHERE meeting_id = ?",
+                (meeting_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def upsert_uploaded_transcript(
+        self,
+        meeting_id: str,
+        txt: Optional[str],
+        vtt: Optional[str],
+        subject: Optional[str],
+    ) -> None:
+        """Store an operator-uploaded transcript for ``meeting_id``.
+
+        If ``subject`` is provided, also UPDATE the meetings registry so
+        ``/v2/meetings`` returns the operator-supplied subject. Insert a
+        meetings row if one doesn't exist yet (needed for "+Apps"
+        meetings the bot never emitted a `meeting.created` for).
+        """
+        now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO transcript_uploads
+                    (meeting_id, txt, vtt, subject, uploaded_at_utc)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(meeting_id) DO UPDATE SET
+                    txt = excluded.txt,
+                    vtt = excluded.vtt,
+                    subject = COALESCE(excluded.subject, transcript_uploads.subject),
+                    uploaded_at_utc = excluded.uploaded_at_utc
+                """,
+                (meeting_id, txt, vtt, subject, now_iso),
+            )
+            if subject is not None and subject.strip():
+                # Upsert subject onto the meetings registry so list/get
+                # endpoints expose it. Insert a row if the bot never
+                # emitted meeting.created for this meeting.
+                conn.execute(
+                    """
+                    INSERT INTO meetings
+                        (meeting_id, meeting_chat_thread_id, subject,
+                         last_event_utc, created_at_utc, updated_at_utc)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(meeting_id) DO UPDATE SET
+                        subject = excluded.subject,
+                        last_event_utc = excluded.last_event_utc,
+                        updated_at_utc = excluded.updated_at_utc
+                    """,
+                    (meeting_id, meeting_id, subject.strip(), now_iso, now_iso, now_iso),
+                )
+
+    def get_uploaded_transcript(self, meeting_id: str) -> Optional[dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT txt, vtt, subject, uploaded_at_utc FROM transcript_uploads"
+                " WHERE meeting_id = ?",
                 (meeting_id,),
             ).fetchone()
         return dict(row) if row else None

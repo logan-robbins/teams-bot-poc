@@ -36,6 +36,9 @@ public sealed class AlfredBot : TeamsActivityHandler
     private readonly BotConfiguration _botConfig;
     private readonly GraphApiClient _graph;
     private readonly GraphMetadataResolver _metadataResolver;
+    private readonly OfficialTranscriptFetcher _transcriptFetcher;
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _publishedMeetingCreated =
+        new(StringComparer.Ordinal);
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _publishedLinks =
         new(StringComparer.Ordinal);
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTimeOffset> _meetingJoinAttempts =
@@ -53,6 +56,7 @@ public sealed class AlfredBot : TeamsActivityHandler
         BotConfiguration botConfig,
         GraphApiClient graph,
         GraphMetadataResolver metadataResolver,
+        OfficialTranscriptFetcher transcriptFetcher,
         ILogger<AlfredBot> logger)
     {
         _references = references;
@@ -65,6 +69,7 @@ public sealed class AlfredBot : TeamsActivityHandler
         _botConfig = botConfig;
         _graph = graph;
         _metadataResolver = metadataResolver;
+        _transcriptFetcher = transcriptFetcher;
         _logger = logger;
     }
 
@@ -455,6 +460,142 @@ public sealed class AlfredBot : TeamsActivityHandler
             // thread id. Resolve once per chat thread (cached).
             var canonicalMeetingId = await _metadataResolver.ResolveCanonicalMeetingIdAsync(
                 chatThreadId, cancellationToken) ?? chatThreadId;
+
+            // Use Bot Framework's TeamsInfo helper to pull the canonical
+            // Graph meeting id, organizer, and subject for this meeting
+            // chat. This is the SAME pattern Microsoft's official
+            // meetings-transcription sample uses
+            // (OfficeDev/Microsoft-Teams-Samples
+            // /samples/meetings-transcription/csharp/.../TranscriptionBot.cs),
+            // and it works with our RSC-only permissions because
+            // TeamsInfo goes through the Bot Framework Teams extension
+            // — not raw Graph endpoints that need Chat.ReadBasic.
+            //
+            // Net effect when this fires (first @-mention of Alfred in
+            // any +Apps meeting):
+            //   1. Subject populated  → UI shows the real meeting name.
+            //   2. Organizer captured → fetch_meeting_transcript has the
+            //      user id it needs for /users/{oid}/onlineMeetings/{id}.
+            //   3. Canonical meeting id mapped from the chat thread id
+            //      → /v2/meetings registry no longer collapses both ids
+            //      into the chat-thread fallback.
+            //   4. Transcript fetcher auto-registered with the right
+            //      (meetingId, organizerOid) — when the meeting ends
+            //      with R+T on, the bot pulls the transcript itself.
+            if (_publishedMeetingCreated.TryAdd(chatThreadId, 1))
+            {
+                string? subject = null;
+                string? graphMeetingId = null;
+                SenderRef? organizer = null;
+
+                try
+                {
+                    var meetingInfo = await TeamsInfo.GetMeetingInfoAsync(
+                        turnContext, cancellationToken: cancellationToken);
+                    graphMeetingId = meetingInfo?.Details?.MsGraphResourceId;
+                    subject = meetingInfo?.Details?.Title?.Trim();
+                    var orgAadId = meetingInfo?.Organizer?.AadObjectId;
+                    if (!string.IsNullOrWhiteSpace(orgAadId))
+                    {
+                        organizer = new SenderRef
+                        {
+                            AadId = orgAadId,
+                            DisplayName = meetingInfo!.Organizer.Name,
+                        };
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex,
+                        "TeamsInfo.GetMeetingInfoAsync failed for ChatThreadId={ChatThreadId}; falling back to Conversation.Name",
+                        chatThreadId);
+                }
+
+                // Fallback chain for subject: TeamsInfo.Details.Title
+                // (best, post-fix) → activity.Conversation.Name (often
+                // the meeting title for +Apps installs) → null.
+                if (string.IsNullOrWhiteSpace(subject))
+                {
+                    var convName = activity.Conversation?.Name?.Trim();
+                    if (!string.IsNullOrWhiteSpace(convName))
+                    {
+                        subject = convName;
+                    }
+                }
+
+                // Use the canonical Graph meeting id if TeamsInfo gave
+                // one, otherwise stick with the chat-thread fallback we
+                // already resolved (canonicalMeetingId).
+                var resolvedMeetingId = !string.IsNullOrWhiteSpace(graphMeetingId)
+                    ? graphMeetingId!
+                    : canonicalMeetingId;
+
+                if (organizer is null && !string.IsNullOrWhiteSpace(sender.AadId))
+                {
+                    // Last-resort organizer fallback: the user who just
+                    // typed. They're not necessarily the organizer, but
+                    // populating SOMETHING beats null on the dossier.
+                    organizer = new SenderRef
+                    {
+                        AadId = sender.AadId,
+                        DisplayName = sender.DisplayName,
+                    };
+                }
+
+                try
+                {
+                    await _dispatcher.PublishAsync(
+                        new AlfredEventEnvelope
+                        {
+                            EventType = AlfredEventTypes.MeetingCreated,
+                            EventId = Guid.NewGuid().ToString("N"),
+                            Ts = DateTimeOffset.UtcNow.ToString("O"),
+                            MeetingRef = new MeetingRef
+                            {
+                                MeetingId = resolvedMeetingId,
+                                MeetingChatThreadId = chatThreadId,
+                                Subject = subject,
+                                Organizer = organizer,
+                            },
+                            ConversationReferenceId = chatThreadId,
+                            Payload = new MeetingLifecyclePayload
+                            {
+                                Subject = subject,
+                                Organizer = organizer,
+                            },
+                        },
+                        cancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex,
+                        "Failed to emit meeting.created from Bot Framework activity for ChatThreadId={ChatThreadId}",
+                        chatThreadId);
+                    _publishedMeetingCreated.TryRemove(chatThreadId, out _);
+                }
+
+                // Eagerly register the transcript fetcher so it's polling
+                // the moment a transcript appears. Idempotent — Register
+                // dedups on botCallId. Only meaningful when we have both
+                // the canonical meeting id AND organizer (the user-scoped
+                // Graph URL needs both).
+                if (!string.IsNullOrWhiteSpace(graphMeetingId)
+                    && organizer?.AadId is { } orgOid
+                    && !string.IsNullOrWhiteSpace(orgOid))
+                {
+                    _transcriptFetcher.Register(
+                        botCallId: graphMeetingId!,
+                        organizerOid: orgOid,
+                        meetingChatThreadId: chatThreadId,
+                        // Look back 24h so an already-completed meeting
+                        // whose transcript landed BEFORE this @-mention
+                        // still gets picked up.
+                        registeredAtUtc: DateTimeOffset.UtcNow.AddHours(-24));
+                    _logger.LogInformation(
+                        "Registered transcript fetcher from Bot Framework activity MeetingId={MeetingId} OrganizerOid={OrganizerOid} ChatThreadId={ChatThreadId}",
+                        graphMeetingId, orgOid, chatThreadId);
+                }
+            }
 
             var meetingPayload = new MeetingChatPayload
             {

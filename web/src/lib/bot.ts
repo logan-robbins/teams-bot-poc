@@ -220,6 +220,38 @@ export const bot = {
       body: JSON.stringify({ joinUrl, displayName }),
     }),
 
+  /**
+   * Manually register the official-transcript fetcher for a meeting. Use
+   * when Microsoft has produced the post-meeting transcript (R+T was on
+   * during the meeting) but the bot's auto-trigger didn't fire — e.g.
+   * for "+Apps" meetings whose chat-metadata resolve hit a 403 and
+   * skipped registration.
+   *
+   * The fetcher polls Graph for ~30 min looking for transcripts created
+   * since `registered_at_utc` (defaults to 24h back). When it finds one,
+   * it lands at `meetings/{meeting_id}/transcripts/official.txt`.
+   *
+   * `organizerOid` is required by the endpoint but used only as metadata
+   * on the fetch — any non-empty value works (the Graph URL uses the
+   * bot's app id, not the organizer).
+   */
+  fetchTranscript: (
+    meetingId: string,
+    organizerOid: string,
+    meetingChatThreadId?: string,
+  ) =>
+    json<{ ok: boolean; registered_key: string; registered_at_utc: string; note: string }>(
+      "/api/debug/fetch-transcript",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          meeting_id: meetingId,
+          organizer_oid: organizerOid,
+          meeting_chat_thread_id: meetingChatThreadId ?? meetingId,
+        }),
+      },
+    ),
+
   listDebugThreads: () => json<DebugThreadsResponse>("/api/debug/transcripts"),
 
   tailDebug: (

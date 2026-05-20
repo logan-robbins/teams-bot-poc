@@ -56,6 +56,7 @@ export function MeetingDossier({ chatThreadId }: Props) {
         muted={muted}
         chatThreadId={chatThreadId}
         onEnd={endSession}
+        onTranscriptUploaded={() => window.location.reload()}
       />
 
       <main

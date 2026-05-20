@@ -4,6 +4,7 @@ import { ChevronRight, Folder, FileText, ExternalLink, Moon } from "lucide-react
 import { bot, type ChannelAttachment } from "../lib/bot";
 import { sink, type V2Meeting } from "../lib/sink";
 import { TopNav } from "./TopNav";
+import { friendlyMeetingTitle } from "./MeetingList";
 
 /**
  * Read-only browser for the Azure Blob archive that mirrors every
@@ -165,15 +166,18 @@ function buildMeetingMap(meetings: V2Meeting[]) {
   const meetingMap = new Map<string, string>();
   const sanitize = (raw: string) => raw.replace(/[^a-zA-Z0-9\-_.]/g, "_");
   for (const m of meetings) {
-    const subject = (m.subject || "").trim();
-    if (!subject) continue;
+    // Use the same fallback chain as the meeting list so the archive
+    // never shows raw sanitized chat-thread ids when the bot couldn't
+    // resolve a subject (subject → organizer → date-derived).
+    const label = friendlyMeetingTitle(m);
+    if (!label || label === m.meeting_id) continue;
     if (m.meeting_id) {
-      meetingMap.set(m.meeting_id, subject);
-      meetingMap.set(sanitize(m.meeting_id), subject);
+      meetingMap.set(m.meeting_id, label);
+      meetingMap.set(sanitize(m.meeting_id), label);
     }
     if (m.meeting_chat_thread_id) {
-      meetingMap.set(m.meeting_chat_thread_id, subject);
-      meetingMap.set(sanitize(m.meeting_chat_thread_id), subject);
+      meetingMap.set(m.meeting_chat_thread_id, label);
+      meetingMap.set(sanitize(m.meeting_chat_thread_id), label);
     }
   }
   return meetingMap;
