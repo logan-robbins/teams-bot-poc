@@ -503,12 +503,20 @@ public sealed class AlfredBot : TeamsActivityHandler
                             DisplayName = meetingInfo!.Organizer.Name,
                         };
                     }
+                    _logger.LogInformation(
+                        "TeamsInfo.GetMeetingInfoAsync result ChatThreadId={ChatThreadId} MsGraphResourceId={MsGraphResourceId} Title={Title} OrganizerOid={OrganizerOid} OrganizerName={OrganizerName} ConversationName={ConvName}",
+                        chatThreadId,
+                        graphMeetingId ?? "(null)",
+                        subject ?? "(null)",
+                        orgAadId ?? "(null)",
+                        meetingInfo?.Organizer?.Name ?? "(null)",
+                        activity.Conversation?.Name ?? "(null)");
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogDebug(ex,
-                        "TeamsInfo.GetMeetingInfoAsync failed for ChatThreadId={ChatThreadId}; falling back to Conversation.Name",
-                        chatThreadId);
+                    _logger.LogWarning(ex,
+                        "TeamsInfo.GetMeetingInfoAsync failed for ChatThreadId={ChatThreadId} ConversationName={ConvName}; falling back",
+                        chatThreadId, activity.Conversation?.Name ?? "(null)");
                 }
 
                 // Fallback chain for subject: TeamsInfo.Details.Title

@@ -397,6 +397,45 @@ class InterviewSessionManager:
                     previous.display_name = event.display_name
                 return previous
 
+        # Alfred-outbound echo dedup. tools.send_to_meeting_chat appends a
+        # synthetic "alfred:{msg_id}" event right after posting so the next
+        # agent tick sees Alfred's own utterance. Bot Framework then
+        # round-trips the same outbound back as a "chat:{teams_msg_id}"
+        # event when the sink ingests the envelope. Without this guard,
+        # the dossier ledger ends up with the same Alfred reply twice
+        # (different event_id, same text, ~seconds apart).
+        if event.kind == "chat" and event.from_bot and self._session.meeting_events:
+            normalized = _normalize_text(event.text or "")
+            if normalized:
+                event_ts = _parse_utc_timestamp(event.timestamp_utc)
+                # Scan the last ~10 events backward for a from_bot match
+                # within 60s. Bound the scan so worst case stays O(1).
+                for previous in reversed(self._session.meeting_events[-10:]):
+                    if not previous.from_bot or previous.kind != "chat":
+                        continue
+                    prev_normalized = _normalize_text(previous.text or "")
+                    if prev_normalized != normalized:
+                        continue
+                    prev_ts = _parse_utc_timestamp(previous.timestamp_utc)
+                    if event_ts and prev_ts and abs((event_ts - prev_ts).total_seconds()) > 60:
+                        continue
+                    # Match: merge the incoming Teams message metadata
+                    # (real message_id, raw payload) onto the existing
+                    # alfred-synthetic entry so the ledger keeps one row
+                    # but gains the canonical Teams id.
+                    if event.message_id and not previous.message_id.startswith("alfred_"):
+                        # Already canonical — keep it.
+                        pass
+                    if previous.message_id and previous.message_id.startswith("alfred_") and event.message_id:
+                        previous.message_id = event.message_id
+                    if not previous.raw and event.raw is not None:
+                        previous.raw = event.raw
+                    if event.source_raw_event_ids:
+                        merged = set(previous.source_raw_event_ids or [])
+                        merged.update(event.source_raw_event_ids)
+                        previous.source_raw_event_ids = sorted(merged)
+                    return previous
+
         self._session.meeting_events.append(event)
         return event
 
