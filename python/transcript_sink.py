@@ -3181,7 +3181,7 @@ async def receive_v2_event_envelope(
     )
 
     raw_envelope_json = _stable_json(envelope.model_dump(mode="json", exclude_none=True))
-    await asyncio.to_thread(
+    was_new = await asyncio.to_thread(
         store.record_envelope,
         envelope.event_id,
         schema_version=envelope.schema_version,
@@ -3193,6 +3193,21 @@ async def receive_v2_event_envelope(
         channel_id=channel_id,
         thread_id=thread_id,
     )
+
+    # event_id-based dedup: if this envelope was already ingested in a
+    # prior call (Graph subscription replay, retry on transport error,
+    # or in-flight overlap during a sink container deploy), skip the
+    # dispatch entirely. Storage-layer dedup is enforced by
+    # ``INSERT OR IGNORE`` in record_envelope; the boolean return
+    # tells us whether THIS call wrote a new row. Without this guard,
+    # the AlfredAnalyzer would run twice for the same event and could
+    # produce duplicate send_to_meeting_chat calls.
+    if not was_new:
+        logger.info(
+            "Dedup: dropping duplicate v2 envelope event_id=%s type=%s",
+            envelope.event_id, envelope.event_type,
+        )
+        return {"ok": True, "event_id": envelope.event_id, "deduped": True}
 
     # Stamp every meeting.* event's metadata on the meetings registry so
     # subject / organizer / channel link survive bot restarts.

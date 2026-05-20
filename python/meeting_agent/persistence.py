@@ -1358,10 +1358,26 @@ class SessionStore:
         team_id: Optional[str] = None,
         channel_id: Optional[str] = None,
         thread_id: Optional[str] = None,
-    ) -> None:
-        """Append a raw v2 envelope row. Idempotent on ``envelope_id``."""
+    ) -> bool:
+        """Append a raw v2 envelope row. Idempotent on ``envelope_id``.
+
+        Returns:
+            True if a new row was inserted, False if the envelope_id
+            was already present (duplicate). Callers should skip
+            event dispatch when False — the analyzer has already
+            processed this event in a prior call.
+
+        Why this matters:
+            Graph subscription notifications can be delivered more
+            than once (documented Microsoft behavior), and during
+            sink container rolling deploys the brief termination
+            grace window can put a single event into both the
+            terminating and starting replicas. Without dedup, the
+            agent would analyze the same event twice and could
+            produce duplicate `send_to_meeting_chat` calls.
+        """
         with self._lock, self._connect() as conn:
-            conn.execute(
+            cur = conn.execute(
                 """
                 INSERT OR IGNORE INTO raw_ingest_envelopes (
                     envelope_id, schema_version, event_type, ts, received_at_utc,
@@ -1381,6 +1397,7 @@ class SessionStore:
                     raw_json,
                 ),
             )
+            return cur.rowcount > 0
 
     def list_thread_messages(
         self,
