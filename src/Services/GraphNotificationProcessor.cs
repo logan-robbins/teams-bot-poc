@@ -37,6 +37,18 @@ public sealed partial class GraphNotificationProcessor
     private readonly ConcurrentDictionary<string, byte> _attemptedJoins =
         new(StringComparer.Ordinal);
 
+    /// <summary>
+    /// Per-chat-thread latch so we emit <c>meeting.created</c> exactly
+    /// once per "+Apps"-installed meeting chat we see. The first chat
+    /// event on a previously-unseen meeting chat thread resolves
+    /// subject/organizer/scheduled times via Graph and emits a
+    /// metadata-rich <c>meeting.created</c> envelope so the sink's
+    /// <c>/v2/meetings</c> registry shows a real subject instead of
+    /// the raw chat-thread fallback id.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, byte> _meetingCreatedEmitted =
+        new(StringComparer.Ordinal);
+
     public GraphNotificationProcessor(
         EventFanoutDispatcher dispatcher,
         MeetingChatConfiguration config,
@@ -224,6 +236,15 @@ public sealed partial class GraphNotificationProcessor
                         ctx.Value.ChatThreadId);
                 }
 
+                // First chat event on a "+Apps"-installed meeting chat we
+                // haven't seen before: resolve subject + organizer +
+                // scheduled times via Graph and emit a metadata-rich
+                // meeting.created. Sink registry then shows a human-readable
+                // subject instead of the raw chat-thread fallback id.
+                // Best-effort; failures don't block the chat event.
+                await MaybeEmitMeetingCreatedForChatThreadAsync(
+                    ctx.Value.ChatThreadId, canonicalMeetingId, cancellationToken);
+
                 var meetingPayload = new MeetingChatPayload
                 {
                     MessageId = ctx.Value.MessageId,
@@ -255,6 +276,98 @@ public sealed partial class GraphNotificationProcessor
         finally
         {
             document?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Fires when Teams posts a <c>callStartedEventMessageDetail</c>
+    /// system message into a channel Alfred is attached to. Synthesizes
+    /// First chat event on a "+Apps"-installed meeting chat we haven't
+    /// seen → resolve subject/organizer/scheduled times via Graph and
+    /// emit a metadata-rich <c>meeting.created</c> envelope so the
+    /// sink's <c>/v2/meetings</c> shows a real subject instead of the
+    /// raw chat-thread fallback id. Idempotent (latched on chat thread
+    /// id), best-effort (Graph failures don't throw — we just retry on
+    /// the next chat event for that thread).
+    /// </summary>
+    private async Task MaybeEmitMeetingCreatedForChatThreadAsync(
+        string chatThreadId,
+        string? canonicalMeetingId,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(chatThreadId)) return;
+        if (!_meetingCreatedEmitted.TryAdd(chatThreadId, 1)) return;
+
+        try
+        {
+            var chat = await _metadataResolver.GetChatAsync(chatThreadId, cancellationToken);
+            string? subject = null;
+            string? scheduledStart = null;
+            string? scheduledEnd = null;
+            SenderRef? organizer = null;
+
+            // We can only fetch the full onlineMeeting record when we
+            // have BOTH the organizer's AAD id AND a canonical meeting
+            // id (not a chat-thread fallback). The fallback case still
+            // emits meeting.created with whatever we have.
+            if (chat?.OrganizerAadId is not null
+                && !string.IsNullOrWhiteSpace(canonicalMeetingId)
+                && !string.Equals(canonicalMeetingId, chatThreadId, StringComparison.Ordinal))
+            {
+                var meeting = await _metadataResolver.GetOnlineMeetingAsync(
+                    chat.OrganizerAadId, canonicalMeetingId, cancellationToken);
+                if (meeting is not null)
+                {
+                    subject = meeting.Subject;
+                    scheduledStart = meeting.ScheduledStartUtc;
+                    scheduledEnd = meeting.ScheduledEndUtc;
+                    organizer = new SenderRef
+                    {
+                        AadId = meeting.OrganizerAadId ?? chat.OrganizerAadId,
+                        DisplayName = meeting.OrganizerDisplayName,
+                    };
+                }
+            }
+
+            var resolvedMeetingId = canonicalMeetingId ?? chatThreadId;
+            var nowIso = DateTimeOffset.UtcNow.ToString("O");
+            await _dispatcher.PublishAsync(
+                new AlfredEventEnvelope
+                {
+                    EventType = AlfredEventTypes.MeetingCreated,
+                    EventId = Guid.NewGuid().ToString("N"),
+                    Ts = nowIso,
+                    MeetingRef = new MeetingRef
+                    {
+                        MeetingId = resolvedMeetingId,
+                        MeetingChatThreadId = chatThreadId,
+                        Subject = subject,
+                        Organizer = organizer,
+                        ScheduledStartUtc = scheduledStart,
+                        ScheduledEndUtc = scheduledEnd,
+                    },
+                    ConversationReferenceId = chatThreadId,
+                    Payload = new MeetingLifecyclePayload
+                    {
+                        Subject = subject,
+                        Organizer = organizer,
+                        ScheduledStartUtc = scheduledStart,
+                        ScheduledEndUtc = scheduledEnd,
+                    },
+                },
+                cancellationToken);
+
+            _logger.LogInformation(
+                "Emitted meeting.created for ChatThreadId={ChatThreadId} MeetingId={MeetingId} Subject={Subject} Organizer={Organizer}",
+                chatThreadId, resolvedMeetingId, subject ?? "(null)", organizer?.DisplayName ?? "(null)");
+        }
+        catch (Exception ex)
+        {
+            // Drop the latch so we retry on the next chat event for this thread.
+            _meetingCreatedEmitted.TryRemove(chatThreadId, out _);
+            _logger.LogWarning(ex,
+                "Failed to emit meeting.created for ChatThreadId={ChatThreadId}; will retry on next chat event.",
+                chatThreadId);
         }
     }
 

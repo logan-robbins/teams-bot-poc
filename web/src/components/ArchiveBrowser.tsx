@@ -308,6 +308,35 @@ export function ArchiveBrowser() {
     return acc;
   }, [prefix, maps]);
 
+  // Prefix ordering: alphabetical by default, BUT when browsing
+  // meetings/ we want most-recent-first by the matching V2Meeting's
+  // actual/scheduled start time (mirrors MeetingList's sort). Folders
+  // we don't recognize in v2ListMeetings sink down (epoch 0). Outside
+  // meetings/ the order falls back to the alphabetic sort already
+  // applied in listAll().
+  const sortedPrefixes = useMemo(() => {
+    if (!prefix.startsWith("meetings/")) return prefixes;
+    const ts = new Map<string, number>();
+    for (const m of meetings) {
+      const raw = m.actual_start_utc || m.scheduled_start_utc;
+      if (!raw) continue;
+      const n = new Date(raw).getTime();
+      if (!Number.isFinite(n)) continue;
+      // Sanitized form is what the blob folder name uses.
+      const sanitize = (raw: string) => raw.replace(/[^a-zA-Z0-9\-_.]/g, "_");
+      if (m.meeting_id) ts.set(sanitize(m.meeting_id), n);
+      if (m.meeting_chat_thread_id) ts.set(sanitize(m.meeting_chat_thread_id), n);
+    }
+    const getTs = (entry: PrefixEntry): number => {
+      const segment = entry.name.replace(/\/$/, "").split("/").pop() ?? "";
+      return ts.get(segment) ?? 0;
+    };
+    return [...prefixes].sort((a, b) => {
+      const diff = getTs(b) - getTs(a);
+      return diff !== 0 ? diff : a.name.localeCompare(b.name);
+    });
+  }, [prefix, prefixes, meetings]);
+
   function navigateTo(newPrefix: string) {
     if (newPrefix) {
       setSearchParams({ prefix: newPrefix });
@@ -377,13 +406,13 @@ export function ArchiveBrowser() {
           ) : null}
 
           {/* Folders */}
-          {prefixes.length > 0 ? (
+          {sortedPrefixes.length > 0 ? (
             <section className="mt-5">
               <h2 className="mb-2 text-[10px] font-mono uppercase tracking-widest text-ink-500">
-                Folders ({prefixes.length})
+                Folders ({sortedPrefixes.length})
               </h2>
               <ul className="space-y-1">
-                {prefixes.map((p) => {
+                {sortedPrefixes.map((p) => {
                   const trail = trailingSegment(p.name);
                   // Position in the path is "current depth" — strip the
                   // leading prefix that's already visited, count remaining
