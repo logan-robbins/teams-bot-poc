@@ -146,26 +146,30 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
     {
         // List transcripts for the (organizer, onlineMeeting) pair.
         // Matches the Microsoft sample at OfficeDev/Microsoft-Teams-Samples
-        // (`samples/meetings-transcription/csharp`) — the per-meeting
-        // /users/{userId}/onlineMeetings/{meetingId}/transcripts endpoint
-        // is authorized by either the tenant-wide
-        // OnlineMeetingTranscript.Read.All or our chat-scoped RSC
-        // OnlineMeetingTranscript.Read.Chat (the latter when the bot is
-        // installed in the meeting chat). The previously-used
-        // appCatalogs/.../installedToOnlineMeetings/getAllTranscripts
-        // path is a CHANGE-NOTIFICATION subscription target, NOT a GET
-        // endpoint — calling it as GET returns "404 Requested API is not
-        // supported".
+        // (`samples/meetings-transcription/csharp`).
+        //
+        // Two non-obvious twists vs. the sample:
+        // 1. The Graph URL needs the CANONICAL onlineMeeting.id (URL-safe
+        //    base64 of `1*{tenantId}*0**{chatThreadId}`), not the
+        //    `19:meeting_…@thread.v2` chat thread id. Derive deterministically
+        //    from pending.BotCallId when it's still in chat-thread form.
+        // 2. Append `?useResourceSpecificConsentBasedAuthorization=true`
+        //    so Graph evaluates our chat-scoped RSC
+        //    OnlineMeetingTranscript.Read.Chat (consented at "+Apps"
+        //    install) instead of demanding the tenant-wide
+        //    OnlineMeetingTranscript.Read.All. Without this flag the
+        //    user-scoped URL returns 403 with empty RSC grants.
         if (string.IsNullOrWhiteSpace(pending.OrganizerOid)
             || string.IsNullOrWhiteSpace(pending.BotCallId))
         {
             return (null, null, null);
         }
 
+        var canonicalMeetingId = ToCanonicalMeetingId(pending.BotCallId);
         var resource =
             $"https://graph.microsoft.com/v1.0/users/{Uri.EscapeDataString(pending.OrganizerOid)}" +
-            $"/onlineMeetings/{Uri.EscapeDataString(pending.BotCallId)}/transcripts" +
-            "?$orderby=createdDateTime desc&$top=5";
+            $"/onlineMeetings/{Uri.EscapeDataString(canonicalMeetingId)}/transcripts" +
+            "?$orderby=createdDateTime desc&$top=5&useResourceSpecificConsentBasedAuthorization=true";
 
         try
         {
@@ -233,10 +237,11 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
             return null;
         }
 
+        var canonicalMeetingId = ToCanonicalMeetingId(meetingId);
         var resource =
             $"https://graph.microsoft.com/v1.0/users/{Uri.EscapeDataString(organizerOid)}" +
-            $"/onlineMeetings/{Uri.EscapeDataString(meetingId)}/transcripts/{Uri.EscapeDataString(transcriptId)}/content" +
-            "?$format=text/vtt";
+            $"/onlineMeetings/{Uri.EscapeDataString(canonicalMeetingId)}/transcripts/{Uri.EscapeDataString(transcriptId)}/content" +
+            "?$format=text/vtt&useResourceSpecificConsentBasedAuthorization=true";
         try
         {
             return await _graph.GetResourceTextAsync(resource, "text/vtt", cancellationToken)
@@ -249,6 +254,28 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
                 meetingId, transcriptId);
             return null;
         }
+    }
+
+    /// <summary>
+    /// Convert a chat-thread-shaped meeting id
+    /// (<c>19:meeting_xxx@thread.v2</c>) into Microsoft Graph's canonical
+    /// <c>onlineMeeting.id</c> — URL-safe base64 of
+    /// <c>1*{tenantId}*0**{chatThreadId}</c>. Already-canonical ids
+    /// (no leading <c>19:</c>) pass through unchanged.
+    /// </summary>
+    private string ToCanonicalMeetingId(string meetingId)
+    {
+        if (string.IsNullOrWhiteSpace(meetingId)) return meetingId;
+        if (!meetingId.StartsWith("19:", StringComparison.Ordinal)) return meetingId;
+        var tenantId = _botConfig.TenantId ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(tenantId)) return meetingId;
+        var raw = $"1*{tenantId}*0**{meetingId}";
+        var bytes = System.Text.Encoding.UTF8.GetBytes(raw);
+        var b64 = Convert.ToBase64String(bytes)
+            .TrimEnd('=')
+            .Replace('+', '-')
+            .Replace('/', '_');
+        return b64;
     }
 
     private async Task EmitAsync(
