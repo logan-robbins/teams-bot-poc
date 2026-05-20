@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Moon, Upload } from "lucide-react";
 import { StatusBadge } from "./StatusBadge";
 import { sink } from "../lib/sink";
@@ -21,7 +21,46 @@ type UploadState =
 
 export function Header({ session, muted, chatThreadId, onEnd, onTranscriptUploaded }: Props) {
   const active = !!session?.active;
-  const label = session?.candidate_name || "Awaiting instruction";
+
+  // Prefer the v2 meetings-registry subject (operator-set or bot-emitted)
+  // over the in-memory session.candidate_name. The dossier's in-memory
+  // session lags the registry: when an operator uploads a transcript and
+  // renames the meeting via PATCH /v2/meetings, the session.candidate_name
+  // doesn't refresh on its own, so the header would otherwise show stale
+  // "Meeting" while the registry already says "Supermemory Meeting".
+  const [registrySubject, setRegistrySubject] = useState<string | null>(null);
+  useEffect(() => {
+    if (!chatThreadId) {
+      setRegistrySubject(null);
+      return;
+    }
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    async function tick() {
+      try {
+        const m = await sink.v2GetMeeting(chatThreadId!);
+        if (!cancelled) {
+          const subj = (m.subject || "").trim();
+          setRegistrySubject(subj.length > 0 ? subj : null);
+        }
+      } catch {
+        // ignore — fall back to session.candidate_name
+      } finally {
+        if (!cancelled) {
+          // Re-poll every 5s so a fresh rename / upload reflects quickly.
+          timer = setTimeout(tick, 5000);
+        }
+      }
+    }
+    tick();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [chatThreadId]);
+
+  const label =
+    registrySubject ?? session?.candidate_name ?? "Awaiting instruction";
   // Show the URL-bound chat_thread_id so operators can confirm at a
   // glance which meeting the dossier is wired to.
   const threadLabel = chatThreadId || session?.meeting_url || "";
