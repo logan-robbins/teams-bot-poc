@@ -124,10 +124,12 @@ different control:
 | **`disney.com` → WDI R&D subscription `e02c0038-...`** — the Azure subscription where the **infrastructure** runs | C# bot VM, Container Apps (sink + UI), ACR, Azure OpenAI, Speech Services, Storage account `stalfreddisney`, Bot Service registration | **Subscription Contributors.** We can deploy anything, change env vars, build images, restart services. **No** Entra-admin rights even here — Azure AD app-registration **Owners** can edit the Alfred app registration (`207a38a4-...`); other Entra-admin actions need a separate principal. |
 
 Concrete consequences:
-- **Anything that needs a tenant policy grant in Sandbox is out of
-  reach.** That includes `CsApplicationAccessPolicy` (the
-  7504/7505 unlock) and `OnlineMeetingTranscript.Read.All`. We
-  always have to find an RSC-only path or work around it.
+- **Anything that needs a tenant-wide grant in Sandbox is out of
+  reach.** That includes tenant-wide Graph `Calls.*` application
+  permissions, `CsApplicationAccessPolicy` changes for online-meeting
+  artifact APIs, and Microsoft support/account-team enablement for
+  Cloud Communications app-hosted media. We always have to prefer an
+  RSC-only path or route the admin/support action through Sandbox.
 - **The bot's App Registration owner** in WDI Entra determines the
   "via {UPN}" parenthetical Teams shows next to Alfred's chat
   messages. Change it via Azure Portal → Entra ID → App
@@ -149,7 +151,7 @@ Concrete consequences:
 | `python/meeting_agent/` | Canonical session/agent state. `tools.py` defines the two agent tools. | — | — |
 | `python/batcave_platform/specs/alfred.yaml` | **Sole source of truth** for Alfred's prompt + intervention policy | — | — |
 | `web/` | React 19 + Vite + Tailwind v4 | `npm run build` | `ca-alfred-web` Container App |
-| `manifest/` | Teams app manifest (currently **v1.0.11**, 16 RSCs) | `cd manifest && zip alfred-sandbox.zip manifest.json color.png outline.png` | Teams Admin Center / Developer Portal |
+| `manifest/` | Teams app manifest (currently **v1.0.12**, 16 RSCs) | `cd manifest && zip alfred-sandbox.zip manifest.json color.png outline.png` | Teams Admin Center / Developer Portal |
 | `scripts/deploy-azure-vm.sh` | One-shot bot VM deploy (Phase 1: bootstrap, Phase 2: publish + restart) | — | — |
 | `docs/` | Reference docs ([event-contract](docs/event-contract.md), [retrieving-transcripts](docs/retrieving-transcripts.md), STT comparisons, auto-invite setup) | — | — |
 
@@ -209,11 +211,16 @@ The manifest declares **16 RSCs**. Zero tenant-wide Entra app permissions.
 | `TeamSettings.Read.Group` | `GET /teams/{id}` for team display name |
 | `ChannelSettings.Read.Group` | `GET /teams/{id}/channels/{id}` for channel display name |
 
-**Runtime gate outside RSC:** tenant `CsApplicationAccessPolicy` /
-`CsTeamsCallingPolicy`. If a join returns `502 CALL_JOIN_FAILED_7504_OR_7505`,
-that's a tenant policy, not a permission — Teams admin must grant the
-bot's AppId via `Grant-CsApplicationAccessPolicy` and/or
-`Set-CsTeamsAppPermissionPolicy`.
+**Runtime gate outside RSC:** a `502 CALL_JOIN_FAILED_7504_OR_7505`
+means Graph rejected `/communications/calls` before media was
+established. Do not treat this as only `CsApplicationAccessPolicy`
+propagation. As of 2026-05-21 the deployed Sandbox app registration
+has `requiredResourceAccess: []`, so Alfred has no tenant-wide Graph
+`Calls.*` application roles and can only use RSC for meetings/chats
+where the Teams app is installed. Joining arbitrary meeting URLs needs
+Sandbox admin consent for tenant-wide calling/media permissions and may
+also need Microsoft Teams / Graph Cloud Communications app-hosted-media
+tenant enablement.
 
 **Adding a new RSC requires re-installing on the team** — Teams binds
 RSC scopes at install time, so the team must update or reinstall
@@ -280,14 +287,10 @@ polling consumer needs to keep working through the cutover, and
 
 ### 7.1 Call-join failures (the most common, most-frustrating bug)
 
-For org-internal calling bots there are **two real authorization gates**.
-Both must be in place before any join can succeed; once both are in
-place, real-time audio flows. There is **no separate Microsoft "RTM
-allowlist" review** for org-internal bots — verified empirically against
-a parallel Alfred deployment in another tenant (`qmachina.com`) where
-audio works with zero Microsoft submissions. The historical
-`aka.ms/teams-rtm-onboarding` process applies to AppSource publication,
-not to org-internal use.
+For Alfred's current RSC-only design there are **three authorization
+boundaries**. Do not collapse them into "wait for
+`CsApplicationAccessPolicy` propagation"; that was the wrong conclusion
+for the 2026-05-21 investigation.
 
 **Gate 1 — Bot channel calling config (in the Azure Bot resource).**
 `MsTeamsChannel.incomingCallRoute` must be `graphPma`. With it `null`,
@@ -300,25 +303,58 @@ az rest --method PATCH \
   --body '{"location":"global","properties":{"channelName":"MsTeamsChannel","properties":{"enableCalling":true,"incomingCallRoute":"graphPma","callingWebhook":"https://alfred-disney-bot.eastus.cloudapp.azure.com/api/calling","deploymentEnvironment":"CommercialDeployment","isEnabled":true,"isTeamsIvrEnabled":false,"acceptedTerms":false}}}'
 ```
 
-**Gate 2 — Tenant calling policy (`CsApplicationAccessPolicy`) in the
-*meeting* tenant.** Must be granted in **Sandbox** (`plutosdoghouse.com`),
-not WDI. The policy is enforced by Teams in the tenant whose users /
-meetings the bot acts on; granting it in WDI is a no-op because no
-Teams meetings happen there. Requires a Sandbox Teams admin:
+**Gate 2 — Permission model for this specific meeting.** Alfred's
+manifest has `Calls.JoinGroupCalls.Chat` and `Calls.AccessMedia.Chat`.
+Those are RSC permissions; they only authorize calls associated with a
+chat/meeting where the Teams app is installed. They do **not** authorize
+"join any meeting URL" by themselves. As of 2026-05-21, the Sandbox
+Entra app registration has `requiredResourceAccess: []`, so there are
+no tenant-wide Graph `Calls.*` application roles on the app. To use
+arbitrary meeting URLs, a Sandbox admin must add and admin-consent
+tenant-wide Graph permissions such as `Calls.JoinGroupCall.All` and
+`Calls.AccessMedia.All`.
 
-```powershell
-Connect-MicrosoftTeams -TenantId 38387f0b-9a6f-46e2-8373-67422f8c2cb0
-New-CsApplicationAccessPolicy -Identity "AlfredOnlineMeetingsPolicy" `
-  -AppIds "207a38a4-67c5-4ef9-ada8-ea7998734d59" `
-  -Description "Allow Alfred to join online meetings via Graph"
-Grant-CsApplicationAccessPolicy -PolicyName "AlfredOnlineMeetingsPolicy" -Global
+Verify the current Sandbox app registration:
+
+```bash
+az account set --subscription 38387f0b-9a6f-46e2-8373-67422f8c2cb0
+az ad app show --id 207a38a4-67c5-4ef9-ada8-ea7998734d59 \
+  --query '{signInAudience:signInAudience,requiredResourceAccess:requiredResourceAccess}' -o json
+az account set --subscription e02c0038-82c8-4655-9647-38083f301099
 ```
+
+**Gate 3 — Sandbox tenant Cloud Communications media eligibility.**
+If Gate 1 is correct and Graph still returns `403` with
+`Insufficient enterprise tenant permissions, cannot access this API`,
+the block is at the Microsoft Graph Communications / Teams media
+authorization layer before Alfred's media socket is reached. Microsoft
+2026 Q&A for this exact 7504 payload says app-hosted media calling bots
+may require tenant eligibility/enablement through Microsoft Teams /
+Graph Cloud Communications support, even when app permissions, calling
+config, manifest, and policies appear correct.
+
+`CsApplicationAccessPolicy` still matters for some online-meeting
+application-permission APIs and may be an admin prerequisite in
+tenant-wide call setups, but Microsoft's current application-access-
+policy doc lists OnlineMeetings / artifact / transcript / recording /
+virtual-event permissions, not `Calls.*`. Treat it as a prerequisite to
+verify, not as the full explanation for 7504.
+
+**SDK state as of 2026-05-21:** `src/TeamsMediaBot.csproj` is on the
+latest stable Graph Communications package family
+`Microsoft.Graph.Communications.*` `1.2.0.15690` (released
+2025-10-24). NuGet also lists `1.2.0-beta.16019` (2026-02-25). The
+latest stable SDK being installed means the immediate 403 is not caused
+by an obviously stale stable SDK, but Microsoft support may still ask
+for a beta-package validation because the app-hosted-media guidance says
+to stay on the newest available media library or a version less than
+three months old.
 
 When a join attempt fails, the error code maps to a specific cause:
 
 | Error / code | Cause | What to do |
 |---|---|---|
-| `502 CALL_JOIN_FAILED_7504_OR_7505` | **Sandbox `CsApplicationAccessPolicy` not granted** for AppId `207a38a4-...`. Most common failure mode today. Same code surfaces if Gate 1's `incomingCallRoute` is `null` — check both. | Verify Gate 1 via `az rest --method GET .../channels/MsTeamsChannel`. If that's correct, the remaining cause is the policy — Sandbox admin (Michael Barron) runs the PowerShell above. |
+| `502 CALL_JOIN_FAILED_7504_OR_7505` with `Insufficient enterprise tenant permissions` in VM logs | Graph rejected `/communications/calls` before media. Current evidence: Gate 1 is correct; app has no tenant-wide `Calls.*` roles; arbitrary join URLs are outside RSC; Sandbox may also need Cloud Communications app-hosted-media enablement. | For RSC-only tests, add Alfred through `+ Apps` to that meeting/chat and retry. For arbitrary URL joins, Sandbox admin adds/admin-consents tenant-wide `Calls.JoinGroupCall.All` + `Calls.AccessMedia.All`, verifies any relevant policy, and opens a Microsoft Teams / Graph Cloud Communications support case if 7504 persists. Include scenario id and timestamp from VM logs. |
 | `403 GRAPH_PERMISSION_MISSING` | RSC scope: manifest on the team is older than the one with the needed scope, OR the team hasn't been re-installed since a new RSC was added. | Verify manifest version on the install: Teams Admin Center → Manage apps → Alfred Sandbox. If old, click **Update** on every team install. Confirm with `curl $BOT/api/channels`. |
 | `403 TENANT_NOT_ENABLED_FOR_MODE` | `CsTeamsMeetingPolicy` blocks the requested join mode (commonly `invite_and_graph_join` is disabled). | Sandbox admin allows the mode. Workaround: switch to `policy_auto_invite` if the bot is on the meeting invite. |
 | `400 BOT_NOT_INVITED` | C# join workflow's `BotAttendeePresent=true` assertion failed — no service-account row in the meeting roster matching the bot. | Either set `BotAttendeePresent=false` (relies purely on Graph join), or actually invite the bot's service account to the meeting. |
@@ -645,7 +681,11 @@ version (per §5).
 
 What it does: the bot enters the call as an actual participant. Uses
 the `Calls.JoinGroupCalls.Chat` + `Calls.AccessMedia.Chat` RSCs to
-join via Graph and read the diarized audio stream.
+join via Graph and read the diarized audio stream, but only for a
+meeting/chat where Alfred has been installed through Teams. The current
+Sandbox app registration has no tenant-wide `Calls.*` application
+roles, so arbitrary "join this URL" is not authorized by the current
+permission model.
 
 You get everything from Surface 1, PLUS:
 - Live STT events (`meeting.transcript.partial/final`) feeding the
@@ -664,16 +704,20 @@ How to add — three paths, in order of automation:
    `auto_join_enabled: true`, the bot joins automatically when
    Teams posts a `callStartedEventMessageDetail` system message.
    No per-meeting action needed.
-2. **Manual join via the bot API.** `POST $BOT/api/calling/join`
-   with the meeting's `joinUrl`. Surfaces 502/7504/7505 if the
-   tenant calling policy isn't granted; see §7.1.
+2. **Manual join via the bot API for a meeting where Alfred is
+   installed.** `POST $BOT/api/calling/join` with the meeting's
+   `joinUrl`. Surfaces 502/7504/7505 if the target meeting is outside
+   Alfred's RSC grant or the Sandbox tenant is not enabled for
+   app-hosted media; see §7.1.
 3. **Invite the bot's service account** to the meeting via the
    organizer's calendar invite. The bot answers the call when it
-   starts. Same `CsApplicationAccessPolicy` gate as above.
+   starts. This still needs the same Graph Communications media
+   authorization described in §7.1.
 
-All three paths require the Sandbox `CsApplicationAccessPolicy`
-gate to be open (§7.1 Gate 2) — without that, every join attempt
-returns 7504/7505.
+All three paths require the correct Sandbox meeting/chat authorization
+and Cloud Communications media gate (§7.1). Waiting on
+`CsApplicationAccessPolicy` alone is not enough to explain or clear
+7504/7505.
 
 ### Doing both — and the "double response" concern
 

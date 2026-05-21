@@ -358,7 +358,10 @@ public sealed class AlfredBot : TeamsActivityHandler
             var chatThreadId = activity.Conversation?.Id;
             if (LooksLikeMeetingChat(chatThreadId))
             {
-                _ = Task.Run(() => TryAutoJoinMeetingChatAsync(chatThreadId!, "added_to_meeting_chat"));
+                _ = Task.Run(() => TryAutoJoinMeetingChatAsync(
+                    chatThreadId!,
+                    "added_to_meeting_chat",
+                    activity.From?.AadObjectId ?? activity.From?.Id));
             }
         }
 
@@ -397,7 +400,10 @@ public sealed class AlfredBot : TeamsActivityHandler
     /// dedupe with a 60s window so we don't double-join on rapid retries
     /// (multiple membersAdded + @-mention firing back-to-back).
     /// </summary>
-    private async Task TryAutoJoinMeetingChatAsync(string chatThreadId, string source)
+    private async Task TryAutoJoinMeetingChatAsync(
+        string chatThreadId,
+        string source,
+        string? organizerOid)
     {
         var now = DateTimeOffset.UtcNow;
         if (_meetingJoinAttempts.TryGetValue(chatThreadId, out var prev)
@@ -418,15 +424,23 @@ public sealed class AlfredBot : TeamsActivityHandler
                 _logger.LogWarning("Auto-join skipped: BotConfig.TenantId is unset.");
                 return;
             }
+            if (string.IsNullOrWhiteSpace(organizerOid))
+            {
+                _logger.LogWarning(
+                    "Auto-join skipped: organizer/user OID is required to synthesize a Teams meeting URL. Thread={Thread} Source={Source}",
+                    chatThreadId,
+                    source);
+                return;
+            }
 
             var joinUrl = ChannelMeetingJoinUrls.Build(
                 chatThreadId,
                 tenantId!,
-                _botConfig.AppId ?? string.Empty);
+                organizerOid!);
 
             _logger.LogInformation(
-                "Auto-joining meeting chat thread={Thread} source={Source}",
-                chatThreadId, source);
+                "Auto-joining meeting chat thread={Thread} source={Source} organizerOid={OrganizerOid}",
+                chatThreadId, source, organizerOid);
 
             var transcriber = _transcriberFactory.Create();
             var result = await _botService.JoinMeetingWithModeAsync(
@@ -633,6 +647,7 @@ public sealed class AlfredBot : TeamsActivityHandler
             AadId = activity.From?.AadObjectId ?? activity.From?.Id,
             DisplayName = activity.From?.Name,
         };
+        var autoJoinOrganizerOid = sender.AadId;
         var fromBot = activity.From?.Role == "bot";
         var messageId = activity.Id ?? Guid.NewGuid().ToString("N");
         var html = activity.Attachments?.FirstOrDefault(a => a.ContentType == "text/html")?.Content?.ToString();
@@ -717,6 +732,7 @@ public sealed class AlfredBot : TeamsActivityHandler
                     var orgAadId = meetingInfo?.Organizer?.AadObjectId;
                     if (!string.IsNullOrWhiteSpace(orgAadId))
                     {
+                        autoJoinOrganizerOid = orgAadId;
                         organizer = new SenderRef
                         {
                             AadId = orgAadId,
@@ -897,7 +913,10 @@ public sealed class AlfredBot : TeamsActivityHandler
         // If Alfred was @-mentioned in any meeting chat AND isn't already in the call, auto-join.
         if (LooksLikeMeetingChat(chatThreadId) && WasBotMentioned(activity))
         {
-            _ = Task.Run(() => TryAutoJoinMeetingChatAsync(chatThreadId, "at_mention"));
+            _ = Task.Run(() => TryAutoJoinMeetingChatAsync(
+                chatThreadId,
+                "at_mention",
+                autoJoinOrganizerOid));
         }
     }
 

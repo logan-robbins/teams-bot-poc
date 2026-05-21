@@ -6,40 +6,76 @@ commands, success criteria.
 
 ---
 
-## P0 — blocked on external action
+## P0 — 2026 call-join investigation
 
-### Wait for `CsApplicationAccessPolicy` propagation in Sandbox tenant
+1. [x] Read `ERROR.md` and extract each explicit assumption about the
+   failing call join.
+2. [x] Verify current 2026 Microsoft documentation and latest SDK /
+   package versions for Teams cloud communications call joining with
+   app-hosted media.
+3. [x] Compare the repository's join implementation, bot channel
+   configuration, Teams manifest scopes, and runtime configuration
+   against the documented requirements.
+4. [x] Probe the deployed bot, Azure Bot Service channel state, and VM
+   logs to validate which gate fails before media establishment.
+5. [x] Reconcile the evidence against each `ERROR.md` assumption and
+   identify the actual blocker for call joining.
+6. [x] Update `README.md` and this checklist with the final diagnosis,
+   exact verification commands, and any required operator/admin action.
 
-**Status:** Bound (per `Get-CsUserPolicyAssignment` screenshot from
-Eric.Ortiz on 2026-05-19 11:55) but not yet enforced by the
-Teams/Skype calling backbone. Manual join still returns
-`502 CALL_JOIN_FAILED_7504_OR_7505`.
+**Status 2026-05-21:** RSC-scoped meeting joins work, but only when the
+bot uses the hidden `meetup-join/{meeting_chat_thread_id}` URL with the
+meeting organizer/user OID in the Teams context. The short URL copied
+from Teams (`https://teams.microsoft.com/meet/{id}?p=...`) still returns
+7504. We proved this with meeting chat
+`19:meeting_NmFkYWM1NDQtYTM3ZC00ZjlmLTk4ZjItZjE0M2YwOWEzODIx@thread.v2`:
+the short URL failed; the synthesized URL with Logan's OID
+`accf88ee-68d1-4df3-a5b0-98fae5d59ef1` returned `200`, then
+`/api/calling/health` reached `state=Established`, `readiness=ready`,
+and media frames flowed. The earlier "tenant-wide Cloud Communications
+blocked everything" theory was too broad; arbitrary URL joins remain
+unauthorized, but installed meeting-chat RSC joins can work.
 
-**Action:** Retry the join probe periodically (`POST $BOT/api/calling/join`
-with any meeting URL whose organizer is on the policy list — Logan or
-Michael). When 7504/7505 disappears, the gate has opened. Per IT,
-expected retry timing is "tomorrow morning" (i.e. 2026-05-20 ish);
-MS-side propagation can also take up to 24h.
-
-**Owner:** External (Eric.Ortiz to re-bind if needed; us to verify).
-
-**Success:** `POST /api/calling/join` returns `200` with `call_id` set,
-`/api/calling/health` shows `activeCalls: 1`, and a fresh
-`meeting.transcript.final` blob lands under
-`meetings/{meeting_id}/meeting.transcript.final/` within ~30s of audio.
+**Code fix:** `src/Services/AlfredBot.cs` now passes the Teams
+organizer/sender OID into auto-join URL synthesis instead of the bot
+AppId. `src/Services/ChannelMeetingJoinUrls.cs` now fails fast if the
+thread, tenant, or organizer OID is missing.
 
 ---
 
-## P1 — bot-side gaps for "+Apps" meetings
+## P0 — blocked on external action
+
+### Fix and deploy RSC meeting-chat auto-join URL synthesis
+
+**Status:** Root cause found. The bot's RSC auto-join path synthesized
+the hidden Teams join URL with the bot AppId in the context `Oid`.
+Teams/Graph expects a real tenant user OID, normally the meeting
+organizer or call initiator. With the bot AppId, Graph returns
+`403 Insufficient enterprise tenant permissions` / 7504. With the
+organizer OID, the same meeting joins and media establishes.
+
+**Action:** Build, commit, push, and deploy the C# bot patch. After
+deploy, create a new scheduled private meeting, send one meeting-chat
+message so Teams materializes the chat, add Alfred to that meeting, and
+mention Alfred. Expected result: auto-join succeeds without manually
+constructing a URL.
+
+**Owner:** Us.
+
+**Success:** `POST /api/calling/join` returns `200` with `call_id` set,
+`/api/calling/health` shows `activeCalls: 1`, and a fresh
+`meeting.transcript.final` envelope lands under
+`meetings/{meeting_id}/live_transcript/` within ~30s of audio.
+
+---
+
+## P1 — bot-side gaps for "+Apps" meetings ✓ DONE (commit 594cced)
 
 The bot today auto-handles transcript retrieval and meeting metadata
-only for **channel** meetings. Meetings where Alfred is added via
-"+Apps" in the meeting chat (the most common installation pattern)
-are sparse in the sink — no subject, no organizer, no auto-fetched
-transcript. See README §10 for the operator-facing description of
-the gap; the items below close it on the bot side.
+for both channel AND "+Apps" meetings. Both items below shipped in
+commit `594cced` and are live in the deployed bot.
 
-### B. Auto-resolve subject + organizer for "+Apps" meetings → emit `meeting.created`
+### B. Auto-resolve subject + organizer for "+Apps" meetings → emit `meeting.created` ✓ DONE
 
 **Where:** `src/Services/MeetingChatService.cs` (probably in
 `AttachToCallAsync` or wherever a new chat subscription is created)
@@ -63,7 +99,7 @@ queryable by subject and listable with human-readable metadata.
 meeting causes the sink's `/v2/meetings` to show that meeting with
 `subject` and `organizer` populated within ~10s.
 
-### A. Auto-trigger `OfficialTranscriptFetcher.Register(...)` for "+Apps" meetings
+### A. Auto-trigger `OfficialTranscriptFetcher.Register(...)` for "+Apps" meetings ✓ DONE
 
 **Where:** `src/Services/GraphNotificationProcessor.cs` — add a
 sibling to `MaybeFetchPostMeetingTranscript` (line ~200) that fires
@@ -95,61 +131,187 @@ the pre-deploy SHA as `deployed-bot-YYYY-MM-DD` per README §7.6.
 
 ---
 
-## P2 — sink-side agent-tool ergonomics
+## P2 — sink-side agent-tool ergonomics ✓ DONE (local, not yet deployed)
 
-Tools live in `python/meeting_agent/tools.py`. All four changes are
-Python-only — sink container rebuild, no bot deploy.
+All four agent tools shipped together in this session. The
+implementation took the "extend the sink data layer" route for
+C2 and C4 (rather than client-side filtering or iteration), which
+keeps the contract clean and reusable.
 
-### C1. Sort `list_meetings` results by recency descending
+### C1. Sort `list_meetings` results by recency descending ✓ DONE
 
-**What:** Today the tool returns whatever order
-`GET /v2/meetings?limit=N` returns. Sort by
-`actual_start_utc ?? scheduled_start_utc` descending in
-`list_meetings_impl` before returning. Matches the new MeetingList
-UI sort.
+`python/meeting_agent/tools.py:list_meetings_impl` now calls
+`_recency_sort_key` (actual_start_utc → scheduled_start_utc → empty)
+and sorts descending after the sink response. Defense-in-depth: the
+sink's `list_meetings_v2` already `ORDER BY COALESCE(last_event_utc,
+scheduled_start_utc, created_at_utc) DESC` so this is a guarantee,
+not the primary sort.
 
-**Why:** When the agent calls "the most recent meeting" or scans the
-list, the top entry should be the freshest. Removes ambiguity.
+### C2. Date-range filter on `list_meetings` ✓ DONE
 
-### C2. Add date-range filter to `list_meetings`
+- Store: `persistence.py:list_meetings_v2` gained `since` / `until`
+  kwargs (filters on `COALESCE(actual_start_utc, scheduled_start_utc,
+  created_at_utc)`).
+- Sink: `GET /v2/meetings?since=...&until=...` — ISO 8601 UTC strings.
+- Tool: `list_meetings(limit, since, until)` passes through.
 
-**What:** Optional args `since: str | None = None, until: str | None = None`
-on `list_meetings`. Pass through to the sink as
-`?since=...&until=...` (sink already supports these per
-retrieving-transcripts.md §1.1). Document in the tool docstring.
+### C3. `resolve_meeting_by_date` tool ✓ DONE
 
-**Why:** Lets the agent answer "show me yesterday's meetings",
-"meetings from last week", etc.
+Tool wraps a stdlib date-phrase parser (`parse_date_phrase` in
+`tools.py`) — no `dateparser` dependency. Recognized phrases:
+`today` / `yesterday` / `this week` / `last week` / `this month` /
+`last month` / `YYYY-MM-DD` / `YYYY-MM-DD to YYYY-MM-DD`. Unrecognized
+phrases return `ok: false` with a hint listing the supported forms.
 
-### C3. Add a `resolve_meeting_by_date` tool
+### C4. `find_meeting_by_chat_thread_id` tool ✓ DONE
 
-**What:** New tool that takes a natural-language date phrase
-("yesterday", "last Friday", "2026-05-15") and returns matching
-meetings. Use `dateparser` or write a small phrase-to-range
-translator. Probably wraps `list_meetings` with a `since/until`
-range derived from the phrase.
+- Store already had `get_meeting_by_chat_thread_id`.
+- Sink: `GET /v2/resolve?kind=meeting&chat_thread_id=...` returns
+  the matching meeting (0 or 1 row).
+- Tool: `find_meeting_by_chat_thread_id(chat_thread_id)` returns a
+  `MeetingResolveResult` with at most one entry.
 
-**Why:** Bridges the gap between conversational queries ("alfred,
-what was decided in yesterday's standup?") and the structured tools.
+---
 
-### C4. Add a `find_meeting_by_chat_thread_id` tool
+## P1.5 — meeting subject is unreliable + filename search has a gap (post-demo 2026-05-20)
 
-**What:** Reverse-lookup tool that takes a `chat_thread_id`
-(`19:abc@thread.v2`) and returns the meeting (canonical
-`meeting_id` + subject). The sink's `V2Meeting` already carries
-`meeting_chat_thread_id`; iterate `list_meetings` for a match, OR
-add a new sink endpoint `GET /v2/resolve?kind=meeting&chat_thread_id=...`.
+The 2026-05-19 demo session surfaced two related bugs we need to fix
+properly after the demo:
 
-**Why:** Some upstream code paths know the chat thread id but not
-the canonical meeting id. Without this tool the agent can't bridge
-the two reliably (the canonicalization fix at the bot helps for
-new events but historical data may still have only the chat thread id).
+### The subject problem
+
+For "+Apps"-installed meetings, the bot consistently fails to capture
+the meeting's real subject. Every path we tried this session failed:
+
+| Path | Result | Why |
+|---|---|---|
+| `GraphNotificationProcessor.MaybeEmitMeetingCreatedForChatThreadAsync` → `_metadataResolver.GetChatAsync` | 403 Forbidden | API requires `Chat.ReadBasic.WhereInstalled` / `ChatSettings.Read.Chat`; our manifest has none |
+| Bot Framework `activity.Conversation.Name` in `OnMessageActivityAsync` | null | Microsoft doesn't populate this for the chat activities we receive |
+| `TeamsInfo.GetMeetingInfoAsync` | 403 (`Microsoft.Rest.HttpOperationException` from `TeamsOperations.FetchMeetingInfoWithHttpMessagesAsync`) | Manifest lacks a meeting-extension capability (would need `OnlineMeeting.ReadBasic.Chat` RSC at minimum) |
+| `OnTeamsMeetingStart/EndAsync` handlers (added in commit `5b58285`) | Never fire | Requires `OnlineMeeting.ReadBasic.Chat` RSC; manifest v1.0.12 has it but sideload failed because Sandbox `Upload custom apps` policy is disabled for the user |
+| Catalog re-publish with v1.0.12 | Not attempted | Needs Sandbox admin approval; not feasible day-of-demo |
+
+User reported the meeting WAS scheduled with a real subject in their
+calendar, so Microsoft has the data — we just can't reach it with
+current permissions. Operator-set subject via the
+`POST /v2/meetings/{id}/transcript-upload` form field worked, and so
+did the new `PATCH /v2/meetings/{id}` endpoint (commit `524062e`),
+but both are manual.
+
+**The systematic question to answer first:**
+1. Sandbox admin: enable `Upload custom apps` policy for the demo
+   AAD user so v1.0.12 sideload works. Validate that `meetingStart` /
+   `meetingEnd` events then deliver with `Title` populated.
+2. If sideload still doesn't work, go through the catalog re-approval
+   path with v1.0.12 (RSC delta is just `+OnlineMeeting.ReadBasic.Chat`,
+   `-ChatMessageReadReceipt.Read.Chat`). Once it's live, every team
+   that has Alfred installed has to UPDATE the app for the new RSC
+   to bind.
+3. Once `OnlineMeeting.ReadBasic.Chat` is consented, validate end-to-
+   end by:
+   a. Scheduling a meeting with a real subject in calendar
+   b. Adding Alfred via "+Apps"
+   c. Confirming `OnTeamsMeetingStartAsync` fires and the bot log
+      shows `Title=<actual subject>`, `MsGraphResourceId=<canonical id>`
+   d. Confirming auto transcript fetch works after meeting end
+
+### The filename-search gap
+
+`fetch_transcript_by_filename(filename_substring)` searches blob
+filenames only. For operator-uploaded transcripts it works (the user's
+original filename is preserved at the canonical path). But for
+bot-auto-fetched transcripts, the only files would be the generic
+`meetings/{id}/transcripts/official.{vtt,txt}` — filename search by
+`"Supermemory"` returns nothing because no file is named "Supermemory".
+
+**The fix (when implementing):**
+- Extend `list_meeting_transcript_files_impl` to join each transcript
+  file against `/v2/meetings/{meeting_id}` and pull the meeting's
+  `subject`.
+- Match the query against EITHER the filename OR the meeting subject
+  (case-insensitive substring on both).
+- The agent's flow becomes: `resolve_meeting_by_name` (primary, sink
+  registry only) → `fetch_transcript_by_filename` (fallback, blob +
+  registry).
+- Note: this only matters once subject is reliable end-to-end (see
+  above). If subject is null in the registry too, neither tool helps —
+  the upload form prompt is the only escape.
+
+---
+
+## P2.5 — synthesis tick architecture (DESIGN ONLY — not yet approved)
+
+The agent loop today is purely reactive: `drain_with_debounce` in
+`python/meeting_agent/debounce.py` pulls items off `agent_queue`,
+each item is a real chat / transcript event, and the analyzer runs
+once per debounced batch. In a long lull the agent thinks zero
+times — even if the dossier has drifted out of sync with reality
+("the room verbally agreed on X 8 minutes ago; nobody followed up;
+no chat / transcript event has fired since").
+
+### Proposal
+
+Add a **periodic synthesis tick** per active session. Every
+`SYNTHESIS_INTERVAL_SECONDS` (proposal: 300 = 5 min) of relative
+quiet (no real event in the last `SYNTHESIS_QUIET_REQ_SECONDS`,
+proposal: 120 = 2 min), enqueue a sentinel onto `agent_queue` for
+that session. The analyzer treats the sentinel as a "re-examine
+the dossier" prompt rather than a normal event.
+
+### Code touch points
+
+- `python/transcript_sink.py` — add a background coroutine per
+  active session (spawned from `_resolve_analyzer` when first
+  initialized, cancelled when the session ends). Tracks
+  `last_real_event_utc` on the manager.
+- `python/meeting_agent/debounce.py` — extend item shape (or
+  use a sentinel value) so the agent loop can tell a synthesis
+  tick from a real event.
+- `python/meeting_agent/agent.py` — `analyze_async` gains a
+  `mode: Literal["reactive", "synthesis"] = "reactive"` kwarg;
+  passes through to the prompt context.
+- `python/batcave_platform/specs/alfred.yaml` — new Principle C
+  for synthesis-mode ticks: ONLY post if you've identified a
+  concrete unresolved item (decision needed, missing owner,
+  meeting drift) that organic ticks would have missed. Default
+  silent even more aggressively than reactive ticks.
+
+### Open questions (need user input before implementing)
+
+1. **Cadence.** 5 min default seems right; configurable per
+   product spec (`alfred.yaml`)?
+2. **Quiet-period requirement.** Should a recent event suppress
+   the synthesis tick (don't double up)?
+3. **Scope.** Apply to Surface 2 only (in-call) or also to
+   Surface 1 ("+Apps" only) where the agent has only chat
+   context?
+4. **Posting threshold.** Strict (require concrete action item) or
+   same threshold as reactive ticks?
+5. **Cost ceiling.** Cap synthesis ticks per session per hour
+   (e.g. max 6 ticks/hour even if quiet windows last all hour)?
+
+### Blast radius if implemented
+
+- More LLM calls per active session. Worst case 12/hour/session.
+  At gpt-5-mini pricing, marginal cost is small but non-zero.
+- More chances for a spurious agent post. Mitigation: tighter
+  cooldown for synthesis-mode posts.
+- Loop concurrency — sentinel events compete with real events on
+  the same queue. Real events should preempt synthesis ticks
+  (don't fire a synthesis tick if the queue already has real
+  items waiting).
+
+### Not implemented — awaiting approval
+
+Per FIX.md §"Out-of-scope items", this was deliberately deferred
+from the path-taxonomy fix. Bring it back when there's bandwidth
+and an explicit owner.
 
 ---
 
 ## P3 — agent autonomy
 
-### D. Add a `request_transcript_backfill` tool to the agent
+### D. Add a `request_transcript_backfill` tool to the agent ✓ DONE (commit 594cced)
 
 **What:** New tool that calls `POST $BOT/api/debug/fetch-transcript`
 with `meeting_id` (which the DebugController now accepts after the
@@ -181,7 +343,7 @@ that fails silently.
 `BlobArchive` section.
 
 **What:** Once Michael's `server.py` reads v2 paths
-(`teams/{tid}/channels/{cid}/channel.message.created/...`):
+(`teams/{tid}/channels/{cid}/messages/...`):
 
 1. Edit `BlobArchive.V1CompatEnabled` to `false` (or empty
    `V1CompatChannelIds`) via a Run Command — no redeploy needed
@@ -197,19 +359,11 @@ that fails silently.
 **Why:** Compat layer is by design temporary. Less code, less
 config, less drift.
 
-### Resolve `openai-agents` vs `anthropic-sdk` naming inconsistency
+### Resolve `openai-agents` vs `anthropic-sdk` naming inconsistency ✓ DONE
 
-**Where:** `README.md:65` says "AlfredAnalyzer (claude-haiku-4-5,
-Anthropic Agents SDK)". `python/pyproject.toml` pins
-`openai-agents>=0.0.16`. These are different SDK families.
-
-**What:** Pick one truth and update the other. The deployed code
-actually uses OpenAI Agents SDK against Azure OpenAI (per
-`agent.py` imports and the `aoai-alfred-disney.openai.azure.com`
-responses endpoint in the logs). README is wrong.
-
-**Why:** Mis-attribution confuses anyone trying to understand the
-architecture or migrate the model.
+README §1 now reads "AlfredAnalyzer (Azure OpenAI gpt-5-mini,
+OpenAI Agents SDK)". Matches `pyproject.toml` (`openai-agents`) and
+`agent.py` (imports `from agents …`).
 
 ### Prune VM Run Commands when count exceeds ~20
 

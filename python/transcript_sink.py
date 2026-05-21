@@ -1307,7 +1307,7 @@ async def agent_processing_loop(
                         result = tc_dict.get("result") or {}
                         # Truncate to keep one-line log lines readable.
                         def _trunc(obj, n=200):
-                            s = json.dumps(obj, default=str) if not isinstance(obj, str) else obj
+                            s = _json_mod.dumps(obj, default=str) if not isinstance(obj, str) else obj
                             return s if len(s) <= n else s[:n] + "…"
                         logger.info(
                             "  tool[%d] name=%s ok=%s error=%s args=%s result=%s",
