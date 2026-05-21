@@ -1,17 +1,8 @@
 # Alfred — Teams Meeting Platform
 
-Microsoft Teams bot that captures audio + chat from meetings and
-channels, publishes a versioned event stream
-([`docs/event-contract.md`](docs/event-contract.md)) to per-channel
-consumer URLs, and mirrors every event into Azure Blob Storage
-([`docs/retrieving-transcripts.md`](docs/retrieving-transcripts.md))
-for replay. A reference Python sink + the Alfred note-taker agent
-ship in this repo as the canonical consumer.
+Microsoft Teams bot. Captures audio + chat from meetings and channels. Publishes a versioned event stream ([`docs/event-contract.md`](docs/event-contract.md)) to per-channel consumer URLs. Mirrors every event into Azure Blob Storage ([`docs/retrieving-transcripts.md`](docs/retrieving-transcripts.md)) for replay. The reference Python sink + Alfred note-taker agent ship in this repo as the canonical consumer.
 
-> **AI coding agents:** this README is the **what / where / how**.
-> [`AGENTS.md`](AGENTS.md) is the deeper ops manual (debug recipes,
-> auto-join tiers, `dotnet publish` traps, etc.). Read this first;
-> page over to AGENTS.md when you need to actually fix something.
+For deeper ops detail (debug recipes, auto-join tiers, `dotnet publish` traps), see [`AGENTS.md`](AGENTS.md).
 
 ---
 
@@ -33,58 +24,49 @@ ship in this repo as the canonical consumer.
   │   Joins    ──► auto-join channel meetings + manual /join URL     │
   │   Names    ──► resolved via GraphApiClient using RSCs            │
   │                                                                  │
-  │   Every event flows through EventFanoutDispatcher.PublishAsync:  │
-  │     ├─► BlobEventArchive   (per-event JSON blobs in Blob Storage) │
-  │     └─► per-channel consumer URLs  (POST, retry/queue)           │
+  │   Every event flows through the event fanout dispatcher:         │
+  │     ├─► blob archive       (per-event JSON blobs)                │
+  │     └─► per-channel consumer URLs (POST, retry/queue)            │
   │                                                                  │
   │   Schema: alfred-v2. Two event families:                         │
   │     channel.*   → ChannelRef { team_id, channel_id, thread_id }  │
   │     meeting.*   → MeetingRef { meeting_id, channel_link? }       │
-  │                                                                  │
-  │   Linkage: "@Alfred link to <channel>" persists a channel_link   │
-  │   on MeetingRef. All subsequent meeting events carry the link.   │
   └────────────────────┬─────────────────────────────────────────────┘
-                       │
-                       │  POST  https://{consumer}/v2/events  (HTTP)
-                       │  PUT   stalfreddisney/alfred-events   (Blob)
+                       │  POST  https://{consumer}/v2/events
+                       │  PUT   stalfreddisney/alfred-events
                        ▼
   ┌──────────────────────────────────────────────────────────────────┐
   │   PYTHON SINK   python/   ·   ca-alfred-api Container App        │
   │                                                                  │
-  │   POST /v2/events  →  single ingest for all event types          │
-  │   GET  /v2/index                                  discovery      │
-  │   GET  /v2/meetings                               list meetings  │
-  │   GET  /v2/meetings/{meeting_id}                  one meeting    │
-  │   GET  /v2/meetings/{mid}/events                  ledger         │
-  │   GET  /v2/meetings/{mid}/transcript              official text  │
-  │   GET  /v2/teams/{tid}/channels/{cid}             one channel    │
-  │   GET  /v2/teams/{tid}/channels/{cid}/events      channel ledger │
-  │   GET  /v2/teams/{tid}/channels/{cid}/threads/{thrid}/messages   │
-  │   GET  /v2/resolve?kind=meeting&subject=…         name lookup    │
+  │   POST /v2/events                  single ingest                 │
+  │   GET  /v2/index                   discovery                     │
+  │   GET  /v2/meetings                list meetings                 │
+  │   GET  /v2/meetings/{mid}/events   ledger                        │
+  │   GET  /v2/meetings/{mid}/transcript                             │
+  │   GET  /v2/teams/{tid}/channels/{cid}/events                     │
+  │   GET  /v2/resolve?kind=meeting&subject=…                        │
   │                                                                  │
-  │   AlfredAnalyzer (Azure OpenAI gpt-5-mini, OpenAI Agents SDK):   │
-  │     · runs on every debounced tick                               │
-  │     · tools: send_to_meeting_chat, fetch_meeting_transcript,     │
-  │              list_meetings, resolve_meeting_by_name,             │
-  │              resolve_meeting_by_date,                            │
-  │              find_meeting_by_chat_thread_id,                     │
-  │              request_transcript_backfill                         │
-  │     · spec: python/batcave_platform/specs/alfred.yaml            │
+  │   AlfredAnalyzer (Azure OpenAI gpt-5-mini, OpenAI Agents SDK)    │
+  │   on every debounced tick. Tools:                                │
+  │     send_to_meeting_chat, fetch_meeting_transcript,              │
+  │     list_meetings, resolve_meeting_by_name,                      │
+  │     resolve_meeting_by_date, find_meeting_by_chat_thread_id,     │
+  │     request_transcript_backfill                                  │
+  │   Prompt + intervention policy: python/batcave_platform/specs/   │
+  │   alfred.yaml                                                    │
   └────────────────────┬─────────────────────────────────────────────┘
                        │  SSE + JSON
                        ▼
   ┌──────────────────────────────────────────────────────────────────┐
   │   REACT UI   web/   ·   ca-alfred-web Container App              │
-  │     /                    → meeting picker (subject; meeting_id   │
-  │                            on hover)                             │
-  │     /m/<meeting_chat_thread_id> → per-meeting dossier            │
-  │     /channels            → consumer admin + join-any-meeting     │
-  │     /channels/inspect/.. → per-channel command center            │
-  │     /archive             → blob-archive folder browser           │
+  │     /                            meeting picker                  │
+  │     /m/<meeting_chat_thread_id>  per-meeting dossier             │
+  │     /channels                    consumer admin + join-any       │
+  │     /archive                     blob-archive folder browser     │
   └──────────────────────────────────────────────────────────────────┘
 ```
 
-**Two canonical keys, mirroring the Microsoft Graph URL hierarchy:**
+**Two canonical keys, mirroring Microsoft Graph's URL hierarchy:**
 
 ```
 Team (team_id)
@@ -92,53 +74,31 @@ Team (team_id)
         └── Thread (thread_id = root message id)
               └── Messages / Attachments
 
-Meeting (meeting_id = Graph onlineMeeting id)
-  ├── Chat (meeting_chat_thread_id) → Messages / Attachments
+Meeting (meeting_id = chat thread id of the meeting, 19:meeting_<base64>@thread.v2)
+  ├── Chat → Messages / Attachments
   ├── Transcripts → partial / final / official VTT
   └── channel_link? → optional back-reference to (team_id, channel_id)
 ```
 
-**Channel meetings have no audio.** The bot lacks `Calls.AccessMedia`
-at team scope. A meeting inside a channel shows up only as
-`channel.message.*` events. The `meeting.*` event family exists only
-for **private meetings the bot was added to via `+ Apps`**.
+**`meeting_id` is the Teams chat thread id of the meeting** (`19:meeting_<base64>@thread.v2`). The Graph `onlineMeeting.id` is a separate Graph-side identifier that the system does not key on.
 
-**The channel-link problem.** Microsoft Graph does not natively tie a
-meeting to a channel. Alfred bridges this via: (a) Bot Framework
-`channelData` when the Teams client tells us which channel spawned the
-meeting, (b) the `@Alfred link to <channel-name>` chat command, or (c)
-`GraphMetadataResolver` lookups at join time. The `channel_link` on
-`MeetingRef` is the result; once set, it rides on every subsequent
-event for that meeting.
+**Channel meetings have no audio.** The bot lacks `Calls.AccessMedia` at team scope. A meeting inside a channel surfaces only as `channel.message.*` events. The `meeting.*` family exists only for private meetings the bot was added to via `+ Apps`.
+
+**The channel-link problem.** Microsoft Graph does not natively tie a meeting to a channel. Alfred bridges this via (a) Bot Framework `channelData` when the Teams client tells us which channel spawned the meeting, (b) the `@Alfred link to <channel-name>` chat command, or (c) Graph metadata resolution at join time. Once `MeetingRef.channel_link` is set, it rides on every subsequent event.
 
 ---
 
 ## 2. Two tenants — read this before debugging permissions
 
-This deployment straddles two Entra / Teams tenants with very
-different control:
-
 | Tenant | What lives here | Our role |
 |---|---|---|
-| **`plutosdoghouse.com`** (id `38387f0b-...`) — the **Sandbox** Teams + Entra tenant where Alfred is installed as a Teams app, where meetings happen, and where chat flows | Teams manifest install, RSC grants on each install, the actual Teams meetings + channels the bot listens to | **Tenant member only** — we are **not** Entra / Teams admins here. We **cannot** run `Grant-CsApplicationAccessPolicy`, `New-CsApplicationAccessPolicy`, or grant any tenant-wide Entra app permissions. Everything we get is RSC-scoped at install time. |
-| **`disney.com` → WDI R&D subscription `e02c0038-...`** — the Azure subscription where the **infrastructure** runs | C# bot VM, Container Apps (sink + UI), ACR, Azure OpenAI, Speech Services, Storage account `stalfreddisney`, Bot Service registration | **Subscription Contributors.** We can deploy anything, change env vars, build images, restart services. **No** Entra-admin rights even here — Azure AD app-registration **Owners** can edit the Alfred app registration (`207a38a4-...`); other Entra-admin actions need a separate principal. |
+| **`plutosdoghouse.com`** (id `38387f0b-...`) — Sandbox Teams + Entra tenant where Alfred is installed | Teams manifest install, RSC grants on each install, the actual Teams meetings + channels | **Tenant member only.** Not Entra / Teams admins. Cannot run `Grant-CsApplicationAccessPolicy`, `New-CsApplicationAccessPolicy`, or grant any tenant-wide Entra app permissions. Everything is RSC-scoped at install time. |
+| **`disney.com` → WDI R&D `e02c0038-...`** — Azure subscription with the infrastructure | C# bot VM, Container Apps (sink + UI), ACR, Azure OpenAI, Speech Services, `stalfreddisney`, Bot Service registration | **Subscription Contributors.** Can deploy, change env vars, build images, restart services. App-registration Owners on the Alfred app (`207a38a4-...`) can edit it; other Entra-admin actions need a separate principal. |
 
 Concrete consequences:
-- **Anything that needs a tenant-wide grant in Sandbox is out of
-  reach.** That includes tenant-wide Graph `Calls.*` application
-  permissions, `CsApplicationAccessPolicy` changes for online-meeting
-  artifact APIs, and Microsoft support/account-team enablement for
-  Cloud Communications app-hosted media. We always have to prefer an
-  RSC-only path or route the admin/support action through Sandbox.
-- **The bot's App Registration owner** in WDI Entra determines the
-  "via {UPN}" parenthetical Teams shows next to Alfred's chat
-  messages. Change it via Azure Portal → Entra ID → App
-  registrations → Owners (WDI admins can; Sandbox admins cannot).
-- **Manifest upload + admin consent** happens in the **Sandbox**
-  tenant. We submit the zip; a Sandbox admin (e.g., Michael
-  Barron) approves it. Re-uploading a new manifest version
-  requires that same admin's approval. Adding a new RSC further
-  requires every existing team installation to **update** the app.
+- Anything that needs a tenant-wide grant in Sandbox is out of reach: tenant-wide Graph `Calls.*` application permissions, `CsApplicationAccessPolicy` changes, Microsoft Cloud Communications app-hosted-media enablement. Prefer RSC-only paths; route admin/support through Sandbox.
+- The bot's App Registration owner in WDI Entra determines the "via {UPN}" parenthetical Teams shows next to Alfred's chat messages.
+- Manifest upload + admin consent happens in the Sandbox tenant. A Sandbox admin (e.g., Michael Barron) approves the zip. Adding a new RSC also requires every existing team installation to update the app.
 
 ---
 
@@ -148,12 +108,12 @@ Concrete consequences:
 |---|---|---|---|
 | `src/` | C# bot (Graph Communications SDK + Bot Framework) | `dotnet publish -c Release` (.NET 8, win-x64) | `vm-alfred-disney` (`TeamsMediaBot` service) |
 | `python/` | FastAPI sink + Alfred agent | `uv sync` | `ca-alfred-api` Container App |
-| `python/meeting_agent/` | Canonical session/agent state. `tools.py` defines the two agent tools. | — | — |
-| `python/batcave_platform/specs/alfred.yaml` | **Sole source of truth** for Alfred's prompt + intervention policy | — | — |
+| `python/meeting_agent/` | Canonical session/agent state; tool definitions | — | — |
+| `python/batcave_platform/specs/alfred.yaml` | Sole source of truth for prompt + intervention policy | — | — |
 | `web/` | React 19 + Vite + Tailwind v4 | `npm run build` | `ca-alfred-web` Container App |
-| `manifest/` | Teams app manifest (currently **v1.0.12**, 16 RSCs) | `cd manifest && zip alfred-sandbox.zip manifest.json color.png outline.png` | Teams Admin Center / Developer Portal |
-| `scripts/deploy-azure-vm.sh` | One-shot bot VM deploy (Phase 1: bootstrap, Phase 2: publish + restart) | — | — |
-| `docs/` | Reference docs ([event-contract](docs/event-contract.md), [retrieving-transcripts](docs/retrieving-transcripts.md), STT comparisons, auto-invite setup) | — | — |
+| `manifest/` | Teams app manifest (currently v1.0.12, 16 RSCs) | `cd manifest && zip alfred-sandbox.zip manifest.json color.png outline.png` | Teams Admin Center / Developer Portal |
+| `scripts/deploy-azure-vm.sh` | One-shot bot VM deploy (bootstrap + publish + restart) | — | — |
+| `docs/` | Reference docs (event contract, retrieving transcripts, STT comparisons, auto-invite setup) | — | — |
 
 ---
 
@@ -171,19 +131,20 @@ Concrete consequences:
 | Web Container App | [`ca-alfred-web.gentlewater-5aa74a73.eastus.azurecontainerapps.io`](https://ca-alfred-web.gentlewater-5aa74a73.eastus.azurecontainerapps.io) |
 | ACR | `acralfreddisneye02c0038.azurecr.io` |
 | Blob archive | `stalfreddisney/alfred-events` (anonymous public read) |
+| Sink persistent storage | `stalfreddisney/alfred-sink-data` (Azure File share, mounted at `/var/lib/alfred` in `ca-alfred-api`) |
 | Azure OpenAI | `aoai-alfred-disney` (`gpt-5-mini`) |
 | Speech Services | `speech-alfred-disney` (S0) |
 
 **Remotes:**
 - `private` → `github.com:logan-robbins/alfred-teams-bot.git` (canonical)
 - `disney` → `gitlab.wdi.disney.com/Michael.Barron.-ND/teams_integration.git` (branch `alfred-agent-updates` = active MR)
-- Never push to `origin` (public mirror — Disney-specific work stays on the two above).
+- Never push to `origin` (public mirror).
 
 ---
 
 ## 5. Permissions
 
-The manifest declares **16 RSCs**. Zero tenant-wide Entra app permissions.
+The manifest declares 16 RSCs. Zero tenant-wide Entra app permissions.
 
 **Chat-scoped** (per-meeting / per-chat install):
 
@@ -192,7 +153,7 @@ The manifest declares **16 RSCs**. Zero tenant-wide Entra app permissions.
 | `Calls.JoinGroupCalls.Chat` | Bot enters the call as a participant |
 | `Calls.AccessMedia.Chat` | Receive 16 kHz / 16-bit / mono PCM audio |
 | `OnlineMeetingParticipant.Read.Chat` | MSI ↔ AAD ↔ display-name lookup |
-| `OnlineMeetingTranscript.Read.Chat` | Post-meeting Microsoft transcript (private meetings only — does **not** apply to channel meetings per Microsoft) |
+| `OnlineMeetingTranscript.Read.Chat` | Post-meeting Microsoft transcript (private meetings only — not channel meetings) |
 | `OnlineMeetingRecording.Read.Chat` | Reserved |
 | `ChatMessage.Read.Chat` | Graph subscription on the meeting chat |
 | `ChatMessageReadReceipt.Read.Chat` | Reserved |
@@ -202,29 +163,18 @@ The manifest declares **16 RSCs**. Zero tenant-wide Entra app permissions.
 | Permission | Used for |
 |---|---|
 | `ChannelMessage.Read.Group` | Subscription on `teams/{tid}/channels/{cid}/messages` |
-| `ChannelMessage.Send.Group` | Outbound channel send (Bot Framework adapter is the default; Graph is fallback) |
+| `ChannelMessage.Send.Group` | Outbound channel send (Bot Framework adapter default; Graph fallback) |
 | `ChannelMeeting.ReadBasic.Group` | Discover channel meetings |
 | `ChannelMeetingParticipant.Read.Group` | Channel meeting roster |
-| `ChannelMeetingTranscript.Read.Group` | Channel meeting transcripts (no documented public GET endpoint uses this — see "Channel meeting transcripts" note in §7) |
+| `ChannelMeetingTranscript.Read.Group` | Channel meeting transcripts (no documented public GET endpoint uses this alone — see §7.2) |
 | `ChannelMeetingRecording.Read.Group` | Reserved |
 | `TeamsAppInstallation.Read.Group` | Install verification |
 | `TeamSettings.Read.Group` | `GET /teams/{id}` for team display name |
 | `ChannelSettings.Read.Group` | `GET /teams/{id}/channels/{id}` for channel display name |
 
-**Runtime gate outside RSC:** a `502 CALL_JOIN_FAILED_7504_OR_7505`
-means Graph rejected `/communications/calls` before media was
-established. Do not treat this as only `CsApplicationAccessPolicy`
-propagation. As of 2026-05-21 the deployed Sandbox app registration
-has `requiredResourceAccess: []`, so Alfred has no tenant-wide Graph
-`Calls.*` application roles and can only use RSC for meetings/chats
-where the Teams app is installed. Joining arbitrary meeting URLs needs
-Sandbox admin consent for tenant-wide calling/media permissions and may
-also need Microsoft Teams / Graph Cloud Communications app-hosted-media
-tenant enablement.
+**Runtime gate outside RSC.** A `502 CALL_JOIN_FAILED_7504_OR_7505` means Graph rejected `/communications/calls` before media. As of 2026-05-21 the Sandbox app registration has `requiredResourceAccess: []`, so Alfred has no tenant-wide Graph `Calls.*` application roles. Joining arbitrary meeting URLs requires Sandbox admin consent for tenant-wide calling/media permissions and may also need Microsoft Cloud Communications app-hosted-media tenant enablement.
 
-**Adding a new RSC requires re-installing on the team** — Teams binds
-RSC scopes at install time, so the team must update or reinstall
-Alfred for any new scope to take effect.
+**Adding a new RSC requires re-installing on the team** — Teams binds RSC scopes at install time.
 
 ---
 
@@ -236,7 +186,7 @@ git push private main
 git push disney main:alfred-agent-updates --force-with-lease
 
 # Bot VM (rebuild C# + restart service via az vm run-command).
-# Full example in AGENTS.md §3.4 — the canonical fields are commit SHA,
+# Full example in AGENTS.md §3.4 — canonical fields: commit SHA,
 # rm -rf src/bin src/obj before publish, then Start-Service.
 
 # Sink + UI container apps:
@@ -255,47 +205,27 @@ az containerapp update --subscription e02c0038-82c8-4655-9647-38083f301099 \
   --image acralfreddisneye02c0038.azurecr.io/ca-alfred-web:$TAG
 ```
 
-**Gotchas (full list in AGENTS.md §7):**
-- Always `rm -rf src/bin src/obj` before `dotnet publish`. MSBuild's
-  incremental cache ships new-timestamped DLLs with old content.
-- Use a unique `--run-command-name` per VM deploy attempt. Names are
-  cached; rerunning the same name returns the prior attempt's output.
-- VM caps at **25 managed Run Commands**. Prune Succeeded ones
-  periodically — full deploys silently fail with `BadRequest` then
-  appear as `ResourceNotFound` on the new name.
-- The bot's live config is `C:/teams-bot-poc/src/Config/appsettings.production.json`
-  (not `appsettings.json`). The deploy script reads the file from
-  `src/Config/`; `dotnet publish` copies it into the publish dir. Set
-  `reloadOnChange:true` is on, so config-only changes (e.g. flipping
-  `BlobArchive:V1CompatEnabled`) don't require a redeploy — just edit
-  the file via Run Command.
-- The VM's git remote is `origin`, not `private` — the deploy script
-  falls back through `private` → `origin`. Pushes to `private/main`
-  reach the VM's `origin` because `origin` mirrors from it.
-- The `IConversationReferenceStore` is in-memory; a bot restart wipes
-  it, and `/api/send-chat` will 404 until a fresh chat activity
-  re-populates the reference for that thread.
+**Sink persistent storage.** `ca-alfred-api` mounts the `stalfreddisney/alfred-sink-data` Azure File share at `/var/lib/alfred`. `STORE_DB_PATH=/var/lib/alfred/alfred.sqlite3` puts the sink sqlite there, so session/meeting state survives container restarts. Without the mount + env var the sqlite is ephemeral and resets on every revision.
 
-**Before deploying a schema change that downstream consumers
-depend on:** see §7.5 V1 compatibility dual-write if any pre-v2
-polling consumer needs to keep working through the cutover, and
-§7.6 Rollback for the one-command revert path.
+**Gotchas (full list in AGENTS.md §7):**
+- Always `rm -rf src/bin src/obj` before `dotnet publish`. MSBuild's incremental cache ships new-timestamped DLLs with old content.
+- Use a unique `--run-command-name` per VM deploy attempt. Names are cached; rerunning the same name returns the prior attempt's output.
+- VM caps at **25 managed Run Commands**. Prune Succeeded ones before deploying or `create` silently fails with `BadRequest` and then appears as `ResourceNotFound`.
+- The bot's live config is `C:/teams-bot-poc/src/Config/appsettings.production.json` (not `appsettings.json`). `reloadOnChange:true` is set, so config-only changes (e.g. flipping `BlobArchive:V1CompatEnabled`) don't require a redeploy — edit the file via Run Command.
+- The VM's git remote is `origin`, not `private`; the deploy script falls back through `private` → `origin`. Pushes to `private/main` reach the VM because `origin` mirrors from it.
+- `IConversationReferenceStore` is in-memory; a bot restart wipes it, and `/api/send-chat` will 404 until a fresh chat activity re-populates the reference.
+
+Before a schema change downstream consumers depend on, see §7.5 (V1 compat dual-write) and §7.6 (rollback).
 
 ---
 
 ## 7. Debug
 
-### 7.1 Call-join failures (the most common, most-frustrating bug)
+### 7.1 Call-join failures (most common, most-frustrating)
 
-For Alfred's current RSC-only design there are **three authorization
-boundaries**. Do not collapse them into "wait for
-`CsApplicationAccessPolicy` propagation"; that was the wrong conclusion
-for the 2026-05-21 investigation.
+Three authorization boundaries. Do not collapse them into "wait for `CsApplicationAccessPolicy` propagation".
 
-**Gate 1 — Bot channel calling config (in the Azure Bot resource).**
-`MsTeamsChannel.incomingCallRoute` must be `graphPma`. With it `null`,
-the Teams calling backbone never registers the bot for the Graph PMA
-route. Fixable by anyone with Contributor on the Bot Service:
+**Gate 1 — Bot channel calling config (in the Azure Bot resource).** `MsTeamsChannel.incomingCallRoute` must be `graphPma`. With it `null`, the Teams calling backbone never registers the bot for the Graph PMA route.
 
 ```bash
 az rest --method PATCH \
@@ -303,16 +233,7 @@ az rest --method PATCH \
   --body '{"location":"global","properties":{"channelName":"MsTeamsChannel","properties":{"enableCalling":true,"incomingCallRoute":"graphPma","callingWebhook":"https://alfred-disney-bot.eastus.cloudapp.azure.com/api/calling","deploymentEnvironment":"CommercialDeployment","isEnabled":true,"isTeamsIvrEnabled":false,"acceptedTerms":false}}}'
 ```
 
-**Gate 2 — Permission model for this specific meeting.** Alfred's
-manifest has `Calls.JoinGroupCalls.Chat` and `Calls.AccessMedia.Chat`.
-Those are RSC permissions; they only authorize calls associated with a
-chat/meeting where the Teams app is installed. They do **not** authorize
-"join any meeting URL" by themselves. As of 2026-05-21, the Sandbox
-Entra app registration has `requiredResourceAccess: []`, so there are
-no tenant-wide Graph `Calls.*` application roles on the app. To use
-arbitrary meeting URLs, a Sandbox admin must add and admin-consent
-tenant-wide Graph permissions such as `Calls.JoinGroupCall.All` and
-`Calls.AccessMedia.All`.
+**Gate 2 — Permission model for this specific meeting.** The manifest's `Calls.JoinGroupCalls.Chat` + `Calls.AccessMedia.Chat` are RSC scopes; they only authorize calls in chats/meetings where Alfred is installed. They do not authorize "join any meeting URL". The Sandbox app registration has `requiredResourceAccess: []`, so no tenant-wide Graph `Calls.*` roles exist on the app. Arbitrary meeting URLs require a Sandbox admin to add and admin-consent `Calls.JoinGroupCall.All` + `Calls.AccessMedia.All`.
 
 Verify the current Sandbox app registration:
 
@@ -323,53 +244,23 @@ az ad app show --id 207a38a4-67c5-4ef9-ada8-ea7998734d59 \
 az account set --subscription e02c0038-82c8-4655-9647-38083f301099
 ```
 
-**Gate 3 — Sandbox tenant Cloud Communications media eligibility.**
-If Gate 1 is correct and Graph still returns `403` with
-`Insufficient enterprise tenant permissions, cannot access this API`,
-the block is at the Microsoft Graph Communications / Teams media
-authorization layer before Alfred's media socket is reached. Microsoft
-2026 Q&A for this exact 7504 payload says app-hosted media calling bots
-may require tenant eligibility/enablement through Microsoft Teams /
-Graph Cloud Communications support, even when app permissions, calling
-config, manifest, and policies appear correct.
+**Gate 3 — Sandbox tenant Cloud Communications media eligibility.** If Gate 1 is correct and Graph still returns `403 Insufficient enterprise tenant permissions`, the block is at the Microsoft Graph Communications / Teams media authorization layer before Alfred's media socket. Microsoft 2026 guidance for the 7504 payload says app-hosted media bots may require tenant enablement through Microsoft support, even when app permissions, calling config, manifest, and policies appear correct.
 
-`CsApplicationAccessPolicy` still matters for some online-meeting
-application-permission APIs and may be an admin prerequisite in
-tenant-wide call setups, but Microsoft's current application-access-
-policy doc lists OnlineMeetings / artifact / transcript / recording /
-virtual-event permissions, not `Calls.*`. Treat it as a prerequisite to
-verify, not as the full explanation for 7504.
+`CsApplicationAccessPolicy` still matters for some online-meeting application-permission APIs, but Microsoft's current policy doc lists OnlineMeetings / artifact / transcript / recording / virtual-event — not `Calls.*`. Treat it as a prerequisite to verify, not the full explanation for 7504.
 
-**SDK state as of 2026-05-21:** `src/TeamsMediaBot.csproj` is on the
-latest stable Graph Communications package family
-`Microsoft.Graph.Communications.*` `1.2.0.15690` (released
-2025-10-24). NuGet also lists `1.2.0-beta.16019` (2026-02-25). The
-latest stable SDK being installed means the immediate 403 is not caused
-by an obviously stale stable SDK, but Microsoft support may still ask
-for a beta-package validation because the app-hosted-media guidance says
-to stay on the newest available media library or a version less than
-three months old.
-
-When a join attempt fails, the error code maps to a specific cause:
+**SDK state.** The bot project (under `src/`) is on `Microsoft.Graph.Communications.* 1.2.0.15690` (released 2025-10-24). NuGet also lists `1.2.0-beta.16019` (2026-02-25). Microsoft support may ask for a beta-package validation because the app-hosted-media guidance recommends staying on the newest media library or one less than three months old.
 
 | Error / code | Cause | What to do |
 |---|---|---|
-| `502 CALL_JOIN_FAILED_7504_OR_7505` with `Insufficient enterprise tenant permissions` in VM logs | Graph rejected `/communications/calls` before media. Current evidence: Gate 1 is correct; app has no tenant-wide `Calls.*` roles; arbitrary join URLs are outside RSC; Sandbox may also need Cloud Communications app-hosted-media enablement. | For RSC-only tests, add Alfred through `+ Apps` to that meeting/chat and retry. For arbitrary URL joins, Sandbox admin adds/admin-consents tenant-wide `Calls.JoinGroupCall.All` + `Calls.AccessMedia.All`, verifies any relevant policy, and opens a Microsoft Teams / Graph Cloud Communications support case if 7504 persists. Include scenario id and timestamp from VM logs. |
-| `403 GRAPH_PERMISSION_MISSING` | RSC scope: manifest on the team is older than the one with the needed scope, OR the team hasn't been re-installed since a new RSC was added. | Verify manifest version on the install: Teams Admin Center → Manage apps → Alfred Sandbox. If old, click **Update** on every team install. Confirm with `curl $BOT/api/channels`. |
-| `403 TENANT_NOT_ENABLED_FOR_MODE` | `CsTeamsMeetingPolicy` blocks the requested join mode (commonly `invite_and_graph_join` is disabled). | Sandbox admin allows the mode. Workaround: switch to `policy_auto_invite` if the bot is on the meeting invite. |
-| `400 BOT_NOT_INVITED` | C# join workflow's `BotAttendeePresent=true` assertion failed — no service-account row in the meeting roster matching the bot. | Either set `BotAttendeePresent=false` (relies purely on Graph join), or actually invite the bot's service account to the meeting. |
-| `Audio socket up`, `PeakSample=0`, no transcript | Bot joined cleanly, Teams is sending frames, but the audio buffer is silence. Speaker muted client-side or meeting options suppress app audio. | Confirm Alfred is in the roster; have a human unmute and speak; consider removing + re-adding Alfred. Not a code bug. |
+| `502 CALL_JOIN_FAILED_7504_OR_7505` with `Insufficient enterprise tenant permissions` | Graph rejected `/communications/calls` before media. App has no tenant-wide `Calls.*` roles; arbitrary URL joins are outside RSC; Sandbox may need Cloud Communications enablement. | For RSC-only tests, add Alfred via `+ Apps` to that meeting/chat. For arbitrary URLs, Sandbox admin adds/admin-consents `Calls.JoinGroupCall.All` + `Calls.AccessMedia.All`, verifies policy, and opens a Microsoft Cloud Communications support case if 7504 persists. Include scenario id and timestamp. |
+| `403 GRAPH_PERMISSION_MISSING` | RSC scope: manifest is older than the one with the needed scope, OR team hasn't been re-installed since a new RSC was added. | Teams Admin Center → Manage apps → Alfred Sandbox. Update on every team install. Confirm with `curl $BOT/api/channels`. |
+| `403 TENANT_NOT_ENABLED_FOR_MODE` | `CsTeamsMeetingPolicy` blocks the requested join mode. | Sandbox admin allows the mode. Workaround: `policy_auto_invite` if the bot is on the meeting invite. |
+| `400 BOT_NOT_INVITED` | C# join workflow's `BotAttendeePresent=true` assertion failed. | Set `BotAttendeePresent=false` (rely on Graph join), or invite the bot's service account. |
+| `Audio socket up`, `PeakSample=0`, no transcript | Bot joined cleanly; buffer is silence. Speaker muted client-side or meeting options suppress app audio. | Confirm Alfred in the roster; have a human unmute and speak. Not a code bug. |
 
-### 7.2 Why a channel meeting transcript never lands
+### 7.2 Channel meeting transcripts never land
 
-Microsoft documents `OnlineMeetingTranscript.Read.Chat` as
-"**applies only to scheduled private chat meetings, not to channel
-meetings.**" There is no public GET endpoint that consumes our
-`ChannelMeetingTranscript.Read.Group` RSC alone. Workaround: schedule
-the meeting as a **private** meeting (not channel), add Alfred to the
-meeting chat via `+ Apps`, then post `@Alfred link to <channel-name>`
-in the meeting chat. From then on every event from that meeting
-rolls up under the named channel.
+Microsoft documents `OnlineMeetingTranscript.Read.Chat` as applying only to scheduled private chat meetings, not channel meetings. There is no public GET endpoint consuming `ChannelMeetingTranscript.Read.Group` alone. Workaround: schedule as a private meeting, add Alfred via `+ Apps`, then post `@Alfred link to <channel-name>` in the chat. Every event then rolls up under the named channel.
 
 ### 7.3 General health probes
 
@@ -383,45 +274,21 @@ curl -sS $SINK/health                            # sink
 curl -sS $BOT/api/channels | jq                  # channel attachments + last_auto_join_attempt
 curl -sS $SINK/v2/index | jq                     # what the sink knows about
 
-# Manual transcript backfill (when the auto-trigger missed a meeting)
-# Accepts meeting_id (canonical Graph onlineMeeting.id, preferred) OR
-# call_id (ephemeral). organizer_oid is required.
-# meeting_chat_thread_id is optional.
+# Manual transcript backfill. meeting_id (chat thread id of the meeting,
+# 19:meeting_<base64>@thread.v2) or ephemeral call_id. organizer_oid required.
 curl -sS -X POST "$BOT/api/debug/fetch-transcript" -H 'Content-Type: application/json' \
-  -d '{"meeting_id":"MSpkYzE3...","organizer_oid":"...","meeting_chat_thread_id":"..."}'
+  -d '{"meeting_id":"19:meeting_NmFkYWM1NDQ...@thread.v2","organizer_oid":"...","meeting_chat_thread_id":"..."}'
 ```
 
-**See `AGENTS.md` §7** for the full symptom→fix index (auto-join
-tiers, `vmAgent: null` ARM lag, stale `dotnet publish`, run-command
-name caching, etc.).
+See `AGENTS.md` §7 for the full symptom→fix index.
 
 ### 7.4 Consumer routing — bootstrap fallback and isolation
 
-`EventFanoutDispatcher` has a **bootstrap fallback consumer**
-(`BotConfiguration.BootstrapConsumerUrl` →
-`EventFanoutDispatcher.cs:92-104`) that fires whenever a channel's
-per-channel consumer list is empty. Per the dispatcher logic at
-`EventFanoutDispatcher.cs:257-262`:
+The event fanout dispatcher (under `src/Services/`) has a bootstrap fallback consumer (`BotConfiguration.BootstrapConsumerUrl`) that fires whenever a channel's per-channel consumer list is empty. Per-channel consumers win when present; otherwise the bootstrap URL fires.
 
-```csharp
-if (record is not null && record.Consumers.Count > 0)
-    return record.Consumers;        // per-channel wins
-return _fallbackConsumers;          // else bootstrap URL fires
-```
+The bootstrap URL is wired to the sink in this deployment. **Deleting a channel's consumer registration does NOT silence the sink** — the fallback delivers to the same URL. The `bootstrap-default` consumer at `GET /api/channels/{tid}/{cid}/consumers` is the bot auto-recording the fallback target; deleting it just routes through the real fallback in code.
 
-The bootstrap URL is wired to the sink in this deployment. **Deleting
-a channel's consumer registration does NOT silence the sink** — the
-fallback path takes over and delivers events to the same URL. The
-default `bootstrap-default` consumer name you'll see at
-`GET /api/channels/{tid}/{cid}/consumers` is the bot auto-recording the
-fallback target on each channel; deleting it just routes through the
-real fallback in code.
-
-**To truly isolate a sink** from a channel (e.g. to confirm which agent
-is actually replying when two are running), register a placeholder
-consumer with `enabled: false`. `Count > 0` suppresses the fallback;
-`enabled: false` suppresses the placeholder itself. Net: zero POSTs
-for that channel.
+To truly isolate a sink, register a placeholder consumer with `enabled: false`. `Count > 0` suppresses the fallback; `enabled: false` suppresses the placeholder itself. Net: zero POSTs.
 
 ```bash
 TEAM=d3f5f412-2abf-4300-ac73-019e892c2a05
@@ -431,36 +298,19 @@ curl -X POST "$BOT/api/channels/$TEAM/$CHAN_ENC/consumers" \
   -d '{"name":"isolation-placeholder","url":"https://disabled.invalid/events",
        "event_kinds":["*"],"enabled":false}'
 
-# To restore, delete the placeholder — the bootstrap fallback kicks in again:
+# Restore — delete the placeholder, fallback resumes:
 curl -X DELETE "$BOT/api/channels/$TEAM/$CHAN_ENC/consumers/isolation-placeholder"
 ```
 
-A pull-based consumer that polls the blob archive directly (e.g. a
-custom bridge that lists `channels/{tid}/{cid_sanitized}/chat.message/`)
-is **unaffected by either path** — the C# bot writes blobs
-unconditionally, independent of consumer registration. Use the
-placeholder trick to silence push-based sinks; pull-based ones keep
-working because the blob is the source of truth.
+A pull-based consumer that polls the blob archive directly is unaffected by either path — the bot writes blobs unconditionally, independent of consumer registration. Use the placeholder trick to silence push-based sinks; pull-based ones keep working.
 
-### 7.5 V1 compatibility dual-write (keep a pre-v2 consumer working)
+### 7.5 V1 compatibility dual-write
 
-A polling consumer written against the pre-v2 blob layout
-(`channels/{team}/{cid_sanitized}/chat.message/{ts}-{eid}.txt`, with
-the human header + `---ENVELOPE---` separator + flat
-`payload.sender_display_name`) breaks the moment the bot starts
-writing only the v2 layout
-(`teams/{team_id}/channels/{cid_sanitized}/messages/{ts}-{eid}.json` —
-one category folder aggregates `channel.message.{created,updated,deleted}`).
+A polling consumer written against the pre-v2 layout (`channels/{team}/{cid_sanitized}/chat.message/{ts}-{eid}.txt`, with the human header + `---ENVELOPE---` separator + flat `payload.sender_display_name`) breaks when the bot writes only v2.
 
-The bot has a scoped dual-write to bridge that for one or more
-specific channels. When the feature flag is on and an envelope's
-channel id is in the allow-list, the bot writes the v2 blob at its
-canonical v2 path **and** a v1-format blob at the legacy v1 path for
-the same event. The pre-v2 consumer keeps polling the v1 path and
-sees the same shape it always did.
+The bot's blob archive (under `src/Services/`) has a scoped dual-write to bridge that for specific channels. When the feature flag is on and an envelope's channel id is in the allow-list, the bot writes the canonical v2 blob **and** a v1-format blob at the legacy path for the same event.
 
-Config lives in `appsettings.production.json` (`reloadOnChange:true` —
-no redeploy needed to flip):
+Config lives in `appsettings.production.json` (`reloadOnChange:true`):
 
 ```json
 "BlobArchive": {
@@ -472,32 +322,18 @@ no redeploy needed to flip):
 ```
 
 - `V1CompatEnabled` (bool, default `false`) — master switch.
-- `V1CompatChannelIds` (list, default `[]`) — exact channel ids
-  (e.g. `19:abc@thread.tacv2`) that get the extra write. Empty list
-  = no compat writes (zero overhead).
-- Only `channel.message.{created,updated,deleted}` events get
-  compat-written — that's the only family pre-v2 polling bridges
-  consumed. Transcripts, meeting events, etc. stay v2-only even
-  for allow-listed channels.
+- `V1CompatChannelIds` (list, default `[]`) — exact channel ids that get the extra write. Empty = zero overhead.
+- Only `channel.message.{created,updated,deleted}` get compat-written. Transcripts, meeting events, etc. stay v2-only.
 
-Lookup is `O(1)` per envelope (HashSet), and the v2 write is
-unchanged — compat is additive. When the downstream consumer
-migrates to read v2, set `V1CompatEnabled: false` (or empty the
-list) and the extra write goes away. See
-`src/Services/BlobEventArchive.cs` (`BuildV1CompatChannelMessage`)
-for the exact v1 body format.
+Lookup is O(1) (HashSet); v2 write is unchanged — compat is additive. When the downstream consumer migrates to v2, set `V1CompatEnabled: false` and the extra write goes away.
 
-Pair with the consumer-isolation trick in §7.4 if you also need to
-prevent your sink's AlfredAnalyzer from posting into the same
-channel while the pre-v2 consumer is the active responder there.
+**Sidecar bridge (`server.py` / `server_1.py` at the repo root).** Untracked files. A v1 polling-bridge sidecar — a separate FastAPI app that polls both the legacy v1 blob path (`channels/{team}/{cid_sanitized}/chat.message/{ts}-{eid}.txt`) and the new v2 path. Exists so a pre-v2 polling consumer keeps working during the v1→v2 cutover. NOT part of the v2 contract; not deployed; lives at the repo root because the maintainer iterates locally.
+
+Pair with §7.4's consumer-isolation trick if you also need to prevent your sink's AlfredAnalyzer from posting into the same channel while the pre-v2 consumer is the active responder.
 
 ### 7.6 Rollback after a bad deploy
 
-Every full-stack deploy pushes tags `deployed-{bot,sink,web}-YYYY-MM-DD`
-to the `private` remote pinning the SHAs that were live before the
-cutover. ACR retention keeps the prior container images
-(`disney-sandbox-{sha}`). Rollback is therefore one Run Command per
-component:
+Every full-stack deploy pushes `deployed-{bot,sink,web}-YYYY-MM-DD` tags to the `private` remote pinning the SHAs that were live before cutover. ACR retention keeps prior images (`disney-sandbox-{sha}`). Rollback is one Run Command per component:
 
 ```bash
 # Bot
@@ -506,22 +342,19 @@ az vm run-command create --subscription <sub> \
   --run-command-name alfred-rollback-$(date +%s) --location eastus \
   --script 'Set-Location C:/teams-bot-poc; git fetch origin --tags; git reset --hard deployed-bot-2026-05-13; Stop-Service TeamsMediaBot -Force; rm -r src/bin,src/obj -ErrorAction SilentlyContinue; dotnet publish src --configuration Release --output src/bin/Release/net8.0/publish; Start-Service TeamsMediaBot'
 
-# Sink / Web — just point Container App back to the old image tag
+# Sink / Web — point Container App back to the old image tag
 az containerapp update -n ca-alfred-api -g rg-alfred-disney --image acralfreddisneye02c0038.azurecr.io/ca-alfred-api:disney-sandbox-0baf2af
 az containerapp update -n ca-alfred-web -g rg-alfred-disney --image acralfreddisneye02c0038.azurecr.io/ca-alfred-web:disney-sandbox-4026981
 ```
 
----
+### 7.7 Consuming captured data
 
-## 7.7 Consuming captured data (the part downstream teams care about)
-
-Everything Alfred captures lives in two places. **Pick whichever path
-fits your consumer; both serve the same `alfred-v2` envelopes**.
+Everything Alfred captures lives in two places. Both serve the same `alfred-v2` envelopes.
 
 | Path | Best for |
 |------|----------|
-| **Sink API** — `$SINK/v2/*` | "I want one HTTP call → JSON" — list / lookup / proxy reads |
-| **Blob archive** — `$SA/...` | "I want the raw event stream forever" — replay, bulk, offline |
+| **Sink API** — `$SINK/v2/*` | "One HTTP call → JSON" — list / lookup / proxy reads |
+| **Blob archive** — `$SA/...` | "Raw event stream forever" — replay, bulk, offline |
 
 Full contract + recipes: [`docs/retrieving-transcripts.md`](docs/retrieving-transcripts.md).
 
@@ -529,243 +362,129 @@ Full contract + recipes: [`docs/retrieving-transcripts.md`](docs/retrieving-tran
 SINK=https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io
 SA=https://stalfreddisney.blob.core.windows.net/alfred-events
 
-# What meetings are in the system?
+# Meetings in the system
 curl -sS "$SINK/v2/meetings?limit=20" | jq '.meetings[] | {meeting_id, subject, scheduled_start_utc}'
 
 # Subject → meeting_id (case-insensitive substring)
 curl -sS "$SINK/v2/resolve?kind=meeting&subject=sprint%20planning" | jq
 
-# Official Microsoft transcript for a meeting (plaintext, inline)
-MID="MSpkYzE3..."
+# Official Microsoft transcript (plaintext, inline)
+MID="19:meeting_NmFkYWM1NDQ...@thread.v2"
 curl -sS "$SINK/v2/meetings/$MID/transcript" | jq -r '.text'
-# Or grab the raw blob directly:
+# Or raw blobs:
 curl -sS "$SA/meetings/$MID/transcripts/official.txt"
 curl -sS "$SA/meetings/$MID/transcripts/official.vtt"
 
-# Full ledger (live STT + chat) for a meeting
+# Full ledger (live STT + chat)
 curl -sS "$SINK/v2/meetings/$MID/events?limit=500" | jq
 
-# Channel messages by team + channel
+# Channel messages
 TID="d3f5f412-..." CID="19:abc@thread.tacv2"
 curl -sS "$SINK/v2/teams/$TID/channels/$CID" | jq
 curl -sS "$SINK/v2/teams/$TID/channels/$CID/events?kinds=chat&limit=200" | jq
 ```
 
-**Blob path layout** (folder segments are logical *categories*, not
-raw event_types — one folder per data type. `messages/` mirrors
-Graph's `/messages` endpoint; `transcripts/` mirrors Graph's
-`/transcripts` callTranscript resource. `live_transcript/` and
-`lifecycle/` are our own labels — no Graph sub-resource exists):
+**Blob path layout.** Folder segments are logical *categories*, not raw event_types — one folder per data type. `messages/` mirrors Graph's `/messages` endpoint; `transcripts/` mirrors Graph's `/transcripts` callTranscript resource. `live_transcript/` and `lifecycle/` are our own labels.
+
+Sanitization rule: `[^a-zA-Z0-9\-_.]` replaced with `_`, max 200 chars. Worked example: `19:meeting_NmFkYWM1NDQ...@thread.v2` → `19_meeting_NmFkYWM1NDQ..._thread.v2`.
 
 ```
 # Channel scope (channel meetings have no audio → messages + lifecycle only)
-teams/{team_id}/channels/{channel_id_sanitized}/messages/{utcTs}-{event_id}.json
-teams/{team_id}/channels/{channel_id_sanitized}/lifecycle/{utcTs}-{event_id}.json
+teams/{team_id_sanitized}/channels/{channel_id_sanitized}/messages/{utcTs}-{event_id}.json
+teams/{team_id_sanitized}/channels/{channel_id_sanitized}/lifecycle/{utcTs}-{event_id}.json
 
-# Meeting scope
-meetings/{meeting_id}/messages/{utcTs}-{event_id}.json             ← meeting.chat.{created,updated,deleted}
-meetings/{meeting_id}/live_transcript/{utcTs}-{event_id}.json      ← meeting.transcript.{partial,final}  (Alfred's Azure Speech STT)
-meetings/{meeting_id}/transcripts/{utcTs}-{event_id}.json          ← meeting.transcript.official envelope (MS Graph callTranscript)
-meetings/{meeting_id}/transcripts/official.txt                      ← flat plaintext (overwritten on each fetch)
-meetings/{meeting_id}/transcripts/official.vtt                      ← flat WebVTT     (overwritten on each fetch)
-meetings/{meeting_id}/lifecycle/{utcTs}-{event_id}.json            ← meeting.{created,ended,linked,call.joined,call.left}
+# Meeting scope (meeting_id is the chat thread id, sanitized)
+meetings/{meeting_id_sanitized}/messages/{utcTs}-{event_id}.json          ← meeting.chat.{created,updated,deleted}
+meetings/{meeting_id_sanitized}/live_transcript/{utcTs}-{event_id}.json   ← meeting.transcript.{partial,final}  (Azure Speech STT)
+meetings/{meeting_id_sanitized}/transcripts/{utcTs}-{event_id}.json       ← meeting.transcript.official envelope (Graph callTranscript)
+meetings/{meeting_id_sanitized}/transcripts/official.txt                  ← flat plaintext (overwritten on each fetch)
+meetings/{meeting_id_sanitized}/transcripts/official.vtt                  ← flat WebVTT     (overwritten on each fetch)
+meetings/{meeting_id_sanitized}/lifecycle/{utcTs}-{event_id}.json         ← meeting.{created,ended,linked,call.joined,call.left}
 ```
 
-The precise `event_type` lives in the envelope JSON, so consumers
-that need `created` vs. `updated` vs. `deleted` read it from there.
+Real production URL example:
+```
+https://ca-alfred-web.gentlewater-5aa74a73.eastus.azurecontainerapps.io/archive?prefix=meetings%2F19_meeting_NmFkYWM1NDQtYTM3ZC00ZjlmLTk4ZjItZjE0M2YwOWEzODIx_thread.v2%2Flive_transcript%2F
+```
 
-Every `.json` blob is a **pure `alfred-v2` envelope** — no preamble,
-just `{ … }`. `jq` it directly.
+The precise `event_type` lives in the envelope JSON; consumers that need `created` vs. `updated` vs. `deleted` read it from there.
 
-> **Legacy v1 compat path (preserved):**
-> `channels/{tid}/{cid_sanitized}/chat.message/{ts}-{eid}.txt` is
-> still written for channel ids in `BlobArchive:V1CompatChannelIds`
-> — see §7.5. New consumers must read the v2 category layout above.
+Every `.json` blob is a pure `alfred-v2` envelope — no preamble, just `{ … }`. `jq` it directly.
 
-> **Channel meetings have no audio.** They surface only as
-> `channel.message.*` events. The `meeting.*` family exists for
-> private meetings the bot was added to via `+ Apps`.
+> **Legacy v1 compat path (preserved):** `channels/{tid}/{cid_sanitized}/chat.message/{ts}-{eid}.txt` is still written for channel ids in `BlobArchive:V1CompatChannelIds` — see §7.5. New consumers must read the v2 category layout above.
 
-> **`meeting_id` is canonical.** It's the Graph `onlineMeeting` id
-> (URL-safe base64). The chat thread id (`19:meeting_xxx@thread.v2`)
-> is a sub-resource; never key on it when you mean the meeting.
+> **Channel meetings have no audio.** They surface only as `channel.message.*` events.
+
+> **`meeting_id` is canonical.** It is the Teams chat thread id of the meeting (`19:meeting_<base64>@thread.v2`). Graph's `onlineMeeting.id` is a separate identifier the system does not key on.
 
 ---
 
 ## 8. Editing rules (do not violate)
 
-1. **`meeting_id` is the canonical meeting key** — the Graph
-   `onlineMeeting` id (URL-safe base64). `meeting_chat_thread_id` is a
-   sub-resource. Never use `chat_thread_id` as a surrogate meeting key.
-2. **Discriminated envelope** — every `AlfredEventEnvelope` has exactly
-   one of `ChannelRef` or `MeetingRef` populated, never both, never
-   neither. The discriminator is the `event_type` prefix (`channel.*`
-   → `ChannelRef`; `meeting.*` → `MeetingRef`).
-3. **No v1 shims.** Do not add "if old schema, do X else Y" branches.
-   `alfred-v2` is the only schema the bot emits. v1 is dead.
-4. **Channel meetings have no `meeting.*` events.** They surface only
-   as `channel.message.*` on the channel thread. Do not model channel
-   meetings as first-class `Meeting` entities.
-5. **One inbound chat path** — Bot Framework `/api/messages` → C#
-   bot publishes via `EventFanoutDispatcher`. No parallel ingress.
-6. **Outbound Alfred chat** goes through the `send_to_meeting_chat`
-   tool only.
-7. **`alfred.yaml` is the sole source of truth** for Alfred's prompt
-   and intervention policy. `AlfredAnalyzer` raises at construction
-   if `instructions` is missing — do not add a code fallback.
-8. **One canonical implementation per concern.** No duplicate files,
-   no parallel paths, no `v2` copies.
-9. **Fail fast.** Clear, specific errors at system boundaries. No
-   validation for impossible scenarios.
-10. **`dotnet publish` always after `rm -rf src/bin src/obj`** in any
-    deploy script that touches code. See AGENTS.md §7.4.
-11. **Manifest changes** require: bump `version`, regenerate
-    `alfred-sandbox.zip`, re-import in Teams Developer Portal,
-    re-grant admin consent if RSCs changed. **New RSCs require team
-    re-install** — Teams binds RSC scopes at install time.
-12. **Push protocol** — only `private` and `disney` remotes. Never
-    push to `origin`.
+1. **`meeting_id` is the Teams chat thread id of the meeting** (`19:meeting_<base64>@thread.v2`). Graph's `onlineMeeting.id` is a separate identifier and is not used as the key. Never substitute a different surrogate.
+2. **Discriminated envelope.** Every `AlfredEventEnvelope` has exactly one of `ChannelRef` or `MeetingRef` populated, never both, never neither. Discriminator is the `event_type` prefix (`channel.*` → `ChannelRef`; `meeting.*` → `MeetingRef`).
+3. **No v1 shims.** Do not add "if old schema, do X else Y" branches. `alfred-v2` is the only schema the bot emits. v1 is dead.
+4. **Channel meetings have no `meeting.*` events.** They surface only as `channel.message.*` on the channel thread. Do not model channel meetings as first-class `Meeting` entities.
+5. **One inbound chat path** — Bot Framework `/api/messages` → C# bot publishes via the event fanout dispatcher. No parallel ingress.
+6. **Outbound Alfred chat** goes through the `send_to_meeting_chat` tool only.
+7. **`alfred.yaml` is the sole source of truth** for prompt and intervention policy. The analyzer raises at construction if `instructions` is missing — do not add a code fallback.
+8. **One canonical implementation per concern.** No duplicate files, no parallel paths, no `v2` copies.
+9. **Fail fast.** Clear, specific errors at system boundaries. No validation for impossible scenarios.
+10. **`dotnet publish` always after `rm -rf src/bin src/obj`** in any deploy script that touches code. See AGENTS.md §7.4.
+11. **Manifest changes** require: bump `version`, regenerate `alfred-sandbox.zip`, re-import in Teams Developer Portal, re-grant admin consent if RSCs changed. **New RSCs require team re-install.**
+12. **Push protocol** — only `private` and `disney` remotes. Never `origin`.
 
 ---
 
 ## 9. Pointers
 
-- [`AGENTS.md`](AGENTS.md) — deep ops manual (build internals, debug
-  recipes, deploy mechanics, gotchas).
-- [`docs/event-contract.md`](docs/event-contract.md) —
-  `alfred-v2` envelope schema + per-`event_type` payload.
-- [`docs/retrieving-transcripts.md`](docs/retrieving-transcripts.md) —
-  blob archive layout + Python / curl / az recipes.
-- [`docs/TEAMS-AUTO-INVITE-SETUP.md`](docs/TEAMS-AUTO-INVITE-SETUP.md) —
-  one-time Sandbox-tenant admin setup for auto-invite mode.
-- [`TODO.md`](TODO.md) — prioritized backlog with code-level paths
-  for the next agent to pick up cold.
+- [`AGENTS.md`](AGENTS.md) — deep ops manual (build internals, debug recipes, deploy mechanics, gotchas).
+- [`docs/event-contract.md`](docs/event-contract.md) — `alfred-v2` envelope schema + per-`event_type` payload.
+- [`docs/retrieving-transcripts.md`](docs/retrieving-transcripts.md) — blob archive layout + Python / curl / az recipes.
+- [`docs/TEAMS-AUTO-INVITE-SETUP.md`](docs/TEAMS-AUTO-INVITE-SETUP.md) — one-time Sandbox-tenant admin setup for auto-invite mode.
+- [`TODO.md`](TODO.md) — prioritized backlog with code-level paths.
 
 ---
 
-## 10. Adding Alfred to a Teams meeting (operator guide)
+## 10. Adding Alfred to a Teams meeting
 
-Alfred is one Teams app with two attach surfaces. They grant
-different things; pick based on what you need.
+Alfred is one Teams app with two attach surfaces.
 
 ### Surface 1 — "+Apps" in the meeting chat
 
-What it does: installs Alfred per-meeting in the meeting's chat
-container. The manifest's chat-scoped RSCs (`ChatMessage.Read.Chat`,
-`OnlineMeetingTranscript.Read.Chat`, `OnlineMeetingParticipant.Read.Chat`,
-`Calls.AccessMedia.Chat`, etc.) become consented for that one chat.
+Installs Alfred per-meeting in the meeting's chat container. The manifest's chat-scoped RSCs become consented for that one chat.
 
 You get:
-- Real-time chat events (`meeting.chat.created/updated/deleted`)
-  flow into the bot → sink → dossier.
-- Post-meeting transcript fetch via
-  `installedToOnlineMeetings/getAllTranscripts` works *in
-  principle*, but the auto-trigger for "+Apps" meetings is not yet
-  wired (see [`TODO.md`](TODO.md) §P1 items B + A). For now use
-  `POST $BOT/api/debug/fetch-transcript` (see §7.3) to backfill.
-- Alfred can post into the chat via `/api/send-chat` (the agent's
-  `send_to_meeting_chat` tool).
+- Real-time chat events (`meeting.chat.created/updated/deleted`) → bot → sink → dossier.
+- Post-meeting transcript fetch via `installedToOnlineMeetings/getAllTranscripts` works in principle. Auto-trigger for `+Apps` meetings is not yet wired (see [`TODO.md`](TODO.md)). Use `POST $BOT/api/debug/fetch-transcript` (§7.3) to backfill.
+- Alfred can post into the chat via `/api/send-chat` (the agent's `send_to_meeting_chat` tool).
 
-You DON'T get:
-- Live audio / `meeting.transcript.partial` / `meeting.transcript.final`
-  events — the bot is not in the call.
-- The bot in the meeting roster — it's invisible to call participants.
-- Speaker diarization for live notes.
+You DON'T get: live audio, `meeting.transcript.partial/final`, the bot in the meeting roster, speaker diarization for live notes.
 
-How to add: in the meeting chat, click **+** → **Apps** → search
-"Alfred Sandbox" → Add. Approval may be required from a Sandbox
-admin if the manifest version is newer than the team's installed
-version (per §5).
+How: meeting chat → **+** → **Apps** → search "Alfred Sandbox" → Add. Sandbox admin approval may be required if the manifest version is newer than the installed version.
 
 ### Surface 2 — Alfred as a call participant (live audio)
 
-What it does: the bot enters the call as an actual participant. Uses
-the `Calls.JoinGroupCalls.Chat` + `Calls.AccessMedia.Chat` RSCs to
-join via Graph and read the diarized audio stream, but only for a
-meeting/chat where Alfred has been installed through Teams. The current
-Sandbox app registration has no tenant-wide `Calls.*` application
-roles, so arbitrary "join this URL" is not authorized by the current
-permission model.
+Bot enters the call as an actual participant via `Calls.JoinGroupCalls.Chat` + `Calls.AccessMedia.Chat` RSCs — but only for a meeting/chat where Alfred is installed. The current Sandbox app registration has no tenant-wide `Calls.*` roles, so arbitrary "join this URL" is not authorized.
 
-You get everything from Surface 1, PLUS:
-- Live STT events (`meeting.transcript.partial/final`) feeding the
-  dossier in real time.
-- Speaker diarization with AAD ids resolved.
-- Live participant roster events.
-- Alfred visibly in the meeting roster ("Alfred" with the app
-  identity).
-- Real-time interventions (the agent can post "who's owning X?"
-  while the meeting is still happening).
+You get everything from Surface 1, plus: live STT (`meeting.transcript.partial/final`), speaker diarization with AAD ids, live participant roster events, Alfred visibly in the roster, real-time interventions.
 
-How to add — three paths, in order of automation:
+Three paths, in order of automation:
 
-1. **Auto-join for channel meetings.** If the channel is attached
-   (`POST $BOT/api/channels/attach`, see §7.4) and the bot has
-   `auto_join_enabled: true`, the bot joins automatically when
-   Teams posts a `callStartedEventMessageDetail` system message.
-   No per-meeting action needed.
-2. **Manual join via the bot API for a meeting where Alfred is
-   installed.** `POST $BOT/api/calling/join` with the meeting's
-   `joinUrl`. Surfaces 502/7504/7505 if the target meeting is outside
-   Alfred's RSC grant or the Sandbox tenant is not enabled for
-   app-hosted media; see §7.1.
-3. **Invite the bot's service account** to the meeting via the
-   organizer's calendar invite. The bot answers the call when it
-   starts. This still needs the same Graph Communications media
-   authorization described in §7.1.
+1. **Auto-join for channel meetings.** If the channel is attached (`POST $BOT/api/channels/attach`, §7.4) and `auto_join_enabled: true`, the bot joins when Teams posts a `callStartedEventMessageDetail`.
+2. **Manual join.** `POST $BOT/api/calling/join` with the meeting's `joinUrl`. Surfaces 502/7504/7505 if outside Alfred's RSC grant or Sandbox isn't enabled for app-hosted media (§7.1).
+3. **Invite the bot's service account** via the organizer's calendar. Still needs the Graph Communications media authorization in §7.1.
 
-All three paths require the correct Sandbox meeting/chat authorization
-and Cloud Communications media gate (§7.1). Waiting on
-`CsApplicationAccessPolicy` alone is not enough to explain or clear
-7504/7505.
+### Doing both
 
-### Doing both — and the "double response" concern
+**Yes, you can (and often should) do both.** "+Apps" gives the chat surface; the call-participant path adds audio on top. Additive, not duplicative.
 
-**Yes, you can (and often should) do both.** "+Apps" gives the
-chat surface; the call-participant path adds audio on top. They are
-additive, not duplicative.
+**No double agent responses.** Alfred is one bot with one identity. Both surfaces feed events into the SAME `AlfredAnalyzer` instance scoped to the same chat thread. The analyzer is event-driven and debounced — each tick is ONE LLM call producing AT MOST one `send_to_meeting_chat`. The session merge logic is idempotent on `id`: if the same statement appears in chat and audio, both flow through the SAME action_item id and the second observation just updates it.
 
-**No, you don't get double agent responses from doing both.** Here's
-why:
+What changes when you add both: more data per tick → more ticks; richer dossier (direct quotes, speaker attribution); silence-default still applies to chat output.
 
-- Alfred is **one bot** with one identity (`AppId 207a38a4-…`,
-  display name "Alfred"). Both surfaces feed events into the SAME
-  `AlfredAnalyzer` instance scoped to the same chat thread.
-- The analyzer is **event-driven and debounced** (`drain-now` per
-  `python/meeting_agent/debounce.py`). Each tick is ONE LLM call
-  that produces AT MOST one `send_to_meeting_chat` invocation.
-- The session-side **merge logic** (`session.apply_extraction`)
-  is idempotent on `id` — if Sarah says "I'll handle deploy" in
-  chat and the audio transcript captures the same statement, both
-  events flow through the SAME action_item id and the second
-  observation just updates (not duplicates) the existing item.
-- The new prompt's **Principle B** ("every tick, re-assess the
-  whole dossier") explicitly tells the model to recognize that a
-  transcript echo of a chat message is the same content, not a new
-  commitment.
+When to pick one:
+- **"+Apps" only** for post-meeting retrieval + chat presence where live agent posts would be intrusive, or when the calling policy gate isn't open.
+- **Call-only (no +Apps)** is unusual — chat events come via the chat-resource subscription which requires the `+Apps` install. You'd get audio-only Alfred, losing chat context.
 
-What changes when you add both surfaces:
-- The agent has MORE data per tick (chat AND audio), so it ticks
-  more often. Total agent activity goes up, but per-event response
-  rate is unchanged.
-- Total reply volume from the agent goes up only modestly — the
-  silence-default still applies to chat output. You'll see more
-  posts because the agent has more reason to speak (it now knows
-  who said what verbatim, not just what was typed).
-- The dossier becomes richer — direct quotes, owner attribution
-  from speaker diarization, real-time status escalation as the
-  room agrees in audio after a chat proposal.
-
-There are scenarios where you'd want only ONE surface:
-- **"+Apps" only** for meetings where you want post-meeting
-  retrieval + chat presence but find live agent posts intrusive,
-  OR where the tenant policy gate isn't open for call join.
-- **Call-only (no +Apps)** is unusual — chat events come via the
-  chat-resource subscription which requires the +Apps install. You'd
-  effectively be getting audio-only Alfred, which works but loses
-  the chat context that gives the dossier most of its richness.
-
-For the common case (Disney Sandbox internal meetings where you
-want the full Alfred experience): do BOTH. "+Apps" first, then —
-once the calling policy is open — let auto-join handle the audio
-surface, or hit the manual join endpoint.
+For the common case (Disney Sandbox internal meetings): do BOTH. `+Apps` first, then once the calling policy is open let auto-join handle audio, or hit the manual join endpoint.

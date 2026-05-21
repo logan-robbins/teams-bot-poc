@@ -1,38 +1,16 @@
 # Alfred Event Contract — `alfred-v2`
 
-The canonical contract published by the Alfred bot. The bot is a
-Teams platform that captures **channel chat** (team → channel →
-thread → message) and **meetings** (audio + chat in private meetings
-the bot is added to). Every event POSTs as a versioned JSON envelope.
+Canonical reference for the `alfred-v2` event envelope. The bot emits one envelope per event: channel chat under `channel.*`, meeting audio + chat under `meeting.*`. Envelope shape mirrors the Microsoft Graph URL hierarchy.
 
-This contract mirrors **the Microsoft Graph URL hierarchy**. The
-shape of every event tells you exactly which Graph resource it
-belongs to. No flat keyspace, no overloaded ids, no nullable
-routing fields that you have to interpret.
-
-If you are building a consumer:
-
-1. Pick a URL on your network.
-2. Register it via `POST $BOT/api/channels/{teamId}/{channelId}/consumers`
-   (the only scope the bot currently implements — channel-scope
-   consumers also receive `meeting.*` events for meetings linked to
-   that channel), or use the read-only blob archive
-   ([`docs/retrieving-transcripts.md`](retrieving-transcripts.md)).
-3. Accept the envelope shape in §2.
-4. To post back into chat, `POST $BOT/api/send-chat` (§5).
+Consumers: register a webhook at `POST $BOT/api/channels/{teamId}/{channelId}/consumers` (only scope implemented), or read the blob archive (see `docs/retrieving-transcripts.md`).
 
 ---
 
 ## 1. Versioning
 
-- Current schema version: **`alfred-v2`**. Every envelope carries
-  `"schema_version": "alfred-v2"`.
-- v1 (`alfred-events-v1`) is **dead**. The bot does not emit v1. No
-  back-compat shims exist on the sink. If you have v1 code, replace
-  it.
-- Within v2: additive only. New optional fields may appear; new
-  event types may appear. Existing fields never change shape inside
-  v2. Breaking changes ship as `v3`.
+- Current: `"schema_version": "alfred-v2"`.
+- v1 (`alfred-events-v1`) is dead. No back-compat shims on the sink. See [§7 V1 polling bridge](#7-v1-polling-bridge) for one carve-out.
+- Within v2: additive only. New optional fields and new event types are allowed. Breaking changes ship as `v3`.
 
 ---
 
@@ -45,22 +23,19 @@ If you are building a consumer:
   "event_id":       "8a3f1c0e2b9d4a7e9f12bb0001020304",
   "ts":             "2026-05-14T16:34:12.184Z",
 
-  // EXACTLY ONE of these two blocks is populated. Which one tells
-  // you whether this event belongs to channel chat or to a meeting.
+  // Exactly one of these two blocks is populated.
   "channel_ref":    null,
-  "meeting_ref":    { /* see §2.2 */ },
+  "meeting_ref":    { /* §2.2 */ },
 
-  // Optional. Echo to /api/send-chat to reply into the source thread.
+  // Optional. Echo to /api/send-chat to reply in the source thread.
   "conversation_reference_id": "<bot-framework conv ref id>",
 
-  // Event-type-specific payload. See §3.
-  "payload":        { /* ... */ }
+  "payload":        { /* §3 */ }
 }
 ```
 
-Rules:
-- `channel_ref` is populated iff `event_type` starts with `channel.`.
-- `meeting_ref` is populated iff `event_type` starts with `meeting.`.
+- `channel_ref` populated iff `event_type` starts with `channel.`.
+- `meeting_ref` populated iff `event_type` starts with `meeting.`.
 - Both blocks are never populated on the same envelope.
 
 ### 2.1 `channel_ref`
@@ -74,28 +49,20 @@ Mirrors `/teams/{team_id}/channels/{channel_id}/messages/{thread_id}/replies/{me
   "channel_id":           "19:abc@thread.tacv2",
   "channel_display_name": "general",
   "thread_id":            "1700000000000",   // root message id; required
-  "message_id":           "1700000000123"    // present on *.message.* events; null on system events
+  "message_id":           "1700000000123"    // required on *.message.*; null on system events
 }
 ```
 
-Display names are **best-effort, populated when the bot knows them**.
-Resolution happens via `GET /teams/{id}` and `GET /teams/{id}/channels/{id}`
-on first sighting and is cached. Consumers should not rely on display
-names being present; they should fall back to ids and call the sink's
-`/v2/resolve` endpoint if a name is needed.
+Display names are best-effort. Resolved via `GET /teams/{id}` and `GET /teams/{id}/channels/{id}` on first sighting; cached. Fall back to ids and `/v2/resolve` if a name is needed.
 
 ### 2.2 `meeting_ref`
 
-Mirrors `/me/onlineMeetings/{meeting_id}` (the canonical resource)
-plus the meeting's separate `/chats/{thread_id}` chat container.
-
 ```jsonc
 {
-  "meeting_id":             "MSpkYzE3NjY0Mi0...",        // Graph onlineMeeting id; canonical
-  "meeting_chat_thread_id": "19:meeting_xxx@thread.v2",  // chat container id
-  "call_id":                "abc-123-def",                // present only while bot is in-call
+  "meeting_id":             "19:meeting_NmFkYW...@thread.v2",  // see §2.2.1
+  "meeting_chat_thread_id": "19:meeting_NmFkYW...@thread.v2",  // same value as meeting_id
+  "call_id":                "abc-123-def",                      // present only while bot is in-call
 
-  // Best-effort human-readable metadata (populated when known).
   "subject":                "Sprint planning",
   "organizer": {
     "aad_id":               "accf88ee-...",
@@ -104,98 +71,72 @@ plus the meeting's separate `/chats/{thread_id}` chat container.
   "scheduled_start_utc":    "2026-05-14T16:00:00Z",
   "scheduled_end_utc":      "2026-05-14T16:30:00Z",
 
-  // Optional channel link (set after the bot learns this meeting
-  // belongs to a channel — see meeting.linked event).
+  // Optional channel back-reference, set after meeting.linked.
   "channel_link": {
     "team_id":              "...",
     "team_display_name":    "Engineering",
     "channel_id":           "19:abc@thread.tacv2",
     "channel_display_name": "general",
-    "thread_id":            "1700000000000",  // optional thread granularity
+    "thread_id":            "1700000000000",
     "linked_at_utc":        "2026-05-14T16:01:30Z",
     "linked_source":        "bot_framework_channeldata"
   }
 }
 ```
 
-`meeting_id` is the stable key — it survives across the meeting chat
-thread, the call instance, and the post-meeting transcript fetch.
+#### 2.2.1 `meeting_id`
 
-> **Implementation note.** The bot resolves the canonical Graph
-> `onlineMeeting.id` via `GET /chats/{thread_id}` → `joinWebUrl` →
-> `GET /users/{organizer}/onlineMeetings?$filter=joinWebUrl eq '...'`.
-> When that two-hop resolution fails (organizer not visible to the
-> app, expired meeting, Graph transient), the bot falls back to using
-> the chat thread id as `meeting_id` and **logs a warning**. Consumers
-> that group strictly by `meeting_id` will see two buckets for the
-> same meeting in that case. The fallback is observable: a `meeting.*`
-> envelope whose `meeting_id` starts with `19:` and `@thread.v2`
-> instead of being URL-safe base64. The blob layout under
-> `meetings/{meeting_id}/` reflects the same id used in the envelope.
+> **`meeting_id` is the Teams chat thread id of the meeting (`19:meeting_<base64>@thread.v2`).**
+
+This is the stable key for everything meeting-scoped: the live transcript stream, the meeting chat, the official transcript blobs, the sink's `/v2/meetings/{meeting_id}/...` endpoints, and the consumer dossier. `meeting_chat_thread_id` carries the same value and exists only because the field name reads more naturally inside chat-payload contexts.
+
+Microsoft Graph exposes a separate identifier called `onlineMeeting.id` (returned by `GET /me/onlineMeetings`). The bot uses that identifier internally only when it calls `/onlineMeetings/{id}/transcripts` to retrieve the post-meeting Microsoft transcript. `onlineMeeting.id` is never written to an envelope, never written to a blob path, and never accepted as a key by the sink. Consumers key on `meeting_id` (the chat thread id) — that is the contract.
 
 ### 2.3 Transport
 
 - `POST application/json`, one envelope per request (not batched).
-- 2xx = accepted. 5xx / 408 / 429 = retry (up to 3 attempts, exponential
-  backoff 250ms / 1s / 4s). 4xx (other) = permanent drop.
+- 2xx accepted. 5xx / 408 / 429 retry up to 3 with backoff 250ms / 1s / 4s. Other 4xx drops permanently.
 - Per-consumer queue: bounded 1000 entries, drop-oldest.
 
 ---
 
 ## 3. Event types
 
-### Channel events (`channel.*`)
+### Channel events
 
-Requires `channel_ref` with `team_id` + `channel_id` + `thread_id`
-populated. `message_id` is required for `.message.*` events.
+| Event type                  | Required `channel_ref` fields                          | Payload § |
+|-----------------------------|--------------------------------------------------------|-----------|
+| `channel.attached`          | `team_id`, `channel_id`                                | §3.1      |
+| `channel.detached`          | `team_id`, `channel_id`                                | §3.1      |
+| `channel.message.created`   | `team_id`, `channel_id`, `thread_id`, `message_id`     | §3.2      |
+| `channel.message.updated`   | `team_id`, `channel_id`, `thread_id`, `message_id`     | §3.2      |
+| `channel.message.deleted`   | `team_id`, `channel_id`, `thread_id`, `message_id`     | §3.2      |
 
-| Event type                  | Required `channel_ref` fields                          | Payload §  |
-|-----------------------------|--------------------------------------------------------|------------|
-| `channel.attached`          | `team_id`, `channel_id`                                | §3.1       |
-| `channel.detached`          | `team_id`, `channel_id`                                | §3.1       |
-| `channel.message.created`   | `team_id`, `channel_id`, `thread_id`, `message_id`     | §3.2       |
-| `channel.message.updated`   | `team_id`, `channel_id`, `thread_id`, `message_id`     | §3.2       |
-| `channel.message.deleted`   | `team_id`, `channel_id`, `thread_id`, `message_id`     | §3.2       |
+### Meeting events
 
-### Meeting events (`meeting.*`)
+| Event type                       | Required `meeting_ref` fields            | Payload § |
+|----------------------------------|------------------------------------------|-----------|
+| `meeting.created`                | `meeting_id`, `meeting_chat_thread_id`   | §3.3      |
+| `meeting.linked`                 | `meeting_id`, `channel_link`             | §3.4      |
+| `meeting.call.joined`            | `meeting_id`, `call_id`                  | §3.5      |
+| `meeting.call.left`              | `meeting_id`, `call_id`                  | §3.5      |
+| `meeting.chat.created`           | `meeting_id`, `meeting_chat_thread_id`   | §3.6      |
+| `meeting.chat.updated`           | `meeting_id`, `meeting_chat_thread_id`   | §3.6      |
+| `meeting.chat.deleted`           | `meeting_id`, `meeting_chat_thread_id`   | §3.6      |
+| `meeting.transcript.partial`     | `meeting_id`                             | §3.7      |
+| `meeting.transcript.final`       | `meeting_id`                             | §3.7      |
+| `meeting.transcript.official`    | `meeting_id`                             | §3.8      |
+| `meeting.ended`                  | `meeting_id`                             | §3.3      |
 
-Requires `meeting_ref` with `meeting_id` populated.
-
-| Event type                       | Required `meeting_ref` fields                          | Payload § |
-|----------------------------------|--------------------------------------------------------|-----------|
-| `meeting.created`                | `meeting_id`, `meeting_chat_thread_id`                 | §3.3      |
-| `meeting.linked`                 | `meeting_id`, `channel_link`                           | §3.4      |
-| `meeting.call.joined`            | `meeting_id`, `call_id`                                | §3.5      |
-| `meeting.call.left`              | `meeting_id`, `call_id`                                | §3.5      |
-| `meeting.chat.created`           | `meeting_id`, `meeting_chat_thread_id`                 | §3.6      |
-| `meeting.chat.updated`           | `meeting_id`, `meeting_chat_thread_id`                 | §3.6      |
-| `meeting.chat.deleted`           | `meeting_id`, `meeting_chat_thread_id`                 | §3.6      |
-| `meeting.transcript.partial`     | `meeting_id`                                           | §3.7      |
-| `meeting.transcript.final`       | `meeting_id`                                           | §3.7      |
-| `meeting.transcript.official`    | `meeting_id`                                           | §3.8      |
-| `meeting.ended`                  | `meeting_id`                                           | §3.3      |
-
-> **Channel meetings have no separate chat container.** A channel
-> meeting's "chat" IS the channel thread — Microsoft Graph does not
-> create a `chatType: "meeting"` chat for channel meetings (the
-> `chatType` enum is `oneOnOne | group | meeting`, and meeting-type
-> chats only exist for private meetings). Channel meetings surface
-> exclusively as `channel.message.*` events on the parent channel
-> thread. No `meeting.chat.*` events are emitted for them, and the
-> `meeting.*` family as a whole exists only for **private meetings
-> the bot was added to via `+ Apps` in the meeting chat**. Consumers
-> that want "the chat from a channel meeting" should read the channel
-> thread's `channel.message.*` events for the time window of the
-> meeting (use `meeting.created` / `meeting.ended` on linked meetings
-> as a cue) — there is no separate stream.
+The `meeting.*` family exists only for private meetings the bot was added to via `+ Apps`. Channel meetings surface as `channel.message.*` on the parent thread — Graph does not create a `chatType: "meeting"` chat for channel meetings, and no `meeting.chat.*` events are emitted for them. To reconstruct a channel meeting's "chat," read the channel thread's `channel.message.*` events for the meeting's time window (use `meeting.created` / `meeting.ended` on linked meetings as cues).
 
 ### 3.1 `channel.attached` / `channel.detached`
 
 ```jsonc
 {
-  "installed_by":         "<aad object id>",
-  "installation_id":      "<teams app installation id>",
-  "membership_type":      "standard"   // | "private" | "shared"
+  "installed_by":    "<aad object id>",
+  "installation_id": "<teams app installation id>",
+  "membership_type": "standard"   // | "private" | "shared"
 }
 ```
 
@@ -211,266 +152,205 @@ Requires `meeting_ref` with `meeting_id` populated.
   "text":                 "plain text body",
   "html":                 "<div>...</div>",
   "timestamp_utc":        "2026-05-14T18:23:45.401Z",
-  "reply_to_message_id":  null,            // populated if this is a reply within the thread
-  "is_root":              true,            // true iff message_id == thread_id (this is the thread's root post)
+  "reply_to_message_id":  null,           // populated if this is a reply within the thread
+  "is_root":              true,           // true iff message_id == thread_id
   "from_bot":             false,
-  "attachments":          [ /* see §3.9 */ ],
+  "attachments":          [ /* §3.9 */ ],
   "mentions":             [ /* raw Bot Framework / Graph mentions */ ],
-  "raw":                  { /* full source payload, best-effort */ }
+  "raw":                  { /* source payload, best-effort */ }
 }
 ```
 
-For `channel.message.updated`: same shape; `text` / `html` reflect
-the latest version.
-
-For `channel.message.deleted`: `text` and `html` may be null;
-`timestamp_utc` is the deletion time.
+For `.updated`: same shape, latest text/html. For `.deleted`: text/html may be null; `timestamp_utc` is deletion time.
 
 ### 3.3 `meeting.created` / `meeting.ended`
-
-Emitted when the bot first sees a meeting (`created`) and when it
-detects the meeting ended (`ended`, via Graph or call-state).
 
 ```jsonc
 {
   "subject":              "Sprint planning",
-  "organizer": {
-    "aad_id":             "...",
-    "display_name":       "..."
-  },
+  "organizer":            { "aad_id": "...", "display_name": "..." },
   "scheduled_start_utc":  "2026-05-14T16:00:00Z",
   "scheduled_end_utc":    "2026-05-14T16:30:00Z",
-  "actual_start_utc":     "2026-05-14T16:01:12Z",   // ended only
-  "actual_end_utc":       "2026-05-14T16:34:55Z"    // ended only
+  "actual_start_utc":     "2026-05-14T16:01:12Z",  // ended only
+  "actual_end_utc":       "2026-05-14T16:34:55Z"   // ended only
 }
 ```
 
 ### 3.4 `meeting.linked`
 
-The bot learned this meeting belongs to a channel (and optionally a
-specific thread within it). The `channel_link` block on `meeting_ref`
-is now populated. Consumers should treat this as authoritative and
-backfill any prior `meeting.*` events for this `meeting_id` under
-the linked channel.
+Bot learned this meeting belongs to a channel. `channel_link` on `meeting_ref` is now populated. Consumers should backfill any prior `meeting.*` events for this `meeting_id` under the linked channel.
 
 ```jsonc
-{
-  "linked_source":        "bot_framework_channeldata"   // | "manual_command" | "auto_detect"
-}
+{ "linked_source": "bot_framework_channeldata" }   // | "manual_command" | "auto_detect"
 ```
 
 ### 3.5 `meeting.call.joined` / `meeting.call.left`
 
 ```jsonc
 {
-  "join_url":             "https://teams.microsoft.com/l/meetup-join/...",
-  "join_mode":            "graph_join"   // | "policy_auto_invite" | "invite_and_graph_join"
+  "join_url":  "https://teams.microsoft.com/l/meetup-join/...",
+  "join_mode": "graph_join"   // | "policy_auto_invite" | "invite_and_graph_join"
 }
 ```
 
 ### 3.6 `meeting.chat.*`
 
-Almost the same shape as `channel.message.*` (§3.2), but **without
-`is_root`** (meeting chat has no thread-root concept) and **with a
-top-level `message_id` on the payload** (channel messages carry
-their `message_id` on `channel_ref` instead — meeting chats don't
-have a comparable ref-level slot):
+Same shape as `channel.message.*` (§3.2) except no `is_root` and a top-level `message_id` on the payload (channel messages carry `message_id` on `channel_ref`):
 
 ```jsonc
 {
-  "message_id":           "1779129648463",  // required
-  "sender": {
-    "aad_id":             "accf88ee-...",
-    "display_name":       "Jane Doe",
-    "kind":               "user"   // | "bot" | "application"
-  },
+  "message_id":           "1779129648463",
+  "sender":               { "aad_id": "...", "display_name": "Jane Doe", "kind": "user" },
   "text":                 "plain text body",
   "html":                 "<div>...</div>",
   "timestamp_utc":        "2026-05-14T18:23:45.401Z",
   "reply_to_message_id":  null,
   "from_bot":             false,
-  "attachments":          [ /* see §3.9 */ ],
-  "mentions":             [ /* raw Bot Framework / Graph mentions */ ],
-  "raw":                  { /* full source payload, best-effort */ }
+  "attachments":          [ /* §3.9 */ ],
+  "mentions":             [ /* raw mentions */ ],
+  "raw":                  { /* source payload, best-effort */ }
 }
 ```
 
 ### 3.7 `meeting.transcript.partial` / `meeting.transcript.final`
 
-Real-time STT output from the bot's media stream.
+Real-time STT output from the bot's media stream (Azure Speech).
 
 ```jsonc
 {
-  "text":                 "the transcribed text",
-  "timestamp_utc":        "2026-05-14T16:34:12.184Z",
+  "text":           "the transcribed text",
+  "timestamp_utc": "2026-05-14T16:34:12.184Z",
   "speaker": {
-    "id":                 "speaker_0",         // STT-provider speaker label
-    "aad_id":             "accf88ee-...",      // resolved when MSI ↔ AAD lookup succeeds
-    "display_name":       "Jane Doe"
+    "id":          "speaker_0",
+    "aad_id":      "accf88ee-...",
+    "display_name":"Jane Doe"
   },
-  "audio_start_ms":       1234.5,
-  "audio_end_ms":         5678.9,
-  "confidence":           0.94,
-  "words":                [ /* word-level detail with timestamps */ ],
-  "media_source": {
-    "dominant_id":        4096,
-    "active_ids":         [4096, 4112]
-  },
-  "provider": {
-    "name":               "azure_speech",
-    "model":              null,
-    "session_id":         "..."
-  }
+  "audio_start_ms": 1234.5,
+  "audio_end_ms":   5678.9,
+  "confidence":     0.94,
+  "words":          [ /* word-level detail */ ],
+  "media_source":   { "dominant_id": 4096, "active_ids": [4096, 4112] },
+  "provider":       { "name": "azure_speech", "model": null, "session_id": "..." }
 }
 ```
 
 ### 3.8 `meeting.transcript.official`
 
-Microsoft's post-meeting transcript, fetched via Graph after the
-meeting ends. **Private chat meetings only** —
-`OnlineMeetingTranscript.Read.Chat` does not apply to channel
-meetings per Microsoft (confirmed in MS Learn v1.0 docs for
-`Get callTranscript`, `List transcripts`, and all
-`/transcripts` change-notification subscription pages).
+Microsoft's post-meeting transcript, fetched via Graph after the meeting ends. **Private chat meetings only** — `OnlineMeetingTranscript.Read.Chat` does not apply to channel meetings (MS Learn v1.0, `Get callTranscript` / `List transcripts`).
 
-> **Channel-meeting transcript escape hatch.** Microsoft v1.0 docs
-> note that `GET /me/onlineMeetings/{meeting_id}/transcripts` is
-> *also* available to "users who are part of the meeting calendar
-> invite, which applies to both private chat meetings AND channel
-> meetings." That is a **delegated user-token** path — it does not
-> use our RSC app permission, so this bot cannot call it on its own.
-> A downstream consumer that has a calendar-invitee's delegated
-> token can fetch channel-meeting transcripts directly from Graph.
+A delegated user token belonging to a meeting calendar-invitee can fetch channel-meeting transcripts directly from Graph via `GET /me/onlineMeetings/{meeting_id}/transcripts`. The bot's RSC app permission cannot.
 
 ```jsonc
 {
-  "transcript_id":        "MSMjMCMjOWNlOTU2YjAtY...",  // required — Graph callTranscript id
-  "organizer_oid":        "accf88ee-...",               // optional — AAD id of the organizer scoping the fetch
-  "fetched_at_utc":       "2026-05-14T16:36:42Z",       // required
-  "created_at_utc":       "2026-05-14T16:35:01Z",       // optional — Graph createdDateTime on the transcript
-  "vtt_url":              "meetings/<meeting_id>/transcripts/official.vtt",  // required
-  "cue_count":            142,                          // required — len(cues)
+  "transcript_id":  "MSMjMCMjOWNlOTU2YjAtY...",
+  "organizer_oid":  "accf88ee-...",                       // optional
+  "fetched_at_utc": "2026-05-14T16:36:42Z",
+  "created_at_utc": "2026-05-14T16:35:01Z",               // optional
+  "vtt_url":        "meetings/<meeting_id_sanitized>/transcripts/official.vtt",
+  "cue_count":      142,
   "cues": [
-    {
-      "start_ms":         1200,
-      "end_ms":           3450,
-      "speaker": {
-        "aad_id":         "...",
-        "display_name":   "..."
-      },
-      "text":             "..."
-    }
+    { "start_ms": 1200, "end_ms": 3450,
+      "speaker": { "aad_id": "...", "display_name": "..." },
+      "text":    "..." }
   ]
 }
 ```
 
-The raw WebVTT is in the blob archive at the `vtt_url` path. `cues`
-is the parsed form for consumers that prefer JSON.
+The raw WebVTT lives in the blob archive at `vtt_url`. `cues` is the parsed form for JSON consumers.
 
-### 3.9 Attachment shape (channel + meeting chat)
+### 3.9 Attachment shape
 
 ```jsonc
 {
-  "attachment_id":        "<graph drive item id | bot framework id>",
-  "name":                 "design.pdf",
-  "content_type":         "application/pdf",
-  "size_bytes":           184320,
-  "graph_drive_item_id":  "01XYZ...",
-  "download_url":         "https://...",
-  "blob_archive_path":    "teams/{tid}/channels/{cid}/threads/{thrid}/attachments/01XYZ...pdf"
+  "attachment_id":       "<graph drive item id | bot framework id>",
+  "name":                "design.pdf",
+  "content_type":        "application/pdf",
+  "size_bytes":          184320,
+  "graph_drive_item_id": "01XYZ...",
+  "download_url":        "https://...",
+  "blob_archive_path":   "teams/{tid}/channels/{cid}/threads/{thrid}/attachments/01XYZ...pdf"
 }
 ```
 
-The bot fetches and mirrors attachments to the blob archive when
-possible; `blob_archive_path` is populated after the mirror succeeds.
+`blob_archive_path` is populated after the attachment mirror succeeds.
 
 ---
 
-## 4. Routing tables (quick reference for consumers)
+## 4. Blob path layout
 
-Every event lands at exactly one blob path. The folder segment is a
-**logical category** — one folder per data type — not the verbatim
-`event_type`. The precise `event_type` stays on the envelope JSON,
-so consumers that need to distinguish `created` from `updated` /
-`deleted` read it from the envelope.
+The bot writes each envelope as one pretty-printed JSON file, keyed by scope + category + timestamp + event_id. The category folder is a logical grouping — multiple `event_type` values collapse into one folder; the precise type stays on the envelope.
 
-The four categories collapse the v2 `event_type` variants. Folder
-names mirror Microsoft Graph sub-resources where one exists
-(`messages/` → Graph `/messages`, `transcripts/` → Graph
-`/transcripts`); `live_transcript/` and `lifecycle/` are our own
-labels because Graph has no equivalent sub-resource:
-
-| Category | Aggregates these `event_type` values | Graph mirror |
-|---|---|---|
-| `messages` | `channel.message.{created,updated,deleted}`, `meeting.chat.{created,updated,deleted}` | `/teams/{id}/channels/{id}/messages`, `/chats/{id}/messages` |
-| `live_transcript` | `meeting.transcript.{partial,final}` | none — this bot's Azure Speech STT of the real-time audio stream |
-| `transcripts` | `meeting.transcript.official` (sits alongside the flat `official.txt` / `official.vtt`) | `/onlineMeetings/{id}/transcripts` (callTranscript resource) |
-| `lifecycle` | `channel.{attached,detached}`, `meeting.{created,ended,linked,call.joined,call.left}` | none |
+### Channel scope
 
 ```
-event_type                        → present block  → blob path
-─────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-channel.attached                  → channel_ref     → teams/{tid}/channels/{cid_sanitized}/lifecycle/{ts}-{eid}.json
-channel.detached                  → channel_ref     → teams/{tid}/channels/{cid_sanitized}/lifecycle/{ts}-{eid}.json
-channel.message.created           → channel_ref     → teams/{tid}/channels/{cid_sanitized}/messages/{ts}-{eid}.json
-channel.message.updated           → channel_ref     → teams/{tid}/channels/{cid_sanitized}/messages/{ts}-{eid}.json
-channel.message.deleted           → channel_ref     → teams/{tid}/channels/{cid_sanitized}/messages/{ts}-{eid}.json
-meeting.created                   → meeting_ref     → meetings/{meeting_id}/lifecycle/{ts}-{eid}.json
-meeting.ended                     → meeting_ref     → meetings/{meeting_id}/lifecycle/{ts}-{eid}.json
-meeting.linked                    → meeting_ref     → meetings/{meeting_id}/lifecycle/{ts}-{eid}.json
-meeting.call.joined               → meeting_ref     → meetings/{meeting_id}/lifecycle/{ts}-{eid}.json
-meeting.call.left                 → meeting_ref     → meetings/{meeting_id}/lifecycle/{ts}-{eid}.json
-meeting.chat.created              → meeting_ref     → meetings/{meeting_id}/messages/{ts}-{eid}.json
-meeting.chat.updated              → meeting_ref     → meetings/{meeting_id}/messages/{ts}-{eid}.json
-meeting.chat.deleted              → meeting_ref     → meetings/{meeting_id}/messages/{ts}-{eid}.json
-meeting.transcript.partial        → meeting_ref     → meetings/{meeting_id}/live_transcript/{ts}-{eid}.json
-meeting.transcript.final          → meeting_ref     → meetings/{meeting_id}/live_transcript/{ts}-{eid}.json
-meeting.transcript.official       → meeting_ref     → meetings/{meeting_id}/transcripts/{ts}-{eid}.json
+teams/{team_id_sanitized}/channels/{channel_id_sanitized}/messages/{ts}-{event_id}.json
+teams/{team_id_sanitized}/channels/{channel_id_sanitized}/lifecycle/{ts}-{event_id}.json
 ```
 
-Plus the two flat post-meeting transcript files (overwritten on each
-fetch — these live alongside the `meeting.transcript.official`
-envelope in the same `transcripts/` folder):
+### Meeting scope
 
 ```
-meetings/{meeting_id}/transcripts/official.txt   (clean speaker-per-line plaintext)
-meetings/{meeting_id}/transcripts/official.vtt   (raw WebVTT)
+meetings/{meeting_id_sanitized}/messages/{ts}-{event_id}.json
+meetings/{meeting_id_sanitized}/live_transcript/{ts}-{event_id}.json
+meetings/{meeting_id_sanitized}/transcripts/{ts}-{event_id}.json
+meetings/{meeting_id_sanitized}/transcripts/official.txt
+meetings/{meeting_id_sanitized}/transcripts/official.vtt
+meetings/{meeting_id_sanitized}/lifecycle/{ts}-{event_id}.json
 ```
 
-> **Legacy v1 compat path (preserved, do not consume from new code):**
-> The bot also writes `channels/{tid}/{cid_sanitized}/chat.message/{ts}-{eid}.txt`
-> for channels listed in `BlobArchive:V1CompatChannelIds`. That path
-> uses the legacy `alfred-events-v1` body (header + `---ENVELOPE---`
-> separator) and exists only to keep the pre-v2 `server.py` polling
-> bridge working through the cutover. New consumers must read the v2
-> category layout above.
+### Categories
 
-> **Historical event-type-per-folder blobs.** Blobs written before
-> this category refactor live at their old `…/{event_type}/…` paths
-> (e.g. `meetings/{mid}/meeting.chat.created/`). They are still
-> readable; new writes land at the category paths. No backfill.
+| Path                                          | Receives                                                                       |
+|-----------------------------------------------|--------------------------------------------------------------------------------|
+| `teams/{tid}/channels/{cid}/messages/`        | `channel.message.{created,updated,deleted}`                                    |
+| `teams/{tid}/channels/{cid}/lifecycle/`       | `channel.attached`, `channel.detached`                                         |
+| `meetings/{mid}/messages/`                    | `meeting.chat.{created,updated,deleted}`                                       |
+| `meetings/{mid}/live_transcript/`             | `meeting.transcript.{partial,final}` (Alfred's Azure Speech STT)               |
+| `meetings/{mid}/transcripts/`                 | `meeting.transcript.official` envelope + flat `official.txt` / `official.vtt`  |
+| `meetings/{mid}/lifecycle/`                   | `meeting.{created,ended,linked,call.joined,call.left}`                         |
 
-See [`docs/retrieving-transcripts.md`](retrieving-transcripts.md) for
-recipes + Python helpers.
+No other category folders are used.
+
+### Sanitization
+
+Every `{*_sanitized}` segment is built by the blob writer (`BlobEventArchive` under `src/Services/`):
+
+- Regex: `[^a-zA-Z0-9\-_.]` → `_`
+- Truncated to 200 chars
+
+`{ts}` is `yyyyMMddTHHmmssfffZ` (millisecond UTC, lexicographic = time order). `{event_id}` is the 32-char hex from the envelope; use for dedup.
+
+Worked example — production-typical `meeting_id` (chat thread id):
+
+```
+19:meeting_NmFkYWM1NDQtYTM3ZC00ZjlmLTk4ZjItZjE0M2YwOWEzODIx@thread.v2
+→
+19_meeting_NmFkYWM1NDQtYTM3ZC00ZjlmLTk4ZjItZjE0M2YwOWEzODIx_thread.v2
+```
+
+Live archive prefix for that meeting (in production now):
+
+```
+https://ca-alfred-web.gentlewater-5aa74a73.eastus.azurecontainerapps.io/archive?prefix=meetings%2F19_meeting_NmFkYWM1NDQtYTM3ZC00ZjlmLTk4ZjItZjE0M2YwOWEzODIx_thread.v2%2Flive_transcript%2F
+```
+
+Build blob URLs from the sanitized form, not the raw envelope value.
+
+> **Historical event-type-per-folder blobs.** Blobs written before the category refactor live at their old `…/{event_type}/…` paths (e.g. `meetings/{mid}/meeting.chat.created/`). They remain readable; new writes land at the category paths. No backfill.
+
+See `docs/retrieving-transcripts.md` for read recipes.
 
 ---
 
 ## 5. Posting back to chat
 
-`POST $BOT/api/send-chat`. The send-chat surface is unchanged from
-v1; it takes a `conversation_reference_id` (echoed from any envelope)
-and the message text. See `src/Controllers/SendChatController.cs` for
-the canonical request/response shape.
+`POST $BOT/api/send-chat`. Unchanged from v1; takes a `conversation_reference_id` (echoed from any envelope) and the message text. Request/response shape is in `SendChatController` under `src/Controllers/`.
 
 ---
 
 ## 6. Registering consumers
 
-**Channel scope is the only scope the bot currently implements.** A
-channel-scope consumer receives all `channel.*` events for that
-channel AND all `meeting.*` events for meetings linked to that
-channel (via the `meeting.linked` event or the
-`@Alfred link to <channel-name>` chat command):
+Channel scope is the only scope the bot implements. A channel-scope consumer receives every `channel.*` event for the channel AND every `meeting.*` event for meetings linked to that channel (via `meeting.linked` or the `@Alfred link to <channel-name>` chat command).
 
 ```bash
 curl -X POST $BOT/api/channels/$TEAM/$CHAN/consumers \
@@ -478,39 +358,29 @@ curl -X POST $BOT/api/channels/$TEAM/$CHAN/consumers \
   -d '{"name":"team-a","url":"https://...","event_kinds":["*"],"enabled":true}'
 ```
 
-The body field is **`event_kinds`** (matched against
-`AlfredEventEnvelope.event_type` in `EventFanoutDispatcher`).
-`["*"]` accepts everything. Otherwise filter to specific event
-types verbatim — no wildcards inside a type. Sending `event_types`
-instead silently produces an empty filter (matches all by default),
-which is rarely what you want.
+**Filter key is `event_kinds`** (matched against `AlfredEventEnvelope.event_type` in `EventFanoutDispatcher`). `["*"]` accepts everything. Otherwise list exact event types — no wildcards inside a type. Sending `event_types` instead produces a silently-empty filter that matches everything.
 
-There is no separate per-meeting consumer endpoint; if you need a
-narrower stream than a channel, register multiple channel-scope
-consumers with disjoint `event_kinds` filters.
+For a narrower stream than a channel, register multiple channel-scope consumers with disjoint `event_kinds`.
 
-Management endpoints (all under `/api/channels/{team}/{channel}/consumers`):
+Management endpoints under `/api/channels/{team}/{channel}/consumers`:
 
 | Method | Body / params | Behavior |
 |---|---|---|
-| `GET` | — | List current consumers for the channel |
-| `POST` | `{name, url, event_kinds, enabled, headers?}` | Upsert one consumer by name |
-| `PUT` | `{consumers: [...]}` | Replace the entire list |
-| `DELETE /{consumerName}` | — | Remove one by name |
+| `GET`                       | —                                                | List current consumers |
+| `POST`                      | `{name, url, event_kinds, enabled, headers?}`    | Upsert one consumer by name |
+| `PUT`                       | `{consumers: [...]}`                             | Replace the entire list |
+| `DELETE /{consumerName}`    | —                                                | Remove one by name |
 
-When the consumer list for a channel is empty, the
-`EventDispatch.BootstrapConsumerUrl` (configured per-deployment)
-receives events as a fallback. To suppress that fallback for a
-specific channel without re-pointing the bootstrap, register a
-placeholder with `enabled:false` (see README §7.4).
+When the consumer list is empty, `EventDispatch.BootstrapConsumerUrl` (per-deployment config) receives events as a fallback. To suppress the fallback for one channel, register a placeholder with `enabled:false`.
 
 ---
 
-## 7. Reference consumer
+## 7. V1 polling bridge
 
-The Python sink at `python/transcript_sink.py` consumes this contract
-at `POST /v2/events` and exposes the hierarchical query API
-described in [`docs/retrieving-transcripts.md §3`](retrieving-transcripts.md).
-Other teams' backends are free to implement their own consumer —
-only the envelope shape and the consumer-registration / send-chat
-surfaces are stable.
+The repo root holds two untracked sidecar scripts — `server.py` and `server_1.py` — that are iterated on locally to bridge a pre-v2 polling consumer during the v1→v2 cutover. They poll both the legacy `channels/{team_sanitized}/{cid_sanitized}/chat.message/{ts}-{eid}.txt` path AND the new v2 `teams/{tid}/channels/{cid}/messages/` path. They are not part of v2; this doc does not cover v1 mechanics. For v1 specifics see comments inside those files.
+
+---
+
+## 8. Reference consumer
+
+The Python sink at `python/transcript_sink.py` consumes this contract at `POST /v2/events` and exposes the hierarchical query API described in `docs/retrieving-transcripts.md` §1. Only the envelope shape and the consumer-registration / send-chat surfaces are stable — backends can implement their own consumer.
