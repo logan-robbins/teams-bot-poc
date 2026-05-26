@@ -7,7 +7,7 @@ Two read paths over the same `alfred-v2` envelopes:
 | **Sink API** — `https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io` | None (sandbox is public) | one HTTP call → JSON; list / lookup / proxy reads |
 | **Blob archive** — `https://stalfreddisney.blob.core.windows.net/alfred-events/` | Anonymous read | raw event stream; replay, bulk, offline |
 
-The sink is a thin SQLite + HTTP layer over the blob archive. **Blob archive is the source of truth.** For envelope shape and event types see `docs/event-contract.md`.
+The sink is a thin PostgreSQL + HTTP layer over the blob archive. **Blob archive is the source of truth.** For envelope shape and event types see `docs/event-contract.md`.
 
 ---
 

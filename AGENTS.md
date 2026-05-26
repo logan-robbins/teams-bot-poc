@@ -145,10 +145,10 @@ Command (§6.3).
 
 ### 4.3 Teams app manifest
 
-`manifest/alfred-sandbox.zip` uploads to Teams Developer Portal at
+`manifest/alfred-sandbox-v1.0.12.zip` uploads to Teams Developer Portal at
 `https://dev.teams.microsoft.com/apps`. Publisher is unverified — M365
 admin must grant org-wide consent in Teams Admin Center → Manage apps
-→ Permissions. Currently `1.0.7` with 11 RSC permissions (5 chat + 6
+→ Permissions. Currently `1.0.12` with 16 RSC permissions (7 chat + 9
 team). Version-bump rule in §11.
 
 ---
@@ -747,7 +747,7 @@ deploy via `deploy-azure-vm.sh` or §6.3 incremental; verify
 "succeeded" alone is not enough.
 
 **Channel-attached bot in a sandbox tenant:** re-import
-`manifest/alfred-sandbox.zip` (1.0.7+) in Teams Developer Portal →
+`manifest/alfred-sandbox-v1.0.12.zip` in Teams Developer Portal →
 M365 admin consents to RSC perms in Teams Admin Center → install at
 team level → `curl $BOT/api/channels | jq` shows the attachment →
 post in channel → `curl $SINK/c/{teamId}/{channelId}/events` shows it
