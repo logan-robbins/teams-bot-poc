@@ -97,7 +97,18 @@ try
         new CloudAdapter(
             sp.GetRequiredService<BotFrameworkAuthentication>(),
             sp.GetRequiredService<ILogger<IBotFrameworkHttpAdapter>>()));
-    builder.Services.AddSingleton<IConversationReferenceStore, InMemoryConversationReferenceStore>();
+    // File-backed conversation references. Survives bot restarts so
+    // /api/send-chat keeps working without each chat having to emit a
+    // fresh Bot Framework activity after every redeploy.
+    builder.Services.AddSingleton(new ConversationReferenceStoreOptions
+    {
+        FilePath = meetingChatConfig.ConversationReferenceStorePath,
+    });
+    builder.Services.AddSingleton<FileBackedConversationReferenceStore>();
+    builder.Services.AddSingleton<IConversationReferenceStore>(sp =>
+        sp.GetRequiredService<FileBackedConversationReferenceStore>());
+    builder.Services.AddHostedService(sp =>
+        sp.GetRequiredService<FileBackedConversationReferenceStore>());
     builder.Services.AddSingleton<IBot, AlfredBot>();
 
     // Per-meeting raw event audit log (NDJSON files keyed by sanitized chat_thread_id).

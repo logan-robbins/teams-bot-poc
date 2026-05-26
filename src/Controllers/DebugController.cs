@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Mvc;
 using Newtonsoft.Json;
 using System.Text.Json;
+using TeamsMediaBot.Models;
 using TeamsMediaBot.Services;
 
 namespace TeamsMediaBot.Controllers;
@@ -25,15 +26,21 @@ public sealed class DebugController : ControllerBase
 
     private readonly MeetingAuditLogger _audit;
     private readonly OfficialTranscriptFetcher _transcriptFetcher;
+    private readonly GraphMetadataResolver _metadataResolver;
+    private readonly EventFanoutDispatcher _dispatcher;
     private readonly ILogger<DebugController> _logger;
 
     public DebugController(
         MeetingAuditLogger audit,
         OfficialTranscriptFetcher transcriptFetcher,
+        GraphMetadataResolver metadataResolver,
+        EventFanoutDispatcher dispatcher,
         ILogger<DebugController> logger)
     {
         _audit = audit;
         _transcriptFetcher = transcriptFetcher;
+        _metadataResolver = metadataResolver;
+        _dispatcher = dispatcher;
         _logger = logger;
     }
 
@@ -107,6 +114,139 @@ public sealed class DebugController : ControllerBase
 
         [JsonProperty("registered_at_utc")]
         public DateTimeOffset? RegisteredAtUtc { get; set; }
+    }
+
+    /// <summary>
+    /// Operator-triggered backfill for the <c>meeting.created</c> envelope.
+    /// Re-runs the same resolver chain
+    /// <see cref="GraphNotificationProcessor"/> uses on first-sighting of a
+    /// meeting chat (chat → joinWebUrl → onlineMeeting by joinWebUrl) and
+    /// re-publishes a metadata-rich <c>meeting.created</c> through the
+    /// event dispatcher so the sink upserts the meetings row.
+    ///
+    /// <para>
+    /// Bypasses the per-thread emission latch in
+    /// <see cref="GraphNotificationProcessor"/> — this endpoint exists
+    /// precisely to fix meetings emitted earlier with <c>subject:null</c>,
+    /// so it must always fire and let the sink's upsert reconcile.
+    /// </para>
+    /// </summary>
+    [HttpPost("refresh-meeting-metadata")]
+    public async Task<IActionResult> RefreshMeetingMetadata(
+        [FromBody] RefreshMeetingMetadataRequest request,
+        CancellationToken cancellationToken)
+    {
+        if (request is null || string.IsNullOrWhiteSpace(request.MeetingChatThreadId))
+        {
+            return BadRequest(new { error = "meeting_chat_thread_id is required" });
+        }
+
+        var chatThreadId = request.MeetingChatThreadId!;
+
+        try
+        {
+            var chat = await _metadataResolver.GetChatAsync(chatThreadId, cancellationToken);
+            if (chat is null)
+            {
+                _logger.LogWarning(
+                    "Refresh meeting metadata: Graph returned no chat for ChatThreadId={ChatThreadId}",
+                    chatThreadId);
+                return Ok(new
+                {
+                    ok = true,
+                    warning = "Graph returned no chat for this meeting_chat_thread_id",
+                });
+            }
+
+            GraphOnlineMeetingMeta? meeting = null;
+            if (!string.IsNullOrWhiteSpace(chat.OrganizerAadId)
+                && !string.IsNullOrWhiteSpace(chat.JoinWebUrl))
+            {
+                meeting = await _metadataResolver.GetOnlineMeetingByJoinUrlAsync(
+                    chat.OrganizerAadId!, chat.JoinWebUrl!, cancellationToken);
+            }
+
+            if (meeting is null || string.IsNullOrWhiteSpace(meeting.Subject))
+            {
+                _logger.LogWarning(
+                    "Refresh meeting metadata: Graph returned no onlineMeeting (or empty subject) for ChatThreadId={ChatThreadId} JoinWebUrl={JoinWebUrl}",
+                    chatThreadId, chat.JoinWebUrl ?? "(null)");
+                return Ok(new
+                {
+                    ok = true,
+                    warning = "Graph returned no onlineMeeting for this joinWebUrl",
+                });
+            }
+
+            var subject = meeting.Subject;
+            var scheduledStart = meeting.ScheduledStartUtc;
+            var scheduledEnd = meeting.ScheduledEndUtc;
+            var organizer = new SenderRef
+            {
+                AadId = meeting.OrganizerAadId ?? chat.OrganizerAadId,
+                DisplayName = meeting.OrganizerDisplayName,
+            };
+
+            // meeting_id is the Teams chat thread id of the meeting per §8.1
+            // of README.md — never the Graph onlineMeeting.id. Keep that
+            // invariant on the refreshed envelope too.
+            var resolvedMeetingId = chatThreadId;
+            var nowIso = DateTimeOffset.UtcNow.ToString("O");
+
+            await _dispatcher.PublishAsync(
+                new AlfredEventEnvelope
+                {
+                    EventType = AlfredEventTypes.MeetingCreated,
+                    EventId = Guid.NewGuid().ToString("N"),
+                    Ts = nowIso,
+                    MeetingRef = new MeetingRef
+                    {
+                        MeetingId = resolvedMeetingId,
+                        MeetingChatThreadId = chatThreadId,
+                        Subject = subject,
+                        Organizer = organizer,
+                        ScheduledStartUtc = scheduledStart,
+                        ScheduledEndUtc = scheduledEnd,
+                    },
+                    ConversationReferenceId = chatThreadId,
+                    Payload = new MeetingLifecyclePayload
+                    {
+                        Subject = subject,
+                        Organizer = organizer,
+                        ScheduledStartUtc = scheduledStart,
+                        ScheduledEndUtc = scheduledEnd,
+                    },
+                },
+                cancellationToken);
+
+            _logger.LogInformation(
+                "Refresh meeting metadata published meeting.created ChatThreadId={ChatThreadId} MeetingId={MeetingId} Subject={Subject} Organizer={Organizer}",
+                chatThreadId, resolvedMeetingId, subject, organizer.DisplayName ?? "(null)");
+
+            return Ok(new
+            {
+                ok = true,
+                meeting_id = resolvedMeetingId,
+                subject,
+                scheduled_start_utc = scheduledStart,
+                scheduled_end_utc = scheduledEnd,
+                organizer_display_name = organizer.DisplayName,
+                organizer_aad_id = organizer.AadId,
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "Refresh meeting metadata failed for ChatThreadId={ChatThreadId}",
+                chatThreadId);
+            return StatusCode(500, new { ok = false, error = ex.Message });
+        }
+    }
+
+    public sealed class RefreshMeetingMetadataRequest
+    {
+        [JsonProperty("meeting_chat_thread_id")]
+        public string? MeetingChatThreadId { get; set; }
     }
 
     /// <summary>

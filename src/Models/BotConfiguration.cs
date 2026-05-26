@@ -318,4 +318,15 @@ public sealed class MeetingChatConfiguration
     /// </summary>
     public string ChannelAttachmentStorePath { get; init; } =
         @"C:\teams-bot-poc\state\channel-attachments.json";
+
+    /// <summary>
+    /// Absolute path to the JSON file that persists Bot Framework
+    /// <c>ConversationReference</c>s across bot restarts. Proactive
+    /// messaging via <c>CloudAdapter.ContinueConversationAsync</c>
+    /// requires a captured reference per chat thread; without on-disk
+    /// persistence, <c>/api/send-chat</c> 404s for chats that haven't
+    /// emitted a fresh activity since the most recent restart.
+    /// </summary>
+    public string ConversationReferenceStorePath { get; init; } =
+        @"C:\teams-bot-poc\state\conversation-references.json";
 }
