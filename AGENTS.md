@@ -20,7 +20,7 @@ Teams ──► C# bot (Windows VM, Graph Media SDK + Bot Framework)
 - **C# bot** on `vm-alfred-disney`. Graph Media SDK is Windows-only and
   needs Server-Media-Foundation.
 - **Python sink** owns session state, intervention policy, dossier,
-  SQLite ledger.
+  PostgreSQL ledger (`pg-alfred-disney`).
 - **React UI** is read-only; SSE consumer.
 
 `chat_thread_id` ties everything together
@@ -44,9 +44,11 @@ joins.
 
 Canonical concepts:
 - **Session state**: `InterviewSession` in `meeting_agent/models.py`.
-- **Persistent ledger**: SQLite. Path = `STORE_DB_PATH` (prod:
-  `/var/lib/alfred/alfred.sqlite3`). Schema in
-  `meeting_agent/persistence.py`.
+- **Persistent ledger**: PostgreSQL. DSN = `ALFRED_DB_URL` (prod:
+  `pg-alfred-disney.postgres.database.azure.com:5432/alfred`, sourced
+  from Container App secret `alfred-db-url`). Schema +
+  `psycopg[binary]` + `psycopg_pool.ConnectionPool` (min=1, max=5,
+  autocommit, dict_row) in `meeting_agent/persistence.py`.
 - **Sole outbound**: `send_to_meeting_chat` in `meeting_agent/tools.py`.
   No parallel path.
 - **Prompt + intervention policy**: `batcave_platform/specs/alfred.yaml`
@@ -197,20 +199,48 @@ az containerapp update -n ca-alfred-web -g rg-alfred-disney \
 
 #### 6.1.1 Persistent-sink wiring (critical)
 
-`ca-alfred-api` must have **both** of the following — they keep the
-sqlite ledger alive across restarts:
+`ca-alfred-api` persists to `pg-alfred-disney` (Azure Database for
+PostgreSQL Flexible Server, `Standard_B1ms`, eastus2, db `alfred`,
+PG 16, 32 GB storage). The connection string lives in the Container
+App secret `alfred-db-url` and is surfaced to the container via the
+`ALFRED_DB_URL` env var. Firewall rule
+`AllowAllAzureServicesAndResourcesWithinAzureIps` is what lets ACA
+reach the server.
 
-- **Volume mount**: `sink-data` (Azure File share
-  `stalfreddisney/alfred-sink-data`) → `/var/lib/alfred` via the
-  Container App template's `volumeMounts`.
-- **Env var**: `STORE_DB_PATH=/var/lib/alfred/alfred.sqlite3`.
-
-Without both, sqlite is container-ephemeral and state is lost on every
-restart. Verify:
+Wire (one-time, idempotent):
 ```bash
-az containerapp show -n ca-alfred-api -g rg-alfred-disney \
-  --query "properties.template.{vols:volumes, mounts:containers[0].volumeMounts, env:containers[0].env[?name=='STORE_DB_PATH']}" -o json
+SUB=e02c0038-82c8-4655-9647-38083f301099
+DSN='postgresql://alfredadmin:<password>@pg-alfred-disney.postgres.database.azure.com:5432/alfred?sslmode=require'
+
+az containerapp secret set --subscription $SUB \
+  -n ca-alfred-api -g rg-alfred-disney \
+  --secrets alfred-db-url="$DSN"
+
+az containerapp update --subscription $SUB \
+  -n ca-alfred-api -g rg-alfred-disney \
+  --set-env-vars ALFRED_DB_URL=secretref:alfred-db-url
 ```
+
+Verify:
+```bash
+az postgres flexible-server show --subscription $SUB \
+  -g rg-alfred-disney -n pg-alfred-disney \
+  --query '{state:state, version:version, sku:sku.name, fqdn:fullyQualifiedDomainName}' -o json
+az postgres flexible-server firewall-rule list --subscription $SUB \
+  -g rg-alfred-disney -n pg-alfred-disney \
+  --query "[].{name:name, start:startIpAddress, end:endIpAddress}" -o json
+az containerapp secret list --subscription $SUB \
+  -n ca-alfred-api -g rg-alfred-disney \
+  --query "[?name=='alfred-db-url'].name" -o tsv
+az containerapp show --subscription $SUB \
+  -n ca-alfred-api -g rg-alfred-disney \
+  --query "properties.template.containers[0].env[?name=='ALFRED_DB_URL']" -o json
+```
+
+The old `sink-data` volume + `STORE_DB_PATH=/var/lib/alfred/alfred.sqlite3`
+wiring is gone. The volume declaration may still exist in the template
+but is unused; the `stalfreddisney/alfred-sink-data` file share is
+dormant. Don't restore that pattern (§7.11).
 
 ### 6.2 VM bot — full bootstrap (`scripts/deploy-azure-vm.sh`)
 
@@ -472,6 +502,21 @@ variant (verbose `[bridge]` / `[probe]` logging, dual-path polling on
 both `channels/…/chat.message/` and `teams/…/channel.message.created/`).
 Touch `server_1.py` first to validate, then fold into `server.py`.
 
+### 7.11 Don't retry sqlite-over-SMB
+
+The persistent ledger used to be sqlite on an Azure File share
+(`stalfreddisney/alfred-sink-data` mounted at `/var/lib/alfred`).
+Sqlite requires `fcntl` advisory locks; SMB/CIFS does not implement
+them. Result: every new revision crashed at startup with
+`sqlite3.OperationalError: database is locked`, ACA marked the
+revision unhealthy and silently rolled traffic back to the last
+healthy revision, and the bad image looked deployed in `az
+containerapp show` while users kept hitting the old code (gpt-5-mini
+deploy looked live for days but wasn't). Use Postgres for durable
+persistence (current setup — `pg-alfred-disney`, §6.1.1) — or NetApp
+NFS if a filesystem mount is unavoidable. Never put sqlite on Azure
+Files again.
+
 ---
 
 ## 8. API surface
@@ -534,11 +579,17 @@ spec.
 
 ---
 
-## 9. Data shape — what's in SQLite
+## 9. Data shape — what's in Postgres
 
-DB path = `STORE_DB_PATH` (prod: `/var/lib/alfred/alfred.sqlite3` on
-the Azure File mount; §6.1.1). Schema in `meeting_agent/persistence.py`.
-Canonical tables (verified against current schema):
+DSN = `ALFRED_DB_URL` (prod: `pg-alfred-disney`, sourced from the
+`alfred-db-url` Container App secret; §6.1.1). Schema in
+`meeting_agent/persistence.py` via `psycopg[binary]` +
+`psycopg_pool.ConnectionPool` (min=1, max=5, autocommit, dict_row).
+Schema is portable from the previous sqlite layout — same table
+names, same column names. The dialect deltas are: `?` placeholders
+→ `%s`, `INSERT OR REPLACE` → `INSERT ... ON CONFLICT DO UPDATE`,
+`PRAGMA table_info` → `information_schema.columns`. No behavioral
+change for callers. Canonical tables:
 
 ```
 sessions                    one row per meeting
@@ -574,8 +625,11 @@ when calling `/onlineMeetings/{id}/transcripts`; it is never written to
 an envelope, blob path, or accepted as a sink key.
 
 Schema migrations are additive in `_migrate`. Indexes on
-newly-added columns must go in `_migrate`, NOT the main `SCHEMA` string
-— `executescript` runs before the migration adds the column.
+newly-added columns must go in `_migrate`, NOT the main `SCHEMA`
+string — the bootstrap statement batch runs before the migration adds
+the column. Migration column-existence checks use
+`information_schema.columns` (Postgres) rather than the old
+`PRAGMA table_info` lookup.
 
 ---
 
@@ -658,7 +712,8 @@ AND every meeting's events under one ordered timeline.
 | Azure Bot Service | `bot-alfred-disney` (SingleTenant) |
 | Sink (Container App) | `https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io` |
 | UI (Container App) | `https://ca-alfred-web.gentlewater-5aa74a73.eastus.azurecontainerapps.io` |
-| Sink file share | `stalfreddisney/alfred-sink-data` (mounted at `/var/lib/alfred`) |
+| PostgreSQL | `pg-alfred-disney` (`Standard_B1ms`, eastus2, db `alfred`, PG 16, 32 GB) — DSN in Container App secret `alfred-db-url`, env `ALFRED_DB_URL` |
+| Sink file share (dormant) | `stalfreddisney/alfred-sink-data` — historical sqlite mount, no longer used |
 | ACR | `acralfreddisneye02c0038.azurecr.io` |
 | Azure OpenAI | `aoai-alfred-disney` (`gpt-5-mini`) |
 | Speech Services | `speech-alfred-disney` (eastus) |
@@ -675,7 +730,10 @@ AND every meeting's events under one ordered timeline.
 4. Update `append_meeting_event` to write; update `get_ledger` (and
    `get_channel_ledger` if relevant) to SELECT.
 5. New index → `CREATE INDEX` in `_migrate` only, NOT in `SCHEMA` (§9).
-6. Wipe `python/output/alfred-test/alfred.sqlite3`; `uv run pytest tests`.
+6. Point `ALFRED_DB_URL` at a throwaway Postgres database (drop +
+   recreate to wipe), then `uv run pytest tests`. Test fixtures still
+   pass a path-like argument for backwards-compatible naming, but the
+   real persistence layer is Postgres via `psycopg`.
 
 **Add a sink endpoint:** add the route in `transcript_sink.py`; use
 `state["store"]` for SQL and `state["session_registry"]` for live

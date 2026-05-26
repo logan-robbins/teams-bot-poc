@@ -127,11 +127,12 @@ Concrete consequences:
 | Bot VM | `vm-alfred-disney` ([`alfred-disney-bot.eastus.cloudapp.azure.com`](https://alfred-disney-bot.eastus.cloudapp.azure.com)) |
 | Azure Bot Service | `bot-alfred-disney` (SingleTenant) |
 | Bot AppId | `207a38a4-67c5-4ef9-ada8-ea7998734d59` |
-| Sink Container App | [`ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io`](https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io) |
+| Sink Container App | [`ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io`](https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io) (depends on `pg-alfred-disney`) |
 | Web Container App | [`ca-alfred-web.gentlewater-5aa74a73.eastus.azurecontainerapps.io`](https://ca-alfred-web.gentlewater-5aa74a73.eastus.azurecontainerapps.io) |
 | ACR | `acralfreddisneye02c0038.azurecr.io` |
 | Blob archive | `stalfreddisney/alfred-events` (anonymous public read) |
-| Sink persistent storage | `stalfreddisney/alfred-sink-data` (Azure File share, mounted at `/var/lib/alfred` in `ca-alfred-api`) |
+| PostgreSQL | `pg-alfred-disney` (Azure Database for PostgreSQL Flexible Server, `Standard_B1ms`, eastus2, db `alfred`, PG 16, 32 GB) |
+| Sink file share (dormant) | `stalfreddisney/alfred-sink-data` — historical sqlite mount, no longer used (§6 / §7) |
 | Azure OpenAI | `aoai-alfred-disney` (`gpt-5-mini`) |
 | Speech Services | `speech-alfred-disney` (S0) |
 
@@ -205,7 +206,15 @@ az containerapp update --subscription e02c0038-82c8-4655-9647-38083f301099 \
   --image acralfreddisneye02c0038.azurecr.io/ca-alfred-web:$TAG
 ```
 
-**Sink persistent storage.** `ca-alfred-api` mounts the `stalfreddisney/alfred-sink-data` Azure File share at `/var/lib/alfred`. `STORE_DB_PATH=/var/lib/alfred/alfred.sqlite3` puts the sink sqlite there, so session/meeting state survives container restarts. Without the mount + env var the sqlite is ephemeral and resets on every revision.
+**Sink persistent storage.** The sink connects to `pg-alfred-disney` (Azure Database for PostgreSQL Flexible Server) via the `ALFRED_DB_URL` env var, sourced from the `alfred-db-url` Container App secret. Connection string is `postgresql://alfredadmin:****@pg-alfred-disney.postgres.database.azure.com:5432/alfred?sslmode=require`. The firewall rule `AllowAllAzureServicesAndResourcesWithinAzureIps` lets ACA reach the server. The previous sqlite-on-Azure-Files mount (`stalfreddisney/alfred-sink-data` → `/var/lib/alfred`) is no longer used — sqlite needs `fcntl` advisory locks that SMB does not provide, so every revision crashed with `database is locked` at startup and ACA silently rolled traffic back to the last-healthy revision. Don't retry that approach (see AGENTS.md §7).
+
+```bash
+az postgres flexible-server show --subscription e02c0038-82c8-4655-9647-38083f301099 \
+  -g rg-alfred-disney -n pg-alfred-disney \
+  --query '{state:state, version:version, sku:sku.name, fqdn:fullyQualifiedDomainName}' -o json
+az containerapp secret list --subscription e02c0038-82c8-4655-9647-38083f301099 \
+  -n ca-alfred-api -g rg-alfred-disney --query "[?name=='alfred-db-url'].name" -o tsv
+```
 
 **Gotchas (full list in AGENTS.md §7):**
 - Always `rm -rf src/bin src/obj` before `dotnet publish`. MSBuild's incremental cache ships new-timestamped DLLs with old content.
