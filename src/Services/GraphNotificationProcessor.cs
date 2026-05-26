@@ -306,27 +306,41 @@ public sealed partial class GraphNotificationProcessor
             string? scheduledEnd = null;
             SenderRef? organizer = null;
 
-            // We can only fetch the full onlineMeeting record when we
-            // have BOTH the organizer's AAD id AND a canonical meeting
-            // id (not a chat-thread fallback). The fallback case still
-            // emits meeting.created with whatever we have.
-            if (chat?.OrganizerAadId is not null
-                && !string.IsNullOrWhiteSpace(canonicalMeetingId)
-                && !string.Equals(canonicalMeetingId, chatThreadId, StringComparison.Ordinal))
+            // Fetch the full onlineMeeting record (subject + scheduled
+            // times) via Graph. Two routes depending on what we know:
+            //   1. Canonical Graph onlineMeeting id available →
+            //      GET /users/{org}/onlineMeetings/{id}
+            //   2. Only the chat thread id + joinWebUrl available →
+            //      GET /users/{org}/onlineMeetings?$filter=joinWebUrl eq '...'
+            // Route 2 is the dominant case (Graph notification flow rarely
+            // carries a canonical id), so we must fall through when route
+            // 1 is unavailable instead of emitting subject:null.
+            GraphOnlineMeetingMeta? meeting = null;
+            if (chat?.OrganizerAadId is not null)
             {
-                var meeting = await _metadataResolver.GetOnlineMeetingAsync(
-                    chat.OrganizerAadId, canonicalMeetingId, cancellationToken);
-                if (meeting is not null)
+                if (!string.IsNullOrWhiteSpace(canonicalMeetingId)
+                    && !string.Equals(canonicalMeetingId, chatThreadId, StringComparison.Ordinal))
                 {
-                    subject = meeting.Subject;
-                    scheduledStart = meeting.ScheduledStartUtc;
-                    scheduledEnd = meeting.ScheduledEndUtc;
-                    organizer = new SenderRef
-                    {
-                        AadId = meeting.OrganizerAadId ?? chat.OrganizerAadId,
-                        DisplayName = meeting.OrganizerDisplayName,
-                    };
+                    meeting = await _metadataResolver.GetOnlineMeetingAsync(
+                        chat.OrganizerAadId, canonicalMeetingId, cancellationToken);
                 }
+                else if (!string.IsNullOrWhiteSpace(chat.JoinWebUrl))
+                {
+                    meeting = await _metadataResolver.GetOnlineMeetingByJoinUrlAsync(
+                        chat.OrganizerAadId, chat.JoinWebUrl, cancellationToken);
+                }
+            }
+
+            if (meeting is not null)
+            {
+                subject = meeting.Subject;
+                scheduledStart = meeting.ScheduledStartUtc;
+                scheduledEnd = meeting.ScheduledEndUtc;
+                organizer = new SenderRef
+                {
+                    AadId = meeting.OrganizerAadId ?? chat!.OrganizerAadId,
+                    DisplayName = meeting.OrganizerDisplayName,
+                };
             }
 
             var resolvedMeetingId = canonicalMeetingId ?? chatThreadId;
@@ -360,6 +374,16 @@ public sealed partial class GraphNotificationProcessor
             _logger.LogInformation(
                 "Emitted meeting.created for ChatThreadId={ChatThreadId} MeetingId={MeetingId} Subject={Subject} Organizer={Organizer}",
                 chatThreadId, resolvedMeetingId, subject ?? "(null)", organizer?.DisplayName ?? "(null)");
+
+            // Hold the latch only when the emission was metadata-complete
+            // (subject populated). If we emitted with subject:null because
+            // the Graph lookup hadn't landed yet (cache warm-up, transient
+            // 404 on a just-created meeting), drop the latch so the next
+            // chat event in this thread re-attempts and backfills subject.
+            if (string.IsNullOrWhiteSpace(subject))
+            {
+                _meetingCreatedEmitted.TryRemove(chatThreadId, out _);
+            }
 
             // Also register for post-meeting transcript fetch. The fetcher
             // polls installedToOnlineMeetings/getAllTranscripts for ~30 min
