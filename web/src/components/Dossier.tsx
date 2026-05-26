@@ -30,11 +30,24 @@ interface Props {
  * Each section renders its cards, an honest empty state when absent, and a
  * count badge. New items glow softly on first appearance via a seen-set ref.
  */
+const DOSSIER_CATEGORY_CAP = 20;
+
+function recentFirst<T extends { first_seen_at?: string; id: string }>(items: T[]): T[] {
+  return [...items]
+    .sort((a, b) => {
+      const ta = a.first_seen_at ?? "";
+      const tb = b.first_seen_at ?? "";
+      if (tb !== ta) return tb < ta ? -1 : 1;
+      return b.id < a.id ? -1 : 1;
+    })
+    .slice(0, DOSSIER_CATEGORY_CAP);
+}
+
 export function Dossier({ analysis }: Props) {
-  const decisions = analysis?.decisions ?? [];
-  const questions = analysis?.open_questions ?? [];
-  const actions = analysis?.action_items ?? [];
-  const risks = analysis?.risks ?? [];
+  const decisions = recentFirst(analysis?.decisions ?? []);
+  const questions = recentFirst(analysis?.open_questions ?? []);
+  const actions = recentFirst(analysis?.action_items ?? []);
+  const risks = recentFirst(analysis?.risks ?? []);
 
   const seenRef = useRef<Set<string>>(new Set());
   const [, tick] = useState(0);
