@@ -1,4 +1,9 @@
-"""Tests for the SQLite-backed SessionStore."""
+"""Tests for the PostgreSQL-backed SessionStore.
+
+These tests require a real Postgres instance reachable at ``ALFRED_DB_URL``
+(or whatever the local fixture wires up). They cannot run against a file
+path because the store is no longer sqlite-backed.
+"""
 
 from __future__ import annotations
 

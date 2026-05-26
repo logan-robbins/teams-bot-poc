@@ -95,7 +95,7 @@ class RuntimeConfig:
     sink_port: int
     output_dir: Path
     transcript_file: Path
-    store_db_path: Path
+    store_db_url: str
 
 
 def load_runtime_config() -> RuntimeConfig:
@@ -150,11 +150,12 @@ def load_runtime_config() -> RuntimeConfig:
         else:
             transcript_file = desktop_path / f"meeting_transcript_{instance_id}.txt"
 
-    store_override = os.environ.get("STORE_DB_PATH")
-    if store_override:
-        store_db_path = Path(store_override).expanduser()
-    else:
-        store_db_path = output_dir / "alfred.sqlite3"
+    store_db_url = (os.environ.get("ALFRED_DB_URL") or "").strip()
+    if not store_db_url:
+        raise RuntimeError(
+            "ALFRED_DB_URL is required. Provide a PostgreSQL connection string "
+            "(e.g. 'postgres://user:pass@host:5432/alfred?sslmode=require')."
+        )
 
     return RuntimeConfig(
         variant_id=variant_id,
@@ -164,7 +165,7 @@ def load_runtime_config() -> RuntimeConfig:
         sink_port=sink_port,
         output_dir=output_dir,
         transcript_file=transcript_file,
-        store_db_path=store_db_path,
+        store_db_url=store_db_url,
     )
 
 
@@ -1438,12 +1439,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[dict[str, Any]]:
     )
     logger.info("Product spec path: %s", PRODUCT_SPEC_PATH)
 
-    # Initialize output directory, analysis writer, and SQLite store
+    # Initialize output directory, analysis writer, and PostgreSQL store
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     output_writer = AnalysisOutputWriter(OUTPUT_DIR)
     logger.info("Analysis output directory: %s", OUTPUT_DIR)
-    store = build_store(RUNTIME_CONFIG.store_db_path)
-    logger.info("Session store: %s", RUNTIME_CONFIG.store_db_path)
+    store = build_store(RUNTIME_CONFIG.store_db_url)
+    logger.info("Session store: PostgreSQL (ALFRED_DB_URL set)")
     event_bus = AlfredEventBus()
     logger.info("Event bus initialized")
 
@@ -3488,7 +3489,7 @@ def _get_blob_container_client():
     env var (set as a Container App secret). Falls back to
     `AZURE_STORAGE_CONNECTION_STRING` for parity with the Azure SDK
     conventional name. Returns None when neither is set so callers can
-    degrade gracefully (sqlite-only upload).
+    degrade gracefully (DB-only upload).
     """
     global _blob_container_client
     if _blob_container_client is not None:
@@ -3512,7 +3513,7 @@ def _blob_upload_text(path: str, content: str, content_type: str) -> None:
 
     Overwrites the blob if it exists (canonical upload semantics). Content
     is UTF-8 encoded. Raises on failure so the caller can decide whether
-    to swallow (sqlite still serves the transcript) or fail.
+    to swallow (the DB still serves the transcript) or fail.
     """
     client = _get_blob_container_client()
     if client is None:
@@ -3535,7 +3536,7 @@ def _http_client() -> httpx.AsyncClient:
 
 
 def _meeting_to_v2_dict(row: dict[str, Any]) -> dict[str, Any]:
-    """Render a sqlite meetings row into the v2 wire shape from the docs."""
+    """Render a meetings row into the v2 wire shape from the docs."""
     channel_link: dict[str, Any] | None = None
     if row.get("channel_team_id") and row.get("channel_id"):
         channel_link = {
@@ -3677,7 +3678,7 @@ async def v2_get_meeting_transcript(
     """Return the meeting transcript.
 
     Checks two sources, in order:
-      1. **Operator-uploaded** transcript (sqlite `transcript_uploads`):
+      1. **Operator-uploaded** transcript (`transcript_uploads` table):
          set via `POST /v2/meetings/{meeting_id}/transcript-upload` when
          the bot's Graph fetch path can't auto-retrieve. Highest priority
          because an operator explicitly attached it.
@@ -3692,7 +3693,7 @@ async def v2_get_meeting_transcript(
     found = False
     source: str | None = None
 
-    # 1. Operator upload (sqlite).
+    # 1. Operator upload (DB).
     store: SessionStore = state["store"]
     uploaded = await asyncio.to_thread(store.get_uploaded_transcript, meeting_id)
     if uploaded is not None:
@@ -3781,7 +3782,7 @@ async def v2_upload_meeting_transcript(
          already look for. The third preserves the operator's source
          file (typically Microsoft's `"<meeting subject> Recording.vtt"`)
          so the archive view shows the upload by name.
-      2. **Sink sqlite** (`transcript_uploads`) for fast inline serve.
+      2. **Sink DB** (`transcript_uploads` table) for fast inline serve.
 
     Optional `subject` form field also updates the meeting registry —
     handy when the bot couldn't auto-resolve the subject and never
@@ -3811,7 +3812,7 @@ async def v2_upload_meeting_transcript(
 
     # Write to blob storage at the canonical paths so the archive view
     # shows it and the agent's existing /v2/meetings/{id}/transcript
-    # (which falls back to blob when sqlite is empty) survives a sink
+    # (which falls back to blob when the DB is empty) survives a sink
     # container restart.
     blob_writes: list[str] = []
     blob_error: str | None = None
@@ -3835,7 +3836,7 @@ async def v2_upload_meeting_transcript(
             await asyncio.to_thread(_blob_upload_text, path, content, content_type)
             blob_writes.append(path)
     except Exception as exc:  # noqa: BLE001
-        # Don't fail the upload if blob write fails — sqlite path still
+        # Don't fail the upload if blob write fails — DB path still
         # serves /v2/meetings/{id}/transcript. Log + report in response.
         logger.warning("Blob write failed for upload meeting_id=%s: %s", meeting_id, exc)
         blob_error = f"{type(exc).__name__}: {exc!s}"

@@ -100,7 +100,7 @@ class ParticipantResolver:
             row = conn.execute(
                 "SELECT aad_object_id, display_name, is_application"
                 " FROM meeting_participants"
-                " WHERE session_id = ? AND aad_object_id = ?",
+                " WHERE session_id = %s AND aad_object_id = %s",
                 (session_id, sender),
             ).fetchone()
             if row is None:
@@ -245,7 +245,7 @@ class ParticipantResolver:
         with self._store._connect() as conn:  # type: ignore[attr-defined]
             row = conn.execute(
                 "SELECT display_name FROM meeting_participants"
-                " WHERE session_id = ? AND aad_object_id = ?",
+                " WHERE session_id = %s AND aad_object_id = %s",
                 (session_id, aad_object_id),
             ).fetchone()
             display = row["display_name"] if row else aad_object_id
