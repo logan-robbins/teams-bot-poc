@@ -222,7 +222,7 @@ az containerapp secret list --subscription e02c0038-82c8-4655-9647-38083f301099 
 - VM caps at **25 managed Run Commands**. Prune Succeeded ones before deploying or `create` silently fails with `BadRequest` and then appears as `ResourceNotFound`.
 - The bot's live config is `C:/teams-bot-poc/src/Config/appsettings.production.json` (not `appsettings.json`). `reloadOnChange:true` is set, so config-only changes (e.g. flipping `BlobArchive:V1CompatEnabled`) don't require a redeploy — edit the file via Run Command.
 - The VM's git remote is `origin`, not `private`; the deploy script falls back through `private` → `origin`. Pushes to `private/main` reach the VM because `origin` mirrors from it.
-- `IConversationReferenceStore` is in-memory; a bot restart wipes it, and `/api/send-chat` will 404 until a fresh chat activity re-populates the reference.
+- `IConversationReferenceStore` is file-backed at `C:/teams-bot-poc/state/conversation-references.json` so `/api/send-chat` keeps working across restarts. If the file is missing/empty (fresh bootstrap or wiped state dir), the endpoint 404s for that thread until a fresh chat activity re-populates the reference.
 
 Before a schema change downstream consumers depend on, see §7.5 (V1 compat dual-write) and §7.6 (rollback).
 

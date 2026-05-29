@@ -517,6 +517,103 @@ persistence (current setup — `pg-alfred-disney`, §6.1.1) — or NetApp
 NFS if a filesystem mount is unavoidable. Never put sqlite on Azure
 Files again.
 
+### 7.12 Post-meeting Microsoft transcript didn't land
+
+Distinct from Tier 3 (live STT, audio-no-transcripts in §7.7). This
+is "the meeting ended, no `official.txt` / `official.vtt` showed up
+in `meetings/{mid_sanitized}/transcripts/`". Auto-fetch is wired
+through `OfficialTranscriptFetcher`; this is where to look when it
+silently misses.
+
+**0. Was the meeting eligible?** Channel meetings are intentionally
+skipped — `OnlineMeetingTranscript.Read.Chat` doesn't cover them and
+no public Graph endpoint consumes `ChannelMeetingTranscript.Read.Group`
+alone (README §7.2). The fetcher's `Register` early-returns on any
+`@thread.tacv2` id with a "Skipping ... no public Graph transcripts
+endpoint" log. Don't debug what Microsoft doesn't ship.
+
+**1. Was Record-and-Transcribe on?** No transcribe → no transcript
+to fetch. The fetcher will poll the full 30-min budget + 1h retry +
+another 30 min, then give up with `exhausted retry`. Confirm in the
+meeting organizer's Stream / OneDrive whether the meeting produced
+a transcript at all.
+
+**2. Did the fetcher register?** Grep service-output.log for one of:
+- `Scheduled transcript fetch botCallId=...` — first chat sighting,
+  registered at meeting start.
+- `Extended transcript fetch botCallId=... new_deadline=...` —
+  `OnTeamsMeetingEndAsync` re-registered, pushing the deadline to
+  "30 min after end".
+- `Skipping transcript fetcher for channel meeting` — guard fired
+  (see step 0).
+
+If neither Scheduled nor Extended appears: the chat-sighting handler
+didn't see the chat, OR `OnTeamsMeetingEndAsync` never received the
+meetingEnd activity. The latter requires `groupChat` scope in the
+manifest (present in 1.0.12) plus the bot being installed in the
+meeting chat (`+Apps`). Confirm with `curl $BOT/api/channels` and
+the chat showing Alfred in the participants list.
+
+**3. Is the session still in-flight or already gave up?** The
+persistence file is the source of truth — every Register, every
+deadline-extension, every retry-arming flushes there atomically.
+
+```bash
+az vm run-command create --subscription e02c0038-82c8-4655-9647-38083f301099 \
+  -g rg-alfred-disney --vm-name vm-alfred-disney --location eastus \
+  --run-command-name pending-fetches --async-execution false \
+  --timeout-in-seconds 60 --output none \
+  --script 'Get-Content C:\teams-bot-poc\state\pending-transcript-fetches.json -ErrorAction SilentlyContinue'
+az vm run-command show --subscription e02c0038-82c8-4655-9647-38083f301099 \
+  -g rg-alfred-disney --vm-name vm-alfred-disney \
+  --run-command-name pending-fetches --instance-view \
+  --query "instanceView.output" -o tsv
+az vm run-command delete --subscription e02c0038-82c8-4655-9647-38083f301099 \
+  -g rg-alfred-disney --vm-name vm-alfred-disney \
+  --run-command-name pending-fetches --yes
+```
+
+Each record has `bot_call_id`, `organizer_oid`, `deadline_utc`,
+`retry_used`. Interpretation:
+- `deadline_utc > now` and `retry_used: false` → first poll window
+  still active; just wait.
+- `deadline_utc > now` and `retry_used: true` → bonus retry window
+  active; transcript landed late but is still in scope.
+- `deadline_utc < now` and present in the file → record was pruned
+  out at startup; about to be dropped by the next persist write.
+- absent and no `Emitted meeting.transcript.official` log → fetcher
+  gave up. Manual backfill (step 5).
+
+**4. Did Graph 403 / 404 the poll?** Polls log at Debug level:
+`List transcripts returned Forbidden for organizer=... meeting=...`
+or `... NotFound ...`. The fetcher swallows these and retries on the
+next interval. Persistent 403 means the chat-scoped RSC didn't
+consent — re-install Alfred via `+Apps` on that meeting chat.
+Persistent 404 with the canonical meeting id means the organizer's
+tenant doesn't expose the transcript via the
+`useResourceSpecificConsentBasedAuthorization=true` path; check
+whether `OnlineMeetingTranscript.Read.Chat` is grantable in Sandbox
+at all.
+
+**5. Operator backfill.** `POST /api/debug/fetch-transcript` fires
+the same poller against a hand-supplied `meeting_id` + `organizer_oid`
+with a 24h look-back window. Idempotent — re-registering a key that
+already produced a transcript is a no-op.
+
+```bash
+BOT=https://alfred-disney-bot.eastus.cloudapp.azure.com
+curl -sS -X POST $BOT/api/debug/fetch-transcript \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "meeting_id":"19:meeting_NmFkYW...@thread.v2",
+    "organizer_oid":"38387f0b-...",
+    "meeting_chat_thread_id":"19:meeting_NmFkYW...@thread.v2"
+  }'
+```
+
+Watch `meetings/{mid_sanitized}/transcripts/` over the next ~2 min.
+Re-tail logs with the §7.7 recipe if it stays empty.
+
 ---
 
 ## 8. API surface
@@ -535,6 +632,9 @@ Files again.
 | `POST` | `/api/channels/attach` | Attach |
 | `DELETE` | `/api/channels/{teamId}/{channelId}` | Detach |
 | `GET / PUT / POST / DELETE` | `/api/channels/{teamId}/{channelId}/consumers[/{name}]` | Manage per-channel consumer URLs |
+| `POST` | `/api/debug/fetch-transcript` | Operator backfill for `OfficialTranscriptFetcher` — body: `{meeting_id OR call_id, organizer_oid, meeting_chat_thread_id?}`. Idempotent on the supplied key; fires the same poller the auto-trigger uses (§7.12). |
+| `POST` | `/api/debug/refresh-meeting-metadata` | Re-run the resolver chain (chat → joinWebUrl → onlineMeeting) and re-emit a metadata-complete `meeting.created`. Body: `{meeting_chat_thread_id}`. Fixes meetings emitted earlier with `subject:null`. |
+| `GET` | `/api/debug/transcripts[/{sanitized_chat_thread_id}]` | Read the bot's NDJSON audit log under `C:/teams-bot-poc/meeting-logs/...`. List threads or tail one's `transcript|chat|system` stream. |
 
 The bot's event fanout dispatcher (under `src/Services/`) POSTs every
 event to every registered consumer URL using the `alfred-events-v1`
@@ -655,6 +755,20 @@ change-notification subscription on
 `teams/{teamId}/channels/{channelId}/messages`, re-issues on bot
 restart, and POSTs every channel post to the sink as a
 `conversation_kind:"channel"` chat event.
+
+The bot's full state directory contents (all atomic temp+rename,
+all reloaded by hosted services at startup):
+
+| File | Owner | Purpose |
+|---|---|---|
+| `channel-attachments.json` | `ChannelAttachmentStore` | `(teamId, channelId)` + subscription state. Re-issues subscriptions on restart. |
+| `conversation-references.json` | `FileBackedConversationReferenceStore` | Bot Framework `ConversationReference` per chat thread. Keeps `/api/send-chat` working across restarts. |
+| `meeting-channel-links.json` | `MeetingChannelLinkStore` | `chat_thread_id → (team_id, channel_id)` overrides set via `@Alfred link to <channel-name>`. |
+| `pending-transcript-fetches.json` | `OfficialTranscriptFetcher` | In-flight 30-min polls for post-meeting Microsoft transcripts. Restart resumes every record whose deadline hasn't truly expired (see §7.12). |
+
+Hand-editable JSON in a pinch. Wipe the directory only as a last
+resort: every store re-bootstraps from new events, but in-flight
+transcript polls and the conversation-reference cache get lost.
 
 Meetings spawned from an attached channel are a separate thread
 (`19:meeting_<base64>@thread.v2`) — their own session in the sink. The
