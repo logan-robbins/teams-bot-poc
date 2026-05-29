@@ -202,7 +202,9 @@ meetings/{meeting_id_sanitized}/transcripts/official.vtt   # raw WebVTT (start/e
 
 `official.txt` is what an exec opens. `official.vtt` is what a parser opens.
 
-Channel meetings produce no official transcript via this bot — `OnlineMeetingTranscript.Read.Chat` is private-chat-only. A consumer with a calendar-invitee's delegated user token can fetch channel-meeting transcripts directly from `GET /me/onlineMeetings/{meeting_id}/transcripts` (bypasses this bot).
+**Auto-fetch lifecycle.** For any private meeting where Alfred is installed (`+Apps`) with Record-and-Transcribe on, the bot's `OfficialTranscriptFetcher` registers on first chat sighting (start) and re-anchors on `OnTeamsMeetingEndAsync` (end), then polls Graph for up to 30 min after the most recent register. If that first window misses, the fetcher sleeps one hour and runs one more 30-min window before giving up. Pending sessions are persisted to disk, so a bot restart mid-poll resumes cleanly. Net: for any +Apps meeting with transcribe on, expect `meeting.transcript.official` in the sink and `official.{txt,vtt}` in blob storage within a few minutes of meeting end, without operator intervention. Operator backfill via `POST $BOT/api/debug/fetch-transcript` covers misses beyond that envelope.
+
+Channel meetings produce no official transcript via this bot — `OnlineMeetingTranscript.Read.Chat` is private-chat-only and there is no public Graph endpoint a `ChannelMeetingTranscript.Read.Group` install can hit alone. The fetcher's `Register` defensively skips `@thread.tacv2` ids so it never burns a poll budget on a guaranteed 404. A consumer with a calendar-invitee's delegated user token can fetch channel-meeting transcripts directly from `GET /me/onlineMeetings/{meeting_id}/transcripts` (bypasses this bot).
 
 ### 2.3 Blob body shape
 

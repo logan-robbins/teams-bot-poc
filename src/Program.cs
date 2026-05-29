@@ -136,7 +136,19 @@ try
     builder.Services.AddSingleton<GraphMetadataResolver>();
     builder.Services.AddSingleton<GraphNotificationProcessor>();
     builder.Services.AddSingleton<EventFanoutDispatcher>();
+
+    // Post-meeting transcript fetcher. File-backed so pending polls
+    // survive a redeploy mid-meeting; without persistence, an
+    // in-flight 30-min budget started just before restart is silently
+    // dropped and only operator backfill via
+    // /api/debug/fetch-transcript can recover the transcript.
+    builder.Services.AddSingleton(new OfficialTranscriptFetcherOptions
+    {
+        FilePath = meetingChatConfig.PendingTranscriptFetchStorePath,
+    });
     builder.Services.AddSingleton<OfficialTranscriptFetcher>();
+    builder.Services.AddHostedService(sp =>
+        sp.GetRequiredService<OfficialTranscriptFetcher>());
 
     // Persistent channel attachments (channel-level analog of "the bot is in
     // this meeting"). Re-issues subscriptions for each persisted channel on

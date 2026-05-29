@@ -465,7 +465,7 @@ Installs Alfred per-meeting in the meeting's chat container. The manifest's chat
 
 You get:
 - Real-time chat events (`meeting.chat.created/updated/deleted`) → bot → sink → dossier.
-- Post-meeting transcript fetch via `installedToOnlineMeetings/getAllTranscripts` works in principle. Auto-trigger for `+Apps` meetings is not yet wired (see [`TODO.md`](TODO.md)). Use `POST $BOT/api/debug/fetch-transcript` (§7.3) to backfill.
+- **Auto-fetched** post-meeting Microsoft transcript via `OfficialTranscriptFetcher`. The fetcher polls Graph's per-meeting `transcripts` endpoint (gated by the chat-scoped `OnlineMeetingTranscript.Read.Chat` RSC, evaluated via `useResourceSpecificConsentBasedAuthorization=true`) and emits `meeting.transcript.official` to the sink + `meetings/{mid}/transcripts/official.{txt,vtt}` to blob storage. Two triggers cooperate: first chat sighting (start) registers an initial 30-min poll window; `OnTeamsMeetingEndAsync` extends it to "30 min after end" no matter how long the meeting ran. One bounded retry one hour later if the first window misses. State is persisted to `C:/teams-bot-poc/state/pending-transcript-fetches.json` so a redeploy mid-poll doesn't drop the fetch. Operator backfill via `POST $BOT/api/debug/fetch-transcript` (§7.3) remains the escape hatch for misses beyond that envelope.
 - Alfred can post into the chat via `/api/send-chat` (the agent's `send_to_meeting_chat` tool).
 
 You DON'T get: live audio, `meeting.transcript.partial/final`, the bot in the meeting roster, speaker diarization for live notes.

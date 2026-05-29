@@ -210,9 +210,6 @@ public sealed partial class GraphNotificationProcessor
 
                 // Auto-join the channel meeting when Teams posts a callStartedEventMessageDetail.
                 MaybeAutoJoinChannelMeeting(ctx.Value.TeamId!, ctx.Value.ChannelId!, ctx.Value.ChatThreadId, document?.RootElement);
-
-                // Register post-meeting transcript fetch on meeting-export system payloads.
-                MaybeFetchPostMeetingTranscript(ctx.Value.Text, ctx.Value.TeamId!, ctx.Value.ChannelId!, ctx.Value.ChatThreadId);
             }
             else
             {
@@ -554,14 +551,14 @@ public sealed partial class GraphNotificationProcessor
                         SourceCallId = callId,
                     }).ConfigureAwait(false);
 
-                if (!result.Deferred && !string.IsNullOrWhiteSpace(initiatorOid) && !string.IsNullOrWhiteSpace(result.CallId))
-                {
-                    _transcriptFetcher.Register(
-                        botCallId: result.CallId!,
-                        organizerOid: initiatorOid!,
-                        meetingChatThreadId: channelThreadId,
-                        registeredAtUtc: DateTimeOffset.UtcNow);
-                }
+                // Intentionally do not register the official-transcript
+                // fetcher here. Channel meetings have no public Graph
+                // transcripts endpoint this bot can call (README §7.2 —
+                // OnlineMeetingTranscript.Read.Chat is private-chat-only
+                // and ChannelMeetingTranscript.Read.Group has no public
+                // GET). The fetcher's Register also defensively skips
+                // tacv2 thread ids; calling it here would just log "skip"
+                // and waste a round-trip.
             }
             catch (JoinWorkflowException jex)
             {
@@ -624,160 +621,7 @@ public sealed partial class GraphNotificationProcessor
         return await _graphApiClient.GetResourceAsync(resource, cancellationToken);
     }
 
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _attemptedTranscriptFetches =
-        new(StringComparer.Ordinal);
-
-    /// <summary>
-    /// Extracts <c>(callId, organizerOid)</c> from either supported Teams
-    /// meeting system-message shape (JSON with <c>scopeId</c>/<c>callId</c>
-    /// or the <c>&lt;URIObject type="Video.2/CallRecording.1"&gt;</c> XML
-    /// form). Returns nulls when the payload isn't a recognized shape.
-    /// </summary>
-    private static (string? callId, string? organizerOid) ExtractMeetingMetadata(string text)
-    {
-        var trimmed = text.TrimStart();
-
-        if (trimmed.StartsWith("{", StringComparison.Ordinal))
-        {
-            try
-            {
-                using var doc = JsonDocument.Parse(text);
-                if (doc.RootElement.ValueKind != JsonValueKind.Object) return (null, null);
-                if (!doc.RootElement.TryGetProperty("callId", out var cId) ||
-                    cId.ValueKind != JsonValueKind.String)
-                {
-                    return (null, null);
-                }
-                var callId = cId.GetString();
-                string? organizerOid = null;
-                if (doc.RootElement.TryGetProperty("meetingOrganizerId", out var mo) &&
-                    mo.ValueKind == JsonValueKind.String)
-                {
-                    var raw = mo.GetString();
-                    organizerOid = raw is not null && raw.StartsWith("8:orgid:", StringComparison.Ordinal)
-                        ? raw.Substring("8:orgid:".Length)
-                        : raw;
-                }
-                return (callId, organizerOid);
-            }
-            catch
-            {
-                return (null, null);
-            }
-        }
-
-        if (trimmed.StartsWith("<URIObject", StringComparison.Ordinal))
-        {
-            var callMatch = _callIdRegex.Match(text);
-            var orgMatch = _organizerRegex.Match(text);
-            var callId = callMatch.Success ? callMatch.Groups[1].Value : null;
-            var organizerOid = orgMatch.Success ? orgMatch.Groups[1].Value : null;
-            return (callId, organizerOid);
-        }
-
-        return (null, null);
-    }
-
-    /// <summary>
-    /// True when this chat-message text is a Teams meeting lifecycle
-    /// system payload. Teams emits two distinct shapes into channel
-    /// chat streams, both of which we want to peel off from the
-    /// human-chat envelope path:
-    /// <list type="bullet">
-    /// <item>JSON: <c>{"scopeId":"...","callId":"..."}</c> — call
-    /// started / ended / exported to ODSP.</item>
-    /// <item>XML: <c>&lt;URIObject type="Video.2/CallRecording.1"
-    /// ...&gt;...&lt;/URIObject&gt;</c> — recording / transcript
-    /// chunk-finished / call-ended notification with embedded
-    /// <c>&lt;Id type="callId"&gt;</c> and
-    /// <c>&lt;MeetingOrganizerId&gt;</c> elements.</item>
-    /// </list>
-    /// </summary>
-    private static bool LooksLikeTeamsMeetingSystemPayload(string? text)
-    {
-        if (string.IsNullOrWhiteSpace(text)) return false;
-        var trimmed = text.TrimStart();
-        if (trimmed.StartsWith("{", StringComparison.Ordinal))
-        {
-            try
-            {
-                using var doc = JsonDocument.Parse(text);
-                if (doc.RootElement.ValueKind != JsonValueKind.Object) return false;
-                return doc.RootElement.TryGetProperty("scopeId", out _) &&
-                       doc.RootElement.TryGetProperty("callId", out _);
-            }
-            catch
-            {
-                return false;
-            }
-        }
-        if (trimmed.StartsWith("<URIObject", StringComparison.Ordinal))
-        {
-            // Cheap content check: every Teams call/recording URIObject
-            // we've seen carries Video.2/CallRecording.1 in its type attr.
-            return trimmed.Contains("type=\"Video.2/CallRecording.1\"", StringComparison.Ordinal) ||
-                   trimmed.Contains("type='Video.2/CallRecording.1'", StringComparison.Ordinal);
-        }
-        return false;
-    }
-
-    private static readonly System.Text.RegularExpressions.Regex _callIdRegex = new(
-        @"<Id\s+type=""callId""\s+value=""([^""]+)""",
-        System.Text.RegularExpressions.RegexOptions.Compiled);
-
-    private static readonly System.Text.RegularExpressions.Regex _organizerRegex = new(
-        @"<MeetingOrganizerId\s+value=""8:orgid:([^""]+)""",
-        System.Text.RegularExpressions.RegexOptions.Compiled);
-
-    /// <summary>
-    /// When Teams posts a meeting lifecycle system message (call ended,
-    /// recording exported, transcript ready) into an attached channel,
-    /// the message body is a JSON payload with <c>scopeId</c>,
-    /// <c>callId</c>, and <c>meetingOrganizerId</c>. Use that to
-    /// register a post-meeting Graph transcript fetch even if Alfred
-    /// never joined the call itself — the
-    /// <c>installedToOnlineMeetings/getAllTranscripts</c> endpoint is
-    /// gated by the channel's team-level install, not by whether the
-    /// bot was a participant.
-    /// </summary>
-    private void MaybeFetchPostMeetingTranscript(string? text, string teamId, string channelId, string channelThreadId)
-    {
-        if (string.IsNullOrWhiteSpace(text))
-        {
-            return;
-        }
-
-        var (callId, organizerOid) = ExtractMeetingMetadata(text!);
-        if (string.IsNullOrWhiteSpace(callId) || string.IsNullOrWhiteSpace(organizerOid))
-        {
-            return;
-        }
-
-        // Idempotent per callId — Teams emits several system messages per
-        // meeting (start, end, recording exported, etc.) and we only need
-        // to schedule one fetch per call.
-        if (!_attemptedTranscriptFetches.TryAdd(callId!, 1))
-        {
-            return;
-        }
-
-        // Register with a small look-back so transcripts created during
-        // the call (before this "export" message lands) still match the
-        // fetcher's createdDateTime filter.
-        var registerAt = DateTimeOffset.UtcNow.AddMinutes(-30);
-
-        _logger.LogInformation(
-            "Scheduling post-meeting transcript fetch from channel system event callId={CallId} organizer={Oid} team={TeamId} channel={ChannelId}",
-            callId, organizerOid, teamId, channelId);
-
-        _transcriptFetcher.Register(
-            botCallId: callId!,
-            organizerOid: organizerOid!,
-            meetingChatThreadId: channelThreadId,
-            registeredAtUtc: registerAt);
-    }
-
-    private readonly record struct MessageContext(
+private readonly record struct MessageContext(
         string ChangeType,
         string ChatThreadId,
         string MessageId,

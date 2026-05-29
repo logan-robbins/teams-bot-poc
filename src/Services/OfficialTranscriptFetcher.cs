@@ -2,54 +2,117 @@ using System.Collections.Concurrent;
 using System.Globalization;
 using System.Net;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using TeamsMediaBot.Models;
 
 namespace TeamsMediaBot.Services;
 
 /// <summary>
-/// After Alfred joins a channel meeting, registers a background poller
-/// that watches Graph for the meeting's "Record and Transcribe"
-/// transcript to land, then publishes it as a
-/// <see cref="AlfredEventTypes.TranscriptOfficial"/> envelope through
-/// the fan-out dispatcher.
+/// Configuration for <see cref="OfficialTranscriptFetcher"/>.
+/// </summary>
+public sealed class OfficialTranscriptFetcherOptions
+{
+    /// <summary>
+    /// Absolute path to the JSON file that persists pending
+    /// transcript-fetch sessions across bot restarts. Without it, a
+    /// redeploy mid-poll silently drops every in-flight fetcher.
+    /// </summary>
+    public required string FilePath { get; init; }
+}
+
+/// <summary>
+/// On-disk representation of one pending fetch session. Kept distinct
+/// from the in-memory <see cref="OfficialTranscriptFetcher.PollSession"/>
+/// so the persistence schema can evolve independently.
+/// </summary>
+public sealed record PendingTranscriptFetchRecord
+{
+    [JsonPropertyName("bot_call_id")] public required string BotCallId { get; init; }
+    [JsonPropertyName("organizer_oid")] public required string OrganizerOid { get; init; }
+    [JsonPropertyName("meeting_chat_thread_id")] public string? MeetingChatThreadId { get; init; }
+    [JsonPropertyName("registered_at_utc")] public required DateTimeOffset RegisteredAtUtc { get; init; }
+    [JsonPropertyName("deadline_utc")] public required DateTimeOffset DeadlineUtc { get; init; }
+    [JsonPropertyName("retry_used")] public bool RetryUsed { get; init; }
+}
+
+/// <summary>
+/// After Alfred sees a meeting (chat sighting or end activity),
+/// schedules a background poll for the post-meeting Microsoft
+/// transcript and, when it lands, publishes a
+/// <see cref="AlfredEventTypes.MeetingTranscriptOfficial"/> envelope
+/// through the fan-out dispatcher.
 ///
 /// <para>
-/// We poll the <b>app-scoped</b> Graph resource
-/// <c>appCatalogs/teamsApps/{teamsAppId}/installedToOnlineMeetings/getAllTranscripts</c>
-/// every 60s starting 60s after the join, timing out at 30 min. This
-/// resource is gated by the RSC <c>OnlineMeetingTranscript.Read.Chat</c>
-/// declared in the manifest and consented at team-install time — so no
-/// tenant-wide Entra application permission is required. The first
-/// transcript whose <c>createdDateTime</c> is after the join time is
-/// treated as the transcript for that call.
+/// We poll the <b>user-scoped</b> Graph resource
+/// <c>users/{organizer}/onlineMeetings/{meeting}/transcripts?useResourceSpecificConsentBasedAuthorization=true</c>
+/// every 60s starting 60s after Register. The RSC flag makes Graph
+/// evaluate <c>OnlineMeetingTranscript.Read.Chat</c> (consented at
+/// "+Apps" install) instead of demanding the tenant-wide equivalent.
 /// </para>
+///
+/// <para>
+/// Reliability behaviour:
+/// </para>
+/// <list type="bullet">
+///   <item>
+///     Per-meeting state is a <see cref="PollSession"/> with a mutable
+///     deadline. Repeat <see cref="Register"/> calls for the same
+///     <c>botCallId</c> extend the deadline — a start-time register
+///     (first chat sighting) and an end-time register
+///     (<c>OnTeamsMeetingEndAsync</c>) cooperate so the poll window is
+///     anchored on the most recent signal, regardless of meeting
+///     length.
+///   </item>
+///   <item>
+///     Sessions are persisted to a JSON file on every state change.
+///     Bot restart resumes every pending poll with its on-disk
+///     deadline; nothing is silently lost across redeploys.
+///   </item>
+///   <item>
+///     If the first 30-min poll budget elapses without a transcript,
+///     the session sleeps one hour and runs one more 30-min window.
+///     After that, give up and rely on operator backfill via
+///     <c>POST /api/debug/fetch-transcript</c>.
+///   </item>
+///   <item>
+///     Channel-meeting chat thread ids (the <c>@thread.tacv2</c>
+///     suffix) are skipped at registration. Microsoft does not expose
+///     channel-meeting transcripts through any public Graph endpoint
+///     this bot can call (README §7.2); polling them only burns the
+///     30-min budget on guaranteed 404s.
+///   </item>
+/// </list>
 /// </summary>
-public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
+public sealed partial class OfficialTranscriptFetcher : IHostedService, IAsyncDisposable
 {
     private static readonly TimeSpan InitialDelay = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan PollDuration = TimeSpan.FromMinutes(30);
+    private static readonly TimeSpan RetryGap = TimeSpan.FromHours(1);
 
-    private static readonly JsonSerializerOptions SerializerOptions = new(JsonSerializerDefaults.Web);
+    private static readonly JsonSerializerOptions PersistenceOptions = new(JsonSerializerDefaults.Web)
+    {
+        WriteIndented = true,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+    };
 
     private readonly EventFanoutDispatcher _dispatcher;
     private readonly GraphApiClient _graph;
     private readonly BotConfiguration _botConfig;
     private readonly BlobEventArchive? _blobArchive;
+    private readonly OfficialTranscriptFetcherOptions _options;
     private readonly ILogger<OfficialTranscriptFetcher> _logger;
     private readonly CancellationTokenSource _cts = new();
-    private readonly ConcurrentDictionary<string, Task> _activeFetches = new(StringComparer.Ordinal);
-    // meetingId → organizerOid, so FetchVttAsync can reconstruct the
-    // user-scoped URL after TryFindTranscriptAsync hands off just the
-    // (meetingId, transcriptId) pair.
-    private readonly ConcurrentDictionary<string, string> _activeFetchOrganizers = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, PollSession> _sessions = new(StringComparer.Ordinal);
+    private readonly SemaphoreSlim _persistMutex = new(1, 1);
     private bool _disposed;
 
     public OfficialTranscriptFetcher(
         EventFanoutDispatcher dispatcher,
         GraphApiClient graph,
         BotConfiguration botConfig,
+        OfficialTranscriptFetcherOptions options,
         ILogger<OfficialTranscriptFetcher> logger,
         BlobEventArchive? blobArchive = null)
     {
@@ -57,13 +120,22 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
         _graph = graph;
         _botConfig = botConfig;
         _blobArchive = blobArchive;
+        _options = options ?? throw new ArgumentNullException(nameof(options));
         _logger = logger;
     }
 
+    public Task StartAsync(CancellationToken cancellationToken) => LoadFromDiskAsync(cancellationToken);
+
+    public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
     /// <summary>
-    /// Schedule a one-shot post-meeting fetch. Idempotent on
-    /// <paramref name="botCallId"/>; subsequent calls with the same id
-    /// are no-ops.
+    /// Schedule a post-meeting fetch, or extend an existing session's
+    /// deadline. The most recent caller wins on deadline (so end-time
+    /// registers anchor the window to "30 min after meeting end"
+    /// regardless of how long the meeting ran); the earliest caller
+    /// wins on <see cref="PollSession.RegisteredAtUtc"/> (so the
+    /// createdDateTime filter in <see cref="TryFindTranscriptAsync"/>
+    /// doesn't tighten on re-entry).
     /// </summary>
     public void Register(
         string botCallId,
@@ -81,33 +153,115 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
             return;
         }
 
-        var pending = new PendingFetch(botCallId, organizerOid, meetingChatThreadId, registeredAtUtc);
-        _activeFetchOrganizers[botCallId] = organizerOid;
+        // Channel meetings have no public Graph transcripts endpoint
+        // (README §7.2 — `OnlineMeetingTranscript.Read.Chat` is private
+        // chat only; `ChannelMeetingTranscript.Read.Group` has no
+        // public GET). Skip them so we don't burn a 30-min poll budget
+        // on guaranteed 404s.
+        if (LooksLikeChannelThreadId(meetingChatThreadId) || LooksLikeChannelThreadId(botCallId))
+        {
+            _logger.LogInformation(
+                "Skipping transcript fetcher for channel meeting (no public Graph transcripts endpoint). botCallId={CallId} meetingChatThreadId={MeetingChatThreadId}",
+                botCallId, meetingChatThreadId);
+            return;
+        }
 
-        _activeFetches.GetOrAdd(botCallId, _ => Task.Run(() => RunAsync(pending, _cts.Token)));
+        var fresh = new PollSession
+        {
+            BotCallId = botCallId,
+            OrganizerOid = organizerOid,
+            MeetingChatThreadId = meetingChatThreadId,
+            RegisteredAtUtc = registeredAtUtc,
+            Deadline = DateTimeOffset.UtcNow + PollDuration,
+        };
+
+        var session = _sessions.GetOrAdd(botCallId, fresh);
+        if (ReferenceEquals(session, fresh))
+        {
+            session.Task = Task.Run(() => RunAsync(session, _cts.Token));
+            _logger.LogInformation(
+                "Scheduled transcript fetch botCallId={CallId} organizerOid={Oid} deadline={Deadline:O}",
+                botCallId, organizerOid, session.Deadline);
+        }
+        else
+        {
+            lock (session.SyncRoot)
+            {
+                var pushed = DateTimeOffset.UtcNow + PollDuration;
+                if (pushed > session.Deadline) session.Deadline = pushed;
+                if (registeredAtUtc < session.RegisteredAtUtc) session.RegisteredAtUtc = registeredAtUtc;
+                if (string.IsNullOrWhiteSpace(session.OrganizerOid)) session.OrganizerOid = organizerOid;
+                if (string.IsNullOrWhiteSpace(session.MeetingChatThreadId)) session.MeetingChatThreadId = meetingChatThreadId;
+            }
+            _logger.LogInformation(
+                "Extended transcript fetch botCallId={CallId} new_deadline={Deadline:O}",
+                botCallId, session.Deadline);
+        }
+
+        FireAndForgetPersist();
     }
 
-    private async Task RunAsync(PendingFetch pending, CancellationToken cancellationToken)
+    private async Task RunAsync(PollSession session, CancellationToken cancellationToken)
     {
         try
         {
             await Task.Delay(InitialDelay, cancellationToken).ConfigureAwait(false);
 
-            var deadline = DateTimeOffset.UtcNow + PollDuration;
-            while (DateTimeOffset.UtcNow < deadline)
+            while (true)
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
+                DateTimeOffset deadline;
+                bool retryUsed;
+                lock (session.SyncRoot)
+                {
+                    deadline = session.Deadline;
+                    retryUsed = session.RetryUsed;
+                }
+
+                if (DateTimeOffset.UtcNow >= deadline)
+                {
+                    if (retryUsed)
+                    {
+                        _logger.LogWarning(
+                            "Official transcript fetch exhausted retry for botCallId={CallId} meetingChatThreadId={MeetingChatThreadId}; operator can backfill via /api/debug/fetch-transcript.",
+                            session.BotCallId, session.MeetingChatThreadId);
+                        return;
+                    }
+
+                    _logger.LogInformation(
+                        "Official transcript fetch hit first deadline botCallId={CallId}; sleeping {RetryGap} before one more {PollDuration} window.",
+                        session.BotCallId, RetryGap, PollDuration);
+
+                    try
+                    {
+                        await Task.Delay(RetryGap, cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        return;
+                    }
+
+                    lock (session.SyncRoot)
+                    {
+                        session.RetryUsed = true;
+                        var pushed = DateTimeOffset.UtcNow + PollDuration;
+                        if (pushed > session.Deadline) session.Deadline = pushed;
+                    }
+                    FireAndForgetPersist();
+                    continue;
+                }
+
                 var (meetingId, transcriptId, createdAt) =
-                    await TryFindTranscriptAsync(pending, cancellationToken).ConfigureAwait(false);
+                    await TryFindTranscriptAsync(session, cancellationToken).ConfigureAwait(false);
 
                 if (!string.IsNullOrEmpty(meetingId) && !string.IsNullOrEmpty(transcriptId))
                 {
-                    var vtt = await FetchVttAsync(meetingId!, transcriptId!, cancellationToken)
+                    var vtt = await FetchVttAsync(session, meetingId!, transcriptId!, cancellationToken)
                         .ConfigureAwait(false);
                     if (!string.IsNullOrWhiteSpace(vtt))
                     {
-                        await EmitAsync(pending, meetingId!, transcriptId!, createdAt, vtt, cancellationToken)
+                        await EmitAsync(session, meetingId!, transcriptId!, createdAt, vtt, cancellationToken)
                             .ConfigureAwait(false);
                         return;
                     }
@@ -122,55 +276,36 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
                     return;
                 }
             }
-
-            _logger.LogWarning(
-                "Official transcript fetch timed out after {Mins} min for botCallId={CallId} meetingChatThreadId={MeetingChatThreadId}.",
-                (int)PollDuration.TotalMinutes, pending.BotCallId, pending.MeetingChatThreadId);
         }
         catch (OperationCanceledException) { /* shutdown */ }
         catch (Exception ex)
         {
             _logger.LogError(ex,
-                "Official transcript fetch crashed for botCallId={CallId} meetingChatThreadId={MeetingChatThreadId}.",
-                pending.BotCallId, pending.MeetingChatThreadId);
+                "Official transcript fetch crashed botCallId={CallId} meetingChatThreadId={MeetingChatThreadId}.",
+                session.BotCallId, session.MeetingChatThreadId);
         }
         finally
         {
-            _activeFetches.TryRemove(pending.BotCallId, out _);
-            _activeFetchOrganizers.TryRemove(pending.BotCallId, out _);
+            _sessions.TryRemove(session.BotCallId, out _);
+            FireAndForgetPersist();
         }
     }
 
     private async Task<(string? MeetingId, string? TranscriptId, string? CreatedAt)>
-        TryFindTranscriptAsync(PendingFetch pending, CancellationToken cancellationToken)
+        TryFindTranscriptAsync(PollSession session, CancellationToken cancellationToken)
     {
-        // List transcripts for the (organizer, onlineMeeting) pair.
-        // Matches the Microsoft sample at OfficeDev/Microsoft-Teams-Samples
-        // (`samples/meetings-transcription/csharp`).
-        //
-        // Two non-obvious twists vs. the sample:
-        // 1. The Graph URL needs the CANONICAL onlineMeeting.id (URL-safe
-        //    base64 of `1*{tenantId}*0**{chatThreadId}`), not the
-        //    `19:meeting_…@thread.v2` chat thread id. Derive deterministically
-        //    from pending.BotCallId when it's still in chat-thread form.
-        // 2. Append `?useResourceSpecificConsentBasedAuthorization=true`
-        //    so Graph evaluates our chat-scoped RSC
-        //    OnlineMeetingTranscript.Read.Chat (consented at "+Apps"
-        //    install) instead of demanding the tenant-wide
-        //    OnlineMeetingTranscript.Read.All. Without this flag the
-        //    user-scoped URL returns 403 with empty RSC grants.
-        if (string.IsNullOrWhiteSpace(pending.OrganizerOid)
-            || string.IsNullOrWhiteSpace(pending.BotCallId))
+        if (string.IsNullOrWhiteSpace(session.OrganizerOid)
+            || string.IsNullOrWhiteSpace(session.BotCallId))
         {
             return (null, null, null);
         }
 
-        var canonicalMeetingId = ToCanonicalMeetingId(pending.BotCallId);
+        var canonicalMeetingId = ToCanonicalMeetingId(session.BotCallId);
         // NOTE: Graph's per-meeting transcripts endpoint REJECTS $orderby
         // and $top with `400 Query option 'OrderBy' is not allowed`.
         // List everything; pick newest in-process below.
         var resource =
-            $"https://graph.microsoft.com/v1.0/users/{Uri.EscapeDataString(pending.OrganizerOid)}" +
+            $"https://graph.microsoft.com/v1.0/users/{Uri.EscapeDataString(session.OrganizerOid!)}" +
             $"/onlineMeetings/{Uri.EscapeDataString(canonicalMeetingId)}/transcripts" +
             "?useResourceSpecificConsentBasedAuthorization=true";
 
@@ -181,14 +316,11 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
             {
                 return (null, null, null);
             }
-            // pending.RegisteredAtUtc is our "look back from here" anchor.
+            // RegisteredAtUtc - 1h is our "look back from here" anchor.
             // Microsoft's transcripts API doesn't filter by createdDateTime
             // server-side reliably, so we filter client-side: only consider
-            // transcripts created after our register time minus a 24h
-            // grace window (handles transcripts that landed before the
-            // fetcher was registered — see DebugController which defaults
-            // RegisteredAtUtc to 24h back for that reason).
-            var minCreated = pending.RegisteredAtUtc.UtcDateTime.AddHours(-1);
+            // transcripts created after our register time minus 1h.
+            var minCreated = session.RegisteredAtUtc.UtcDateTime.AddHours(-1);
             foreach (var item in arr.EnumerateArray())
             {
                 var transcriptId = item.TryGetProperty("id", out var i) ? i.GetString() : null;
@@ -202,47 +334,42 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
                 {
                     continue;
                 }
-                return (pending.BotCallId, transcriptId, createdAt);
+                return (session.BotCallId, transcriptId, createdAt);
             }
         }
         catch (GraphApiException ex) when (ex.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.Forbidden)
         {
             _logger.LogDebug(
                 "List transcripts returned {Status} for organizer={Oid} meeting={Mid}; polling will retry.",
-                ex.StatusCode, pending.OrganizerOid, pending.BotCallId);
+                ex.StatusCode, session.OrganizerOid, session.BotCallId);
         }
         catch (Exception ex)
         {
             _logger.LogDebug(ex,
                 "List transcripts probe failed for organizer={Oid} meeting={Mid}; polling will retry.",
-                pending.OrganizerOid, pending.BotCallId);
+                session.OrganizerOid, session.BotCallId);
         }
 
         return (null, null, null);
     }
 
     private async Task<string?> FetchVttAsync(
+        PollSession session,
         string meetingId,
         string transcriptId,
         CancellationToken cancellationToken)
     {
-        // The list call returned a meetingId equal to pending.BotCallId
-        // and was scoped to pending.OrganizerOid; reuse those for the
-        // content fetch URL. Caller passes meetingId verbatim from
-        // TryFindTranscriptAsync; we need the organizer too, so look it
-        // up from the active fetch table.
-        var organizerOid = _activeFetchOrganizers.GetValueOrDefault(meetingId);
-        if (string.IsNullOrWhiteSpace(organizerOid))
+        if (string.IsNullOrWhiteSpace(session.OrganizerOid))
         {
             _logger.LogWarning(
-                "FetchVttAsync: no organizer cached for meetingId={MeetingId}; cannot fetch.",
+                "FetchVttAsync: no organizer on session for meetingId={MeetingId}; cannot fetch.",
                 meetingId);
             return null;
         }
 
         var canonicalMeetingId = ToCanonicalMeetingId(meetingId);
         var resource =
-            $"https://graph.microsoft.com/v1.0/users/{Uri.EscapeDataString(organizerOid)}" +
+            $"https://graph.microsoft.com/v1.0/users/{Uri.EscapeDataString(session.OrganizerOid!)}" +
             $"/onlineMeetings/{Uri.EscapeDataString(canonicalMeetingId)}/transcripts/{Uri.EscapeDataString(transcriptId)}/content" +
             "?$format=text/vtt&useResourceSpecificConsentBasedAuthorization=true";
         try
@@ -282,7 +409,7 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
     }
 
     private async Task EmitAsync(
-        PendingFetch pending,
+        PollSession session,
         string meetingId,
         string transcriptId,
         string? createdAt,
@@ -294,7 +421,7 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
         var payload = new MeetingOfficialTranscriptPayload
         {
             TranscriptId = transcriptId,
-            OrganizerOid = pending.OrganizerOid,
+            OrganizerOid = session.OrganizerOid,
             FetchedAtUtc = fetchedAt,
             CreatedAtUtc = createdAt,
             VttUrl = $"meetings/{SanitizeBlobSegment(meetingId)}/transcripts/official.vtt",
@@ -310,8 +437,8 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
             MeetingRef = new MeetingRef
             {
                 MeetingId = meetingId,
-                MeetingChatThreadId = string.IsNullOrWhiteSpace(pending.MeetingChatThreadId)
-                    ? null : pending.MeetingChatThreadId,
+                MeetingChatThreadId = string.IsNullOrWhiteSpace(session.MeetingChatThreadId)
+                    ? null : session.MeetingChatThreadId,
             },
             Payload = payload,
         }, cancellationToken).ConfigureAwait(false);
@@ -323,7 +450,7 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
 
         _logger.LogInformation(
             "Emitted meeting.transcript.official meetingId={MeetingId} transcriptId={TranscriptId} cues={CueCount} (botCallId={CallId})",
-            meetingId, transcriptId, cues.Count, pending.BotCallId);
+            meetingId, transcriptId, cues.Count, session.BotCallId);
     }
 
     private static IReadOnlyList<OfficialTranscriptCue> ParseVtt(string vtt)
@@ -339,8 +466,6 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
             var startMs = ParseTimestampMs(timing.Groups["start"].Value);
             var endMs = ParseTimestampMs(timing.Groups["end"].Value);
 
-            // Concatenate subsequent non-blank lines into the cue body
-            // until a blank line or EOF.
             var body = new System.Text.StringBuilder();
             for (var j = i + 1; j < lines.Length; j++)
             {
@@ -411,22 +536,168 @@ public sealed partial class OfficialTranscriptFetcher : IAsyncDisposable
     private static string SanitizeBlobSegment(string s) =>
         Regex.Replace(s, @"[^a-zA-Z0-9\-_.]", "_");
 
+    private static bool LooksLikeChannelThreadId(string? id) =>
+        !string.IsNullOrWhiteSpace(id)
+        && id!.StartsWith("19:", StringComparison.Ordinal)
+        && id.IndexOf("@thread.tacv2", StringComparison.Ordinal) > 0;
+
+    private void FireAndForgetPersist()
+    {
+        // Mid-shutdown Persist calls are best-effort. The temp+rename
+        // pattern means a cancelled write never leaves a corrupt file.
+        _ = Task.Run(() => PersistAsync(_cts.Token));
+    }
+
+    private async Task PersistAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await _persistMutex.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                var snapshot = _sessions.Values.Select(s =>
+                {
+                    lock (s.SyncRoot)
+                    {
+                        return new PendingTranscriptFetchRecord
+                        {
+                            BotCallId = s.BotCallId,
+                            OrganizerOid = s.OrganizerOid ?? string.Empty,
+                            MeetingChatThreadId = s.MeetingChatThreadId,
+                            RegisteredAtUtc = s.RegisteredAtUtc,
+                            DeadlineUtc = s.Deadline,
+                            RetryUsed = s.RetryUsed,
+                        };
+                    }
+                }).ToList();
+
+                Directory.CreateDirectory(Path.GetDirectoryName(_options.FilePath)!);
+                var tmp = _options.FilePath + ".tmp";
+                await using (var stream = File.Create(tmp))
+                {
+                    await JsonSerializer.SerializeAsync(stream, snapshot, PersistenceOptions, cancellationToken).ConfigureAwait(false);
+                }
+                File.Move(tmp, _options.FilePath, overwrite: true);
+            }
+            finally
+            {
+                _persistMutex.Release();
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "Failed to persist pending-transcript-fetch store at {FilePath}; in-memory state retained.",
+                _options.FilePath);
+        }
+    }
+
+    /// <summary>
+    /// Load pending fetches from disk and resume them. Records whose
+    /// retry has already been used AND whose deadline has passed are
+    /// dropped — there is no more work to do for them.
+    /// </summary>
+    public async Task LoadFromDiskAsync(CancellationToken cancellationToken)
+    {
+        if (!File.Exists(_options.FilePath))
+        {
+            _logger.LogInformation(
+                "Pending-transcript-fetch store {FilePath} does not exist yet; starting empty.",
+                _options.FilePath);
+            return;
+        }
+
+        List<PendingTranscriptFetchRecord>? records;
+        try
+        {
+            await using var stream = File.OpenRead(_options.FilePath);
+            records = await JsonSerializer.DeserializeAsync<List<PendingTranscriptFetchRecord>>(
+                stream, PersistenceOptions, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "Failed to read pending-transcript-fetch store {FilePath}; starting empty.",
+                _options.FilePath);
+            return;
+        }
+
+        if (records is null) return;
+
+        var resumed = 0;
+        var dropped = 0;
+        foreach (var r in records)
+        {
+            if (string.IsNullOrWhiteSpace(r.BotCallId) || string.IsNullOrWhiteSpace(r.OrganizerOid))
+            {
+                dropped++;
+                continue;
+            }
+            if (r.RetryUsed && r.DeadlineUtc < DateTimeOffset.UtcNow)
+            {
+                dropped++;
+                continue;
+            }
+
+            var session = new PollSession
+            {
+                BotCallId = r.BotCallId,
+                OrganizerOid = r.OrganizerOid,
+                MeetingChatThreadId = r.MeetingChatThreadId,
+                RegisteredAtUtc = r.RegisteredAtUtc,
+                Deadline = r.DeadlineUtc,
+                RetryUsed = r.RetryUsed,
+            };
+
+            if (_sessions.TryAdd(r.BotCallId, session))
+            {
+                session.Task = Task.Run(() => RunAsync(session, _cts.Token));
+                resumed++;
+            }
+        }
+
+        _logger.LogInformation(
+            "Pending-transcript-fetch store loaded: resumed={Resumed} dropped={Dropped} from {FilePath}",
+            resumed, dropped, _options.FilePath);
+
+        // Flush the cleaned view (drops the discarded entries).
+        FireAndForgetPersist();
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (_disposed) return;
         _disposed = true;
         _cts.Cancel();
-        var tasks = _activeFetches.Values.ToArray();
+        var tasks = _sessions.Values
+            .Select(s => s.Task)
+            .Where(t => t is not null)
+            .Cast<Task>()
+            .ToArray();
         foreach (var t in tasks)
         {
             try { await t.ConfigureAwait(false); } catch { /* shutdown */ }
         }
         _cts.Dispose();
+        _persistMutex.Dispose();
     }
 
-    private readonly record struct PendingFetch(
-        string BotCallId,
-        string OrganizerOid,
-        string MeetingChatThreadId,
-        DateTimeOffset RegisteredAtUtc);
+    /// <summary>
+    /// Mutable per-meeting poll state. <see cref="Register"/> extends
+    /// the deadline on this object in-place; <see cref="RunAsync"/>
+    /// re-reads the deadline each iteration so concurrent extensions
+    /// take effect immediately.
+    /// </summary>
+    private sealed class PollSession
+    {
+        public required string BotCallId { get; init; }
+        public string? OrganizerOid { get; set; }
+        public string? MeetingChatThreadId { get; set; }
+        public DateTimeOffset RegisteredAtUtc { get; set; }
+        public DateTimeOffset Deadline { get; set; }
+        public bool RetryUsed { get; set; }
+        public Task? Task { get; set; }
+        public object SyncRoot { get; } = new object();
+    }
 }

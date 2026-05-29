@@ -329,4 +329,15 @@ public sealed class MeetingChatConfiguration
     /// </summary>
     public string ConversationReferenceStorePath { get; init; } =
         @"C:\teams-bot-poc\state\conversation-references.json";
+
+    /// <summary>
+    /// Absolute path to the JSON file that persists pending
+    /// post-meeting transcript-fetch sessions across bot restarts.
+    /// Without it, an in-flight 30-min poll started just before a
+    /// redeploy is silently dropped — the transcript would never
+    /// land in blob storage and only operator backfill via
+    /// <c>POST /api/debug/fetch-transcript</c> could recover it.
+    /// </summary>
+    public string PendingTranscriptFetchStorePath { get; init; } =
+        @"C:\teams-bot-poc\state\pending-transcript-fetches.json";
 }
