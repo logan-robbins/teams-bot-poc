@@ -1,13 +1,15 @@
 # Reading Alfred Data — `alfred-v2`
 
-Two read paths over the same `alfred-v2` envelopes:
+The C# bot publishes the same `alfred-v2` envelopes to two sibling outputs: live HTTP consumers and the blob archive. Our Python sink is one live consumer; it persists a PostgreSQL ledger and exposes query endpoints. Blob storage is the raw replay rail.
+
+Two read surfaces:
 
 | Path | Auth | Use when |
 |------|------|----------|
-| **Sink API** — `https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io` | None (sandbox is public) | one HTTP call → JSON; list / lookup / proxy reads |
+| **Sink API** — `https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io` | None (sandbox is public) | our Alfred implementation's PostgreSQL view; one HTTP call → JSON |
 | **Blob archive** — `https://stalfreddisney.blob.core.windows.net/alfred-events/` | Anonymous read | raw event stream; replay, bulk, offline |
 
-The sink is a thin PostgreSQL + HTTP layer over the blob archive. **Blob archive is the source of truth.** For envelope shape and event types see `docs/event-contract.md`.
+For low-latency custom agents, do not poll these read surfaces as the primary path. Register your own consumer URL and receive `POST` delivery from the C# bot (see §4). For envelope shape and event types see `docs/event-contract.md`.
 
 ---
 
@@ -136,7 +138,7 @@ If anonymous read is ever disabled you'll see `403 AuthenticationFailed` — swi
 
 Every per-event blob is a **single alfred-v2 envelope** as pretty-printed JSON. No preamble, no markers. `jq` works directly.
 
-**Channel scope** (literal `/channels/` segment, per the C# writer under `src/Services/`):
+**Channel scope** (literal `teams/.../channels/...` hierarchy, per the C# writer under `src/Services/`):
 
 ```
 teams/{team_id_sanitized}/channels/{channel_id_sanitized}/messages/{ts}-{event_id}.json
@@ -375,18 +377,23 @@ for b in sorted(
 
 ```python
 import httpx
+import re
 
 SINK = "https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io"
 SA   = "https://stalfreddisney.blob.core.windows.net/alfred-events"
+
+def blob_segment(raw: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9\-_.]", "_", raw)[:200]
 
 with httpx.Client(timeout=10.0) as c:
     r = c.get(f"{SINK}/v2/resolve",
               params={"kind": "meeting", "subject": "sprint planning"}).json()
     meeting_id = r["matches"][0]["meeting_id"]
+    meeting_blob_id = blob_segment(meeting_id)
     subject    = r["matches"][0]["subject"]
 
     meta            = c.get(f"{SINK}/v2/meetings/{meeting_id}").json()
-    transcript_text = c.get(f"{SA}/meetings/{meeting_id}/transcripts/official.txt").text
+    transcript_text = c.get(f"{SA}/meetings/{meeting_blob_id}/transcripts/official.txt").text
     ledger          = c.get(f"{SINK}/v2/meetings/{meeting_id}/events",
                             params={"limit": 500}).json()["events"]
 
@@ -397,9 +404,9 @@ print(f"{len(ledger)} events in the ledger")
 
 ---
 
-## 4. Live processing — register a consumer, don't poll
+## 4. Live Processing — Register a Consumer
 
-The sink and blob archive are **read-after-the-fact**. For low-latency processing, register a push consumer (see `docs/event-contract.md` §6):
+The sink query API and blob archive are read surfaces. For low-latency processing, register a push consumer (see `docs/event-contract.md` §6). The C# bot will POST each matching envelope to the URL you provide and will still write the blob archive independently.
 
 ```bash
 BOT="https://alfred-disney-bot.eastus.cloudapp.azure.com"
@@ -415,7 +422,9 @@ Body field is **`event_kinds`** (not `event_types` — wrong key silently produc
 
 Subscribe to `meeting.transcript.final` (3–5 / min / speaker) for live transcript content. `meeting.transcript.partial` is throttled to 1/speaker/60s by default — it is a progress indicator, not a real-time stream.
 
-For an agent that "listens silently until interesting": consume `meeting.transcript.final`, run your analysis per chunk (or debounced batch), stay silent unless a threshold is crossed or the bot is directly mentioned. The canonical Alfred prompt at `python/batcave_platform/specs/alfred.yaml` encodes this policy.
+For an agent that "listens silently until interesting": consume `meeting.transcript.final`, run your analysis per chunk (or debounced batch), stay silent unless a threshold is crossed or the bot is directly mentioned. The canonical Alfred prompt at `python/batcave_platform/specs/alfred.yaml` encodes our version of that policy.
+
+`server_v2.py` at the repo root is a client-side example: it exposes `POST /v2/events`, can poll the blob archive for catch-up, and uses `$BOT/api/send-chat` to respond. Treat it as a client implementation on top of the platform rails, not as part of the built-in sink.
 
 ---
 
@@ -446,9 +455,11 @@ Content-only consumers: filter to `meeting.transcript.final`, `meeting.transcrip
 
 ---
 
-## 6. V1 polling bridge
+## 6. Sidecar Bridges
 
-The repo root holds two untracked sidecar scripts — `server.py` and `server_1.py` — that bridge a pre-v2 polling consumer during the v1→v2 cutover. They poll both the legacy `channels/{team_sanitized}/{cid_sanitized}/chat.message/{ts}-{eid}.txt` path AND the new v2 `teams/{tid}/channels/{cid}/messages/` path. Not part of v2; this doc does not cover v1. For v1 mechanics see comments inside those files.
+`server_v2.py` is the current sidecar example for a client-owned Alfred: live `POST /v2/events` first, blob polling for replay/catch-up, Teams replies through `$BOT/api/send-chat`.
+
+`server.py` and `server_1.py` are legacy local v1 polling bridge files. They are kept only for comparison while old consumers migrate. New code should use `server_v2.py`, a custom HTTP consumer, or the blob archive category paths documented above.
 
 ---
 

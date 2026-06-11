@@ -1,15 +1,45 @@
 # Alfred Event Contract — `alfred-v2`
 
-Canonical reference for the `alfred-v2` event envelope. The bot emits one envelope per event: channel chat under `channel.*`, meeting audio + chat under `meeting.*`. Envelope shape mirrors the Microsoft Graph URL hierarchy.
+Canonical reference for the `alfred-v2` event envelope. The C# bot emits one envelope per event: channel chat under `channel.*`, meeting audio + chat under `meeting.*`. Envelope shape mirrors the Microsoft Graph URL hierarchy.
 
-Consumers: register a webhook at `POST $BOT/api/channels/{teamId}/{channelId}/consumers` (only scope implemented), or read the blob archive (see `docs/retrieving-transcripts.md`).
+Consumers have two rails:
+
+1. Register a webhook URL with `POST $BOT/api/channels/{teamId}/{channelId}/consumers` for live push delivery.
+2. Read the blob archive for replay, bulk export, and offline processing (see `docs/retrieving-transcripts.md`).
+
+The Python sink is the built-in consumer for our Alfred implementation. A client-owned Alfred can be any service that receives these envelopes and optionally calls `$BOT/api/send-chat` to interact in Teams; `server_v2.py` is a local example of that pattern.
+
+---
+
+## 0. Publisher Rails
+
+```
+Teams activity / Graph notification / media frame
+                  |
+                  v
+          C# bot builds one alfred-v2 envelope
+                  |
+                  v
+          EventFanoutDispatcher.PublishAsync
+                  |
+        +---------+----------+------------------+
+        |                    |                  |
+        v                    v                  v
+ local VM audit       BlobEventArchive     HTTP consumer POSTs
+ NDJSON               PUT .json blob       to registered URLs
+                                           usually /v2/events
+```
+
+Blob writes and HTTP consumer POSTs are sibling outputs from the C# bot. The bot does not post only to `/events`; it POSTs to every configured consumer URL, and the URL may be `/v2/events`, `/events`, or any path that consumer owns. The blob archive is written by the C# bot, not by the Python sink.
+
+`meeting.transcript.partial` is throttled before blob + HTTP delivery by `EventDispatch:PartialThrottleSeconds` to avoid flooding consumers. Final transcript chunks, chat, lifecycle, and official transcript events are delivered normally.
 
 ---
 
 ## 1. Versioning
 
 - Current: `"schema_version": "alfred-v2"`.
-- v1 (`alfred-events-v1`) is dead. No back-compat shims on the sink. See [§7 V1 polling bridge](#7-v1-polling-bridge) for one carve-out.
+- v1 (`alfred-events-v1`) is dead. No back-compat shims on the sink. See [§7 Sidecar clients and v1 compat](#7-sidecar-clients-and-v1-compat) for the local sidecar carve-out.
 - Within v2: additive only. New optional fields and new event types are allowed. Breaking changes ship as `v3`.
 
 ---
@@ -94,7 +124,7 @@ Microsoft Graph exposes a separate identifier called `onlineMeeting.id` (returne
 
 ### 2.3 Transport
 
-- `POST application/json`, one envelope per request (not batched).
+- `POST application/json`, one envelope per request (not batched), to each configured consumer URL.
 - 2xx accepted. 5xx / 408 / 429 retry up to 3 with backoff 250ms / 1s / 4s. Other 4xx drops permanently.
 - Per-consumer queue: bounded 1000 entries, drop-oldest.
 
@@ -348,7 +378,7 @@ See `docs/retrieving-transcripts.md` for read recipes.
 
 ---
 
-## 6. Registering consumers
+## 6. Registering Consumers
 
 Channel scope is the only scope the bot implements. A channel-scope consumer receives every `channel.*` event for the channel AND every `meeting.*` event for meetings linked to that channel (via `meeting.linked` or the `@Alfred link to <channel-name>` chat command).
 
@@ -357,6 +387,8 @@ curl -X POST $BOT/api/channels/$TEAM/$CHAN/consumers \
   -H "Content-Type: application/json" \
   -d '{"name":"team-a","url":"https://...","event_kinds":["*"],"enabled":true}'
 ```
+
+The consumer owns the URL path. Use `/v2/events` if you want to match the built-in Python sink and `server_v2.py`, but the bot treats the URL as opaque.
 
 **Filter key is `event_kinds`** (matched against `AlfredEventEnvelope.event_type` in `EventFanoutDispatcher`). `["*"]` accepts everything. Otherwise list exact event types — no wildcards inside a type. Sending `event_types` instead produces a silently-empty filter that matches everything.
 
@@ -375,12 +407,14 @@ When the consumer list is empty, `EventDispatch.BootstrapConsumerUrl` (per-deplo
 
 ---
 
-## 7. V1 polling bridge
+## 7. Sidecar Clients and V1 Compat
 
-The repo root holds two untracked sidecar scripts — `server.py` and `server_1.py` — that are iterated on locally to bridge a pre-v2 polling consumer during the v1→v2 cutover. They poll both the legacy `channels/{team_sanitized}/{cid_sanitized}/chat.message/{ts}-{eid}.txt` path AND the new v2 `teams/{tid}/channels/{cid}/messages/` path. They are not part of v2; this doc does not cover v1 mechanics. For v1 specifics see comments inside those files.
+`server_v2.py` at the repo root is a client-side bridge example. It preserves the older `/chat` API, receives live envelopes at `POST /v2/events`, can poll the current blob archive paths for catch-up, and posts back through `$BOT/api/send-chat` when its agent decides to respond. It is not part of the C# bot or the built-in Python sink; it is the shape a client can copy when they want to build their own Alfred on top of the platform rails.
+
+`server.py` and `server_1.py` are legacy local sidecars for the v1 polling bridge. They exist only for pre-v2 compatibility comparison. The legacy compat blob path is `channels/{team_sanitized}/{cid_sanitized}/chat.message/{ts}-{eid}.txt`; new consumers should read the v2 category layout or register a live HTTP consumer.
 
 ---
 
 ## 8. Reference consumer
 
-The Python sink at `python/transcript_sink.py` consumes this contract at `POST /v2/events` and exposes the hierarchical query API described in `docs/retrieving-transcripts.md` §1. Only the envelope shape and the consumer-registration / send-chat surfaces are stable — backends can implement their own consumer.
+The Python sink at `python/transcript_sink.py` consumes this contract at `POST /v2/events`, persists its own PostgreSQL ledger, runs our Alfred agent, and exposes the hierarchical query API described in `docs/retrieving-transcripts.md` §1. Only the envelope shape, consumer registration, blob archive layout, and `$BOT/api/send-chat` surface are platform contracts. Backends can implement their own consumer.

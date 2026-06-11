@@ -8,20 +8,31 @@ context.
 ## 1. Mental model
 
 ```
-Teams ──► C# bot (Windows VM, Graph Media SDK + Bot Framework)
-              │ POST /v2/events
-              ▼
-         Python sink (FastAPI on Container Apps)
-              │ SSE + JSON
-              ▼
-         React UI (Vite + React 19, Container App)
+Teams
+  |
+  v
+C# bot (Windows VM, Graph Media SDK + Bot Framework)
+  |
+  +--> BlobEventArchive PUTs alfred-v2 JSON to stalfreddisney/alfred-events
+  |
+  +--> EventFanoutDispatcher POSTs alfred-v2 JSON to consumer URLs
+         |
+         +--> Our Alfred: Python sink POST /v2/events (FastAPI on ACA)
+         |
+         +--> Client Alfred: server_v2.py or a customer service POST /v2/events
 ```
 
 - **C# bot** on `vm-alfred-disney`. Graph Media SDK is Windows-only and
   needs Server-Media-Foundation.
-- **Python sink** owns session state, intervention policy, dossier,
+- **C# bot** is the capture + delivery platform. It writes blob storage
+  and posts live consumer URLs as sibling outputs; it does not write
+  blob storage through the Python sink.
+- **Python sink** is our Alfred implementation. It owns session state,
+  intervention policy, dossier,
   PostgreSQL ledger (`pg-alfred-disney`).
 - **React UI** is read-only; SSE consumer.
+- **Client sidecars** such as `server_v2.py` consume the same rails
+  without changing the core bot or sink.
 
 `chat_thread_id` ties everything together
 (`19:meeting_<base64>@thread.v2` for meetings,
@@ -490,17 +501,19 @@ Subject/FriendlyName on next restart — no manual intervention. If you
 see `Certificate with thumbprint '…' not found`, the cert is genuinely
 missing; re-run the bootstrap.
 
-### 7.10 v1 polling-bridge sidecars (`server.py`, `server_1.py`)
+### 7.10 Sidecar bridges (`server_v2.py`, `server.py`, `server_1.py`)
 
-`server.py` and `server_1.py` at the repo root are v1 polling-bridge
-sidecars — pre-v2 polling consumers kept alive during the v1→v2
-cutover. NOT part of the v2 alfred-events contract; untracked at repo
-root (gitignored); not deployed by any script in `scripts/`; iterated
-on locally to keep a downstream v1 consumer working while the rest of
-the stack moves to `/v2/events`. `server_1.py` is the debug-instrumented
-variant (verbose `[bridge]` / `[probe]` logging, dual-path polling on
-both `channels/…/chat.message/` and `teams/…/channel.message.created/`).
-Touch `server_1.py` first to validate, then fold into `server.py`.
+`server_v2.py` at the repo root is the current client-side bridge
+example. It is not part of the deployed C# bot or Python sink. It keeps
+the old `/chat` API, accepts live `alfred-v2` fanout at `POST
+/v2/events`, can poll the canonical v2 blob archive paths for
+catch-up, and sends replies through `$BOT/api/send-chat`.
+
+`server.py` and `server_1.py` are legacy v1 polling-bridge sidecars for
+comparison during migration. They are not deployed by scripts. Do not
+extend their stale `teams/.../channel.message.created/` polling layout;
+new consumers use `server_v2.py`, a custom HTTP consumer, or the v2
+blob category layout.
 
 ### 7.11 Don't retry sqlite-over-SMB
 
@@ -637,20 +650,23 @@ Re-tail logs with the §7.7 recipe if it stays empty.
 | `GET` | `/api/debug/transcripts[/{sanitized_chat_thread_id}]` | Read the bot's NDJSON audit log under `C:/teams-bot-poc/meeting-logs/...`. List threads or tail one's `transcript|chat|system` stream. |
 
 The bot's event fanout dispatcher (under `src/Services/`) POSTs every
-event to every registered consumer URL using the `alfred-events-v1`
-envelope (`docs/event-contract.md`). The Python sink is one reference
-consumer.
+non-throttled event to every registered consumer URL using the
+`alfred-v2` envelope (`docs/event-contract.md`). In parallel,
+`BlobEventArchive` writes the same envelope to Azure Blob Storage. The
+Python sink is the built-in reference consumer; `server_v2.py` shows
+the client-owned consumer shape.
 
 ### 8.2 Sink HTTP API (Container App)
 
-Reference consumer for the `alfred-events-v1` / `alfred-v2` contract.
+Reference consumer for the `alfred-v2` contract.
 Endpoints verified against `python/transcript_sink.py` route
 decorators. Grouped; OpenAPI at `$SINK/openapi.json` is the canonical
 spec.
 
 **Ingress:**
 - `POST /v2/events` — v2 envelope ingress, idempotent on `envelope_id`.
-- `POST /events` — legacy v1 ingress (kept for cutover).
+- `POST /events` — legacy v1 ingress kept for cutover only; new
+  consumers use `/v2/events` or any URL path they own.
 
 **v2 reads (`meeting_id`-keyed):**
 - `GET /v2/meetings` (filters: `team_id`, `channel_id`, `since`, `until`)

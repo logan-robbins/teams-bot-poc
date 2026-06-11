@@ -9,62 +9,55 @@ For deeper ops detail (debug recipes, auto-join tiers, `dotnet publish` traps), 
 ## 1. The 60-second model
 
 ```
-                            Microsoft Teams
-       (meeting chat, group chat, OR persistent channel attachment)
-                                  │
-   audio PCM + roster   │   Bot Framework activities (/api/messages)
-                        │   Graph change notifications (/api/graph-notifications)
-                        ▼
-  ┌──────────────────────────────────────────────────────────────────┐
-  │   C# BOT   src/   ·   Windows VM (vm-alfred-disney)              │
-  │                                                                  │
-  │   Audio    ──► AzureSpeech ConversationTranscriber (diarized)    │
-  │   Chat     ──► Bot Framework + Graph subscription                │
-  │   Channel  ──► persistent attach + subscription renewal          │
-  │   Joins    ──► auto-join channel meetings + manual /join URL     │
-  │   Names    ──► resolved via GraphApiClient using RSCs            │
-  │                                                                  │
-  │   Every event flows through the event fanout dispatcher:         │
-  │     ├─► blob archive       (per-event JSON blobs)                │
-  │     └─► per-channel consumer URLs (POST, retry/queue)            │
-  │                                                                  │
-  │   Schema: alfred-v2. Two event families:                         │
-  │     channel.*   → ChannelRef { team_id, channel_id, thread_id }  │
-  │     meeting.*   → MeetingRef { meeting_id, channel_link? }       │
-  └────────────────────┬─────────────────────────────────────────────┘
-                       │  POST  https://{consumer}/v2/events
-                       │  PUT   stalfreddisney/alfred-events
-                       ▼
-  ┌──────────────────────────────────────────────────────────────────┐
-  │   PYTHON SINK   python/   ·   ca-alfred-api Container App        │
-  │                                                                  │
-  │   POST /v2/events                  single ingest                 │
-  │   GET  /v2/index                   discovery                     │
-  │   GET  /v2/meetings                list meetings                 │
-  │   GET  /v2/meetings/{mid}/events   ledger                        │
-  │   GET  /v2/meetings/{mid}/transcript                             │
-  │   GET  /v2/teams/{tid}/channels/{cid}/events                     │
-  │   GET  /v2/resolve?kind=meeting&subject=…                        │
-  │                                                                  │
-  │   AlfredAnalyzer (Azure OpenAI gpt-5-mini, OpenAI Agents SDK)    │
-  │   on every debounced tick. Tools:                                │
-  │     send_to_meeting_chat, fetch_meeting_transcript,              │
-  │     list_meetings, resolve_meeting_by_name,                      │
-  │     resolve_meeting_by_date, find_meeting_by_chat_thread_id,     │
-  │     request_transcript_backfill                                  │
-  │   Prompt + intervention policy: python/batcave_platform/specs/   │
-  │   alfred.yaml                                                    │
-  └────────────────────┬─────────────────────────────────────────────┘
-                       │  SSE + JSON
-                       ▼
-  ┌──────────────────────────────────────────────────────────────────┐
-  │   REACT UI   web/   ·   ca-alfred-web Container App              │
-  │     /                            meeting picker                  │
-  │     /m/<meeting_chat_thread_id>  per-meeting dossier             │
-  │     /channels                    consumer admin + join-any       │
-  │     /archive                     blob-archive folder browser     │
-  └──────────────────────────────────────────────────────────────────┘
+                         Microsoft Teams
+       meeting chat / group chat / persistent channel attachment
+                                  |
+              +-----------------------------------------------+
+              | Graph media frames (audio + roster)           |
+              | Bot Framework activities (/api/messages)      |
+              | Graph notifications (/api/graph-notifications)|
+              +-----------------------+-----------------------+
+                                      |
+                                      v
++------------------------------------------------------------------------+
+| C# BOT = PLATFORM RAILS                                                |
+| src/ on Windows VM vm-alfred-disney                                    |
+|                                                                        |
+| Captures: audio PCM + roster, chat activities, Graph channel changes   |
+| Resolves: names, channel links, meeting metadata                       |
+| Emits: one alfred-v2 envelope per event                                |
+|                                                                        |
+| PublishAsync(envelope) does the split:                                 |
+|   1. local NDJSON audit on the VM                                      |
+|   2. PUT blob archive JSON                                             |
+|      stalfreddisney/alfred-events/...                                  |
+|   3. POST the same envelope to each enabled consumer URL               |
+|      default: https://ca-alfred-api.../v2/events                       |
+|      client:  https://client-service.../v2/events                      |
+|                                                                        |
+| Blob writes and HTTP consumer posts are sibling outputs. The bot does  |
+| not post to only one endpoint, and blob storage is not written by the  |
+| Python sink. A slow or broken consumer does not stop archive writes.   |
++-----------------------------+------------------------------------------+
+                              |
+                              v
++-----------------------------+------------------------------------------+
+| CONSUMER IMPLEMENTATIONS                                               |
+|                                                                        |
+| Our Alfred: python/ on ca-alfred-api                                   |
+|   POST /v2/events -> PostgreSQL ledger -> AlfredAnalyzer ->            |
+|   POST $BOT/api/send-chat when policy says to speak                    |
+|                                                                        |
+| Client Alfred: server_v2.py or a service they own                      |
+|   POST /v2/events and/or blob polling -> their agent ->                |
+|   POST $BOT/api/send-chat if they want to interact in Teams            |
+|                                                                        |
+| Read-only UI: web/ on ca-alfred-web                                    |
+|   reads the sink API and blob archive; it is not an event producer     |
++------------------------------------------------------------------------+
 ```
+
+The boundary is intentional: **`src/` is the capture + delivery platform**, while **`python/` is our Alfred implementation**. A client who wants their own Alfred should implement a consumer like `server_v2.py` or register their own service URL; they do not need to fork the C# bot or the Python sink unless they are changing the platform itself.
 
 **Two canonical keys, mirroring Microsoft Graph's URL hierarchy:**
 
@@ -113,7 +106,7 @@ Concrete consequences:
 | `web/` | React 19 + Vite + Tailwind v4 | `npm run build` | `ca-alfred-web` Container App |
 | `manifest/` | Teams app manifest (currently v1.0.12, 16 RSCs) | `cd manifest && zip alfred-sandbox.zip manifest.json color.png outline.png` | Teams Admin Center / Developer Portal |
 | `scripts/deploy-azure-vm.sh` | One-shot bot VM deploy (bootstrap + publish + restart) | — | — |
-| `docs/` | Reference docs (event contract, retrieving transcripts, STT comparisons, auto-invite setup) | — | — |
+| `docs/` | Reference docs (event contract, data retrieval, auto-invite setup) | — | — |
 
 ---
 
@@ -301,7 +294,9 @@ See `AGENTS.md` §7 for the full symptom→fix index.
 
 ### 7.4 Consumer routing — bootstrap fallback and isolation
 
-The event fanout dispatcher (under `src/Services/`) has a bootstrap fallback consumer (`BotConfiguration.BootstrapConsumerUrl`) that fires whenever a channel's per-channel consumer list is empty. Per-channel consumers win when present; otherwise the bootstrap URL fires.
+The event fanout dispatcher (under `src/Services/`) is the C# bot's HTTP delivery rail. For every non-throttled envelope, the bot independently writes the blob archive and POSTs the same envelope to each matching consumer URL. The URL path is not hard-coded by the bot; examples use `/v2/events` because both the Python sink and `server_v2.py` expose that route.
+
+The dispatcher has a bootstrap fallback consumer (`BotConfiguration.BootstrapConsumerUrl`) that fires whenever a channel's per-channel consumer list is empty. Per-channel consumers win when present; otherwise the bootstrap URL fires.
 
 The bootstrap URL is wired to the sink in this deployment. **Deleting a channel's consumer registration does NOT silence the sink** — the fallback delivers to the same URL. The `bootstrap-default` consumer at `GET /api/channels/{tid}/{cid}/consumers` is the bot auto-recording the fallback target; deleting it just routes through the real fallback in code.
 
@@ -368,11 +363,11 @@ az containerapp update -n ca-alfred-web -g rg-alfred-disney --image acralfreddis
 
 ### 7.7 Consuming captured data
 
-Everything Alfred captures lives in two places. Both serve the same `alfred-v2` envelopes.
+Everything Alfred captures is delivered through two sibling rails from the C# bot. Both use the same `alfred-v2` envelopes.
 
 | Path | Best for |
 |------|----------|
-| **Sink API** — `$SINK/v2/*` | "One HTTP call → JSON" — list / lookup / proxy reads |
+| **Sink API** — `$SINK/v2/*` | "One HTTP call → JSON" — our reference consumer's PostgreSQL view |
 | **Blob archive** — `$SA/...` | "Raw event stream forever" — replay, bulk, offline |
 
 Full contract + recipes: [`docs/retrieving-transcripts.md`](docs/retrieving-transcripts.md).
@@ -389,10 +384,11 @@ curl -sS "$SINK/v2/resolve?kind=meeting&subject=sprint%20planning" | jq
 
 # Official Microsoft transcript (plaintext, inline)
 MID="19:meeting_NmFkYWM1NDQ...@thread.v2"
+MID_SAN=$(printf %s "$MID" | sed -E 's/[^a-zA-Z0-9_.-]/_/g' | cut -c1-200)
 curl -sS "$SINK/v2/meetings/$MID/transcript" | jq -r '.text'
 # Or raw blobs:
-curl -sS "$SA/meetings/$MID/transcripts/official.txt"
-curl -sS "$SA/meetings/$MID/transcripts/official.vtt"
+curl -sS "$SA/meetings/$MID_SAN/transcripts/official.txt"
+curl -sS "$SA/meetings/$MID_SAN/transcripts/official.vtt"
 
 # Full ledger (live STT + chat)
 curl -sS "$SINK/v2/meetings/$MID/events?limit=500" | jq
@@ -447,7 +443,7 @@ Every `.json` blob is a pure `alfred-v2` envelope — no preamble, just `{ … }
 5. **One inbound chat path** — Bot Framework `/api/messages` → C# bot publishes via the event fanout dispatcher. No parallel ingress.
 6. **Outbound Alfred chat** goes through the `send_to_meeting_chat` tool only.
 7. **`alfred.yaml` is the sole source of truth** for prompt and intervention policy. The analyzer raises at construction if `instructions` is missing — do not add a code fallback.
-8. **One canonical implementation per concern.** No duplicate files, no parallel paths, no `v2` copies.
+8. **One canonical implementation per core concern.** No duplicate C# bot, sink, or UI implementations. Client-side bridge examples such as `server_v2.py` are allowed because they are consumers, not alternate core paths.
 9. **Fail fast.** Clear, specific errors at system boundaries. No validation for impossible scenarios.
 10. **`dotnet publish` always after `rm -rf src/bin src/obj`** in any deploy script that touches code. See AGENTS.md §7.4.
 11. **Manifest changes** require: bump `version`, regenerate `alfred-sandbox.zip`, re-import in Teams Developer Portal, re-grant admin consent if RSCs changed. **New RSCs require team re-install.**
