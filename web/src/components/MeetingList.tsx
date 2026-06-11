@@ -49,12 +49,17 @@ export function MeetingList() {
     };
   }, []);
 
-  // Most recent first. Prefer actual_start_utc (real join), fall back to
-  // scheduled_start_utc, then meeting_id (stable but arbitrary). Unparseable
-  // timestamps sink to the bottom.
+  // Most recent first. Live calls often arrive before Teams metadata fills
+  // actual/scheduled times, so use the same activity-driven fields the sink
+  // uses for its newest-first ordering.
   const sorted = useMemo(() => {
     const ts = (m: V2Meeting): number => {
-      const raw = m.actual_start_utc || m.scheduled_start_utc;
+      const raw =
+        m.last_event_utc ||
+        m.actual_start_utc ||
+        m.scheduled_start_utc ||
+        m.created_at_utc ||
+        m.updated_at_utc;
       if (!raw) return 0;
       const n = new Date(raw).getTime();
       return Number.isFinite(n) ? n : 0;
@@ -120,7 +125,7 @@ function MeetingRow({ meeting }: { meeting: V2Meeting }) {
   const subject = friendlyMeetingTitle(meeting);
   const start = meeting.actual_start_utc || meeting.scheduled_start_utc;
   const end = meeting.actual_end_utc || meeting.scheduled_end_utc;
-  const isLive = Boolean(meeting.actual_start_utc) && !meeting.actual_end_utc;
+  const isLive = isMeetingLive(meeting);
   return (
     <li>
       <Link
@@ -220,4 +225,17 @@ export function friendlyMeetingTitle(meeting: V2Meeting): string {
     }
   }
   return meeting.meeting_id;
+}
+
+function isMeetingLive(meeting: V2Meeting): boolean {
+  if (meeting.actual_end_utc || meeting.scheduled_end_utc) return false;
+  if (meeting.actual_start_utc) return true;
+
+  const raw = meeting.last_event_utc || meeting.updated_at_utc || meeting.created_at_utc;
+  if (!raw) return false;
+
+  const ts = new Date(raw).getTime();
+  if (!Number.isFinite(ts)) return false;
+
+  return Date.now() - ts < 60 * 60 * 1000;
 }

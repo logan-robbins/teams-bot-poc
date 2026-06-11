@@ -276,18 +276,26 @@ Microsoft documents `OnlineMeetingTranscript.Read.Chat` as applying only to sche
 ```bash
 BOT=https://alfred-disney-bot.eastus.cloudapp.azure.com
 SINK=https://ca-alfred-api.gentlewater-5aa74a73.eastus.azurecontainerapps.io
+WEB=https://ca-alfred-web.gentlewater-5aa74a73.eastus.azurecontainerapps.io
 SA=https://stalfreddisney.blob.core.windows.net/alfred-events
 
 curl -sS $BOT/api/calling/health | jq            # bot media readiness
 curl -sS $SINK/health                            # sink
 curl -sS $BOT/api/channels | jq                  # channel attachments + last_auto_join_attempt
 curl -sS $SINK/v2/index | jq                     # what the sink knows about
+curl -sS "$WEB/sink/v2/meetings?limit=5" | jq    # what the web homepage sees
 
 # Manual transcript backfill. meeting_id (chat thread id of the meeting,
 # 19:meeting_<base64>@thread.v2) or ephemeral call_id. organizer_oid required.
 curl -sS -X POST "$BOT/api/debug/fetch-transcript" -H 'Content-Type: application/json' \
   -d '{"meeting_id":"19:meeting_NmFkYWM1NDQ...@thread.v2","organizer_oid":"...","meeting_chat_thread_id":"..."}'
 ```
+
+The meeting picker at `/` polls `$WEB/sink/v2/meetings?limit=100` every
+2 seconds and sorts by recent activity (`last_event_utc`), then start
+metadata. During a fresh live call, Teams may not have populated
+`actual_start_utc` or subject yet; the row should still appear near the
+top as "Meeting on <date>" and show `live` while events are arriving.
 
 See `AGENTS.md` §7 for the full symptom→fix index.
 
