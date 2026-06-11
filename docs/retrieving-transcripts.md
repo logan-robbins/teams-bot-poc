@@ -426,6 +426,8 @@ For an agent that "listens silently until interesting": consume `meeting.transcr
 
 `server_v2.py` at the repo root is a client-side example: it exposes `POST /v2/events`, can poll the blob archive for catch-up, and uses `$BOT/api/send-chat` to respond. Treat it as a client implementation on top of the platform rails, not as part of the built-in sink.
 
+Adding Alfred to a private meeting is not enough to route live events to a client-owned agent. The bot captures the meeting, writes blobs, and sends live events to the bootstrap consumer unless a channel attachment/consumer route matches. To route a meeting to a client service, register that service under the relevant channel and link the meeting to that channel, or run a dedicated bot instance whose `EventDispatch.BootstrapConsumerUrl` points at the client service.
+
 ---
 
 ## 5. Idempotency + cadence

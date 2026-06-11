@@ -403,7 +403,16 @@ Management endpoints under `/api/channels/{team}/{channel}/consumers`:
 | `PUT`                       | `{consumers: [...]}`                             | Replace the entire list |
 | `DELETE /{consumerName}`    | —                                                | Remove one by name |
 
-When the consumer list is empty, `EventDispatch.BootstrapConsumerUrl` (per-deployment config) receives events as a fallback. To suppress the fallback for one channel, register a placeholder with `enabled:false`.
+Destination resolution:
+
+1. `channel.*` event -> consumers registered on that channel attachment.
+2. `meeting.*` event with `meeting_ref.channel_link` -> consumers registered on the linked channel attachment.
+3. `meeting.*` event whose `meeting_chat_thread_id` matches an attachment's `conversation_thread_id` -> that attachment's consumers.
+4. No matching attachment -> `EventDispatch.BootstrapConsumerUrl` (per-deployment config).
+
+Adding Alfred to a meeting controls capture permissions; it is not a consumer-registration handshake. A private meeting install with no channel link sends live events to the bootstrap consumer, not to an arbitrary client sidecar. A client-owned Alfred must either register a channel consumer URL, link the meeting to that channel, poll the blob archive, or run on a dedicated bot deployment whose bootstrap URL points at that client.
+
+When a channel's consumer list is empty, `EventDispatch.BootstrapConsumerUrl` is seeded as `bootstrap-default` on the attachment. To suppress the fallback for one channel, register a placeholder with `enabled:false`.
 
 ---
 

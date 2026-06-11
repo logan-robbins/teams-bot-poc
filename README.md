@@ -40,24 +40,29 @@ For deeper ops detail (debug recipes, auto-join tiers, `dotnet publish` traps), 
 | Python sink. A slow or broken consumer does not stop archive writes.   |
 +-----------------------------+------------------------------------------+
                               |
-                              v
-+-----------------------------+------------------------------------------+
-| CONSUMER IMPLEMENTATIONS                                               |
-|                                                                        |
-| Our Alfred: python/ on ca-alfred-api                                   |
-|   POST /v2/events -> PostgreSQL ledger -> AlfredAnalyzer ->            |
-|   POST $BOT/api/send-chat when policy says to speak                    |
-|                                                                        |
-| Client Alfred: server_v2.py or a service they own                      |
-|   POST /v2/events and/or blob polling -> their agent ->                |
-|   POST $BOT/api/send-chat if they want to interact in Teams            |
-|                                                                        |
-| Read-only UI: web/ on ca-alfred-web                                    |
-|   reads the sink API and blob archive; it is not an event producer     |
-+------------------------------------------------------------------------+
+              +---------------+----------------+
+              |                                |
+              v                                v
++-----------------------------+--+    +-----------------------------------+
+| PLATFORM INTERFACE             |    | CONSUMER IMPLEMENTATIONS          |
+| web/ on ca-alfred-web          |    |                                   |
+|                                |    | Our Alfred: python/ on            |
+| /channels: attach channels,    |    | ca-alfred-api                     |
+| register consumer URLs,        |    | POST /v2/events -> ledger ->      |
+| toggle auto-join               |    | AlfredAnalyzer -> send-chat       |
+|                                |    |                                   |
+| /archive: browse blob archive  |    | Client Alfred: server_v2.py or    |
+| /m/<meeting_id>: read our      |    | a service Michael owns            |
+| Alfred sink's dossier          |    | POST /v2/events and/or blob       |
+|                                |    | polling -> their agent ->         |
+| This is part of the rails. It  |    | send-chat if they want to speak   |
+| configures and inspects the    |    +-----------------------------------+
+| platform; it is not a custom   |
+| downstream agent.              |
++--------------------------------+
 ```
 
-The boundary is intentional: **`src/` is the capture + delivery platform**, while **`python/` is our Alfred implementation**. A client who wants their own Alfred should implement a consumer like `server_v2.py` or register their own service URL; they do not need to fork the C# bot or the Python sink unless they are changing the platform itself.
+The boundary is intentional: **`src/` plus the `web/` operator interface are the platform rails**, while **`python/` is our Alfred implementation**. A client who wants their own Alfred should implement a consumer like `server_v2.py` or register their own service URL; they do not need to fork the C# bot or the Python sink unless they are changing the platform itself.
 
 **Two canonical keys, mirroring Microsoft Graph's URL hierarchy:**
 
@@ -296,7 +301,16 @@ See `AGENTS.md` §7 for the full symptom→fix index.
 
 The event fanout dispatcher (under `src/Services/`) is the C# bot's HTTP delivery rail. For every non-throttled envelope, the bot independently writes the blob archive and POSTs the same envelope to each matching consumer URL. The URL path is not hard-coded by the bot; examples use `/v2/events` because both the Python sink and `server_v2.py` expose that route.
 
-The dispatcher has a bootstrap fallback consumer (`BotConfiguration.BootstrapConsumerUrl`) that fires whenever a channel's per-channel consumer list is empty. Per-channel consumers win when present; otherwise the bootstrap URL fires.
+The dispatcher chooses destinations in this order:
+
+1. `channel.*` event -> consumers on that `(team_id, channel_id)` attachment.
+2. `meeting.*` event with `MeetingRef.channel_link` -> consumers on the linked channel attachment.
+3. `meeting.*` event whose `meeting_chat_thread_id` matches an attachment's `conversation_thread_id` -> that attachment's consumers.
+4. No matching attachment -> `EventDispatch.BootstrapConsumerUrl`.
+
+That means **adding Alfred to a meeting gives the bot permission to capture that meeting; it does not tell the bot where Michael's agent lives.** If Michael adds Alfred to a private meeting and no channel link or consumer registration exists, events/transcripts still go to blob storage and the bootstrap consumer, which is our Python sink in this deployment. To send live events to Michael's `server_v2.py`, register his public endpoint as a consumer on the relevant channel, link the meeting to that channel, or run a dedicated bot instance whose `EventDispatch.BootstrapConsumerUrl` points at his endpoint.
+
+The dispatcher has a bootstrap fallback consumer (`BotConfiguration.BootstrapConsumerUrl`) that fires whenever a channel's per-channel consumer list is empty or no channel attachment matches a meeting. Per-channel consumers win when present; otherwise the bootstrap URL fires.
 
 The bootstrap URL is wired to the sink in this deployment. **Deleting a channel's consumer registration does NOT silence the sink** — the fallback delivers to the same URL. The `bootstrap-default` consumer at `GET /api/channels/{tid}/{cid}/consumers` is the bot auto-recording the fallback target; deleting it just routes through the real fallback in code.
 
@@ -315,6 +329,22 @@ curl -X DELETE "$BOT/api/channels/$TEAM/$CHAN_ENC/consumers/isolation-placeholde
 ```
 
 A pull-based consumer that polls the blob archive directly is unaffected by either path — the bot writes blobs unconditionally, independent of consumer registration. Use the placeholder trick to silence push-based sinks; pull-based ones keep working.
+
+Register Michael's live sidecar for a channel:
+
+```bash
+MICHAEL_URL="https://michael-agent.example.com/v2/events"
+curl -X POST "$BOT/api/channels/$TEAM/$CHAN_ENC/consumers" \
+  -H "Content-Type: application/json" \
+  -d "$(jq -n --arg url "$MICHAEL_URL" '{
+        name:"michael-server-v2",
+        url:$url,
+        event_kinds:["meeting.transcript.final","meeting.chat.created","channel.message.created"],
+        enabled:true
+      }')"
+```
+
+For a private meeting that is not tied to a channel, either link it to a registered channel with `@Alfred link to <channel-name>` or use the current fallback consumer. There is no per-meeting consumer registry today.
 
 ### 7.5 V1 compatibility dual-write
 

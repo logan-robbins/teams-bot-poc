@@ -30,7 +30,9 @@ C# bot (Windows VM, Graph Media SDK + Bot Framework)
 - **Python sink** is our Alfred implementation. It owns session state,
   intervention policy, dossier,
   PostgreSQL ledger (`pg-alfred-disney`).
-- **React UI** is read-only; SSE consumer.
+- **React UI** is part of the platform rails. It is the operator
+  interface for meeting views, channel attachment, consumer admin, and
+  blob browsing; it is not a custom downstream agent.
 - **Client sidecars** such as `server_v2.py` consume the same rails
   without changing the core bot or sink.
 
@@ -655,6 +657,17 @@ non-throttled event to every registered consumer URL using the
 `BlobEventArchive` writes the same envelope to Azure Blob Storage. The
 Python sink is the built-in reference consumer; `server_v2.py` shows
 the client-owned consumer shape.
+
+Consumer routing is explicit, not inferred from who added Alfred to a
+meeting. Channel events route to that channel's consumers. Meeting
+events route to a linked channel's consumers when `MeetingRef.channel_link`
+is present, or to an attachment whose `conversation_thread_id` matches
+the meeting chat thread. If neither applies, live POST delivery falls
+back to `EventDispatch.BootstrapConsumerUrl` (our Python sink in this
+deployment). Blob archive writes still happen independently. To send a
+private meeting to Michael's `server_v2.py`, register his URL under a
+channel and link the meeting to it, or use a dedicated deployment whose
+bootstrap URL points to Michael.
 
 ### 8.2 Sink HTTP API (Container App)
 
