@@ -487,6 +487,7 @@ Every `.json` blob is a pure `alfred-v2` envelope — no preamble, just `{ … }
 - [`docs/event-contract.md`](docs/event-contract.md) — `alfred-v2` envelope schema + per-`event_type` payload.
 - [`docs/retrieving-transcripts.md`](docs/retrieving-transcripts.md) — blob archive layout + Python / curl / az recipes.
 - [`docs/TEAMS-AUTO-INVITE-SETUP.md`](docs/TEAMS-AUTO-INVITE-SETUP.md) — one-time Sandbox-tenant admin setup for auto-invite mode.
+- [`PLAN.md`](PLAN.md) — implementation plan for email-based client routing.
 - [`TODO.md`](TODO.md) — prioritized backlog with code-level paths.
 
 ---
