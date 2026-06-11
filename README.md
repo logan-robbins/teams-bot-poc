@@ -344,7 +344,9 @@ Config lives in `appsettings.production.json` (`reloadOnChange:true`):
 
 Lookup is O(1) (HashSet); v2 write is unchanged — compat is additive. When the downstream consumer migrates to v2, set `V1CompatEnabled: false` and the extra write goes away.
 
-**Sidecar bridge (`server.py` / `server_1.py` at the repo root).** Untracked files. A v1 polling-bridge sidecar — a separate FastAPI app that polls both the legacy v1 blob path (`channels/{team}/{cid_sanitized}/chat.message/{ts}-{eid}.txt`) and the new v2 path. Exists so a pre-v2 polling consumer keeps working during the v1→v2 cutover. NOT part of the v2 contract; not deployed; lives at the repo root because the maintainer iterates locally.
+**Sidecar bridges at the repo root.** `server.py` / `server_1.py` are legacy untracked v1 polling-bridge sidecars. Leave them in place for local comparison only. `server_v2.py` is the current non-breaking v2 sidecar: it keeps the existing `/chat` API, adds `POST /v2/events` for live bot fanout, and polls the canonical archive paths (`teams/{team_sanitized}/channels/{channel_sanitized}/messages/`, optional `meetings/{meeting_sanitized}/messages/` and `meetings/{meeting_sanitized}/live_transcript/`, plus the legacy compat path while dual-write is enabled).
+
+For `server_v2.py`, configure the Teams bridge with the same `bot_url`, `team`, `channel`, and `poll` values as before, plus a storage target. Preferred storage config is `storage_bucket` or `storage_container` with `storage_account_url`; a full container URL in `storage_bucket` also works. Legacy `blob_base` still works for existing local configs. Default `event_kinds` responds only to `channel.message.created` and `meeting.chat.created`; opt in to live transcript turns explicitly with `event_kinds=["meeting.transcript.final"]`. Runtime logs go to `/tmp/alfred-bridge-v2.log`; set `ALFRED_BRIDGE_DEBUG=1` for per-poll diagnostics.
 
 Pair with §7.4's consumer-isolation trick if you also need to prevent your sink's AlfredAnalyzer from posting into the same channel while the pre-v2 consumer is the active responder.
 
