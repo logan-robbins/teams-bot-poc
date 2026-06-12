@@ -35,6 +35,7 @@ public sealed class GraphMetadataResolver
     private readonly ConcurrentDictionary<string, CacheEntry<GraphOnlineMeetingMeta>> _meetings = new();
     private readonly ConcurrentDictionary<string, CacheEntry<GraphChannelMessage>> _channelMessages = new();
     private readonly ConcurrentDictionary<string, CacheEntry<string>> _chatToMeetingId = new();
+    private readonly ConcurrentDictionary<string, CacheEntry<GraphUserMeta>> _users = new();
 
     public GraphMetadataResolver(GraphApiClient graph, ILogger<GraphMetadataResolver> logger)
     {
@@ -239,6 +240,32 @@ public sealed class GraphMetadataResolver
     }
 
     /// <summary>
+    /// Resolve an AAD user object id to mail + userPrincipalName for
+    /// email-based client routing. Requires the tenant-wide
+    /// <c>User.ReadBasic.All</c> application permission (README §5.2);
+    /// with RSC-only grants this returns null and callers fall back to
+    /// Bot Framework <c>TeamsInfo</c> identity.
+    /// </summary>
+    public async Task<GraphUserMeta?> GetUserAsync(string userId, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(userId)) return null;
+        if (TryGetCached(_users, userId, out var cached)) return cached;
+
+        var meta = await FetchAsync(
+            $"users/{Uri.EscapeDataString(userId)}?$select=id,displayName,mail,userPrincipalName",
+            root => new GraphUserMeta
+            {
+                Id = userId,
+                DisplayName = TryGetString(root, "displayName"),
+                Mail = TryGetString(root, "mail"),
+                UserPrincipalName = TryGetString(root, "userPrincipalName"),
+            },
+            ct);
+
+        return Cache(_users, userId, meta);
+    }
+
+    /// <summary>
     /// Force a re-fetch on next read. Call when a Graph notification
     /// indicates the resource changed.
     /// </summary>
@@ -250,6 +277,7 @@ public sealed class GraphMetadataResolver
         _meetings.Clear();
         _channelMessages.Clear();
         _chatToMeetingId.Clear();
+        _users.Clear();
     }
 
     private async Task<T?> FetchAsync<T>(string resource, Func<JsonElement, T> parse, CancellationToken ct)
@@ -372,4 +400,12 @@ public sealed record GraphChannelMessage
     public string? BodyContent { get; init; }
     public string? FromDisplayName { get; init; }
     public string? CreatedDateTime { get; init; }
+}
+
+public sealed record GraphUserMeta
+{
+    public required string Id { get; init; }
+    public string? DisplayName { get; init; }
+    public string? Mail { get; init; }
+    public string? UserPrincipalName { get; init; }
 }

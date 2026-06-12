@@ -37,6 +37,7 @@ public sealed class AlfredBot : TeamsActivityHandler
     private readonly GraphApiClient _graph;
     private readonly GraphMetadataResolver _metadataResolver;
     private readonly OfficialTranscriptFetcher _transcriptFetcher;
+    private readonly ClientRouteResolver _clientRoutes;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _publishedMeetingCreated =
         new(StringComparer.Ordinal);
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _publishedLinks =
@@ -57,6 +58,7 @@ public sealed class AlfredBot : TeamsActivityHandler
         GraphApiClient graph,
         GraphMetadataResolver metadataResolver,
         OfficialTranscriptFetcher transcriptFetcher,
+        ClientRouteResolver clientRoutes,
         ILogger<AlfredBot> logger)
     {
         _references = references;
@@ -70,7 +72,63 @@ public sealed class AlfredBot : TeamsActivityHandler
         _graph = graph;
         _metadataResolver = metadataResolver;
         _transcriptFetcher = transcriptFetcher;
+        _clientRoutes = clientRoutes;
         _logger = logger;
+    }
+
+    /// <summary>
+    /// Email-based client routing (PLAN.md): resolve the best candidate
+    /// people for this meeting and bind the chat thread to a registered
+    /// client route. Cheap no-op when no enabled routes exist or the
+    /// thread is already bound. TeamsInfo supplies emails through Bot
+    /// Framework, which works with RSC-only grants; the resolver falls
+    /// back to the alias table and Graph. Never throws.
+    /// </summary>
+    private async Task TryBindClientRouteAsync(
+        ITurnContext turnContext,
+        string chatThreadId,
+        string? meetingId,
+        IReadOnlyList<ClientIdentityCandidate> candidates,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            if (!_clientRoutes.NeedsBinding(chatThreadId)) return;
+
+            var enriched = new List<ClientIdentityCandidate>(candidates.Count);
+            foreach (var candidate in candidates)
+            {
+                if (!string.IsNullOrWhiteSpace(candidate.Email)
+                    || string.IsNullOrWhiteSpace(candidate.AadObjectId))
+                {
+                    enriched.Add(candidate);
+                    continue;
+                }
+
+                string? email = null;
+                try
+                {
+                    var member = await TeamsInfo.GetMemberAsync(
+                        turnContext, candidate.AadObjectId, cancellationToken);
+                    email = member?.Email ?? member?.UserPrincipalName;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex,
+                        "TeamsInfo.GetMemberAsync failed for Aad={Aad} in thread={Thread}; resolver will fall back.",
+                        candidate.AadObjectId, chatThreadId);
+                }
+                enriched.Add(candidate with { Email = email });
+            }
+
+            await _clientRoutes.BindMeetingAsync(chatThreadId, meetingId, enriched, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "Client route binding failed for thread={Thread}; events stay on the fallback path.",
+                chatThreadId);
+        }
     }
 
     protected override async Task OnConversationUpdateActivityAsync(
@@ -184,6 +242,24 @@ public sealed class AlfredBot : TeamsActivityHandler
                     chatThreadId);
                 _publishedMeetingCreated.TryRemove(chatThreadId, out _);
             }
+        }
+
+        if (organizer?.AadId is not null)
+        {
+            await TryBindClientRouteAsync(
+                turnContext,
+                chatThreadId,
+                canonicalMeetingId,
+                new[]
+                {
+                    new ClientIdentityCandidate
+                    {
+                        AadObjectId = organizer.AadId,
+                        DisplayName = organizer.DisplayName,
+                        Source = "organizer",
+                    },
+                },
+                cancellationToken);
         }
 
         await base.OnTeamsMeetingStartAsync(meeting, turnContext, cancellationToken);
@@ -362,6 +438,26 @@ public sealed class AlfredBot : TeamsActivityHandler
                     chatThreadId!,
                     "added_to_meeting_chat",
                     activity.From?.AadObjectId ?? activity.From?.Id));
+
+                // The person who added Alfred is the strongest client
+                // routing signal (PLAN.md candidate #1).
+                if (!string.IsNullOrWhiteSpace(activity.From?.AadObjectId))
+                {
+                    await TryBindClientRouteAsync(
+                        turnContext,
+                        chatThreadId!,
+                        meetingId: null,
+                        new[]
+                        {
+                            new ClientIdentityCandidate
+                            {
+                                AadObjectId = activity.From!.AadObjectId,
+                                DisplayName = activity.From.Name,
+                                Source = "installer",
+                            },
+                        },
+                        cancellationToken);
+                }
             }
         }
 
@@ -866,6 +962,33 @@ public sealed class AlfredBot : TeamsActivityHandler
                     Payload = meetingPayload,
                 },
                 cancellationToken);
+
+            // Candidate order per PLAN.md: organizer, then first non-bot
+            // sender. (The installer candidate fires in OnMembersAddedAsync.)
+            var routeCandidates = new List<ClientIdentityCandidate>(2);
+            if (!string.IsNullOrWhiteSpace(autoJoinOrganizerOid))
+            {
+                routeCandidates.Add(new ClientIdentityCandidate
+                {
+                    AadObjectId = autoJoinOrganizerOid,
+                    Source = "organizer",
+                });
+            }
+            if (!fromBot && !string.IsNullOrWhiteSpace(sender.AadId)
+                && !string.Equals(sender.AadId, autoJoinOrganizerOid, StringComparison.OrdinalIgnoreCase))
+            {
+                routeCandidates.Add(new ClientIdentityCandidate
+                {
+                    AadObjectId = sender.AadId,
+                    DisplayName = sender.DisplayName,
+                    Source = "sender",
+                });
+            }
+            if (routeCandidates.Count > 0)
+            {
+                await TryBindClientRouteAsync(
+                    turnContext, chatThreadId, canonicalMeetingId, routeCandidates, cancellationToken);
+            }
 
             // When a meeting chat carries channel context (channel meeting), emit meeting.linked
             // once per (chatThreadId, teamId, channelId) so consumers can roll this meeting under

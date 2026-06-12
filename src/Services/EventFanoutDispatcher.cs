@@ -50,6 +50,8 @@ public sealed class EventFanoutDispatcher : IAsyncDisposable
 
     private readonly ChannelAttachmentStore _store;
     private readonly MeetingChannelLinkStore? _meetingLinks;
+    private readonly ClientRouteStore? _clientRoutes;
+    private readonly ClientBlobMirror? _clientBlobMirror;
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ILogger<EventFanoutDispatcher> _logger;
     private readonly ILoggerFactory _loggerFactory;
@@ -70,7 +72,9 @@ public sealed class EventFanoutDispatcher : IAsyncDisposable
         ILoggerFactory loggerFactory,
         MeetingAuditLogger? auditLogger = null,
         BlobEventArchive? blobArchive = null,
-        MeetingChannelLinkStore? meetingLinks = null)
+        MeetingChannelLinkStore? meetingLinks = null,
+        ClientRouteStore? clientRoutes = null,
+        ClientBlobMirror? clientBlobMirror = null)
     {
         _store = store ?? throw new ArgumentNullException(nameof(store));
         _httpClientFactory = httpClientFactory ?? throw new ArgumentNullException(nameof(httpClientFactory));
@@ -79,6 +83,8 @@ public sealed class EventFanoutDispatcher : IAsyncDisposable
         _auditLogger = auditLogger;
         _blobArchive = blobArchive;
         _meetingLinks = meetingLinks;
+        _clientRoutes = clientRoutes;
+        _clientBlobMirror = clientBlobMirror;
 
         var throttleSeconds = Math.Max(0, dispatchConfig?.PartialThrottleSeconds ?? 60);
         _partialThrottle = TimeSpan.FromSeconds(throttleSeconds);
@@ -149,7 +155,31 @@ public sealed class EventFanoutDispatcher : IAsyncDisposable
             _ = _blobArchive.ArchiveEnvelopeAsync(envelope, _cts.Token);
         }
 
-        var consumers = ResolveConsumers(envelope);
+        // Email-based client routing (PLAN.md): a meeting bound to a
+        // registered client route wins over channel consumers and the
+        // bootstrap fallback. The client's optional storage container
+        // mirror is unfiltered (it is their archive); event_kinds only
+        // filters the HTTP push below.
+        var clientRoute = ResolveClientRoute(envelope);
+        if (clientRoute is not null && _clientBlobMirror is not null
+            && !string.IsNullOrWhiteSpace(clientRoute.StorageContainerUrl))
+        {
+            _ = _clientBlobMirror.MirrorAsync(clientRoute, envelope, _cts.Token);
+        }
+
+        var consumers = clientRoute is not null
+            ? new[]
+              {
+                  new ConsumerConfig
+                  {
+                      Name = $"client:{clientRoute.Email}",
+                      Url = clientRoute.SinkUrl,
+                      EventKinds = clientRoute.EventKinds,
+                      Headers = clientRoute.Headers,
+                      Enabled = true,
+                  },
+              }
+            : ResolveConsumers(envelope);
         if (consumers.Count == 0)
         {
             return ValueTask.CompletedTask;
@@ -230,6 +260,22 @@ public sealed class EventFanoutDispatcher : IAsyncDisposable
         }
         _lastPartialEmitted[key] = now;
         return false;
+    }
+
+    /// <summary>
+    /// Returns the enabled client route this meeting event is bound to,
+    /// or null. Bindings key on the meeting chat thread id; the meeting
+    /// id is tried second because it equals the thread id whenever
+    /// canonical resolution hasn't happened yet.
+    /// </summary>
+    private ClientRouteRecord? ResolveClientRoute(AlfredEventEnvelope envelope)
+    {
+        if (_clientRoutes is null || envelope.MeetingRef is not { } mr)
+        {
+            return null;
+        }
+        return _clientRoutes.RouteForMeeting(mr.MeetingChatThreadId)
+            ?? _clientRoutes.RouteForMeeting(mr.MeetingId);
     }
 
     private IReadOnlyList<ConsumerConfig> ResolveConsumers(AlfredEventEnvelope envelope)

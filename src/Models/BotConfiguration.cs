@@ -340,4 +340,15 @@ public sealed class MeetingChatConfiguration
     /// </summary>
     public string PendingTranscriptFetchStorePath { get; init; } =
         @"C:\teams-bot-poc\state\pending-transcript-fetches.json";
+
+    /// <summary>
+    /// Absolute path to the JSON file that persists the email-based
+    /// client routing tables (client_routes, client_identity_aliases,
+    /// meeting_routes) across bot restarts. A client registers
+    /// email → sink URL (+ optional storage container) once; the bot
+    /// binds their meetings to that route and the binding must survive
+    /// redeploys mid-meeting.
+    /// </summary>
+    public string ClientRouteStorePath { get; init; } =
+        @"C:\teams-bot-poc\state\client-routes.json";
 }

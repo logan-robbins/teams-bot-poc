@@ -125,6 +125,36 @@ export interface ConsumersResponse {
   consumers: ConsumerConfig[];
 }
 
+export interface ClientRoute {
+  email: string;
+  sink_url: string;
+  event_kinds?: string[];
+  headers?: Record<string, string>;
+  storage_container_url?: string | null;
+  enabled?: boolean;
+  created_at_utc?: string;
+  updated_at_utc?: string;
+}
+
+export interface ClientRoutesResponse {
+  count: number;
+  routes: ClientRoute[];
+}
+
+export interface MeetingRoute {
+  meeting_chat_thread_id: string;
+  meeting_id?: string | null;
+  email: string;
+  source?: string | null;
+  created_at_utc?: string;
+  updated_at_utc?: string;
+}
+
+export interface ClientRouteMeetingsResponse {
+  count: number;
+  meetings: MeetingRoute[];
+}
+
 function encodeChannelId(channelId: string): string {
   return encodeURIComponent(channelId);
 }
@@ -250,6 +280,30 @@ export const bot = {
           meeting_chat_thread_id: meetingChatThreadId ?? meetingId,
         }),
       },
+    ),
+
+  /**
+   * Email-based client routing: a client registers email + sink URL
+   * (+ optional client-owned storage container) once; the bot binds
+   * their meetings to that route automatically. No Teams ids needed.
+   */
+  listClientRoutes: () => json<ClientRoutesResponse>("/api/client-routes"),
+
+  upsertClientRoute: (route: ClientRoute) =>
+    json<ClientRoute>("/api/client-routes", {
+      method: "POST",
+      body: JSON.stringify(route),
+    }),
+
+  removeClientRoute: (email: string) =>
+    json<{ deleted: string }>(
+      `/api/client-routes/${encodeURIComponent(email)}`,
+      { method: "DELETE" },
+    ),
+
+  listClientRouteMeetings: (email: string) =>
+    json<ClientRouteMeetingsResponse>(
+      `/api/client-routes/${encodeURIComponent(email)}/meetings`,
     ),
 
   listDebugThreads: () => json<DebugThreadsResponse>("/api/debug/transcripts"),

@@ -107,7 +107,7 @@ public sealed class BlobArchiveConfiguration
 /// </remarks>
 public sealed class BlobEventArchive
 {
-    private static readonly JsonSerializerOptions EnvelopeJsonOptions = new()
+    internal static readonly JsonSerializerOptions EnvelopeJsonOptions = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
         DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull,
@@ -482,7 +482,7 @@ public sealed class BlobEventArchive
         return SanitizePathSegment(eventType ?? "event");
     }
 
-    private static string BuildEnvelopePath(AlfredEventEnvelope envelope)
+    internal static string BuildEnvelopePath(AlfredEventEnvelope envelope)
     {
         // envelope.Ts is an ISO 8601 string. Compact it into a sortable
         // filename segment; if it isn't parseable for any reason, fall

@@ -37,6 +37,7 @@ export function TopNav({ onRefresh }: { onRefresh?: () => void }) {
     <nav className="ml-auto flex items-center gap-1">
       {link("/", "Meetings")}
       {link("/channels", "Channels")}
+      {link("/clients", "Clients")}
       {link("/archive", "Archive")}
       <button
         type="button"

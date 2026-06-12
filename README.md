@@ -322,10 +322,11 @@ The event fanout dispatcher (under `src/Services/`) is the C# bot's HTTP deliver
 
 The dispatcher chooses destinations in this order:
 
-1. `channel.*` event -> consumers on that `(team_id, channel_id)` attachment.
-2. `meeting.*` event with `MeetingRef.channel_link` -> consumers on the linked channel attachment.
-3. `meeting.*` event whose `meeting_chat_thread_id` matches an attachment's `conversation_thread_id` -> that attachment's consumers.
-4. No matching attachment -> `EventDispatch.BootstrapConsumerUrl`.
+1. `meeting.*` event bound to an **email-based client route** (`meeting_routes`, see below) -> that client's sink URL (and storage-container mirror when registered). Wins outright.
+2. `channel.*` event -> consumers on that `(team_id, channel_id)` attachment.
+3. `meeting.*` event with `MeetingRef.channel_link` -> consumers on the linked channel attachment.
+4. `meeting.*` event whose `meeting_chat_thread_id` matches an attachment's `conversation_thread_id` -> that attachment's consumers.
+5. No matching attachment -> `EventDispatch.BootstrapConsumerUrl`.
 
 That means **adding Alfred to a meeting gives the bot permission to capture that meeting; it does not tell the bot where Michael's agent lives.** If Michael adds Alfred to a private meeting and no channel link or consumer registration exists, events/transcripts still go to blob storage and the bootstrap consumer, which is our Python sink in this deployment. To send live events to Michael's `server_v2.py`, register his public endpoint as a consumer on the relevant channel, link the meeting to that channel, or run a dedicated bot instance whose `EventDispatch.BootstrapConsumerUrl` points at his endpoint.
 
@@ -363,7 +364,22 @@ curl -X POST "$BOT/api/channels/$TEAM/$CHAN_ENC/consumers" \
       }')"
 ```
 
-For a private meeting that is not tied to a channel, either link it to a registered channel with `@Alfred link to <channel-name>` or use the current fallback consumer. There is no per-meeting consumer registry today.
+**Email-based client routes (the no-Teams-ids path).** A client registers their email + sink URL (+ optional client-owned storage container) once — via the web UI at `/clients` or the operator API. When that person adds Alfred to a meeting, organizes one, or speaks first in its chat, the bot resolves their email (Bot Framework `TeamsInfo` first — works RSC-only; alias cache; Graph `User.ReadBasic.All` fallback) and persists a sticky `meeting_routes` binding. Every subsequent event for that meeting goes to their sink, and — when `storage_container_url` is set — the envelope is also mirrored into their container at the same canonical blob paths (§7.7). Fail-open: any resolution miss logs `client_route_unresolved` / `client_route_missing` and the event stays on the normal fallback path. State persists in `C:/teams-bot-poc/state/client-routes.json`.
+
+```bash
+# Register / update (upsert on email; storage_container_url + headers optional)
+curl -X POST "$BOT/api/client-routes" -H "Content-Type: application/json" \
+  -d '{"email":"michael.barron@disney.com",
+       "sink_url":"https://michael-agent.example.com/v2/events",
+       "storage_container_url":"https://stmichael.blob.core.windows.net/alfred-events?sv=...&sig=...",
+       "event_kinds":["*"],"enabled":true}'
+
+curl -sS "$BOT/api/client-routes" | jq                          # list
+curl -sS "$BOT/api/client-routes/michael.barron%40disney.com/meetings" | jq  # bound meetings
+curl -X DELETE "$BOT/api/client-routes/michael.barron%40disney.com"          # remove
+```
+
+For a private meeting that is not tied to a channel: register a client route for the person (above), link the meeting to a registered channel with `@Alfred link to <channel-name>`, or rely on the bootstrap fallback consumer.
 
 ### 7.5 V1 compatibility dual-write
 

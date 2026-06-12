@@ -180,6 +180,20 @@ try
     builder.Services.AddHostedService(sp =>
         sp.GetRequiredService<ChannelAttachmentService>());
 
+    // Email-based client routing (PLAN.md): client_routes (email →
+    // sink URL + optional storage container), identity aliases, and
+    // sticky meeting → route bindings. The dispatcher consults the
+    // store on every meeting envelope; the resolver binds threads to
+    // routes as identity candidates appear in Bot Framework activities.
+    builder.Services.AddSingleton(new ClientRouteStoreOptions
+    {
+        FilePath = meetingChatConfig.ClientRouteStorePath,
+    });
+    builder.Services.AddSingleton<ClientRouteStore>();
+    builder.Services.AddHostedService(sp => sp.GetRequiredService<ClientRouteStore>());
+    builder.Services.AddSingleton<ClientRouteResolver>();
+    builder.Services.AddSingleton<ClientBlobMirror>();
+
     // Register Graph Communications logger
     builder.Services.AddSingleton<IGraphLogger>(sp =>
     {

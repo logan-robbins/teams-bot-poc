@@ -1,5 +1,12 @@
 # PLAN.md - Email-Based Client Routing
 
+> **Status (2026-06-12): implemented** in `src/` + `web/` — see checklist
+> annotations below. One extension beyond this plan: `client_routes`
+> carries an optional `storage_container_url` (client-owned Azure Blob
+> container URL + SAS); the bot mirrors every routed envelope there at
+> the canonical archive paths via `ClientBlobMirror`. Central archive
+> writes are unchanged.
+
 ## Goal
 
 Make client-owned Alfred implementations easy to route without requiring
@@ -207,29 +214,28 @@ writes or other consumers.
 
 ## Implementation Checklist
 
-1. Add file-backed or durable store on the C# bot for `client_routes`,
-   `client_identity_aliases`, and `meeting_routes`.
-2. Add `GraphMetadataResolver.GetUserAsync(aadObjectId)` returning
-   `id`, `mail`, and `userPrincipalName`.
-3. Add route manager service:
-   `ResolveClientRouteAsync(envelope, candidateIdentities)`.
-4. In meeting/chat handlers, resolve candidate person email as early as
-   possible and persist `meeting_routes`.
-5. Update `EventFanoutDispatcher.ResolveConsumers` to check
-   `meeting_routes` before bootstrap fallback.
-6. Add operator endpoints:
-   - `GET /api/client-routes`
-   - `POST /api/client-routes`
-   - `DELETE /api/client-routes/{email}`
-   - `GET /api/client-routes/{email}/meetings`
-7. Add web UI controls for email -> sink URL registration.
-8. Add tests for:
-   - email route wins for private meeting
-   - meeting route sticks for transcript events
-   - missing email falls back to bootstrap
-   - disabled client route falls back
-   - multiple consumers do not block blob archive writes
-9. Update README and docs after implementation with exact API shapes.
+1. ✅ File-backed store `src/Services/ClientRouteStore.cs` — one JSON
+   file (`MeetingChat:ClientRouteStorePath`, default
+   `C:\teams-bot-poc\state\client-routes.json`) holding all three tables.
+2. ✅ `GraphMetadataResolver.GetUserAsync(aadObjectId)` →
+   `id`, `mail`, `userPrincipalName` (cached; needs `User.ReadBasic.All`,
+   returns null under RSC-only grants).
+3. ✅ `src/Services/ClientRouteResolver.cs` — candidate → email →
+   route binding; email chain: TeamsInfo (works RSC-only) → alias
+   table → Graph. Fail-open with structured logs.
+4. ✅ `AlfredBot` binds on installer (OnMembersAddedAsync), organizer
+   (OnTeamsMeetingStartAsync), organizer/sender (OnMessageActivityAsync),
+   gated by `ClientRouteResolver.NeedsBinding` so the hot path stays cheap.
+5. ✅ `EventFanoutDispatcher` checks `meeting_routes` first for meeting
+   events; bound route wins over channel consumers + bootstrap.
+   Storage mirror (`ClientBlobMirror`) fires here too.
+6. ✅ `src/Controllers/ClientRoutesController.cs` — all four endpoints.
+7. ✅ Web UI `/clients` page (`web/src/components/ClientsAdmin.tsx`) —
+   email + sink URL + storage container + event kinds + enabled +
+   bound-meetings view.
+8. ⏳ Tests — repo has no C# test project; verification is the docker
+   compile check + live probes (§7.3). Open until a test harness exists.
+9. ✅ README §7.4 updated with exact API shapes.
 
 ## Open Decisions
 
