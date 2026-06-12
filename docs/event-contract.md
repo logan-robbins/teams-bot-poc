@@ -2,10 +2,12 @@
 
 Canonical reference for the `alfred-v2` event envelope. The C# bot emits one envelope per event: channel chat under `channel.*`, meeting audio + chat under `meeting.*`. Envelope shape mirrors the Microsoft Graph URL hierarchy.
 
-Consumers have two rails:
+Consumers have two rails, each with two registration paths:
 
-1. Register a webhook URL with `POST $BOT/api/channels/{teamId}/{channelId}/consumers` for live push delivery.
-2. Read the blob archive for replay, bulk export, and offline processing (see `docs/retrieving-transcripts.md`).
+1. **Live push** — register a webhook URL per channel with `POST $BOT/api/channels/{teamId}/{channelId}/consumers`, or per person with `POST $BOT/api/client-routes` (email → sink URL; the bot binds that person's meetings automatically — README §7.4). Either way the bot POSTs these envelopes to your URL.
+2. **Blob pull** — read the central blob archive for replay, bulk export, and offline processing (see `docs/retrieving-transcripts.md`). A client route may also register a `storage_container_url` to receive a per-client mirror of its meetings' envelopes at the same paths.
+
+The envelope wire shape below is identical on every path.
 
 The Python sink is the built-in consumer for our Alfred implementation. A client-owned Alfred can be any service that receives these envelopes and optionally calls `$BOT/api/send-chat` to interact in Teams; `server_v2.py` is a local example of that pattern.
 

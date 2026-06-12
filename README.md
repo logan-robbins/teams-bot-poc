@@ -408,6 +408,10 @@ Lookup is O(1) (HashSet); v2 write is unchanged — compat is additive. When the
 
 For `server_v2.py`, configure the Teams bridge with the same `bot_url`, `team`, `channel`, and `poll` values as before, plus a storage target. Preferred storage config is `storage_bucket` or `storage_container` with `storage_account_url`; a full container URL in `storage_bucket` also works. Legacy `blob_base` still works for existing local configs. Default `event_kinds` responds only to `channel.message.created` and `meeting.chat.created`; opt in to live transcript turns explicitly with `event_kinds=["meeting.transcript.final"]`. Runtime logs go to `/tmp/alfred-bridge-v2.log`; set `ALFRED_BRIDGE_DEBUG=1` for per-poll diagnostics.
 
+**Consuming a client route with `server_v2.py` (both rails, no code changes):**
+- **Live push** — register the client route's `sink_url` as `https://<your-host>/v2/events`; the bridge's existing `POST /v2/events` queues every envelope the bot routes to you. Add a shared secret via the route's `headers` if you want, but the bridge doesn't require one.
+- **Pull from your mirror container** — point the bridge's `storage_bucket` at your `storage_container_url` value (full container URL incl. SAS query — the bridge appends the SAS to list + download calls), and set `extra_prefixes: ["meetings/"]`. Your mirror holds only your own meetings, so that one prefix covers everything; `team`/`channel` config is unnecessary for mirror-only consumption. Remember the `event_kinds` opt-in if you want live transcript turns.
+
 Pair with §7.4's consumer-isolation trick if you also need to prevent your sink's AlfredAnalyzer from posting into the same channel while the pre-v2 consumer is the active responder.
 
 ### 7.6 Rollback after a bad deploy

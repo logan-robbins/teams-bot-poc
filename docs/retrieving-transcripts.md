@@ -134,6 +134,8 @@ SA="https://stalfreddisney.blob.core.windows.net/alfred-events"
 
 If anonymous read is ever disabled you'll see `403 AuthenticationFailed` — switch to `DefaultAzureCredential` against the subscription.
 
+> **Client mirror containers.** A registered client route with `storage_container_url` (README §7.4) gets every routed meeting envelope mirrored into the client's own container at the **same path layout described below** (meeting scope only — client routes bind meetings, not channels). Auth there is whatever SAS the client supplied; everything else in this section applies unchanged.
+
 ### 2.1 Path layout
 
 Every per-event blob is a **single alfred-v2 envelope** as pretty-printed JSON. No preamble, no markers. `jq` works directly.
