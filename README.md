@@ -320,6 +320,8 @@ See `AGENTS.md` §7 for the full symptom→fix index.
 
 The event fanout dispatcher (under `src/Services/`) is the C# bot's HTTP delivery rail. For every non-throttled envelope, the bot independently writes the blob archive and POSTs the same envelope to each matching consumer URL. The URL path is not hard-coded by the bot; examples use `/v2/events` because both the Python sink and `server_v2.py` expose that route.
 
+**Quick start — receive a channel's events.** On the web UI's `/channels` page (or via the API below): find the channel row → *Add consumer* → any name → your sink URL **including the path** (the bot POSTs to the URL exactly as written, e.g. `https://your-host/v2/events`) → *Save list*. Done — every matching event for that channel now POSTs to you. Semantics: every **enabled** row receives events (N rows = parallel delivery to all of them); an **empty** list falls back to `EventDispatch.BootstrapConsumerUrl`; a single **disabled** row suppresses push entirely (the isolation trick below). For meetings keyed to a person instead of a channel, use a client route (below).
+
 The dispatcher chooses destinations in this order:
 
 1. `meeting.*` event bound to an **email-based client route** (`meeting_routes`, see below) -> that client's sink URL (and storage-container mirror when registered). Wins outright.

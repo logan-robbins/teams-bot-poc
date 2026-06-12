@@ -66,7 +66,11 @@ export function ClientsAdmin() {
             a meeting (or organizes one), every event for that meeting is
             POSTed to their sink URL — and mirrored into their storage
             container if one is set. They never need a meeting, chat, team,
-            or channel id.
+            or channel id. Sink URLs are used exactly as written — include
+            the full path (e.g. <code className="font-mono">/v2/events</code>).
+            For channel events, register on the{" "}
+            <Link to="/channels" className="text-gold-400 underline">Channels</Link>{" "}
+            page instead.
           </p>
 
           {error ? (

@@ -65,9 +65,18 @@ export function ChannelsAdmin() {
           <JoinByUrlPanel />
 
           <p className="mt-8 text-sm text-ink-300">
-            Each row is one Teams channel Alfred is attached to. The bot
-            POSTs every event for that channel to every consumer URL
-            below. See{" "}
+            Each row is one Teams channel Alfred is attached to.{" "}
+            <strong className="text-ink-100">
+              To receive a channel's events: Add consumer → give it any
+              name → paste your sink URL <em>including the path</em> (e.g.{" "}
+              <code className="font-mono">https://your-host/v2/events</code>)
+              → Save list.
+            </strong>{" "}
+            From that moment the bot POSTs every matching event for the
+            channel to that exact URL. Every <em>enabled</em> row receives
+            events (multiple rows = parallel delivery); an empty list falls
+            back to the default Alfred sink; a single disabled row silences
+            push delivery entirely. See{" "}
             <a
               href="https://github.com/logan-robbins/alfred-teams-bot/blob/main/docs/event-contract.md"
               className="text-gold-400 underline"
@@ -319,7 +328,7 @@ function ChannelRow({
                     <input
                       value={c.url}
                       onChange={(e) => patchConsumer(idx, { url: e.target.value })}
-                      placeholder="https://team-a.internal/sink"
+                      placeholder="https://your-host/v2/events"
                       className="w-full rounded border border-ink-700 bg-ink-950 px-2 py-1 font-mono text-xs text-ink-100"
                     />
                   </td>
