@@ -141,39 +141,58 @@ Concrete consequences:
 
 ---
 
-## 5. Permissions
+## 5. Permissions — complete list for a fully functional Alfred
 
-The manifest declares 16 RSCs. Zero tenant-wide Entra app permissions.
+Everything below is **required** for full functionality. Status legend: ✅ granted/live in Sandbox today · ⏳ pending Sandbox tenant-admin action.
 
-**Chat-scoped** (per-meeting / per-chat install):
+### 5.1 Teams app manifest — 16 RSC application permissions ✅
 
-| Permission | Used for |
-|---|---|
-| `Calls.JoinGroupCalls.Chat` | Bot enters the call as a participant |
-| `Calls.AccessMedia.Chat` | Receive 16 kHz / 16-bit / mono PCM audio |
-| `OnlineMeetingParticipant.Read.Chat` | MSI ↔ AAD ↔ display-name lookup |
-| `OnlineMeetingTranscript.Read.Chat` | Post-meeting Microsoft transcript (private meetings only — not channel meetings) |
-| `OnlineMeetingRecording.Read.Chat` | Reserved |
-| `ChatMessage.Read.Chat` | Graph subscription on the meeting chat |
-| `ChatMessageReadReceipt.Read.Chat` | Reserved |
+Granted per resource at install time; nothing to configure in Entra.
 
-**Team-scoped** (persistent channel attachment):
+- **Chat/meeting scope** (consented when Alfred is added to a meeting via `+ Apps`):
+  - `Calls.JoinGroupCalls.Chat` — join that chat's call (`POST /communications/calls`)
+  - `Calls.AccessMedia.Chat` — app-hosted media: 16 kHz / 16-bit / mono PCM audio
+  - `OnlineMeeting.ReadBasic.Chat` — meeting metadata + joinWebUrl → canonical meeting-id resolution
+  - `OnlineMeetingParticipant.Read.Chat` — roster, MSI ↔ AAD ↔ display-name
+  - `OnlineMeetingTranscript.Read.Chat` — official transcript GET (`useResourceSpecificConsentBasedAuthorization=true`; private meetings only)
+  - `OnlineMeetingRecording.Read.Chat` — reserved
+  - `ChatMessage.Read.Chat` — `GET /chats/{id}` + change-notification subscription on `chats/{id}/messages`
+- **Team scope** (consented when Alfred is installed on a team):
+  - `ChannelMessage.Read.Group` — subscription on `teams/{tid}/channels/{cid}/messages`
+  - `ChannelMessage.Send.Group` — outbound channel sends
+  - `ChannelMeeting.ReadBasic.Group` — channel-meeting discovery
+  - `ChannelMeetingParticipant.Read.Group` — channel-meeting roster
+  - `ChannelMeetingTranscript.Read.Group` + `ChannelMeetingRecording.Read.Group` — declared; no public GET consumes them alone (§7.2)
+  - `TeamsAppInstallation.Read.Group` — install verification
+  - `TeamSettings.Read.Group` + `ChannelSettings.Read.Group` — team/channel display names
 
-| Permission | Used for |
-|---|---|
-| `ChannelMessage.Read.Group` | Subscription on `teams/{tid}/channels/{cid}/messages` |
-| `ChannelMessage.Send.Group` | Outbound channel send (Bot Framework adapter default; Graph fallback) |
-| `ChannelMeeting.ReadBasic.Group` | Discover channel meetings |
-| `ChannelMeetingParticipant.Read.Group` | Channel meeting roster |
-| `ChannelMeetingTranscript.Read.Group` | Channel meeting transcripts (no documented public GET endpoint uses this alone — see §7.2) |
-| `ChannelMeetingRecording.Read.Group` | Reserved |
-| `TeamsAppInstallation.Read.Group` | Install verification |
-| `TeamSettings.Read.Group` | `GET /teams/{id}` for team display name |
-| `ChannelSettings.Read.Group` | `GET /teams/{id}/channels/{id}` for channel display name |
+### 5.2 Tenant-wide Entra application permissions ⏳ (admin consent on app `207a38a4-...`; today `requiredResourceAccess: []`)
 
-**Runtime gate outside RSC.** A `502 CALL_JOIN_FAILED_7504_OR_7505` means Graph rejected `/communications/calls` before media. As of 2026-05-21 the Sandbox app registration has `requiredResourceAccess: []`, so Alfred has no tenant-wide Graph `Calls.*` application roles. Joining arbitrary meeting URLs requires Sandbox admin consent for tenant-wide calling/media permissions and may also need Microsoft Cloud Communications app-hosted-media tenant enablement.
+- `Calls.JoinGroupCall.All` — join **any** meeting: arbitrary joinUrl, invites to the bot's service account, and **channel-meeting auto-join** (calls RSC exists only at chat scope — there is no team-scoped calls RSC, so channel audio is impossible without this)
+- `Calls.AccessMedia.All` — app-hosted media on all such joins (required with any `Calls.*` join for media bots)
+- `Calls.JoinGroupCallAsGuest.All` — guest-mode join when meeting options block directory-privileged apps
+- `OnlineMeetings.Read.All` — resolve any meeting by joinUrl/id outside RSC scope
+- `OnlineMeetingTranscript.Read.All` — tenant-wide official transcripts (incl. channel meetings; beta) + `getAllTranscripts` change-notification subscriptions (push replaces today's polling)
+- `OnlineMeetingRecording.Read.All` — recordings + `getAllRecordings` subscriptions
+- `User.ReadBasic.All` — AAD object id → `mail` / `userPrincipalName` (email-based client routing, PLAN.md; basic profile includes both fields)
+- `Mail.Read` — read meeting-invite emails in Alfred's service mailbox (email → joinUrl → auto-join) + subscription on `users/{id}/messages`
+- `Calendars.Read` — read the service mailbox calendar for accepted invites / joinUrl
 
-**Adding a new RSC requires re-installing on the team** — Teams binds RSC scopes at install time.
+### 5.3 Tenant/admin configuration ⏳ (policies, not Entra consent)
+
+- Azure Bot `MsTeamsChannel`: `enableCalling: true`, `incomingCallRoute: "graphPma"`, calling webhook (§7.1 Gate 1) ✅
+- Bot **service account**: Entra user + Exchange Online mailbox that receives invites; doubles as the compliance-recording application-instance UPN
+- **Exchange RBAC for Applications** to scope `Mail.Read`/`Calendars.Read` to only that mailbox (management role assignment + management scope). Application Access Policies are legacy — do not create new ones.
+- `New-CsApplicationAccessPolicy` + `Grant-CsApplicationAccessPolicy` to organizer accounts — prerequisite for the `OnlineMeetings.Read.All` / transcript application APIs
+- **Auto-invite** (`policy_auto_invite`): `New-CsOnlineApplicationInstance` → `Sync-CsOnlineApplicationInstance` → `New/Set-CsTeamsComplianceRecordingPolicy` → `Grant-CsTeamsComplianceRecordingPolicy` (full flow: [`docs/TEAMS-AUTO-INVITE-SETUP.md`](docs/TEAMS-AUTO-INVITE-SETUP.md))
+- `CsTeamsMeetingPolicy` must allow the requested join mode (§7.1)
+- If `7504 Insufficient enterprise tenant permissions` persists after all of the above: Microsoft Cloud Communications support case for app-hosted-media tenant enablement
+
+### 5.4 Compliance + operational gates
+
+- Before persisting any media: `POST /communications/calls/{id}/updateRecordingStatus` must succeed first, and recording must be ended before reporting it stopped (Media Access API terms)
+- Chat sends ride Bot Framework (`/api/messages` conversation references), not Graph — there is no application-permission Graph route for posting chat
+- **Adding a new RSC requires a manifest version bump + re-install on every team/chat** — RSC binds at install time
 
 ---
 
