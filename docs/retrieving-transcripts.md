@@ -430,6 +430,122 @@ For an agent that "listens silently until interesting": consume `meeting.transcr
 
 Adding Alfred to a private meeting is not enough to route live events to a client-owned agent. The bot captures the meeting, writes blobs, and sends live events to the bootstrap consumer unless a channel attachment/consumer route matches. To route a meeting to a client service, register that service under the relevant channel and link the meeting to that channel, or run a dedicated bot instance whose `EventDispatch.BootstrapConsumerUrl` points at the client service.
 
+### 4.1 Receiving the official Teams transcript at your endpoint
+
+After a private meeting ends with Record-and-Transcribe on, the bot's `OfficialTranscriptFetcher` polls Graph and—when the transcript is ready—publishes exactly one `meeting.transcript.official` envelope through the same fanout dispatcher as every other event. **Your registered endpoint receives this envelope exactly like any other push delivery; no special handling is required.** Expect delivery ~1–2 min after meeting end (timing depends on how quickly Teams processes the recording).
+
+#### Prerequisites
+
+- Alfred added to the meeting via `+Apps`.
+- Record-and-Transcribe turned on in the meeting.
+- Your endpoint registered with `event_kinds` that includes `"meeting.transcript.official"` or `"*"`.
+
+#### What the envelope looks like
+
+```jsonc
+{
+  "schema_version": "alfred-v2",
+  "event_type":     "meeting.transcript.official",
+  "event_id":       "8a3f1c0e2b9d4a7e9f12bb0001020304",
+  "ts":             "2026-05-14T16:36:42Z",
+  "meeting_ref": {
+    "meeting_id":             "19:meeting_NmFkYW...@thread.v2",
+    "meeting_chat_thread_id": "19:meeting_NmFkYW...@thread.v2",
+    ...
+  },
+  "payload": {
+    "transcript_id":  "MSMjMCMjOWNlOTU2YjAtY...",  // Graph callTranscript id
+    "organizer_oid":  "accf88ee-...",
+    "fetched_at_utc": "2026-05-14T16:36:42Z",
+    "created_at_utc": "2026-05-14T16:35:01Z",
+    "vtt_url":        "meetings/19_meeting_NmFkYW..._thread.v2/transcripts/official.vtt",  // relative blob path
+    "cue_count":      142,
+    "cues": [
+      { "start_ms": 1200, "end_ms": 3450,
+        "speaker": { "display_name": "Jane Doe" },
+        "text": "Let's start with the deploy retro." },
+      ...
+    ]
+  }
+}
+```
+
+Key points on the payload:
+
+- **`cues`** is the full transcript as parsed VTT — one entry per speaker turn. Iterate these to get the complete text; there is no single `text` field on the payload.
+- **`vtt_url`** is a **relative blob path**, not a full URL. To build the absolute URL: `https://stalfreddisney.blob.core.windows.net/alfred-events/{vtt_url}`.
+- The flat `official.txt` (speaker-per-line plaintext) is written to the blob archive separately by the bot but is **not** included in the payload — use the blob path below to fetch it.
+
+#### Extracting the full transcript text from a pushed envelope
+
+```python
+# envelope is the parsed JSON dict your /v2/events handler received
+cues = envelope["payload"]["cues"]
+lines = [
+    f"{(c.get('speaker') or {}).get('display_name', '?')}: {c['text']}"
+    for c in cues
+]
+transcript_text = "\n".join(lines)
+```
+
+#### Fetching the flat official.txt from the blob archive
+
+The `official.txt` file is always written unconditionally to blob storage — this is your universal fallback if the push was missed:
+
+```bash
+SA="https://stalfreddisney.blob.core.windows.net/alfred-events"
+
+# meeting_id from the envelope: envelope["meeting_ref"]["meeting_id"]
+MID_RAW="19:meeting_NmFkYW...@thread.v2"
+MID_SAN=$(printf %s "$MID_RAW" | sed -E 's/[^a-zA-Z0-9_.-]/_/g' | cut -c1-200)
+
+# Plaintext, one speaker turn per line
+curl -sS "$SA/meetings/$MID_SAN/transcripts/official.txt"
+
+# Raw WebVTT (cues with timestamps)
+curl -sS "$SA/meetings/$MID_SAN/transcripts/official.vtt"
+```
+
+```python
+import urllib.request, re
+
+SA = "https://stalfreddisney.blob.core.windows.net/alfred-events"
+
+def sanitize(raw: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9\-_.]", "_", raw)[:200]
+
+meeting_id = "19:meeting_NmFkYW...@thread.v2"
+txt = urllib.request.urlopen(
+    f"{SA}/meetings/{sanitize(meeting_id)}/transcripts/official.txt"
+).read().decode("utf-8")
+print(txt)
+```
+
+#### Critical: client routes and the Sink API
+
+If your endpoint is registered as a **client route** (`POST $BOT/api/client-routes` keyed on your email), the `meeting.transcript.official` envelope is pushed directly to your `sink_url` — but the meeting never passed through our Python sink. This means:
+
+```
+GET $SINK/v2/meetings/{meeting_id}/transcript
+```
+
+**will return nothing for your meeting.** The Sink API only knows meetings that flowed through our Python consumer. The blob URL above is the universal answer and works regardless of how the meeting was routed.
+
+#### If the push window is missed
+
+The fetcher runs a 30-min polling window anchored to meeting end. If that misses (bot restart mid-poll, Graph delay), it sleeps one hour and runs one more 30-min window. After that it gives up. Operator backfill:
+
+```bash
+BOT="https://alfred-disney-bot.eastus.cloudapp.azure.com"
+curl -sS -X POST "$BOT/api/debug/fetch-transcript" \
+  -H "Content-Type: application/json" \
+  -d '{"meeting_id":"19:meeting_NmFkYW...@thread.v2",
+       "organizer_oid":"accf88ee-...",
+       "meeting_chat_thread_id":"19:meeting_NmFkYW...@thread.v2"}'
+```
+
+This re-runs the fetch and re-emits `meeting.transcript.official` to your endpoint. The blob archive also has `official.txt` / `official.vtt` — they are written at the same time and survive any push failure.
+
 ---
 
 ## 5. Idempotency + cadence
