@@ -1,22 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { Moon } from "lucide-react";
+import { ChevronRight, Radio } from "lucide-react";
 import { sink, type V2Meeting } from "../lib/sink";
 import { TopNav } from "./TopNav";
 
-/**
- * Meeting picker shown at the root path (alfred-v2).
- *
- * Lists every meeting the sink knows about by canonical Graph
- * ``meeting_id``. The display surface shows the meeting's subject
- * first (with organizer / scheduled time) and the canonical
- * ``meeting_id`` appears on hover so an operator can copy it for
- * tooling without leaving the UI.
- *
- * Clicking a row opens the dossier at
- * ``/m/<meeting_chat_thread_id>`` — the chat thread id is the
- * internal session key the dossier reads from.
- */
 export function MeetingList() {
   const [meetings, setMeetings] = useState<V2Meeting[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -49,9 +36,6 @@ export function MeetingList() {
     };
   }, []);
 
-  // Most recent first. Live calls often arrive before Teams metadata fills
-  // actual/scheduled times, so use the same activity-driven fields the sink
-  // uses for its newest-first ordering.
   const sorted = useMemo(() => {
     const ts = (m: V2Meeting): number => {
       const raw =
@@ -70,109 +54,130 @@ export function MeetingList() {
     });
   }, [meetings]);
 
+  const live = sorted.filter(isMeetingLive);
+  const past = sorted.filter((m) => !isMeetingLive(m));
+
   return (
-    <div className="flex h-screen flex-col bg-ink-950 text-ink-50">
-      <header className="flex items-center gap-3 border-b border-ink-800 bg-ink-950/80 px-6 py-3 backdrop-blur">
-        <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-gradient-to-br from-gold-500/20 to-gold-500/5 ring-1 ring-gold-500/30">
-          <Moon size={18} className="text-gold-400" />
-        </div>
+    <div className="flex h-screen flex-col bg-gray-50 text-gray-900">
+      {/* Header — Disney blue */}
+      <header className="flex items-center gap-3 border-b border-blue-800 bg-blue-900 px-6 py-3">
         <div className="flex flex-col leading-tight">
-          <span className="font-serif text-lg font-medium text-ink-50">Alfred</span>
-          <span className="font-mono text-[10px] uppercase tracking-widest text-ink-400">
-            Meeting Selector
+          <span className="text-lg font-semibold text-white tracking-tight">Alfred</span>
+          <span className="text-[10px] uppercase tracking-widest text-blue-300">
+            WDI R&D · Meeting Intelligence
           </span>
         </div>
         <TopNav />
       </header>
 
-      <main className="flex-1 overflow-auto px-6 py-8">
-        <div className="mx-auto max-w-3xl">
-          <h2 className="font-serif text-xl text-ink-100">Open a meeting</h2>
-          <p className="mt-1 text-sm text-ink-300">
-            alfred-v2 — meetings keyed by Graph{" "}
-            <code className="font-mono">meeting_id</code>. Most recent first.
-            Hover a row to see the canonical id.
-          </p>
+      {/* Hero */}
+      <div className="border-b border-gray-200 bg-white px-6 py-10 text-center">
+        <h1 className="text-3xl font-bold text-blue-900 leading-tight">
+          Meeting Intelligence,<br />All in One Place.
+        </h1>
+        <p className="mt-3 text-sm text-gray-500 max-w-xl mx-auto">
+          Alfred captures audio, chat, and transcripts from Teams meetings and channels.
+          Select a meeting below to open its dossier.
+        </p>
+      </div>
 
+      <main className="flex-1 overflow-auto px-6 py-8">
+        <div className="mx-auto max-w-4xl">
           {error ? (
-            <div className="mt-6 rounded-md border border-crimson-500/40 bg-crimson-500/10 px-4 py-3 text-sm text-crimson-300">
+            <div className="mb-6 rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
               Could not load meetings: {error}
             </div>
           ) : null}
 
-          <ul className="mt-6 space-y-2">
-            {sorted.length === 0 && !error ? (
-              <li className="rounded-md border border-ink-800 bg-ink-900/40 px-4 py-3 text-sm italic text-ink-300">
-                No meetings yet, sir. The dossier will appear when the bot
-                joins a Teams meeting.
-              </li>
+          {/* Live meetings */}
+          {live.length > 0 ? (
+            <section className="mb-8">
+              <div className="mb-3 flex items-center gap-2">
+                <Radio size={14} className="text-emerald-500" />
+                <h2 className="text-xs font-semibold uppercase tracking-wider text-gray-500">Live now</h2>
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2">
+                {live.map((m) => (
+                  <MeetingCard key={m.meeting_id} meeting={m} live />
+                ))}
+              </div>
+            </section>
+          ) : null}
+
+          {/* Past meetings */}
+          <section>
+            <div className="mb-3">
+              <h2 className="text-xs font-semibold uppercase tracking-wider text-gray-500">
+                {live.length > 0 ? "Recent meetings" : "Meetings"}
+              </h2>
+            </div>
+            {past.length === 0 && live.length === 0 && !error ? (
+              <div className="rounded-lg border border-gray-200 bg-white px-5 py-4 text-sm italic text-gray-400">
+                No meetings yet. The dossier will appear when the bot joins a Teams meeting.
+              </div>
             ) : null}
-            {sorted.map((m) => (
-              <MeetingRow key={m.meeting_id} meeting={m} />
-            ))}
-          </ul>
+            <div className="grid gap-3 sm:grid-cols-2">
+              {past.map((m) => (
+                <MeetingCard key={m.meeting_id} meeting={m} live={false} />
+              ))}
+            </div>
+          </section>
         </div>
       </main>
     </div>
   );
 }
 
-function MeetingRow({ meeting }: { meeting: V2Meeting }) {
-  // Dossier UI is still keyed by chat_thread_id internally; the meeting
-  // chat thread id is the right surrogate. Fall back to meeting_id when
-  // a meeting has never had a chat (rare).
+function MeetingCard({ meeting, live }: { meeting: V2Meeting; live: boolean }) {
   const linkKey = meeting.meeting_chat_thread_id || meeting.meeting_id;
   const subject = friendlyMeetingTitle(meeting);
   const start = meeting.actual_start_utc || meeting.scheduled_start_utc;
-  const end = meeting.actual_end_utc || meeting.scheduled_end_utc;
-  const isLive = isMeetingLive(meeting);
+
   return (
-    <li>
-      <Link
-        to={`/m/${encodeURIComponent(linkKey)}`}
-        title={`meeting_id: ${meeting.meeting_id}`}
-        className="flex items-center justify-between rounded-md border border-ink-800 bg-ink-900/40 px-4 py-3 transition hover:border-gold-500/40 hover:bg-ink-900"
-      >
-        <div className="min-w-0">
-          <div className="truncate text-sm font-medium text-ink-100">
-            {subject}
-          </div>
-          <div className="truncate font-mono text-[11px] text-ink-400">
-            {meeting.organizer?.display_name ? (
-              <>
-                <span>{meeting.organizer.display_name}</span>
-                <span className="mx-1.5 text-ink-600">·</span>
-              </>
-            ) : null}
-            {start ? <span>{formatTime(start)}</span> : null}
-            {end ? (
-              <>
-                <span className="mx-1.5 text-ink-600">→</span>
-                <span>{formatTime(end)}</span>
-              </>
-            ) : null}
-            {meeting.channel_link?.channel_display_name ? (
-              <>
-                <span className="mx-1.5 text-ink-600">·</span>
-                <span>#{meeting.channel_link.channel_display_name}</span>
-              </>
-            ) : null}
-          </div>
-          <div className="truncate font-mono text-[10px] text-ink-500" title={meeting.meeting_id}>
-            id: {meeting.meeting_id}
-          </div>
+    <Link
+      to={`/m/${encodeURIComponent(linkKey)}`}
+      title={`meeting_id: ${meeting.meeting_id}`}
+      className="group flex items-center justify-between rounded-lg border border-gray-200 bg-white px-5 py-4 shadow-sm transition hover:border-blue-400 hover:shadow-md"
+    >
+      {/* Left accent bar */}
+      <div
+        className={`mr-4 h-10 w-1 flex-none rounded-full ${
+          live ? "bg-emerald-400" : "bg-blue-600"
+        }`}
+      />
+
+      <div className="min-w-0 flex-1">
+        <div className="truncate text-sm font-semibold text-gray-800 group-hover:text-blue-700">
+          {subject}
         </div>
-        <div className="flex flex-col items-end text-right">
-          <span
-            className={`font-mono text-[10px] uppercase tracking-widest ${
-              isLive ? "text-emerald-400" : "text-ink-500"
-            }`}
-          >
-            {isLive ? "live" : "ended"}
+        <div className="mt-0.5 truncate text-xs text-gray-400">
+          {meeting.organizer?.display_name ? (
+            <span>{meeting.organizer.display_name}</span>
+          ) : null}
+          {start ? (
+            <>
+              {meeting.organizer?.display_name ? <span className="mx-1.5">·</span> : null}
+              <span>{formatTime(start)}</span>
+            </>
+          ) : null}
+          {meeting.channel_link?.channel_display_name ? (
+            <>
+              <span className="mx-1.5">·</span>
+              <span>#{meeting.channel_link.channel_display_name}</span>
+            </>
+          ) : null}
+        </div>
+      </div>
+
+      <div className="ml-3 flex flex-none items-center gap-2">
+        {live ? (
+          <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-emerald-600 ring-1 ring-emerald-200">
+            Live
           </span>
-        </div>
-      </Link>
-    </li>
+        ) : null}
+        <ChevronRight size={16} className="text-gray-300 group-hover:text-blue-400" />
+      </div>
+    </Link>
   );
 }
 
@@ -191,18 +196,6 @@ function formatTime(iso: string): string {
   }
 }
 
-/**
- * Pick the most human-readable label we can synthesize for a meeting.
- * Preference order:
- *   1. Explicit `subject` (set by the bot when Bot Framework's
- *      Conversation.Name is available, or by an operator via the
- *      transcript-upload form).
- *   2. Organizer display name (e.g. "Logan Robbins's meeting") when we
- *      know who scheduled it.
- *   3. A date-derived placeholder ("Meeting on May 19") so the list never
- *      shows the raw `19:meeting_...@thread.v2` id.
- *   4. The raw meeting_id as the absolute last resort.
- */
 export function friendlyMeetingTitle(meeting: V2Meeting): string {
   const subj = meeting.subject?.trim();
   if (subj) return subj;

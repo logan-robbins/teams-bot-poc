@@ -24,8 +24,8 @@ export function TopNav({ onRefresh }: { onRefresh?: () => void }) {
         return [
           "rounded-md px-3 py-1.5 text-xs font-medium transition",
           active
-            ? "bg-gold-500/20 text-gold-200 ring-1 ring-gold-500/40"
-            : "text-ink-200 hover:bg-ink-800 hover:text-ink-50",
+            ? "bg-white/20 text-white ring-1 ring-white/30"
+            : "text-blue-200 hover:bg-white/10 hover:text-white",
         ].join(" ");
       }}
     >
@@ -43,7 +43,7 @@ export function TopNav({ onRefresh }: { onRefresh?: () => void }) {
         type="button"
         onClick={() => (onRefresh ? onRefresh() : window.location.reload())}
         title="Refresh"
-        className="ml-2 flex items-center gap-1 rounded-md border border-ink-700 bg-ink-900 px-3 py-1.5 text-xs text-ink-200 transition hover:bg-ink-800"
+        className="ml-2 flex items-center gap-1 rounded-md border border-white/20 bg-white/10 px-3 py-1.5 text-xs text-blue-100 transition hover:bg-white/20"
       >
         <RefreshCw size={12} />
         Refresh
