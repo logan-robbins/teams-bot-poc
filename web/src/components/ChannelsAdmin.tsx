@@ -31,20 +31,18 @@ export function ChannelsAdmin() {
   }, []);
 
   return (
-    <div className="flex h-screen flex-col bg-ink-950 text-ink-50">
-      <header className="flex items-center gap-3 border-b border-ink-800 bg-ink-950/80 px-6 py-3 backdrop-blur">
+    <div className="flex h-screen flex-col bg-gray-50 text-gray-900">
+      <header className="flex items-center gap-3 border-b border-blue-800 bg-blue-900 px-6 py-3">
         <Link
           to="/"
-          className="flex h-9 w-9 items-center justify-center rounded-lg bg-gradient-to-br from-gold-500/20 to-gold-500/5 ring-1 ring-gold-500/30"
+          className="flex h-9 w-9 items-center justify-center rounded-lg bg-white/10 ring-1 ring-white/20"
           aria-label="Back to meetings"
         >
-          <Moon size={18} className="text-gold-400" />
+          <Moon size={18} className="text-blue-200" />
         </Link>
         <div className="flex flex-col leading-tight">
-          <span className="font-serif text-lg font-medium text-ink-50">
-            Channel Config
-          </span>
-          <span className="font-mono text-[10px] uppercase tracking-widest text-ink-400">
+          <span className="text-lg font-semibold text-white tracking-tight">Channel Config</span>
+          <span className="text-[10px] uppercase tracking-widest text-blue-300">
             alfred-events-v2 · per-channel routing
           </span>
         </div>
@@ -53,31 +51,31 @@ export function ChannelsAdmin() {
 
       <main className="flex-1 overflow-auto px-6 py-8">
         <div className="mx-auto max-w-5xl">
-          <p className="text-sm text-ink-300">
+          <p className="text-sm text-gray-500">
             Each row is one Teams channel Alfred is attached to. Paste a sink
             URL and hit Save — the bot POSTs every matching event for that
             channel to that URL. An empty list falls back to the default sink;
             a single disabled row silences push entirely. For meeting-scoped
             routing by person, use the{" "}
-            <Link to="/clients" className="text-gold-400 underline">
+            <Link to="/clients" className="text-blue-600 underline">
               Meeting Config
             </Link>{" "}
             page instead.
           </p>
 
           {error ? (
-            <div className="mt-6 rounded-md border border-crimson-500/40 bg-crimson-500/10 px-4 py-3 text-sm text-crimson-300">
+            <div className="mt-6 rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
               Could not load channels: {error}
             </div>
           ) : null}
 
-          <ul className="mt-6 space-y-6">
+          <ul className="mt-6 space-y-4">
             {loading && channels.length === 0 ? (
-              <li className="text-sm italic text-ink-300">Loading…</li>
+              <li className="text-sm italic text-gray-400">Loading…</li>
             ) : null}
 
             {!loading && channels.length === 0 && !error ? (
-              <li className="rounded-md border border-ink-800 bg-ink-900/40 px-4 py-3 text-sm italic text-ink-300">
+              <li className="rounded-lg border border-gray-200 bg-white px-4 py-3 text-sm italic text-gray-400">
                 No channels attached yet. Use{" "}
                 <code className="font-mono">POST /api/channels/attach</code>{" "}
                 or install the app at the team level.
@@ -162,44 +160,43 @@ function ChannelRow({
   }
 
   return (
-    <li className="rounded-md border border-ink-800 bg-ink-900/40 px-4 py-3">
+    <li className="rounded-lg border border-gray-200 bg-white shadow-sm px-5 py-4">
       <div className="flex items-baseline gap-3">
-        <h3 className="font-serif text-base text-ink-100">
-          {channel.team_display_name ?? <span className="italic text-ink-400">Team (name unknown)</span>}
-          <span className="text-ink-500"> / </span>
-          {channel.channel_display_name ?? <span className="italic text-ink-400">Channel (name unknown)</span>}
+        <h3 className="text-sm font-semibold text-gray-800">
+          {channel.team_display_name ?? <span className="italic text-gray-400">Team (name unknown)</span>}
+          <span className="text-gray-400"> / </span>
+          {channel.channel_display_name ?? <span className="italic text-gray-400">Channel (name unknown)</span>}
         </h3>
-        <span className="ml-auto font-mono text-[10px] text-ink-500">
-          {channel.source ?? "unknown source"} ·
-          attached {fmtTs(channel.attached_at_utc)}
+        <span className="ml-auto font-mono text-[10px] text-gray-400">
+          {channel.source ?? "unknown source"} · attached {fmtTs(channel.attached_at_utc)}
         </span>
       </div>
-      <details className="mt-1 cursor-pointer text-[10px] text-ink-500">
+      <details className="mt-1 cursor-pointer text-[10px] text-gray-400">
         <summary className="font-mono opacity-60 hover:opacity-100">show ids</summary>
-        <div className="mt-1 font-mono">
+        <div className="mt-1 font-mono text-gray-500">
           team_id: {channel.team_id}<br />
           channel_id: {channel.channel_id}
         </div>
       </details>
 
       {error ? (
-        <div className="mt-3 rounded-md border border-crimson-500/40 bg-crimson-500/10 px-3 py-2 text-xs text-crimson-300">
+        <div className="mt-3 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
           {error}
         </div>
       ) : null}
 
       {!loaded ? (
-        <div className="mt-3 text-xs italic text-ink-400">Loading consumers…</div>
+        <div className="mt-3 text-xs italic text-gray-400">Loading consumers…</div>
       ) : (
         <div className="mt-3 space-y-2">
           {consumers.length === 0 ? (
-            <div className="text-xs italic text-ink-400">
+            <div className="text-xs italic text-gray-400">
               No consumers — events fall back to the default sink.
             </div>
           ) : null}
           <table className="w-full table-fixed text-xs">
             <thead>
-              <tr className="text-left text-[10px] uppercase tracking-wider text-ink-500">
+              <tr className="text-left text-[10px] uppercase tracking-wider text-gray-400">
                 <th className="w-40 pb-1 pr-2">Name</th>
                 <th className="pb-1 pr-2">URL</th>
                 <th className="w-44 pb-1 pr-2">Event kinds</th>
@@ -209,13 +206,13 @@ function ChannelRow({
             </thead>
             <tbody>
               {consumers.map((c, idx) => (
-                <tr key={`${idx}-${c.name}`} className="border-t border-ink-800">
+                <tr key={`${idx}-${c.name}`} className="border-t border-gray-100">
                   <td className="py-2 pr-2 align-top">
                     <input
                       value={c.name}
                       onChange={(e) => patchConsumer(idx, { name: e.target.value })}
                       placeholder="team-a"
-                      className="w-full rounded border border-ink-700 bg-ink-950 px-2 py-1 font-mono text-xs text-ink-100"
+                      className="w-full rounded border border-gray-300 bg-white px-2 py-1 font-mono text-xs text-gray-800"
                     />
                   </td>
                   <td className="py-2 pr-2 align-top">
@@ -223,7 +220,7 @@ function ChannelRow({
                       value={c.url}
                       onChange={(e) => patchConsumer(idx, { url: e.target.value })}
                       placeholder="https://your-host/v2/events"
-                      className="w-full rounded border border-ink-700 bg-ink-950 px-2 py-1 font-mono text-xs text-ink-100"
+                      className="w-full rounded border border-gray-300 bg-white px-2 py-1 font-mono text-xs text-gray-800"
                     />
                   </td>
                   <td className="py-2 pr-2 align-top">
@@ -238,7 +235,7 @@ function ChannelRow({
                         })
                       }
                       placeholder="*"
-                      className="w-full rounded border border-ink-700 bg-ink-950 px-2 py-1 font-mono text-xs text-ink-100"
+                      className="w-full rounded border border-gray-300 bg-white px-2 py-1 font-mono text-xs text-gray-800"
                     />
                   </td>
                   <td className="py-2 pr-2 align-top text-center">
@@ -262,7 +259,7 @@ function ChannelRow({
                           setConsumers((prev) => prev.filter((_, i) => i !== idx));
                         }
                       }}
-                      className="rounded p-1 text-ink-400 hover:bg-ink-800 hover:text-crimson-300"
+                      className="rounded p-1 text-gray-400 hover:bg-red-50 hover:text-red-500"
                       aria-label="Remove consumer"
                     >
                       <Trash2 size={12} />
@@ -278,7 +275,7 @@ function ChannelRow({
               type="button"
               disabled={saving}
               onClick={() => void save()}
-              className="flex items-center gap-1 rounded-md bg-gold-500/20 px-3 py-1.5 text-xs text-gold-200 ring-1 ring-gold-500/40 hover:bg-gold-500/30 disabled:opacity-50"
+              className="flex items-center gap-1 rounded-md bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700 disabled:opacity-50"
             >
               <Save size={12} />
               {saving ? "Saving…" : "Save list"}

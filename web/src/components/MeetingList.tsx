@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { ChevronRight, Radio } from "lucide-react";
+import { ChevronRight, Radio, CalendarDays } from "lucide-react";
 import { sink, type V2Meeting } from "../lib/sink";
 import { TopNav } from "./TopNav";
 
@@ -71,7 +71,7 @@ export function MeetingList() {
       </header>
 
       {/* Hero */}
-      <div className="border-b border-gray-200 bg-white px-6 py-10 text-center">
+      <div className="border-b border-blue-100 bg-gradient-to-br from-blue-50 to-indigo-50 px-6 py-10 text-center">
         <h1 className="text-3xl font-bold text-blue-900 leading-tight">
           Meeting Intelligence,<br />All in One Place.
         </h1>
@@ -137,20 +137,29 @@ function MeetingCard({ meeting, live }: { meeting: V2Meeting; live: boolean }) {
     <Link
       to={`/m/${encodeURIComponent(linkKey)}`}
       title={`meeting_id: ${meeting.meeting_id}`}
-      className="group flex items-center justify-between rounded-lg border border-gray-200 bg-white px-5 py-4 shadow-sm transition hover:border-blue-400 hover:shadow-md"
+      className={`group flex items-center gap-4 rounded-lg border px-5 py-4 shadow-sm transition hover:shadow-md ${
+        live
+          ? "border-emerald-100 bg-emerald-50 hover:border-emerald-300"
+          : "border-blue-100 bg-blue-50 hover:border-blue-300"
+      }`}
     >
-      {/* Left accent bar */}
+      {/* Icon square */}
       <div
-        className={`mr-4 h-10 w-1 flex-none rounded-full ${
-          live ? "bg-emerald-400" : "bg-blue-600"
+        className={`flex h-10 w-10 flex-none items-center justify-center rounded-lg ${
+          live ? "bg-emerald-500" : "bg-blue-600"
         }`}
-      />
+      >
+        {live
+          ? <Radio size={18} className="text-white" />
+          : <CalendarDays size={18} className="text-white" />
+        }
+      </div>
 
       <div className="min-w-0 flex-1">
         <div className="truncate text-sm font-semibold text-gray-800 group-hover:text-blue-700">
           {subject}
         </div>
-        <div className="mt-0.5 truncate text-xs text-gray-400">
+        <div className="mt-0.5 truncate text-xs text-gray-500">
           {meeting.organizer?.display_name ? (
             <span>{meeting.organizer.display_name}</span>
           ) : null}
@@ -169,14 +178,7 @@ function MeetingCard({ meeting, live }: { meeting: V2Meeting; live: boolean }) {
         </div>
       </div>
 
-      <div className="ml-3 flex flex-none items-center gap-2">
-        {live ? (
-          <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-emerald-600 ring-1 ring-emerald-200">
-            Live
-          </span>
-        ) : null}
-        <ChevronRight size={16} className="text-gray-300 group-hover:text-blue-400" />
-      </div>
+      <ChevronRight size={16} className="ml-2 flex-none text-gray-400 group-hover:text-blue-500" />
     </Link>
   );
 }

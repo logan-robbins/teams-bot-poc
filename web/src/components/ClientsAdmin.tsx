@@ -39,20 +39,20 @@ export function ClientsAdmin() {
   }, []);
 
   return (
-    <div className="flex h-screen flex-col bg-ink-950 text-ink-50">
-      <header className="flex items-center gap-3 border-b border-ink-800 bg-ink-950/80 px-6 py-3 backdrop-blur">
+    <div className="flex h-screen flex-col bg-gray-50 text-gray-900">
+      <header className="flex items-center gap-3 border-b border-blue-800 bg-blue-900 px-6 py-3">
         <Link
           to="/"
-          className="flex h-9 w-9 items-center justify-center rounded-lg bg-gradient-to-br from-gold-500/20 to-gold-500/5 ring-1 ring-gold-500/30"
+          className="flex h-9 w-9 items-center justify-center rounded-lg bg-white/10 ring-1 ring-white/20"
           aria-label="Back to meetings"
         >
-          <Moon size={18} className="text-gold-400" />
+          <Moon size={18} className="text-blue-200" />
         </Link>
         <div className="flex flex-col leading-tight">
-          <span className="font-serif text-lg font-medium text-ink-50">
+          <span className="text-lg font-semibold text-white tracking-tight">
             Meeting Config
           </span>
-          <span className="font-mono text-[10px] uppercase tracking-widest text-ink-400">
+          <span className="text-[10px] uppercase tracking-widest text-blue-300">
             alfred-events-v2 · email-based routing
           </span>
         </div>
@@ -61,7 +61,7 @@ export function ClientsAdmin() {
 
       <main className="flex-1 overflow-auto px-6 py-8">
         <div className="mx-auto max-w-5xl">
-          <p className="text-sm text-ink-300">
+          <p className="text-sm text-gray-500">
             Register a client by email once. When that person adds Alfred to
             a meeting (or organizes one), every event for that meeting is
             POSTed to their sink URL — and mirrored into their storage
@@ -69,25 +69,25 @@ export function ClientsAdmin() {
             or channel id. Sink URLs are used exactly as written — include
             the full path (e.g. <code className="font-mono">/v2/events</code>).
             For channel events, register on the{" "}
-            <Link to="/channels" className="text-gold-400 underline">Channel Config</Link>{" "}
+            <Link to="/channels" className="text-blue-600 underline">Channel Config</Link>{" "}
             page instead.
           </p>
 
           {error ? (
-            <div className="mt-6 rounded-md border border-crimson-500/40 bg-crimson-500/10 px-4 py-3 text-sm text-crimson-300">
+            <div className="mt-6 rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
               Could not load client routes: {error}
             </div>
           ) : null}
 
           <AddRoutePanel onSaved={() => void refresh()} />
 
-          <ul className="mt-6 space-y-6">
+          <ul className="mt-6 space-y-4">
             {loading && routes.length === 0 ? (
-              <li className="text-sm italic text-ink-300">Loading…</li>
+              <li className="text-sm italic text-gray-400">Loading…</li>
             ) : null}
 
             {!loading && routes.length === 0 && !error ? (
-              <li className="rounded-md border border-ink-800 bg-ink-900/40 px-4 py-3 text-sm italic text-ink-300">
+              <li className="rounded-lg border border-gray-200 bg-white px-4 py-3 text-sm italic text-gray-400">
                 No client routes registered yet. Add one above.
               </li>
             ) : null}
@@ -132,15 +132,15 @@ function AddRoutePanel({ onSaved }: { onSaved: () => void }) {
   }
 
   return (
-    <section className="mt-6 rounded-md border border-ink-800 bg-ink-900/40 px-4 py-3">
-      <h2 className="font-serif text-base text-ink-100">Register a client</h2>
+    <section className="mt-6 rounded-lg border border-gray-200 bg-white px-4 py-4 shadow-sm">
+      <h2 className="text-sm font-semibold text-gray-800">Register a client</h2>
       <div className="mt-3 grid gap-2 sm:grid-cols-[minmax(14rem,1fr)_minmax(18rem,2fr)_minmax(18rem,2fr)_auto]">
         <input
           type="email"
           value={email}
           onChange={(e) => setEmail(e.target.value)}
           placeholder="michael.barron@disney.com"
-          className="rounded border border-ink-700 bg-ink-950 px-3 py-1.5 font-mono text-xs text-ink-100"
+          className="rounded border border-gray-300 bg-white px-3 py-1.5 font-mono text-xs text-gray-800 focus:border-blue-400 focus:outline-none"
           disabled={busy}
         />
         <input
@@ -148,7 +148,7 @@ function AddRoutePanel({ onSaved }: { onSaved: () => void }) {
           value={sinkUrl}
           onChange={(e) => setSinkUrl(e.target.value)}
           placeholder="https://michael-agent.example.com/v2/events"
-          className="rounded border border-ink-700 bg-ink-950 px-3 py-1.5 font-mono text-xs text-ink-100"
+          className="rounded border border-gray-300 bg-white px-3 py-1.5 font-mono text-xs text-gray-800 focus:border-blue-400 focus:outline-none"
           disabled={busy}
         />
         <input
@@ -156,26 +156,26 @@ function AddRoutePanel({ onSaved }: { onSaved: () => void }) {
           value={storageUrl}
           onChange={(e) => setStorageUrl(e.target.value)}
           placeholder="https://account.blob.core.windows.net/container?sv=…  (optional)"
-          className="rounded border border-ink-700 bg-ink-950 px-3 py-1.5 font-mono text-xs text-ink-100"
+          className="rounded border border-gray-300 bg-white px-3 py-1.5 font-mono text-xs text-gray-800 focus:border-blue-400 focus:outline-none"
           disabled={busy}
         />
         <button
           type="button"
           onClick={() => void save()}
           disabled={busy || email.trim().length === 0 || sinkUrl.trim().length === 0}
-          className="flex items-center gap-1 rounded-md bg-gold-500/20 px-3 py-1.5 text-xs text-gold-200 ring-1 ring-gold-500/40 hover:bg-gold-500/30 disabled:opacity-50"
+          className="flex items-center gap-1 rounded-md bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700 disabled:opacity-50"
         >
           <Plus size={12} />
           {busy ? "Saving…" : "Add"}
         </button>
       </div>
-      <p className="mt-2 text-[11px] text-ink-400">
+      <p className="mt-2 text-[11px] text-gray-400">
         Storage container is a full Azure Blob container URL with a SAS
         granting create/write. Envelopes land at the same canonical paths
         as the central archive (<code className="font-mono">meetings/…</code>).
       </p>
       {error ? (
-        <p className="mt-2 font-mono text-[10px] text-crimson-300">{error}</p>
+        <p className="mt-2 font-mono text-[10px] text-red-500">{error}</p>
       ) : null}
     </section>
   );
@@ -238,45 +238,45 @@ function ClientRouteRow({
   }
 
   return (
-    <li className="rounded-md border border-ink-800 bg-ink-900/40 px-4 py-3">
-      <div className="flex items-baseline gap-3">
-        <h3 className="font-mono text-sm text-ink-100">{route.email}</h3>
+    <li className="rounded-lg border border-gray-200 bg-white px-4 py-4 shadow-sm">
+      <div className="flex items-center gap-3">
+        <h3 className="font-mono text-sm font-medium text-gray-800">{route.email}</h3>
         <span
           className={
-            "inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] ring-1 " +
+            "inline-flex items-center rounded px-1.5 py-0.5 text-[10px] ring-1 " +
             (route.enabled !== false
-              ? "bg-emerald-500/15 text-emerald-200 ring-emerald-500/30"
-              : "bg-ink-800/40 text-ink-300 ring-ink-700")
+              ? "bg-emerald-50 text-emerald-700 ring-emerald-200"
+              : "bg-gray-100 text-gray-500 ring-gray-200")
           }
         >
           {route.enabled !== false ? "enabled" : "disabled"}
         </span>
         {route.storage_container_url ? (
-          <span className="inline-flex items-center gap-1 rounded bg-gold-500/15 px-1.5 py-0.5 text-[10px] text-gold-200 ring-1 ring-gold-500/30">
+          <span className="inline-flex items-center rounded bg-blue-50 px-1.5 py-0.5 text-[10px] text-blue-700 ring-1 ring-blue-200">
             storage mirror
           </span>
         ) : null}
-        <span className="ml-auto font-mono text-[10px] text-ink-500">
+        <span className="ml-auto font-mono text-[10px] text-gray-400">
           updated {fmtTs(route.updated_at_utc)}
         </span>
       </div>
 
       {error ? (
-        <div className="mt-3 rounded-md border border-crimson-500/40 bg-crimson-500/10 px-3 py-2 text-xs text-crimson-300">
+        <div className="mt-3 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
           {error}
         </div>
       ) : null}
 
       <div className="mt-3 grid gap-2">
-        <label className="grid grid-cols-[8rem_1fr] items-center gap-2 text-xs text-ink-300">
+        <label className="grid grid-cols-[8rem_1fr] items-center gap-2 text-xs text-gray-500">
           Sink URL
           <input
             value={draft.sink_url}
             onChange={(e) => setDraft({ ...draft, sink_url: e.target.value })}
-            className="rounded border border-ink-700 bg-ink-950 px-2 py-1 font-mono text-xs text-ink-100"
+            className="rounded border border-gray-300 bg-white px-2 py-1 font-mono text-xs text-gray-800 focus:border-blue-400 focus:outline-none"
           />
         </label>
-        <label className="grid grid-cols-[8rem_1fr] items-center gap-2 text-xs text-ink-300">
+        <label className="grid grid-cols-[8rem_1fr] items-center gap-2 text-xs text-gray-500">
           Storage container
           <input
             value={draft.storage_container_url ?? ""}
@@ -284,10 +284,10 @@ function ClientRouteRow({
               setDraft({ ...draft, storage_container_url: e.target.value })
             }
             placeholder="(none — central archive only)"
-            className="rounded border border-ink-700 bg-ink-950 px-2 py-1 font-mono text-xs text-ink-100"
+            className="rounded border border-gray-300 bg-white px-2 py-1 font-mono text-xs text-gray-800 focus:border-blue-400 focus:outline-none"
           />
         </label>
-        <label className="grid grid-cols-[8rem_1fr] items-center gap-2 text-xs text-ink-300">
+        <label className="grid grid-cols-[8rem_1fr] items-center gap-2 text-xs text-gray-500">
           Event kinds
           <input
             value={(draft.event_kinds ?? ["*"]).join(",")}
@@ -301,13 +301,13 @@ function ClientRouteRow({
               })
             }
             placeholder="*"
-            className="rounded border border-ink-700 bg-ink-950 px-2 py-1 font-mono text-xs text-ink-100"
+            className="rounded border border-gray-300 bg-white px-2 py-1 font-mono text-xs text-gray-800 focus:border-blue-400 focus:outline-none"
           />
         </label>
       </div>
 
       <div className="mt-3 flex flex-wrap items-center gap-2">
-        <label className="flex items-center gap-2 text-xs text-ink-200">
+        <label className="flex items-center gap-2 text-xs text-gray-600">
           <input
             type="checkbox"
             checked={draft.enabled !== false}
@@ -319,7 +319,7 @@ function ClientRouteRow({
           type="button"
           disabled={saving}
           onClick={() => void save()}
-          className="flex items-center gap-1 rounded-md bg-gold-500/20 px-3 py-1.5 text-xs text-gold-200 ring-1 ring-gold-500/40 hover:bg-gold-500/30 disabled:opacity-50"
+          className="flex items-center gap-1 rounded-md bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700 disabled:opacity-50"
         >
           <Save size={12} />
           {saving ? "Saving…" : "Save"}
@@ -327,7 +327,7 @@ function ClientRouteRow({
         <button
           type="button"
           onClick={() => void loadMeetings()}
-          className="flex items-center gap-1 rounded-md border border-ink-700 bg-ink-950 px-3 py-1.5 text-xs text-ink-200 hover:bg-ink-800"
+          className="flex items-center gap-1 rounded-md border border-gray-200 bg-white px-3 py-1.5 text-xs text-gray-600 hover:bg-gray-50"
         >
           <CalendarClock size={12} />
           Bound meetings
@@ -335,7 +335,7 @@ function ClientRouteRow({
         <button
           type="button"
           onClick={() => void remove()}
-          className="ml-auto flex items-center gap-1 rounded-md px-3 py-1.5 text-xs text-ink-400 hover:bg-ink-800 hover:text-crimson-300"
+          className="ml-auto flex items-center gap-1 rounded-md px-3 py-1.5 text-xs text-gray-400 hover:bg-red-50 hover:text-red-500"
         >
           <Trash2 size={12} />
           Delete route
@@ -343,9 +343,9 @@ function ClientRouteRow({
       </div>
 
       {meetings !== null ? (
-        <div className="mt-3 border-t border-ink-800 pt-3">
+        <div className="mt-3 border-t border-gray-100 pt-3">
           {meetings.length === 0 ? (
-            <p className="text-xs italic text-ink-400">
+            <p className="text-xs italic text-gray-400">
               No meetings bound yet. The next meeting this person installs,
               organizes, or speaks in binds automatically.
             </p>
@@ -354,11 +354,11 @@ function ClientRouteRow({
               {meetings.map((m) => (
                 <li
                   key={m.meeting_chat_thread_id}
-                  className="flex items-baseline gap-2 font-mono text-[11px] text-ink-300"
+                  className="flex items-baseline gap-2 font-mono text-[11px] text-gray-500"
                 >
                   <span className="truncate">{m.meeting_chat_thread_id}</span>
-                  <span className="text-ink-500">via {m.source ?? "?"}</span>
-                  <span className="ml-auto shrink-0 text-ink-500">
+                  <span className="text-gray-400">via {m.source ?? "?"}</span>
+                  <span className="ml-auto shrink-0 text-gray-400">
                     {fmtTs(m.updated_at_utc)}
                   </span>
                 </li>
