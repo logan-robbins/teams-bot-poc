@@ -50,7 +50,7 @@ export function ClientsAdmin() {
         </Link>
         <div className="flex flex-col leading-tight">
           <span className="font-serif text-lg font-medium text-ink-50">
-            Client Routes
+            Meeting Config
           </span>
           <span className="font-mono text-[10px] uppercase tracking-widest text-ink-400">
             alfred-events-v2 · email-based routing
@@ -69,7 +69,7 @@ export function ClientsAdmin() {
             or channel id. Sink URLs are used exactly as written — include
             the full path (e.g. <code className="font-mono">/v2/events</code>).
             For channel events, register on the{" "}
-            <Link to="/channels" className="text-gold-400 underline">Channels</Link>{" "}
+            <Link to="/channels" className="text-gold-400 underline">Channel Config</Link>{" "}
             page instead.
           </p>
 

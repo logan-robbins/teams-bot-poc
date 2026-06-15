@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { Moon, Plus, Trash2, Save, Phone, ExternalLink, Link2 } from "lucide-react";
+import { Moon, Trash2, Save } from "lucide-react";
 import { TopNav } from "./TopNav";
 import {
   bot,
@@ -8,15 +8,6 @@ import {
   type ConsumerConfig,
 } from "../lib/bot";
 
-/**
- * Per-channel consumer config admin page.
- *
- * The bot's EventFanoutDispatcher fans every event for a channel out
- * to every URL in that channel's consumer list. This page is the
- * operator UI for that list — pure CRUD over /api/channels/.../consumers.
- *
- * Internal/VPN deployment, no auth.
- */
 export function ChannelsAdmin() {
   const [channels, setChannels] = useState<ChannelAttachment[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -51,10 +42,10 @@ export function ChannelsAdmin() {
         </Link>
         <div className="flex flex-col leading-tight">
           <span className="font-serif text-lg font-medium text-ink-50">
-            Channel Consumers
+            Channel Config
           </span>
           <span className="font-mono text-[10px] uppercase tracking-widest text-ink-400">
-            alfred-events-v1 · per-channel routing
+            alfred-events-v2 · per-channel routing
           </span>
         </div>
         <TopNav onRefresh={() => void refresh()} />
@@ -62,30 +53,16 @@ export function ChannelsAdmin() {
 
       <main className="flex-1 overflow-auto px-6 py-8">
         <div className="mx-auto max-w-5xl">
-          <JoinByUrlPanel />
-
-          <p className="mt-8 text-sm text-ink-300">
-            Each row is one Teams channel Alfred is attached to.{" "}
-            <strong className="text-ink-100">
-              To receive a channel's events: Add consumer → give it any
-              name → paste your sink URL <em>including the path</em> (e.g.{" "}
-              <code className="font-mono">https://your-host/v2/events</code>)
-              → Save list.
-            </strong>{" "}
-            From that moment the bot POSTs every matching event for the
-            channel to that exact URL. Every <em>enabled</em> row receives
-            events (multiple rows = parallel delivery); an empty list falls
-            back to the default Alfred sink; a single disabled row silences
-            push delivery entirely. See{" "}
-            <a
-              href="https://github.com/logan-robbins/alfred-teams-bot/blob/main/docs/event-contract.md"
-              className="text-gold-400 underline"
-              target="_blank"
-              rel="noreferrer"
-            >
-              docs/event-contract.md
-            </a>{" "}
-            for the envelope shape.
+          <p className="text-sm text-ink-300">
+            Each row is one Teams channel Alfred is attached to. Paste a sink
+            URL and hit Save — the bot POSTs every matching event for that
+            channel to that URL. An empty list falls back to the default sink;
+            a single disabled row silences push entirely. For meeting-scoped
+            routing by person, use the{" "}
+            <Link to="/clients" className="text-gold-400 underline">
+              Meeting Config
+            </Link>{" "}
+            page instead.
           </p>
 
           {error ? (
@@ -132,9 +109,6 @@ function ChannelRow({
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [joining, setJoining] = useState(false);
-  const [joinMessage, setJoinMessage] = useState<string | null>(null);
-  const [autoJoin, setAutoJoin] = useState<boolean>(channel.auto_join_enabled !== false);
 
   async function load() {
     try {
@@ -152,58 +126,14 @@ function ChannelRow({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [channel.team_id, channel.channel_id]);
 
-  useEffect(() => {
-    setAutoJoin(channel.auto_join_enabled !== false);
-  }, [channel.auto_join_enabled]);
-
-  async function joinNow() {
-    setJoining(true);
-    setJoinMessage(null);
-    setError(null);
-    try {
-      const r = await bot.joinNow(channel.team_id, channel.channel_id);
-      setJoinMessage(
-        r.deferred
-          ? `Deferred (${r.join_mode}): ${r.message ?? "Waiting for Teams to invite Alfred."}`
-          : r.call_id
-            ? `Alfred is joining. callId=${r.call_id}`
-            : (r.message ?? "OK"),
-      );
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Join failed");
-    } finally {
-      setJoining(false);
-    }
-  }
-
-  async function toggleAutoJoin(next: boolean) {
-    const prev = autoJoin;
-    setAutoJoin(next);
-    setError(null);
-    try {
-      await bot.setAutoJoin(channel.team_id, channel.channel_id, next);
-    } catch (e) {
-      setAutoJoin(prev);
-      setError(e instanceof Error ? e.message : "Toggle failed");
-    }
-  }
-
   function patchConsumer(idx: number, patch: Partial<ConsumerConfig>) {
     setConsumers((prev) => prev.map((c, i) => (i === idx ? { ...c, ...patch } : c)));
-  }
-
-  function addBlank() {
-    setConsumers((prev) => [
-      ...prev,
-      { name: "", url: "", event_kinds: ["*"], enabled: true },
-    ]);
   }
 
   async function save() {
     setSaving(true);
     setError(null);
     try {
-      // Strip blank rows; trim names + urls.
       const cleaned = consumers
         .map((c) => ({ ...c, name: c.name.trim(), url: c.url.trim() }))
         .filter((c) => c.name.length > 0 && c.url.length > 0);
@@ -252,42 +182,6 @@ function ChannelRow({
         </div>
       </details>
 
-      <div className="mt-2">
-        <StatusPills channel={channel} />
-      </div>
-
-      <div className="mt-3 flex flex-wrap items-center gap-3 border-b border-ink-800 pb-3">
-        <Link
-          to={`/channels/inspect/${encodeURIComponent(channel.team_id)}/${encodeURIComponent(channel.channel_id)}`}
-          className="flex items-center gap-1 rounded-md bg-gold-500/20 px-3 py-1.5 text-xs text-gold-200 ring-1 ring-gold-500/40 hover:bg-gold-500/30"
-          title="Open per-channel command center"
-        >
-          <ExternalLink size={12} />
-          Open
-        </Link>
-        <button
-          type="button"
-          onClick={() => void joinNow()}
-          disabled={joining}
-          className="flex items-center gap-1 rounded-md bg-emerald-500/20 px-3 py-1.5 text-xs text-emerald-200 ring-1 ring-emerald-500/40 hover:bg-emerald-500/30 disabled:opacity-50"
-          title="Manually trigger Alfred to join the active channel meeting"
-        >
-          <Phone size={12} />
-          {joining ? "Joining…" : "Join now"}
-        </button>
-        <label className="flex items-center gap-2 text-xs text-ink-200">
-          <input
-            type="checkbox"
-            checked={autoJoin}
-            onChange={(e) => void toggleAutoJoin(e.target.checked)}
-          />
-          Auto-join meetings (fires on Teams "Meeting started" event)
-        </label>
-        {joinMessage ? (
-          <span className="font-mono text-[10px] text-emerald-300">{joinMessage}</span>
-        ) : null}
-      </div>
-
       {error ? (
         <div className="mt-3 rounded-md border border-crimson-500/40 bg-crimson-500/10 px-3 py-2 text-xs text-crimson-300">
           {error}
@@ -300,7 +194,7 @@ function ChannelRow({
         <div className="mt-3 space-y-2">
           {consumers.length === 0 ? (
             <div className="text-xs italic text-ink-400">
-              No consumers — events for this channel are dropped after raw audit.
+              No consumers — events fall back to the default sink.
             </div>
           ) : null}
           <table className="w-full table-fixed text-xs">
@@ -359,7 +253,6 @@ function ChannelRow({
                       type="button"
                       onClick={() => {
                         if (c.name && consumers.find((x, i) => i !== idx && x.name === c.name)) {
-                          // duplicate name — strip locally
                           setConsumers((prev) => prev.filter((_, i) => i !== idx));
                           return;
                         }
@@ -383,14 +276,6 @@ function ChannelRow({
           <div className="flex items-center gap-2 pt-2">
             <button
               type="button"
-              onClick={addBlank}
-              className="flex items-center gap-1 rounded-md border border-ink-700 bg-ink-950 px-3 py-1.5 text-xs text-ink-200 hover:bg-ink-800"
-            >
-              <Plus size={12} />
-              Add consumer
-            </button>
-            <button
-              type="button"
               disabled={saving}
               onClick={() => void save()}
               className="flex items-center gap-1 rounded-md bg-gold-500/20 px-3 py-1.5 text-xs text-gold-200 ring-1 ring-gold-500/40 hover:bg-gold-500/30 disabled:opacity-50"
@@ -412,152 +297,4 @@ function fmtTs(ts?: string): string {
   } catch {
     return ts;
   }
-}
-
-function StatusPills({ channel }: { channel: ChannelAttachment }) {
-  const sub = channel.subscription_id ? "ok" : "missing";
-  const autoJoinOn = channel.auto_join_enabled !== false;
-  const last = channel.last_auto_join_attempt;
-
-  const lastPill = last ? (
-    <span
-      className={
-        "inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] ring-1 " +
-        (last.status === "success"
-          ? "bg-emerald-500/15 text-emerald-200 ring-emerald-500/30"
-          : last.status === "failure"
-            ? "bg-crimson-500/15 text-crimson-200 ring-crimson-500/30"
-            : "bg-gold-500/15 text-gold-200 ring-gold-500/30")
-      }
-      title={
-        last.error_message
-          ? `${last.status} via ${last.trigger} · ${last.error_code ?? ""} ${last.error_message}`
-          : `${last.status} via ${last.trigger}`
-      }
-    >
-      last join: {last.status} ({fmtRelative(last.ts)})
-    </span>
-  ) : (
-    <span className="inline-flex items-center gap-1 rounded bg-ink-800/40 px-1.5 py-0.5 text-[10px] text-ink-400 ring-1 ring-ink-700">
-      no join attempts yet
-    </span>
-  );
-
-  return (
-    <div className="flex flex-wrap items-center gap-1.5">
-      <span
-        className={
-          "inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] ring-1 " +
-          (sub === "ok"
-            ? "bg-emerald-500/15 text-emerald-200 ring-emerald-500/30"
-            : "bg-gold-500/15 text-gold-200 ring-gold-500/30")
-        }
-      >
-        sub: {sub}
-      </span>
-      <span
-        className={
-          "inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] ring-1 " +
-          (autoJoinOn
-            ? "bg-emerald-500/15 text-emerald-200 ring-emerald-500/30"
-            : "bg-ink-800/40 text-ink-300 ring-ink-700")
-        }
-      >
-        auto-join: {autoJoinOn ? "on" : "off"}
-      </span>
-      {lastPill}
-    </div>
-  );
-}
-
-function fmtRelative(ts?: string): string {
-  if (!ts) return "?";
-  const t = new Date(ts).getTime();
-  if (Number.isNaN(t)) return ts;
-  const diff = Date.now() - t;
-  if (diff < 60_000) return `${Math.round(diff / 1000)}s ago`;
-  if (diff < 3_600_000) return `${Math.round(diff / 60_000)}m ago`;
-  if (diff < 86_400_000) return `${Math.round(diff / 3_600_000)}h ago`;
-  return `${Math.round(diff / 86_400_000)}d ago`;
-}
-
-/**
- * Join any Teams meeting by URL. No channel attachment required — drives
- * POST /api/calling/join, which is the same Graph Communications
- * Calls.AddAsync path that channel auto-join uses, just keyed off a
- * raw join URL. Useful for one-off meetings the user wants Alfred in
- * without going through a team install.
- */
-function JoinByUrlPanel() {
-  const [url, setUrl] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  async function join() {
-    const trimmed = url.trim();
-    if (!trimmed) {
-      setError("Paste a Teams meeting join URL.");
-      return;
-    }
-    setBusy(true);
-    setResult(null);
-    setError(null);
-    try {
-      const r = await bot.joinMeetingByUrl(trimmed);
-      setResult(
-        r.deferred
-          ? `Deferred (${r.joinMode ?? "?"}): ${r.message ?? "Alfred will join when the meeting starts."}`
-          : r.callId
-            ? `Joining. callId=${r.callId}${r.joinMode ? ` mode=${r.joinMode}` : ""}`
-            : (r.message ?? "OK"),
-      );
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Join failed");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <section className="rounded-md border border-ink-800 bg-ink-900/40 px-4 py-3">
-      <div className="flex items-center gap-2">
-        <Link2 size={14} className="text-gold-400" />
-        <h2 className="font-serif text-base text-ink-100">Join a meeting by URL</h2>
-      </div>
-      <p className="mt-1 text-xs text-ink-400">
-        Drop Alfred into a one-off meeting without installing him in a
-        channel. Same code path as channel auto-join (Graph Communications{" "}
-        <code className="font-mono">Calls.AddAsync</code>) — needs the
-        tenant <code className="font-mono">CsApplicationAccessPolicy</code>{" "}
-        grant and either the meeting's RSC or admin-consented{" "}
-        <code className="font-mono">Calls.JoinGroupCall.All</code>.
-      </p>
-      <div className="mt-3 flex flex-wrap items-center gap-2">
-        <input
-          type="url"
-          value={url}
-          onChange={(e) => setUrl(e.target.value)}
-          placeholder="https://teams.microsoft.com/l/meetup-join/..."
-          className="min-w-[28rem] flex-1 rounded border border-ink-700 bg-ink-950 px-3 py-1.5 font-mono text-xs text-ink-100"
-          disabled={busy}
-        />
-        <button
-          type="button"
-          onClick={() => void join()}
-          disabled={busy || url.trim().length === 0}
-          className="flex items-center gap-1 rounded-md bg-emerald-500/20 px-3 py-1.5 text-xs text-emerald-200 ring-1 ring-emerald-500/40 hover:bg-emerald-500/30 disabled:opacity-50"
-        >
-          <Phone size={12} />
-          {busy ? "Joining…" : "Join"}
-        </button>
-      </div>
-      {result ? (
-        <p className="mt-2 font-mono text-[10px] text-emerald-300">{result}</p>
-      ) : null}
-      {error ? (
-        <p className="mt-2 font-mono text-[10px] text-crimson-300">{error}</p>
-      ) : null}
-    </section>
-  );
 }
