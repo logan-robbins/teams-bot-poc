@@ -208,6 +208,63 @@ async def test_live_final_utterances_batch_before_reflection(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_dynamodb_proposal_conflicts_with_postgres_context_and_uses_chat_tool(tmp_path):
+    app = create_app(IntentStore(tmp_path))
+    base = {
+        "schema_version": "alfred-v2",
+        "event_type": "meeting.transcript.final",
+        "ts": "2026-06-17T20:06:00Z",
+        "conversation_reference_id": "19:meeting_demo@thread.v2",
+        "meeting_ref": {
+            "meeting_id": "19:meeting_demo@thread.v2",
+            "meeting_chat_thread_id": "19:meeting_demo@thread.v2",
+        },
+    }
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await client.post(
+            "/v2/events",
+            json={
+                **base,
+                "event_id": "speech-postgres",
+                "payload": {
+                    "speaker": {"id": "speaker_0"},
+                    "text": "We decided to use Postgres for the durable ledger.",
+                },
+            },
+        )
+        await client.post("/reflect/flush")
+        await client.post(
+            "/v2/events",
+            json={
+                **base,
+                "event_id": "speech-dynamodb",
+                "payload": {
+                    "speaker": {"id": "speaker_0"},
+                    "text": "What kind of database should we use? I think we should be using Dynamo DB.",
+                },
+            },
+        )
+        flushed = await client.post("/reflect/flush")
+        state = await client.get("/state")
+
+    analyses = flushed.json()["analyses"]
+    assert len(analyses) == 1
+    analysis = analyses[0]
+    assert analysis["alignment_state"] == "possible_misalignment"
+    assert analysis["next_action"] == "respond"
+    assert "already decided on Postgres" in analysis["response_text"]
+    assert "DynamoDB" in analysis["response_text"]
+    assert analysis["chat_posted"] is True
+    assert analysis["tool_calls"][0]["tool_name"] == "send_to_meeting_chat"
+    assert analysis["context_observation_count"] == 2
+    assert any(signal["kind"] == "contradiction" for signal in analysis["signals"])
+    rolling = state.json()["rolling"][0]
+    assert rolling["total_context_observations"] == 2
+    assert [row["event_id"] for row in rolling["observations"]] == ["speech-postgres", "speech-dynamodb"]
+
+
+@pytest.mark.asyncio
 async def test_official_transcript_is_not_realtime_input(tmp_path):
     app = create_app(IntentStore(tmp_path))
     envelope = {

@@ -27,16 +27,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from meeting_agent.session import InterviewSessionManager
+from meeting_agent.tools import AlfredAgentContext, SendResult, send_to_meeting_chat_impl
+
 
 DATA_DIR = Path(os.environ.get("INTENT_DATA_DIR", "/tmp/alfred-intent")).expanduser()
-SPEECH_REFLECT_SECONDS = float(os.environ.get("INTENT_SPEECH_REFLECT_SECONDS", "12"))
-CHAT_REFLECT_SECONDS = float(os.environ.get("INTENT_CHAT_REFLECT_SECONDS", "2"))
+SPEECH_REFLECT_SECONDS = float(os.environ.get("INTENT_SPEECH_REFLECT_SECONDS", "1"))
+CHAT_REFLECT_SECONDS = float(os.environ.get("INTENT_CHAT_REFLECT_SECONDS", "1"))
 MAX_REFLECT_BATCH = int(os.environ.get("INTENT_MAX_REFLECT_BATCH", "12"))
+ROLLING_BUFFER_SIZE = int(os.environ.get("INTENT_ROLLING_BUFFER_SIZE", "60"))
 SEND_CHAT_URL = (os.environ.get("INTENT_SEND_CHAT_URL") or os.environ.get("BOT_SEND_CHAT_URL") or "").strip()
 TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_.-]*", re.IGNORECASE)
 STOPWORDS = {
@@ -133,6 +136,9 @@ class IntentAnalysis(BaseModel):
     next_action: Literal["keep_listening", "persist_memory", "retrieve_context", "respond"] = "keep_listening"
     search_queries: list[str] = Field(default_factory=list)
     response_text: str | None = None
+    context_text: str | None = None
+    context_observation_count: int = 0
+    tool_calls: list[dict[str, Any]] = Field(default_factory=list)
     chat_posted: bool = False
     chat_post_error: str | None = None
 
@@ -570,6 +576,36 @@ CONTRADICTION_PATTERNS = (
     "do not need",
 )
 CONFIRMATION_PATTERNS = ("agreed", "+1", "sounds good", "yes", "confirmed", "that works")
+STACK_CHANGE_PATTERNS = (
+    "should use",
+    "should be using",
+    "think we should",
+    "i think we should",
+    "use ",
+    "using ",
+    "go with",
+    "switch to",
+    "move to",
+    "instead",
+)
+DATABASE_ALIASES: dict[str, tuple[str, ...]] = {
+    "postgres": ("postgres", "postgresql"),
+    "dynamodb": ("dynamodb", "dynamo db"),
+    "sqlite": ("sqlite", "sqllite"),
+    "mysql": ("mysql", "my sql"),
+    "sqlserver": ("sql server", "sqlserver", "mssql"),
+    "cosmosdb": ("cosmos db", "cosmosdb"),
+    "mongodb": ("mongodb", "mongo db"),
+}
+DATABASE_LABELS = {
+    "postgres": "Postgres",
+    "dynamodb": "DynamoDB",
+    "sqlite": "SQLite",
+    "mysql": "MySQL",
+    "sqlserver": "SQL Server",
+    "cosmosdb": "Cosmos DB",
+    "mongodb": "MongoDB",
+}
 
 
 def _contains_any(text: str, patterns: tuple[str, ...]) -> bool:
@@ -584,10 +620,54 @@ def _looks_contradictory(text: str) -> bool:
     return _contains_any(text, CONTRADICTION_PATTERNS)
 
 
+def _mentioned_databases(text: str | None) -> set[str]:
+    lower = (text or "").lower()
+    return {
+        canonical
+        for canonical, aliases in DATABASE_ALIASES.items()
+        if any(alias in lower for alias in aliases)
+    }
+
+
+def _hit_text(hit: SearchHit) -> str:
+    return f"{hit.title}\n{hit.summary}\n{hit.text}"
+
+
+def _database_conflict(
+    text: str,
+    hits: list[SearchHit],
+    context_text: str | None = None,
+) -> tuple[str, str, SearchHit | None] | None:
+    proposed = _mentioned_databases(text)
+    if not proposed:
+        return None
+    if not (_contains_any(text, STACK_CHANGE_PATTERNS) or _contains_any(text, QUESTION_PATTERNS)):
+        return None
+
+    indexed_context = "\n".join(_hit_text(hit) for hit in hits)
+    known = _mentioned_databases(indexed_context)
+    known.update(_mentioned_databases(context_text) - proposed)
+    conflicts = known - proposed
+    if not conflicts:
+        return None
+
+    known_choice = "postgres" if "postgres" in conflicts else sorted(conflicts)[0]
+    proposed_choice = "dynamodb" if "dynamodb" in proposed else sorted(proposed)[0]
+    if known_choice == proposed_choice:
+        return None
+
+    conflict_hit = next(
+        (hit for hit in hits if known_choice in _mentioned_databases(_hit_text(hit))),
+        hits[0] if hits else None,
+    )
+    return known_choice, proposed_choice, conflict_hit
+
+
 def _is_search_worthy(text: str, direct_address: bool) -> bool:
     return (
         direct_address
         or "remember" in text.lower()
+        or bool(_mentioned_databases(text))
         or _contains_any(text, DECISION_PATTERNS)
         or _contains_any(text, ACTION_PATTERNS)
         or _contains_any(text, RISK_PATTERNS)
@@ -624,6 +704,7 @@ def analyze_intent(
     store: IntentStore,
     *,
     text: str,
+    context_text: str | None = None,
     speaker: str | None = None,
     meeting_id: str | None = None,
     thread_id: str | None = None,
@@ -636,8 +717,10 @@ def analyze_intent(
     if not body:
         raise ValueError("text is required")
 
-    hits = store.search(body, limit=6)
+    retrieval_text = _reflection_text(body, context_text)
+    hits = store.search(retrieval_text, limit=6)
     signals: list[IntentSignal] = []
+    database_conflict = _database_conflict(body, hits, context_text)
 
     if _contains_any(body, DECISION_PATTERNS):
         signals.append(_signal_from_hits("decision", 0.78, "Statement looks like a decision or proposed direction.", hits))
@@ -649,6 +732,20 @@ def analyze_intent(
         signals.append(_signal_from_hits("open_question", 0.65, "Statement asks for missing alignment context.", hits))
     if _looks_contradictory(body) and hits:
         signals.append(_signal_from_hits("contradiction", 0.82, "Statement may conflict with indexed source or memory context.", hits))
+    if database_conflict is not None:
+        known_choice, proposed_choice, conflict_hit = database_conflict
+        source_ids = [conflict_hit.id] if conflict_hit is not None else []
+        signals.append(
+            IntentSignal(
+                kind="contradiction",
+                confidence=0.86,
+                evidence=(
+                    f"Statement proposes {DATABASE_LABELS[proposed_choice]} while known context "
+                    f"points to {DATABASE_LABELS[known_choice]}."
+                ),
+                source_ids=source_ids,
+            )
+        )
     if _contains_any(body, CONFIRMATION_PATTERNS) and hits:
         signals.append(_signal_from_hits("confirmation", 0.7, "Statement appears to confirm indexed context.", hits))
 
@@ -702,6 +799,7 @@ def analyze_intent(
         signals=signals,
         hits=hits,
         persisted_memory=memory,
+        context_text=(context_text or None),
     )
     if record:
         return store.append_analysis(analysis)
@@ -716,6 +814,18 @@ def _conversation_key(observation: Observation) -> str:
     return "global"
 
 
+def _observation_snapshot(observation: Observation) -> dict[str, Any]:
+    return {
+        "received_at_utc": observation.received_at_utc,
+        "event_id": observation.event_id,
+        "event_type": observation.event_type,
+        "modality": observation.modality,
+        "speaker": observation.speaker,
+        "direct_address": observation.direct_address,
+        "text": observation.text,
+    }
+
+
 def _format_observation_text(observations: list[Observation]) -> str:
     lines: list[str] = []
     for obs in observations:
@@ -724,27 +834,31 @@ def _format_observation_text(observations: list[Observation]) -> str:
     return "\n".join(lines)
 
 
-def _search_queries_for_text(text: str) -> list[str]:
-    tokens = [t for t in _tokens(text) if len(t) > 2]
-    unique: list[str] = []
-    for token in tokens:
-        if token not in unique:
-            unique.append(token)
-    if not unique:
-        return []
-    queries = [" ".join(unique[:8])]
-    if len(unique) > 8:
-        queries.append(" ".join(unique[8:16]))
-    return queries
+def _format_context_text(observations: list[Observation]) -> str:
+    useful = [obs for obs in observations if not obs.from_bot and obs.text.strip()]
+    return _format_observation_text(useful)
 
 
-def _status_topic(search_queries: list[str], text: str) -> str:
-    if search_queries:
-        return search_queries[0]
+def _reflection_text(current_text: str, context_text: str | None) -> str:
+    context = (context_text or "").strip()
+    current = current_text.strip()
+    if not context or context == current:
+        return current
+    return f"Conversation so far:\n{context}\n\nLatest observations:\n{current}"
+
+
+def _compact_topic(text: str, limit: int = 140) -> str:
     compact = " ".join(text.split())
-    if len(compact) <= 80:
+    if len(compact) <= limit:
         return compact
-    return compact[:77].rstrip() + "..."
+    return compact[: limit - 3].rstrip() + "..."
+
+
+def _status_topic(observations: list[Observation], fallback: str) -> str:
+    spoken = " ".join(obs.text.strip() for obs in observations if obs.text.strip())
+    if spoken:
+        return _compact_topic(spoken)
+    return _compact_topic(fallback)
 
 
 def _importance_for(signals: list[IntentSignal], direct_address: bool) -> Literal["low", "medium", "high"]:
@@ -758,6 +872,14 @@ def _importance_for(signals: list[IntentSignal], direct_address: bool) -> Litera
 
 def _response_for(analysis: IntentAnalysis, direct_address: bool) -> str | None:
     top_hit = analysis.hits[0] if analysis.hits else None
+    database_conflict = _database_conflict(analysis.text, analysis.hits, analysis.context_text)
+    if database_conflict is not None:
+        known_choice, proposed_choice, _hit = database_conflict
+        return (
+            "Quick check: I have prior context that we already decided on "
+            f"{DATABASE_LABELS[known_choice]}. Are we intentionally changing that to "
+            f"{DATABASE_LABELS[proposed_choice]}?"
+        )
     if any(signal.kind == "contradiction" for signal in analysis.signals) and top_hit is not None:
         return (
             f"Quick check: I have prior context saying {top_hit.summary} "
@@ -770,37 +892,51 @@ def _response_for(analysis: IntentAnalysis, direct_address: bool) -> str | None:
     return None
 
 
-async def _post_chat_response(
+def _build_tool_context(
+    observations: list[Observation],
     *,
     send_chat_url: str,
-    conversation_reference_id: str | None,
+    trigger_text: str,
+) -> AlfredAgentContext:
+    latest = observations[-1]
+    conversation_reference_id = next(
+        (obs.conversation_reference_id for obs in reversed(observations) if obs.conversation_reference_id),
+        None,
+    )
+    chat_thread_id = conversation_reference_id or latest.meeting_id or latest.thread_id
+    manager = InterviewSessionManager()
+    session = manager.start_session(
+        candidate_name="Intent Alignment",
+        meeting_url="alfred-v2-live-event",
+        chat_thread_id=chat_thread_id,
+    )
+    session.conversation_reference_id = conversation_reference_id or chat_thread_id
+    session.graph_chat_thread_id = chat_thread_id
+    return AlfredAgentContext(
+        session_manager=manager,
+        send_chat_url=send_chat_url or None,
+        trigger_text=trigger_text,
+    )
+
+
+async def _send_chat_response_with_tool(
+    *,
+    send_chat_url: str,
+    observations: list[Observation],
     text: str | None,
-) -> tuple[bool, str | None]:
+) -> tuple[bool, str | None, list[dict[str, Any]]]:
     if not text:
-        return False, None
-    if not send_chat_url:
-        return False, "INTENT_SEND_CHAT_URL is not configured"
-    if not conversation_reference_id:
-        return False, "conversation_reference_id missing"
-    payload = {
-        "conversation_reference_id": conversation_reference_id,
-        "text": text,
-        "action": "SEND",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.post(send_chat_url, json=payload)
-        if response.status_code >= 400:
-            return False, f"HTTP {response.status_code}: {response.text[:160]}"
-    except Exception as exc:  # noqa: BLE001 - chat send failures are recorded on the analysis.
-        return False, f"transport: {exc!s}"
-    return True, None
+        return False, None, []
+    context = _build_tool_context(observations, send_chat_url=send_chat_url, trigger_text=text)
+    result: SendResult = await send_to_meeting_chat_impl(context, text=text, kind="statement")
+    return result.ok, result.reason, [record.model_dump(mode="json") for record in context.tool_records]
 
 
 async def reflect_observations(
     store: IntentStore,
     observations: list[Observation],
     *,
+    context_observations: list[Observation] | None = None,
     send_chat_url: str = "",
     persist_memory: bool | None = None,
     activity_log: ActivityLog | None = None,
@@ -810,12 +946,13 @@ async def reflect_observations(
         return None
 
     combined_text = _format_observation_text(useful)
+    context_text = _format_context_text(context_observations or useful)
     direct_address = any(obs.direct_address for obs in useful)
     latest = useful[-1]
-    search_queries = _search_queries_for_text(combined_text)
+    search_queries = [_status_topic(useful, combined_text)]
     if activity_log is not None:
         if _is_search_worthy(combined_text, direct_address):
-            topic = _status_topic(search_queries, combined_text)
+            topic = search_queries[0]
             activity_log.append(
                 ActivityRecord(
                     kind="status",
@@ -842,6 +979,7 @@ async def reflect_observations(
     analysis = analyze_intent(
         store,
         text=combined_text,
+        context_text=context_text,
         speaker=latest.speaker if len(useful) == 1 else None,
         meeting_id=latest.meeting_id,
         thread_id=latest.thread_id,
@@ -851,6 +989,9 @@ async def reflect_observations(
         record=False,
     )
     analysis.observation_count = len(useful)
+    analysis.context_observation_count = len(
+        [obs for obs in (context_observations or useful) if not obs.from_bot and obs.text.strip()]
+    )
     analysis.search_queries = search_queries
     analysis.importance = _importance_for(analysis.signals, direct_address)
     analysis.response_text = _response_for(analysis, direct_address)
@@ -865,17 +1006,14 @@ async def reflect_observations(
         analysis.next_action = "keep_listening"
 
     if analysis.next_action == "respond":
-        conversation_reference_id = next(
-            (obs.conversation_reference_id for obs in reversed(useful) if obs.conversation_reference_id),
-            None,
-        )
-        posted, error = await _post_chat_response(
+        posted, error, tool_calls = await _send_chat_response_with_tool(
             send_chat_url=send_chat_url,
-            conversation_reference_id=conversation_reference_id,
+            observations=useful,
             text=analysis.response_text,
         )
         analysis.chat_posted = posted
         analysis.chat_post_error = error
+        analysis.tool_calls = tool_calls
 
     store.append_analysis(analysis)
     if activity_log is not None:
@@ -907,6 +1045,7 @@ class ReflectionLoop:
         speech_delay_seconds: float = SPEECH_REFLECT_SECONDS,
         chat_delay_seconds: float = CHAT_REFLECT_SECONDS,
         max_batch: int = MAX_REFLECT_BATCH,
+        rolling_buffer_size: int = ROLLING_BUFFER_SIZE,
     ) -> None:
         self.store = store
         self.send_chat_url = send_chat_url
@@ -914,7 +1053,10 @@ class ReflectionLoop:
         self.speech_delay_seconds = max(0.1, speech_delay_seconds)
         self.chat_delay_seconds = max(0.1, chat_delay_seconds)
         self.max_batch = max(1, max_batch)
+        self.rolling_buffer_size = max(1, rolling_buffer_size)
         self._pending: dict[str, list[Observation]] = {}
+        self._history: dict[str, list[Observation]] = {}
+        self._rolling: dict[str, deque[Observation]] = {}
         self._timers: dict[str, asyncio.Task] = {}
         self._lock = asyncio.Lock()
 
@@ -929,23 +1071,22 @@ class ReflectionLoop:
                 conversations.append(
                     {
                         "key": key,
-                        "observations": [
-                            {
-                                "received_at_utc": row.received_at_utc,
-                                "event_id": row.event_id,
-                                "event_type": row.event_type,
-                                "modality": row.modality,
-                                "speaker": row.speaker,
-                                "direct_address": row.direct_address,
-                                "text": row.text,
-                            }
-                            for row in rows
-                        ],
+                        "observations": [_observation_snapshot(row) for row in rows],
+                    }
+                )
+            rolling = []
+            for key, rows in sorted(self._rolling.items()):
+                rolling.append(
+                    {
+                        "key": key,
+                        "observations": [_observation_snapshot(row) for row in rows],
+                        "total_context_observations": len(self._history.get(key, [])),
                     }
                 )
             return {
                 "count": sum(len(row["observations"]) for row in conversations),
                 "conversations": conversations,
+                "rolling": rolling,
             }
 
     async def submit_many(self, observations: list[Observation]) -> dict[str, int]:
@@ -963,6 +1104,10 @@ class ReflectionLoop:
         key = _conversation_key(observation)
         immediate = observation.direct_address or _looks_contradictory(observation.text)
         async with self._lock:
+            history = self._history.setdefault(key, [])
+            history.append(observation)
+            rolling = self._rolling.setdefault(key, deque(maxlen=self.rolling_buffer_size))
+            rolling.append(observation)
             pending = self._pending.setdefault(key, [])
             pending.append(observation)
             should_flush = (
@@ -996,12 +1141,14 @@ class ReflectionLoop:
     async def flush_key(self, key: str) -> IntentAnalysis | None:
         async with self._lock:
             observations = self._pending.pop(key, [])
+            context_observations = list(self._history.get(key, []))
             self._cancel_timer_locked(key)
         if not observations:
             return None
         return await reflect_observations(
             self.store,
             observations,
+            context_observations=context_observations,
             send_chat_url=self.send_chat_url,
             activity_log=self.activity_log,
         )
@@ -1249,6 +1396,10 @@ def _monitor_html() -> str:
           <h2>Pending Observations</h2>
           <div class="list" id="pending"></div>
         </div>
+        <div class="panel">
+          <h2>Rolling Context</h2>
+          <div class="list" id="rolling"></div>
+        </div>
       </div>
       <div class="stack">
         <div class="panel">
@@ -1276,6 +1427,7 @@ def _monitor_html() -> str:
       streamStatus: document.getElementById("stream-status"),
       analyses: document.getElementById("analyses"),
       pending: document.getElementById("pending"),
+      rolling: document.getElementById("rolling"),
       memories: document.getElementById("memories"),
       sources: document.getElementById("sources"),
       updatedAt: document.getElementById("updated-at"),
@@ -1365,6 +1517,24 @@ def _monitor_html() -> str:
       });
     }
 
+    function renderRolling(rows) {
+      els.rolling.replaceChildren();
+      if (!rows.length) {
+        els.rolling.appendChild(empty("No rolling context yet."));
+        return;
+      }
+      rows.forEach((conversation) => {
+        const item = el("article", "item");
+        item.appendChild(el("h3", null, conversation.key));
+        item.appendChild(el("p", "muted small", `${conversation.total_context_observations || 0} total observations`));
+        (conversation.observations || []).forEach((obs) => {
+          item.appendChild(el("p", "muted small", `${obs.received_at_utc || ""} | ${obs.modality || ""} | ${obs.speaker || "unknown"}`));
+          item.appendChild(el("p", "text", obs.text || ""));
+        });
+        els.rolling.appendChild(item);
+      });
+    }
+
     function renderMemories(rows) {
       els.memories.replaceChildren();
       if (!rows.length) {
@@ -1411,6 +1581,7 @@ def _monitor_html() -> str:
       renderAnalyses(state.analyses || []);
       renderActivity(state.activity || []);
       renderPending(state.pending || { conversations: [] });
+      renderRolling(state.rolling || []);
       renderMemories(state.memories || []);
       renderSources((state.source_overview || {}).sources || []);
     }
@@ -1482,8 +1653,11 @@ async def _state_payload(
         "speech_reflect_seconds": reflector.speech_delay_seconds,
         "chat_reflect_seconds": reflector.chat_delay_seconds,
         "max_reflect_batch": reflector.max_batch,
+        "rolling_buffer_size": reflector.rolling_buffer_size,
         "send_chat_configured": bool(reflector.send_chat_url),
         "pending": pending,
+        "rolling": pending["rolling"],
+        "rolling_observations": sum(len(row["observations"]) for row in pending["rolling"]),
         "activity": [row.model_dump(mode="json") for row in recent_activity],
         "analyses": [row.model_dump(mode="json") for row in recent_analyses],
         "memories": [row.model_dump(mode="json") for row in recent_memories],
@@ -1588,15 +1762,11 @@ def create_app(store: IntentStore | None = None) -> FastAPI:
     async def prompt_policy() -> dict[str, Any]:
         return {
             "role": "Intent Alignment real-time reflector",
-            "cadence": {
-                "speech": (
-                    "Reflect after the live speech stream has been quiet for "
-                    f"{reflector.speech_delay_seconds:g}s, or sooner on direct address, "
-                    "contradiction-like language, or max batch."
-                ),
-                "chat": (
-                    "Reflect after a short chat burst quiets for "
-                    f"{reflector.chat_delay_seconds:g}s, or immediately on direct address."
+            "mechanical_controls": {
+                "speech": "Azure Speech emits live final utterance segments after 3s silence or a 20s maximum segment duration.",
+                "reflection": (
+                    "The sink schedules reflection with per-conversation asyncio timers before any analysis runs; "
+                    "the analyzer does not decide how long to wait."
                 ),
             },
             "default_action": "keep_listening",

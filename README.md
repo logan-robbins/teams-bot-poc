@@ -419,7 +419,7 @@ Pair with §7.4's consumer-isolation trick if you also need to prevent your sink
 
 ### 7.5.1 Intent Alignment prototype consumer
 
-`python/intent.py` is a lightweight variant of the sink focused on Intent Alignment detection rather than the full Alfred dossier. It consumes the same `alfred-v2` `POST /v2/events` contract, but the real-time loop is built around live Azure Speech `meeting.transcript.final` finalized utterance segments and live chat. It searches immutable sample source documents plus persisted JSONL memories, reflects after a short speech/chat quiet window, emits an alignment readout, and persists memory-worthy statements. `meeting.transcript.final` is not every raw audio frame or interim hypothesis; `meeting.transcript.partial` is the interim/progress event and is throttled before consumer fanout by default. The bot currently uses Azure Speech `Speech_SegmentationSilenceTimeoutMs=500` so final segments are less likely to split mid-sentence while still arriving quickly enough for real-time awareness. `meeting.transcript.official` is post-meeting Graph output and is intentionally not used for mid-conversation awareness.
+`python/intent.py` is a lightweight variant of the sink focused on Intent Alignment detection rather than the full Alfred dossier. It consumes the same `alfred-v2` `POST /v2/events` contract, but the real-time loop is built around live Azure Speech `meeting.transcript.final` finalized utterance segments and live chat. It searches immutable sample source documents plus persisted JSONL memories, reflects after a short speech/chat quiet window, emits an alignment readout, and persists memory-worthy statements. `meeting.transcript.final` is not every raw audio frame or interim hypothesis; `meeting.transcript.partial` is the interim/progress event and is throttled before consumer fanout by default. The bot currently uses Azure Speech time-based segmentation with `Speech_SegmentationSilenceTimeoutMs=3000` and `Speech_SegmentationMaximumTimeMs=20000`, so live final segments emit after a 3s pause or a 20s uninterrupted speech cap. `meeting.transcript.official` is post-meeting Graph output and is intentionally not used for mid-conversation awareness.
 
 Run locally:
 ```bash
@@ -444,23 +444,24 @@ docker run --rm -p 8765:8765 -v "$PWD/.intent-data:/data" alfred-intent
 ```
 
 Useful endpoints:
-- `GET /ui` and `/` — browser monitor for streamed live speech/chat activity, agent status lines, pending observations, recent analyses, memories, and source overview.
-- `GET /state` — JSON snapshot used by the monitor.
+- `GET /ui` and `/` — browser monitor for streamed live speech/chat activity, agent status lines, pending observations, rolling context, recent analyses, memories, and source overview.
+- `GET /state` — JSON snapshot used by the monitor; includes pending observations plus the per-conversation rolling context buffer and total retained context count.
 - `GET /stream` — Server-Sent Events stream; emits an initial `snapshot` event and live `activity` events for observations, agent search status, ignored events, and analyses.
 - `POST /v2/events` / `/events` — queue live speech/chat observations.
 - `POST /reflect/flush` — force pending observations to reflect immediately; useful for tests and demos.
 - `POST /analyze` — manual text analysis: `{"text":"We decided to keep Postgres"}`.
-- `GET /prompt` — current reflection cadence and speak-only policy.
+- `GET /prompt` — operator-readable mechanical controls and speak-only policy; timing is enforced by Azure Speech segmentation and sink timers before analysis runs.
 - `GET /sources` — rough source/index overview.
 - `GET /search?q=postgres%20sqlite` — inspect source + memory hits.
 - `GET /memories` and `POST /memories` — inspect or seed persisted memories.
 - `GET /analyses` — recent alignment outputs.
 
 Runtime knobs:
-- `INTENT_SPEECH_REFLECT_SECONDS` — live speech quiet-window before reflection; default `12`.
-- `INTENT_CHAT_REFLECT_SECONDS` — chat burst quiet-window before reflection; default `2`.
+- `INTENT_SPEECH_REFLECT_SECONDS` — quiet-window after a live speech final arrives before reflection; default `1`.
+- `INTENT_CHAT_REFLECT_SECONDS` — chat burst quiet-window before reflection; default `1`.
 - `INTENT_MAX_REFLECT_BATCH` — max observations before immediate reflection; default `12`.
-- `INTENT_SEND_CHAT_URL` or `BOT_SEND_CHAT_URL` — optional `$BOT/api/send-chat` endpoint for real chat responses.
+- `INTENT_ROLLING_BUFFER_SIZE` — number of recent observations shown per conversation in `/state` and `/ui`; default `60`. Full in-process conversation context is still retained for reflection.
+- `INTENT_SEND_CHAT_URL` or `BOT_SEND_CHAT_URL` — optional `$BOT/api/send-chat` endpoint for real chat responses. When configured, intent responses use the canonical `send_to_meeting_chat` tool path; without it, the tool records a dry-run just like the main agent.
 
 Register it like any other consumer:
 ```bash

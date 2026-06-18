@@ -134,14 +134,15 @@ public sealed partial class AzureConversationTranscriber : IRealtimeTranscriber
             PropertyId.SpeechServiceResponse_DiarizeIntermediateResults,
             "true");
 
-        // Latency tuning: keep the silence-to-end-of-utterance threshold
-        // at 500ms so final segments are less likely to fragment
-        // mid-sentence while still arriving quickly enough for
-        // mid-conversation awareness.
-        // Source: Azure Speech docs — Speech_SegmentationSilenceTimeoutMs
+        // Latency tuning: finalize on a natural 3s pause, but force a
+        // segment at 20s so uninterrupted speech still reaches live
+        // consumers. 20s is the supported lower bound for the max-time
+        // segmentation property.
+        speechConfig.SetProperty("Speech_SegmentationStrategy", "Time");
         speechConfig.SetProperty(
             PropertyId.Speech_SegmentationSilenceTimeoutMs,
-            "500");
+            "3000");
+        speechConfig.SetProperty("Speech_SegmentationMaximumTimeMs", "20000");
 
         // Optional: Custom Speech model endpoint
         if (_endpointId is not null)
