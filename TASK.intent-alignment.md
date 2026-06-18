@@ -10,5 +10,5 @@
 10. [completed] Clarify that `meeting.transcript.final` means a finalized live STT utterance segment, not every raw STT/interim chunk.
 11. [completed] Change Azure Speech final-utterance segmentation silence timeout from 200ms to 500ms.
 12. [completed] Verify Python intent consumer, Docker image, and C# compile surface where possible.
-13. [pending] Publish the intent consumer endpoint and record the public `/v2/events` URL.
+13. [completed] Publish the intent consumer endpoint and record the public `/v2/events` URL.
 14. [completed] Update README with the 500ms segmentation note.

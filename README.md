@@ -427,6 +427,11 @@ cd python
 INTENT_DATA_DIR=/tmp/alfred-intent uv run uvicorn intent:app --host 0.0.0.0 --port 8765
 ```
 
+Live Disney sandbox endpoint:
+```text
+https://ca-alfred-intent.gentlewater-5aa74a73.eastus.azurecontainerapps.io/v2/events
+```
+
 Container:
 ```bash
 docker build -t alfred-intent -f python/Dockerfile.intent python/
