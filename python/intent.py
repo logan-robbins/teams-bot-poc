@@ -885,6 +885,14 @@ def _response_for(analysis: IntentAnalysis, direct_address: bool) -> str | None:
             f"Quick check: I have prior context saying {top_hit.summary} "
             "Are we intentionally changing that direction?"
         )
+    if any(signal.kind == "contradiction" for signal in analysis.signals):
+        contradiction = next(signal for signal in analysis.signals if signal.kind == "contradiction")
+        return (
+            f"Quick check: I heard a possible conflict: {contradiction.evidence} "
+            "Are we intentionally changing direction?"
+        )
+    if analysis.alignment_state == "possible_misalignment":
+        return "Quick check: I heard a possible conflict with prior intent. Are we intentionally changing direction?"
     if direct_address and top_hit is not None:
         return f"I found relevant context: {top_hit.summary}"
     if direct_address:

@@ -438,6 +438,7 @@ https://ca-alfred-intent.gentlewater-5aa74a73.eastus.azurecontainerapps.io/ui
 ```
 
 The live `ca-alfred-intent` Container App sets `INTENT_SEND_CHAT_URL=https://alfred-disney-bot.eastus.cloudapp.azure.com/api/send-chat`, so responses use the same `send_to_meeting_chat` tool path as the main Alfred agent. A real Teams post still requires the bot to have captured a conversation reference for that meeting/chat.
+Intent conflicts are proactive: any `possible_misalignment` constructs a short response and invokes `send_to_meeting_chat`. When an event omits `conversation_reference_id`, the intent agent uses `meeting_ref.meeting_id` / `meeting_ref.meeting_chat_thread_id` as the bot send key.
 
 Container:
 ```bash

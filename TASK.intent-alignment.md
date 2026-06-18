@@ -21,3 +21,4 @@
 21. [completed] Route intent chat responses through the canonical `send_to_meeting_chat` tool.
 22. [completed] Verify, publish, and report the updated endpoints.
 23. [completed] Flag database stack changes such as DynamoDB against indexed Postgres intent as contradictions and respond in chat.
+24. [completed] Ensure every possible intent conflict constructs a meeting-chat response and uses the meeting thread id when no explicit conversation reference is present.

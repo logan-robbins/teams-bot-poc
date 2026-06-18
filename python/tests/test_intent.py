@@ -265,6 +265,55 @@ async def test_dynamodb_proposal_conflicts_with_postgres_context_and_uses_chat_t
 
 
 @pytest.mark.asyncio
+async def test_conflict_response_uses_meeting_thread_when_conversation_reference_missing(tmp_path):
+    app = create_app(IntentStore(tmp_path))
+    base = {
+        "schema_version": "alfred-v2",
+        "event_type": "meeting.transcript.final",
+        "ts": "2026-06-17T20:07:00Z",
+        "meeting_ref": {
+            "meeting_id": "19:meeting_thread_fallback@thread.v2",
+            "meeting_chat_thread_id": "19:meeting_thread_fallback@thread.v2",
+        },
+    }
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await client.post(
+            "/v2/events",
+            json={
+                **base,
+                "event_id": "fallback-postgres",
+                "payload": {
+                    "speaker": {"id": "speaker_0"},
+                    "text": "We decided to use Postgres for the durable ledger.",
+                },
+            },
+        )
+        await client.post("/reflect/flush")
+        await client.post(
+            "/v2/events",
+            json={
+                **base,
+                "event_id": "fallback-dynamodb",
+                "payload": {
+                    "speaker": {"id": "speaker_0"},
+                    "text": "What kind of database should we use? I think we should be using Dynamo DB.",
+                },
+            },
+        )
+        flushed = await client.post("/reflect/flush")
+
+    analysis = flushed.json()["analyses"][0]
+    assert analysis["alignment_state"] == "possible_misalignment"
+    assert analysis["next_action"] == "respond"
+    assert analysis["chat_posted"] is True
+    tool_call = analysis["tool_calls"][0]
+    assert tool_call["tool_name"] == "send_to_meeting_chat"
+    assert tool_call["ok"] is True
+    assert tool_call["result"]["message_id"].startswith("alfred_")
+
+
+@pytest.mark.asyncio
 async def test_official_transcript_is_not_realtime_input(tmp_path):
     app = create_app(IntentStore(tmp_path))
     envelope = {
