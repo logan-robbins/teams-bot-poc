@@ -12,3 +12,5 @@
 12. [completed] Verify Python intent consumer, Docker image, and C# compile surface where possible.
 13. [completed] Publish the intent consumer endpoint and record the public `/v2/events` URL.
 14. [completed] Update README with the 500ms segmentation note.
+15. [completed] Add a same-process intent monitor UI with live state polling and manual flush.
+16. [in_progress] Verify and publish the UI-enabled intent container.

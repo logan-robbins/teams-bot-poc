@@ -29,6 +29,7 @@ from typing import Any, Literal
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 
@@ -217,6 +218,10 @@ def _append_jsonl(path: Path, payload: BaseModel | dict[str, Any]) -> None:
     row = payload.model_dump(mode="json") if isinstance(payload, BaseModel) else payload
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
+
+
+def _tail(rows: list[Any], limit: int) -> list[Any]:
+    return rows[-max(1, min(limit, 100)) :]
 
 
 SAMPLE_SOURCES = [
@@ -794,6 +799,32 @@ class ReflectionLoop:
     def pending_count(self) -> int:
         return sum(len(rows) for rows in self._pending.values())
 
+    async def snapshot(self) -> dict[str, Any]:
+        async with self._lock:
+            conversations = []
+            for key, rows in sorted(self._pending.items()):
+                conversations.append(
+                    {
+                        "key": key,
+                        "observations": [
+                            {
+                                "received_at_utc": row.received_at_utc,
+                                "event_id": row.event_id,
+                                "event_type": row.event_type,
+                                "modality": row.modality,
+                                "speaker": row.speaker,
+                                "direct_address": row.direct_address,
+                                "text": row.text,
+                            }
+                            for row in rows
+                        ],
+                    }
+                )
+            return {
+                "count": sum(len(row["observations"]) for row in conversations),
+                "conversations": conversations,
+            }
+
     async def submit_many(self, observations: list[Observation]) -> dict[str, int]:
         queued = 0
         skipped = 0
@@ -872,6 +903,377 @@ class ReflectionLoop:
                 await task
 
 
+def _monitor_html() -> str:
+    return """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Intent Alignment Monitor</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f8fa;
+      --panel: #ffffff;
+      --ink: #1b1f24;
+      --muted: #667085;
+      --line: #d7dce2;
+      --accent: #1463ff;
+      --good: #087443;
+      --warn: #b45309;
+      --bad: #b42318;
+      --soft: #eef4ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 18px 22px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    h1, h2, h3, p { margin: 0; }
+    h1 { font-size: 20px; font-weight: 650; letter-spacing: 0; }
+    h2 { font-size: 15px; font-weight: 650; margin-bottom: 10px; }
+    h3 { font-size: 13px; font-weight: 650; margin-bottom: 4px; }
+    button {
+      border: 1px solid var(--accent);
+      background: var(--accent);
+      color: white;
+      border-radius: 6px;
+      padding: 8px 11px;
+      font: inherit;
+      cursor: pointer;
+    }
+    button.secondary {
+      background: white;
+      color: var(--accent);
+    }
+    button:disabled {
+      cursor: wait;
+      opacity: .65;
+    }
+    main {
+      padding: 18px 22px 28px;
+      max-width: 1500px;
+      margin: 0 auto;
+    }
+    .toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 10px;
+      min-width: 280px;
+    }
+    .muted { color: var(--muted); }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+    }
+    .metric {
+      min-height: 88px;
+    }
+    .metric .value {
+      font-size: 26px;
+      font-weight: 700;
+      margin-top: 8px;
+    }
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.4fr) minmax(320px, .8fr);
+      gap: 14px;
+      align-items: start;
+    }
+    .stack {
+      display: grid;
+      gap: 14px;
+    }
+    .row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .list {
+      display: grid;
+      gap: 10px;
+      max-height: 680px;
+      overflow: auto;
+      padding-right: 2px;
+    }
+    .item {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      background: #fff;
+    }
+    .item.aligned { border-left: 4px solid var(--good); }
+    .item.possible_misalignment { border-left: 4px solid var(--bad); }
+    .item.needs_context { border-left: 4px solid var(--warn); }
+    .item.no_signal { border-left: 4px solid var(--line); }
+    .tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 8px;
+    }
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      min-height: 22px;
+      border-radius: 999px;
+      background: var(--soft);
+      color: #174ea6;
+      padding: 2px 8px;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+    .text {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      margin-top: 8px;
+    }
+    .small {
+      font-size: 12px;
+    }
+    .empty {
+      color: var(--muted);
+      border: 1px dashed var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      background: #fff;
+    }
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      display: inline-block;
+      background: var(--warn);
+      margin-right: 7px;
+    }
+    .status-dot.ok { background: var(--good); }
+    @media (max-width: 980px) {
+      header { align-items: flex-start; flex-direction: column; }
+      .toolbar { justify-content: flex-start; min-width: 0; width: 100%; }
+      .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .layout { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 560px) {
+      main, header { padding-left: 14px; padding-right: 14px; }
+      .grid { grid-template-columns: 1fr; }
+      .toolbar { flex-wrap: wrap; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Intent Alignment Monitor</h1>
+      <p class="muted small" id="subtitle">Waiting for state...</p>
+    </div>
+    <div class="toolbar">
+      <span class="small"><span id="status-dot" class="status-dot"></span><span id="status-text">Loading</span></span>
+      <button class="secondary" id="refresh">Refresh</button>
+      <button id="flush">Flush Pending</button>
+    </div>
+  </header>
+  <main>
+    <section class="grid">
+      <div class="panel metric"><h2>Pending</h2><div id="pending-count" class="value">0</div><p class="muted small">observations queued</p></div>
+      <div class="panel metric"><h2>Analyses</h2><div id="analysis-count" class="value">0</div><p class="muted small">recently retained</p></div>
+      <div class="panel metric"><h2>Memories</h2><div id="memory-count" class="value">0</div><p class="muted small">persisted records</p></div>
+      <div class="panel metric"><h2>Cadence</h2><div id="cadence" class="value">-</div><p class="muted small">speech / chat seconds</p></div>
+    </section>
+    <section class="layout">
+      <div class="stack">
+        <div class="panel">
+          <div class="row"><h2>Latest Analyses</h2><span class="muted small" id="updated-at"></span></div>
+          <div class="list" id="analyses"></div>
+        </div>
+        <div class="panel">
+          <h2>Pending Observations</h2>
+          <div class="list" id="pending"></div>
+        </div>
+      </div>
+      <div class="stack">
+        <div class="panel">
+          <h2>Memory</h2>
+          <div class="list" id="memories"></div>
+        </div>
+        <div class="panel">
+          <h2>Sources</h2>
+          <div class="list" id="sources"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+  <script>
+    const stateUrl = "/state?limit=20";
+    const els = {
+      subtitle: document.getElementById("subtitle"),
+      statusDot: document.getElementById("status-dot"),
+      statusText: document.getElementById("status-text"),
+      pendingCount: document.getElementById("pending-count"),
+      analysisCount: document.getElementById("analysis-count"),
+      memoryCount: document.getElementById("memory-count"),
+      cadence: document.getElementById("cadence"),
+      analyses: document.getElementById("analyses"),
+      pending: document.getElementById("pending"),
+      memories: document.getElementById("memories"),
+      sources: document.getElementById("sources"),
+      updatedAt: document.getElementById("updated-at"),
+      refresh: document.getElementById("refresh"),
+      flush: document.getElementById("flush"),
+    };
+
+    function el(tag, className, text) {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      if (text !== undefined && text !== null) node.textContent = text;
+      return node;
+    }
+
+    function empty(text) {
+      return el("div", "empty", text);
+    }
+
+    function tags(values) {
+      const wrap = el("div", "tags");
+      values.filter(Boolean).forEach((value) => wrap.appendChild(el("span", "tag", value)));
+      return wrap;
+    }
+
+    function renderAnalyses(rows) {
+      els.analyses.replaceChildren();
+      if (!rows.length) {
+        els.analyses.appendChild(empty("No analyses yet."));
+        return;
+      }
+      rows.forEach((row) => {
+        const item = el("article", `item ${row.alignment_state || "no_signal"}`);
+        item.appendChild(el("h3", null, row.alignment_state || "unknown"));
+        item.appendChild(el("p", "muted small", `${row.created_at_utc || ""} | ${row.next_action || ""} | ${row.importance || ""}`));
+        item.appendChild(el("p", "text", row.text || ""));
+        item.appendChild(el("p", "muted small", row.rationale || ""));
+        const signalKinds = (row.signals || []).map((signal) => signal.kind);
+        const hitIds = (row.hits || []).slice(0, 3).map((hit) => `hit:${hit.id}`);
+        item.appendChild(tags([...signalKinds, ...hitIds]));
+        if (row.response_text) item.appendChild(el("p", "text small", `response: ${row.response_text}`));
+        els.analyses.appendChild(item);
+      });
+    }
+
+    function renderPending(pending) {
+      els.pending.replaceChildren();
+      const conversations = pending.conversations || [];
+      if (!conversations.length) {
+        els.pending.appendChild(empty("No pending observations."));
+        return;
+      }
+      conversations.forEach((conversation) => {
+        const item = el("article", "item");
+        item.appendChild(el("h3", null, conversation.key));
+        (conversation.observations || []).forEach((obs) => {
+          item.appendChild(el("p", "muted small", `${obs.received_at_utc || ""} | ${obs.modality || ""} | ${obs.speaker || "unknown"}`));
+          item.appendChild(el("p", "text", obs.text || ""));
+        });
+        els.pending.appendChild(item);
+      });
+    }
+
+    function renderMemories(rows) {
+      els.memories.replaceChildren();
+      if (!rows.length) {
+        els.memories.appendChild(empty("No memories persisted yet."));
+        return;
+      }
+      rows.forEach((row) => {
+        const item = el("article", "item");
+        item.appendChild(el("h3", null, row.reason || "memory"));
+        item.appendChild(el("p", "muted small", `${row.created_at_utc || ""} | ${row.speaker || "unknown"}`));
+        item.appendChild(el("p", "text", row.text || ""));
+        item.appendChild(tags(row.tags || []));
+        els.memories.appendChild(item);
+      });
+    }
+
+    function renderSources(rows) {
+      els.sources.replaceChildren();
+      if (!rows.length) {
+        els.sources.appendChild(empty("No indexed sources."));
+        return;
+      }
+      rows.forEach((row) => {
+        const item = el("article", "item");
+        item.appendChild(el("h3", null, row.source));
+        item.appendChild(el("p", "muted small", `${row.documents} documents`));
+        item.appendChild(tags(row.top_terms || []));
+        els.sources.appendChild(item);
+      });
+    }
+
+    async function refresh() {
+      const response = await fetch(stateUrl, { cache: "no-store" });
+      if (!response.ok) throw new Error(`state HTTP ${response.status}`);
+      const state = await response.json();
+      els.statusDot.classList.toggle("ok", Boolean(state.ok));
+      els.statusText.textContent = state.ok ? "Online" : "Not ready";
+      els.subtitle.textContent = state.service || "intent-alignment";
+      els.pendingCount.textContent = state.pending_observations;
+      els.analysisCount.textContent = state.analysis_count;
+      els.memoryCount.textContent = state.memory_count;
+      els.cadence.textContent = `${state.speech_reflect_seconds}s / ${state.chat_reflect_seconds}s`;
+      els.updatedAt.textContent = state.generated_at_utc;
+      renderAnalyses(state.analyses || []);
+      renderPending(state.pending || { conversations: [] });
+      renderMemories(state.memories || []);
+      renderSources((state.source_overview || {}).sources || []);
+    }
+
+    async function flush() {
+      els.flush.disabled = true;
+      try {
+        await fetch("/reflect/flush", { method: "POST" });
+        await refresh();
+      } finally {
+        els.flush.disabled = false;
+      }
+    }
+
+    els.refresh.addEventListener("click", refresh);
+    els.flush.addEventListener("click", flush);
+    refresh().catch((error) => {
+      els.statusText.textContent = error.message;
+    });
+    setInterval(() => refresh().catch(() => {}), 2000);
+  </script>
+</body>
+</html>"""
+
+
 def create_app(store: IntentStore | None = None) -> FastAPI:
     intent_store = store or IntentStore()
     reflector = ReflectionLoop(intent_store, send_chat_url=SEND_CHAT_URL)
@@ -927,6 +1329,39 @@ def create_app(store: IntentStore | None = None) -> FastAPI:
     async def analyses(limit: int = 50) -> dict[str, Any]:
         rows = intent_store.analyses[-max(1, min(limit, 500)) :]
         return {"analyses": [row.model_dump(mode="json") for row in rows]}
+
+    @app.get("/state")
+    async def state(limit: int = 20) -> dict[str, Any]:
+        safe_limit = max(1, min(limit, 100))
+        pending = await reflector.snapshot()
+        recent_analyses = list(reversed(_tail(intent_store.analyses, safe_limit)))
+        recent_memories = list(reversed(_tail(intent_store.memories, safe_limit)))
+        return {
+            "ok": True,
+            "service": "intent-alignment",
+            "generated_at_utc": utc_now(),
+            "data_dir": str(intent_store.data_dir),
+            "source_count": len(intent_store.sources),
+            "memory_count": len(intent_store.memories),
+            "analysis_count": len(intent_store.analyses),
+            "pending_observations": pending["count"],
+            "speech_reflect_seconds": reflector.speech_delay_seconds,
+            "chat_reflect_seconds": reflector.chat_delay_seconds,
+            "max_reflect_batch": reflector.max_batch,
+            "send_chat_configured": bool(reflector.send_chat_url),
+            "pending": pending,
+            "analyses": [row.model_dump(mode="json") for row in recent_analyses],
+            "memories": [row.model_dump(mode="json") for row in recent_memories],
+            "source_overview": intent_store.source_overview(),
+        }
+
+    @app.get("/", response_class=HTMLResponse, include_in_schema=False)
+    async def root_ui() -> HTMLResponse:
+        return HTMLResponse(_monitor_html())
+
+    @app.get("/ui", response_class=HTMLResponse)
+    async def monitor_ui() -> HTMLResponse:
+        return HTMLResponse(_monitor_html())
 
     @app.get("/prompt")
     async def prompt_policy() -> dict[str, Any]:

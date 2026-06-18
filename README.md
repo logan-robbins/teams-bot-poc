@@ -432,6 +432,11 @@ Live Disney sandbox endpoint:
 https://ca-alfred-intent.gentlewater-5aa74a73.eastus.azurecontainerapps.io/v2/events
 ```
 
+Live monitor UI:
+```text
+https://ca-alfred-intent.gentlewater-5aa74a73.eastus.azurecontainerapps.io/ui
+```
+
 Container:
 ```bash
 docker build -t alfred-intent -f python/Dockerfile.intent python/
@@ -439,6 +444,8 @@ docker run --rm -p 8765:8765 -v "$PWD/.intent-data:/data" alfred-intent
 ```
 
 Useful endpoints:
+- `GET /ui` and `/` — browser monitor for live state, pending observations, recent analyses, memories, and source overview.
+- `GET /state` — JSON payload used by the monitor.
 - `POST /v2/events` / `/events` — queue live speech/chat observations.
 - `POST /reflect/flush` — force pending observations to reflect immediately; useful for tests and demos.
 - `POST /analyze` — manual text analysis: `{"text":"We decided to keep Postgres"}`.

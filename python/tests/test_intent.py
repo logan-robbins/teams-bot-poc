@@ -77,6 +77,40 @@ async def test_manual_analyze_can_suppress_memory(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_monitor_ui_and_state_show_pending_observation(tmp_path):
+    app = create_app(IntentStore(tmp_path))
+    envelope = {
+        "schema_version": "alfred-v2",
+        "event_type": "meeting.transcript.final",
+        "event_id": "evt-ui-1",
+        "ts": "2026-06-17T20:03:00Z",
+        "meeting_ref": {
+            "meeting_id": "19:meeting_demo@thread.v2",
+            "meeting_chat_thread_id": "19:meeting_demo@thread.v2",
+        },
+        "payload": {
+            "speaker": {"display_name": "Alex"},
+            "text": "We agreed the UI should show pending intent observations.",
+        },
+    }
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        ui = await client.get("/ui")
+        root = await client.get("/")
+        posted = await client.post("/v2/events", json=envelope)
+        state = await client.get("/state")
+
+    assert ui.status_code == 200
+    assert "text/html" in ui.headers["content-type"]
+    assert "Intent Alignment Monitor" in ui.text
+    assert root.status_code == 200
+    assert posted.json()["queued"] == 1
+    body = state.json()
+    assert body["pending_observations"] == 1
+    assert body["pending"]["conversations"][0]["observations"][0]["event_id"] == "evt-ui-1"
+
+
+@pytest.mark.asyncio
 async def test_live_final_utterances_batch_before_reflection(tmp_path):
     app = create_app(IntentStore(tmp_path))
     base = {
