@@ -15,4 +15,4 @@
 15. [completed] Add a same-process intent monitor UI with live state polling and manual flush.
 16. [completed] Verify and publish the UI-enabled intent container.
 17. [completed] Add live activity SSE stream and explicit agent status lines for demo visibility.
-18. [in_progress] Verify and publish the streaming intent monitor container.
+18. [completed] Verify and publish the streaming intent monitor container.
