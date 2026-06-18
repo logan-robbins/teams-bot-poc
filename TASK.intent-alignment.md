@@ -19,5 +19,5 @@
 19. [completed] Change live STT segmentation to 3s silence or 20s maximum segment duration.
 20. [completed] Keep whole conversation context available to every intent reflection.
 21. [completed] Route intent chat responses through the canonical `send_to_meeting_chat` tool.
-22. [in-progress] Verify, publish, and report the updated endpoints.
+22. [completed] Verify, publish, and report the updated endpoints.
 23. [completed] Flag database stack changes such as DynamoDB against indexed Postgres intent as contradictions and respond in chat.
