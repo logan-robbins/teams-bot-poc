@@ -134,15 +134,14 @@ public sealed partial class AzureConversationTranscriber : IRealtimeTranscriber
             PropertyId.SpeechServiceResponse_DiarizeIntermediateResults,
             "true");
 
-        // Latency tuning: drop the silence-to-end-of-utterance threshold
-        // from the ConversationTranscriber default (~500-1000ms) down to
-        // 200ms so finals fire ~300ms sooner once the speaker stops.
-        // Lower than ~150ms produces excessive false-end fragmentation
-        // mid-sentence; 200ms is the sweet spot for English meetings.
+        // Latency tuning: keep the silence-to-end-of-utterance threshold
+        // at 500ms so final segments are less likely to fragment
+        // mid-sentence while still arriving quickly enough for
+        // mid-conversation awareness.
         // Source: Azure Speech docs — Speech_SegmentationSilenceTimeoutMs
         speechConfig.SetProperty(
             PropertyId.Speech_SegmentationSilenceTimeoutMs,
-            "200");
+            "500");
 
         // Optional: Custom Speech model endpoint
         if (_endpointId is not null)

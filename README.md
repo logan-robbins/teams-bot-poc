@@ -108,6 +108,7 @@ Concrete consequences:
 | `python/` | FastAPI sink + Alfred agent | `uv sync` | `ca-alfred-api` Container App |
 | `python/meeting_agent/` | Canonical session/agent state; tool definitions | — | — |
 | `python/batcave_platform/specs/alfred.yaml` | Sole source of truth for prompt + intervention policy | — | — |
+| `python/intent.py` | Lightweight Intent Alignment consumer prototype (`/v2/events` + sample indexed sources + JSONL memories) | `uv run uvicorn intent:app --port 8765` | local/container prototype |
 | `web/` | React 19 + Vite + Tailwind v4 | `npm run build` | `ca-alfred-web` Container App |
 | `manifest/` | Teams app manifest (currently v1.0.12, 16 RSCs) | `cd manifest && zip alfred-sandbox.zip manifest.json color.png outline.png` | Teams Admin Center / Developer Portal |
 | `scripts/deploy-azure-vm.sh` | One-shot bot VM deploy (bootstrap + publish + restart) | — | — |
@@ -415,6 +416,47 @@ For `server_v2.py`, configure the Teams bridge with the same `bot_url`, `team`, 
 - **Pull from your mirror container** — point the bridge's `storage_bucket` at your `storage_container_url` value (full container URL incl. SAS query — the bridge appends the SAS to list + download calls), and set `extra_prefixes: ["meetings/"]`. Your mirror holds only your own meetings, so that one prefix covers everything; `team`/`channel` config is unnecessary for mirror-only consumption. Remember the `event_kinds` opt-in if you want live transcript turns.
 
 Pair with §7.4's consumer-isolation trick if you also need to prevent your sink's AlfredAnalyzer from posting into the same channel while the pre-v2 consumer is the active responder.
+
+### 7.5.1 Intent Alignment prototype consumer
+
+`python/intent.py` is a lightweight variant of the sink focused on Intent Alignment detection rather than the full Alfred dossier. It consumes the same `alfred-v2` `POST /v2/events` contract, but the real-time loop is built around live Azure Speech `meeting.transcript.final` finalized utterance segments and live chat. It searches immutable sample source documents plus persisted JSONL memories, reflects after a short speech/chat quiet window, emits an alignment readout, and persists memory-worthy statements. `meeting.transcript.final` is not every raw audio frame or interim hypothesis; `meeting.transcript.partial` is the interim/progress event and is throttled before consumer fanout by default. The bot currently uses Azure Speech `Speech_SegmentationSilenceTimeoutMs=500` so final segments are less likely to split mid-sentence while still arriving quickly enough for real-time awareness. `meeting.transcript.official` is post-meeting Graph output and is intentionally not used for mid-conversation awareness.
+
+Run locally:
+```bash
+cd python
+INTENT_DATA_DIR=/tmp/alfred-intent uv run uvicorn intent:app --host 0.0.0.0 --port 8765
+```
+
+Container:
+```bash
+docker build -t alfred-intent -f python/Dockerfile.intent python/
+docker run --rm -p 8765:8765 -v "$PWD/.intent-data:/data" alfred-intent
+```
+
+Useful endpoints:
+- `POST /v2/events` / `/events` — queue live speech/chat observations.
+- `POST /reflect/flush` — force pending observations to reflect immediately; useful for tests and demos.
+- `POST /analyze` — manual text analysis: `{"text":"We decided to keep Postgres"}`.
+- `GET /prompt` — current reflection cadence and speak-only policy.
+- `GET /sources` — rough source/index overview.
+- `GET /search?q=postgres%20sqlite` — inspect source + memory hits.
+- `GET /memories` and `POST /memories` — inspect or seed persisted memories.
+- `GET /analyses` — recent alignment outputs.
+
+Runtime knobs:
+- `INTENT_SPEECH_REFLECT_SECONDS` — live speech quiet-window before reflection; default `12`.
+- `INTENT_CHAT_REFLECT_SECONDS` — chat burst quiet-window before reflection; default `2`.
+- `INTENT_MAX_REFLECT_BATCH` — max observations before immediate reflection; default `12`.
+- `INTENT_SEND_CHAT_URL` or `BOT_SEND_CHAT_URL` — optional `$BOT/api/send-chat` endpoint for real chat responses.
+
+Register it like any other consumer:
+```bash
+curl -X POST "$BOT/api/channels/$TEAM/$CHAN_ENC/consumers" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"intent-demo","url":"https://<host>/v2/events",
+       "event_kinds":["meeting.transcript.final","meeting.chat.created","channel.message.created"],
+       "enabled":true}'
+```
 
 ### 7.6 Rollback after a bad deploy
 

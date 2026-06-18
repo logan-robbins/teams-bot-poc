@@ -1,0 +1,24 @@
+# Dockerfile for the lightweight Intent Alignment consumer.
+#
+# Build from repo root:
+#   docker build -t alfred-intent -f python/Dockerfile.intent python/
+# Run:
+#   docker run --rm -p 8765:8765 -v "$PWD/.intent-data:/data" alfred-intent
+
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+
+WORKDIR /app
+
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev
+
+COPY . .
+
+ENV INTENT_DATA_DIR=/data
+
+EXPOSE 8765
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD uv run --no-sync python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8765/health').status==200 else 1)" || exit 1
+
+CMD ["uv", "run", "--no-sync", "uvicorn", "intent:app", "--host", "0.0.0.0", "--port", "8765"]
