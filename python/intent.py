@@ -21,7 +21,7 @@ import os
 import re
 import threading
 import uuid
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,7 +29,7 @@ from typing import Any, Literal
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 
@@ -152,6 +152,23 @@ class Observation(BaseModel):
     from_bot: bool = False
 
 
+class ActivityRecord(BaseModel):
+    id: str = Field(default_factory=lambda: f"act_{uuid.uuid4().hex[:12]}")
+    created_at_utc: str = Field(default_factory=lambda: utc_now())
+    kind: Literal["observation", "status", "analysis", "ignored_event"]
+    text: str
+    event_id: str | None = None
+    event_type: str | None = None
+    modality: Literal["speech", "chat"] | None = None
+    speaker: str | None = None
+    meeting_id: str | None = None
+    thread_id: str | None = None
+    alignment_state: str | None = None
+    next_action: str | None = None
+    search_query: str | None = None
+    source_ids: list[str] = Field(default_factory=list)
+
+
 class AnalyzeRequest(BaseModel):
     text: str
     speaker: str | None = None
@@ -181,6 +198,44 @@ class IndexedItem:
     summary: str
     text: str
     tokens: Counter[str] = field(default_factory=Counter)
+
+
+class ActivityLog:
+    def __init__(self, maxlen: int = 250) -> None:
+        self._history: deque[ActivityRecord] = deque(maxlen=maxlen)
+        self._subscribers: set[asyncio.Queue[ActivityRecord]] = set()
+        self._lock = threading.Lock()
+
+    def append(self, record: ActivityRecord) -> ActivityRecord:
+        stale: list[asyncio.Queue[ActivityRecord]] = []
+        with self._lock:
+            self._history.append(record)
+            subscribers = list(self._subscribers)
+        for queue in subscribers:
+            try:
+                queue.put_nowait(record)
+            except asyncio.QueueFull:
+                stale.append(queue)
+        if stale:
+            with self._lock:
+                for queue in stale:
+                    self._subscribers.discard(queue)
+        return record
+
+    def snapshot(self, limit: int = 50) -> list[ActivityRecord]:
+        with self._lock:
+            rows = list(self._history)
+        return rows[-max(1, min(limit, 200)) :]
+
+    def subscribe(self) -> asyncio.Queue[ActivityRecord]:
+        queue: asyncio.Queue[ActivityRecord] = asyncio.Queue(maxsize=100)
+        with self._lock:
+            self._subscribers.add(queue)
+        return queue
+
+    def unsubscribe(self, queue: asyncio.Queue[ActivityRecord]) -> None:
+        with self._lock:
+            self._subscribers.discard(queue)
 
 
 def utc_now() -> str:
@@ -529,6 +584,19 @@ def _looks_contradictory(text: str) -> bool:
     return _contains_any(text, CONTRADICTION_PATTERNS)
 
 
+def _is_search_worthy(text: str, direct_address: bool) -> bool:
+    return (
+        direct_address
+        or "remember" in text.lower()
+        or _contains_any(text, DECISION_PATTERNS)
+        or _contains_any(text, ACTION_PATTERNS)
+        or _contains_any(text, RISK_PATTERNS)
+        or _contains_any(text, QUESTION_PATTERNS)
+        or _looks_contradictory(text)
+        or _contains_any(text, CONFIRMATION_PATTERNS)
+    )
+
+
 def _signal_from_hits(kind: str, confidence: float, evidence: str, hits: list[SearchHit]) -> IntentSignal:
     return IntentSignal(
         kind=kind,  # type: ignore[arg-type]
@@ -670,6 +738,15 @@ def _search_queries_for_text(text: str) -> list[str]:
     return queries
 
 
+def _status_topic(search_queries: list[str], text: str) -> str:
+    if search_queries:
+        return search_queries[0]
+    compact = " ".join(text.split())
+    if len(compact) <= 80:
+        return compact
+    return compact[:77].rstrip() + "..."
+
+
 def _importance_for(signals: list[IntentSignal], direct_address: bool) -> Literal["low", "medium", "high"]:
     kinds = {signal.kind for signal in signals}
     if direct_address or "contradiction" in kinds or "risk" in kinds:
@@ -726,6 +803,7 @@ async def reflect_observations(
     *,
     send_chat_url: str = "",
     persist_memory: bool | None = None,
+    activity_log: ActivityLog | None = None,
 ) -> IntentAnalysis | None:
     useful = [obs for obs in observations if not obs.from_bot and obs.text.strip()]
     if not useful:
@@ -734,6 +812,33 @@ async def reflect_observations(
     combined_text = _format_observation_text(useful)
     direct_address = any(obs.direct_address for obs in useful)
     latest = useful[-1]
+    search_queries = _search_queries_for_text(combined_text)
+    if activity_log is not None:
+        if _is_search_worthy(combined_text, direct_address):
+            topic = _status_topic(search_queries, combined_text)
+            activity_log.append(
+                ActivityRecord(
+                    kind="status",
+                    text=f"Searching sources to see if anything on {topic}",
+                    event_id=latest.event_id,
+                    event_type=latest.event_type if len(useful) == 1 else "reflection.batch",
+                    meeting_id=latest.meeting_id,
+                    thread_id=latest.thread_id,
+                    search_query=topic,
+                )
+            )
+        else:
+            activity_log.append(
+                ActivityRecord(
+                    kind="status",
+                    text="Haven't heard anything worth searching",
+                    event_id=latest.event_id,
+                    event_type=latest.event_type if len(useful) == 1 else "reflection.batch",
+                    meeting_id=latest.meeting_id,
+                    thread_id=latest.thread_id,
+                )
+            )
+
     analysis = analyze_intent(
         store,
         text=combined_text,
@@ -746,7 +851,7 @@ async def reflect_observations(
         record=False,
     )
     analysis.observation_count = len(useful)
-    analysis.search_queries = _search_queries_for_text(combined_text)
+    analysis.search_queries = search_queries
     analysis.importance = _importance_for(analysis.signals, direct_address)
     analysis.response_text = _response_for(analysis, direct_address)
 
@@ -773,6 +878,22 @@ async def reflect_observations(
         analysis.chat_post_error = error
 
     store.append_analysis(analysis)
+    if activity_log is not None:
+        activity_log.append(
+            ActivityRecord(
+                kind="analysis",
+                text=analysis.rationale,
+                event_id=analysis.event_id,
+                event_type=analysis.event_type,
+                speaker=analysis.speaker,
+                meeting_id=analysis.meeting_id,
+                thread_id=analysis.thread_id,
+                alignment_state=analysis.alignment_state,
+                next_action=analysis.next_action,
+                search_query=analysis.search_queries[0] if analysis.search_queries else None,
+                source_ids=[hit.id for hit in analysis.hits[:3]],
+            )
+        )
     return analysis
 
 
@@ -782,12 +903,14 @@ class ReflectionLoop:
         store: IntentStore,
         *,
         send_chat_url: str = "",
+        activity_log: ActivityLog | None = None,
         speech_delay_seconds: float = SPEECH_REFLECT_SECONDS,
         chat_delay_seconds: float = CHAT_REFLECT_SECONDS,
         max_batch: int = MAX_REFLECT_BATCH,
     ) -> None:
         self.store = store
         self.send_chat_url = send_chat_url
+        self.activity_log = activity_log
         self.speech_delay_seconds = max(0.1, speech_delay_seconds)
         self.chat_delay_seconds = max(0.1, chat_delay_seconds)
         self.max_batch = max(1, max_batch)
@@ -880,6 +1003,7 @@ class ReflectionLoop:
             self.store,
             observations,
             send_chat_url=self.send_chat_url,
+            activity_log=self.activity_log,
         )
 
     async def flush_all(self) -> list[IntentAnalysis]:
@@ -1030,6 +1154,10 @@ def _monitor_html() -> str:
     .item.possible_misalignment { border-left: 4px solid var(--bad); }
     .item.needs_context { border-left: 4px solid var(--warn); }
     .item.no_signal { border-left: 4px solid var(--line); }
+    .item.observation { border-left: 4px solid var(--accent); }
+    .item.status { border-left: 4px solid var(--warn); background: #fffaf0; }
+    .item.analysis { border-left: 4px solid var(--good); }
+    .item.ignored_event { border-left: 4px solid var(--line); background: #fafafa; }
     .tags {
       display: flex;
       flex-wrap: wrap;
@@ -1110,6 +1238,10 @@ def _monitor_html() -> str:
     <section class="layout">
       <div class="stack">
         <div class="panel">
+          <div class="row"><h2>Live Activity</h2><span class="muted small" id="stream-status">connecting stream</span></div>
+          <div class="list" id="activity"></div>
+        </div>
+        <div class="panel">
           <div class="row"><h2>Latest Analyses</h2><span class="muted small" id="updated-at"></span></div>
           <div class="list" id="analyses"></div>
         </div>
@@ -1140,6 +1272,8 @@ def _monitor_html() -> str:
       analysisCount: document.getElementById("analysis-count"),
       memoryCount: document.getElementById("memory-count"),
       cadence: document.getElementById("cadence"),
+      activity: document.getElementById("activity"),
+      streamStatus: document.getElementById("stream-status"),
       analyses: document.getElementById("analyses"),
       pending: document.getElementById("pending"),
       memories: document.getElementById("memories"),
@@ -1183,6 +1317,33 @@ def _monitor_html() -> str:
         item.appendChild(tags([...signalKinds, ...hitIds]));
         if (row.response_text) item.appendChild(el("p", "text small", `response: ${row.response_text}`));
         els.analyses.appendChild(item);
+      });
+    }
+
+    function renderActivity(rows) {
+      els.activity.replaceChildren();
+      if (!rows.length) {
+        els.activity.appendChild(empty("No live activity yet."));
+        return;
+      }
+      rows.forEach((row) => {
+        const item = el("article", `item ${row.kind || ""}`);
+        const title = row.kind === "status"
+          ? "Agent"
+          : row.kind === "analysis"
+            ? `Analysis: ${row.alignment_state || "unknown"}`
+            : row.kind === "ignored_event"
+              ? "Ignored"
+              : `${row.modality || "event"} ${row.speaker ? `from ${row.speaker}` : ""}`.trim();
+        item.appendChild(el("h3", null, title));
+        item.appendChild(el("p", "muted small", `${row.created_at_utc || ""} | ${row.event_type || ""}`));
+        item.appendChild(el("p", "text", row.text || ""));
+        const labels = [];
+        if (row.next_action) labels.push(row.next_action);
+        if (row.search_query) labels.push(`search:${row.search_query}`);
+        (row.source_ids || []).slice(0, 3).forEach((source) => labels.push(`hit:${source}`));
+        if (labels.length) item.appendChild(tags(labels));
+        els.activity.appendChild(item);
       });
     }
 
@@ -1248,6 +1409,7 @@ def _monitor_html() -> str:
       els.cadence.textContent = `${state.speech_reflect_seconds}s / ${state.chat_reflect_seconds}s`;
       els.updatedAt.textContent = state.generated_at_utc;
       renderAnalyses(state.analyses || []);
+      renderActivity(state.activity || []);
       renderPending(state.pending || { conversations: [] });
       renderMemories(state.memories || []);
       renderSources((state.source_overview || {}).sources || []);
@@ -1265,18 +1427,79 @@ def _monitor_html() -> str:
 
     els.refresh.addEventListener("click", refresh);
     els.flush.addEventListener("click", flush);
+    let activityRows = [];
+    if ("EventSource" in window) {
+      const source = new EventSource("/stream?limit=20");
+      source.addEventListener("open", () => {
+        els.streamStatus.textContent = "stream connected";
+      });
+      source.addEventListener("snapshot", (event) => {
+        const state = JSON.parse(event.data);
+        activityRows = state.activity || [];
+        renderActivity(activityRows);
+      });
+      source.addEventListener("activity", (event) => {
+        activityRows.unshift(JSON.parse(event.data));
+        activityRows = activityRows.slice(0, 40);
+        renderActivity(activityRows);
+      });
+      source.addEventListener("error", () => {
+        els.streamStatus.textContent = "stream retrying";
+      });
+    } else {
+      els.streamStatus.textContent = "polling";
+    }
     refresh().catch((error) => {
       els.statusText.textContent = error.message;
     });
-    setInterval(() => refresh().catch(() => {}), 2000);
+    setInterval(() => refresh().catch(() => {}), 5000);
   </script>
 </body>
 </html>"""
 
 
+async def _state_payload(
+    intent_store: IntentStore,
+    reflector: ReflectionLoop,
+    activity_log: ActivityLog,
+    *,
+    limit: int = 20,
+) -> dict[str, Any]:
+    safe_limit = max(1, min(limit, 100))
+    pending = await reflector.snapshot()
+    recent_analyses = list(reversed(_tail(intent_store.analyses, safe_limit)))
+    recent_memories = list(reversed(_tail(intent_store.memories, safe_limit)))
+    recent_activity = list(reversed(activity_log.snapshot(safe_limit * 2)))
+    return {
+        "ok": True,
+        "service": "intent-alignment",
+        "generated_at_utc": utc_now(),
+        "data_dir": str(intent_store.data_dir),
+        "source_count": len(intent_store.sources),
+        "memory_count": len(intent_store.memories),
+        "analysis_count": len(intent_store.analyses),
+        "pending_observations": pending["count"],
+        "speech_reflect_seconds": reflector.speech_delay_seconds,
+        "chat_reflect_seconds": reflector.chat_delay_seconds,
+        "max_reflect_batch": reflector.max_batch,
+        "send_chat_configured": bool(reflector.send_chat_url),
+        "pending": pending,
+        "activity": [row.model_dump(mode="json") for row in recent_activity],
+        "analyses": [row.model_dump(mode="json") for row in recent_analyses],
+        "memories": [row.model_dump(mode="json") for row in recent_memories],
+        "source_overview": intent_store.source_overview(),
+    }
+
+
+def _sse(event: str, payload: dict[str, Any]) -> str:
+    data = json.dumps(payload, separators=(",", ":"), default=str)
+    return f"event: {event}\ndata: {data}\n\n"
+
+
 def create_app(store: IntentStore | None = None) -> FastAPI:
     intent_store = store or IntentStore()
-    reflector = ReflectionLoop(intent_store, send_chat_url=SEND_CHAT_URL)
+    activity_log = ActivityLog()
+    reflector = ReflectionLoop(intent_store, send_chat_url=SEND_CHAT_URL, activity_log=activity_log)
 
     @contextlib.asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -1292,6 +1515,7 @@ def create_app(store: IntentStore | None = None) -> FastAPI:
     )
     app.state.intent_store = intent_store
     app.state.reflector = reflector
+    app.state.activity_log = activity_log
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -1332,28 +1556,25 @@ def create_app(store: IntentStore | None = None) -> FastAPI:
 
     @app.get("/state")
     async def state(limit: int = 20) -> dict[str, Any]:
-        safe_limit = max(1, min(limit, 100))
-        pending = await reflector.snapshot()
-        recent_analyses = list(reversed(_tail(intent_store.analyses, safe_limit)))
-        recent_memories = list(reversed(_tail(intent_store.memories, safe_limit)))
-        return {
-            "ok": True,
-            "service": "intent-alignment",
-            "generated_at_utc": utc_now(),
-            "data_dir": str(intent_store.data_dir),
-            "source_count": len(intent_store.sources),
-            "memory_count": len(intent_store.memories),
-            "analysis_count": len(intent_store.analyses),
-            "pending_observations": pending["count"],
-            "speech_reflect_seconds": reflector.speech_delay_seconds,
-            "chat_reflect_seconds": reflector.chat_delay_seconds,
-            "max_reflect_batch": reflector.max_batch,
-            "send_chat_configured": bool(reflector.send_chat_url),
-            "pending": pending,
-            "analyses": [row.model_dump(mode="json") for row in recent_analyses],
-            "memories": [row.model_dump(mode="json") for row in recent_memories],
-            "source_overview": intent_store.source_overview(),
-        }
+        return await _state_payload(intent_store, reflector, activity_log, limit=limit)
+
+    @app.get("/stream")
+    async def stream(limit: int = 20) -> StreamingResponse:
+        async def generate():
+            queue = activity_log.subscribe()
+            try:
+                yield _sse("snapshot", await _state_payload(intent_store, reflector, activity_log, limit=limit))
+                while True:
+                    try:
+                        record = await asyncio.wait_for(queue.get(), timeout=15)
+                    except asyncio.TimeoutError:
+                        yield ": keepalive\n\n"
+                        continue
+                    yield _sse("activity", record.model_dump(mode="json"))
+            finally:
+                activity_log.unsubscribe(queue)
+
+        return StreamingResponse(generate(), media_type="text/event-stream")
 
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)
     async def root_ui() -> HTMLResponse:
@@ -1405,6 +1626,7 @@ def create_app(store: IntentStore | None = None) -> FastAPI:
                 [observation],
                 send_chat_url=SEND_CHAT_URL,
                 persist_memory=request.persist_memory,
+                activity_log=activity_log,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1430,6 +1652,35 @@ def create_app(store: IntentStore | None = None) -> FastAPI:
 
         observations = _normalize_event(envelope)
         queued = await reflector.submit_many(observations)
+        for observation in observations:
+            if observation.from_bot or not observation.text.strip():
+                continue
+            activity_log.append(
+                ActivityRecord(
+                    kind="observation",
+                    text=observation.text,
+                    event_id=observation.event_id,
+                    event_type=observation.event_type,
+                    modality=observation.modality,
+                    speaker=observation.speaker,
+                    meeting_id=observation.meeting_id,
+                    thread_id=observation.thread_id,
+                )
+            )
+        if not observations:
+            event_type = _first_text(envelope.get("event_type")) or "unknown"
+            if event_type == "meeting.transcript.official":
+                text = "Ignored post-meeting official transcript; waiting for live speech or chat"
+            else:
+                text = f"Ignored unsupported event type {event_type}"
+            activity_log.append(
+                ActivityRecord(
+                    kind="ignored_event",
+                    text=text,
+                    event_id=_first_text(envelope.get("event_id")),
+                    event_type=event_type,
+                )
+            )
 
         return {
             "ok": True,

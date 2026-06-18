@@ -444,8 +444,9 @@ docker run --rm -p 8765:8765 -v "$PWD/.intent-data:/data" alfred-intent
 ```
 
 Useful endpoints:
-- `GET /ui` and `/` — browser monitor for live state, pending observations, recent analyses, memories, and source overview.
-- `GET /state` — JSON payload used by the monitor.
+- `GET /ui` and `/` — browser monitor for streamed live speech/chat activity, agent status lines, pending observations, recent analyses, memories, and source overview.
+- `GET /state` — JSON snapshot used by the monitor.
+- `GET /stream` — Server-Sent Events stream; emits an initial `snapshot` event and live `activity` events for observations, agent search status, ignored events, and analyses.
 - `POST /v2/events` / `/events` — queue live speech/chat observations.
 - `POST /reflect/flush` — force pending observations to reflect immediately; useful for tests and demos.
 - `POST /analyze` — manual text analysis: `{"text":"We decided to keep Postgres"}`.

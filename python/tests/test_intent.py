@@ -103,11 +103,59 @@ async def test_monitor_ui_and_state_show_pending_observation(tmp_path):
     assert ui.status_code == 200
     assert "text/html" in ui.headers["content-type"]
     assert "Intent Alignment Monitor" in ui.text
+    assert "EventSource" in ui.text
     assert root.status_code == 200
     assert posted.json()["queued"] == 1
     body = state.json()
     assert body["pending_observations"] == 1
     assert body["pending"]["conversations"][0]["observations"][0]["event_id"] == "evt-ui-1"
+    assert body["activity"][0]["kind"] == "observation"
+    assert body["activity"][0]["event_id"] == "evt-ui-1"
+
+
+@pytest.mark.asyncio
+async def test_reflection_activity_status_lines(tmp_path):
+    app = create_app(IntentStore(tmp_path))
+    base = {
+        "schema_version": "alfred-v2",
+        "event_type": "meeting.chat.created",
+        "ts": "2026-06-17T20:04:00Z",
+        "meeting_ref": {
+            "meeting_id": "19:meeting_demo@thread.v2",
+            "meeting_chat_thread_id": "19:meeting_demo@thread.v2",
+        },
+    }
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await client.post(
+            "/v2/events",
+            json={
+                **base,
+                "event_id": "evt-small-talk",
+                "payload": {
+                    "sender": {"display_name": "Sam"},
+                    "text": "The room is quiet for a moment.",
+                },
+            },
+        )
+        await client.post("/reflect/flush")
+        await client.post(
+            "/v2/events",
+            json={
+                **base,
+                "event_id": "evt-search",
+                "payload": {
+                    "sender": {"display_name": "Sam"},
+                    "text": "We agreed the client route should use the live v2 event sink.",
+                },
+            },
+        )
+        await client.post("/reflect/flush")
+        state = await client.get("/state")
+
+    activity_text = [row["text"] for row in state.json()["activity"]]
+    assert "Haven't heard anything worth searching" in activity_text
+    assert any(text.startswith("Searching sources to see if anything on") for text in activity_text)
 
 
 @pytest.mark.asyncio
